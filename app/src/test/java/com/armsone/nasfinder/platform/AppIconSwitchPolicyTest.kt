@@ -98,9 +98,9 @@ class AppIconSwitchPolicyTest {
         assertEquals(
             listOf(
                 LauncherIconVariant.DEFAULT,
-                LauncherIconVariant.CYBER_VAULT,
-                LauncherIconVariant.VIBE_CODER,
                 LauncherIconVariant.PURPLE_NAS,
+                LauncherIconVariant.VIBE_CODER,
+                LauncherIconVariant.CYBER_VAULT,
             ),
             LauncherIconVariant.entries,
         )

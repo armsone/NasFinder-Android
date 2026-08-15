@@ -2,8 +2,8 @@ package com.armsone.nasfinder.platform
 
 import com.armsone.nasfinder.model.AppTheme
 
-// User-visible order is fixed to the four supplied images: Blue, Cyber Vault, Vibe Coder, Purple.
-enum class LauncherIconVariant { DEFAULT, CYBER_VAULT, VIBE_CODER, PURPLE_NAS }
+// User-visible order matches iPhone: Blue, Purple, Vibe Coder, Cyber Vault.
+enum class LauncherIconVariant { DEFAULT, PURPLE_NAS, VIBE_CODER, CYBER_VAULT }
 
 internal object AppIconComponentContract {
     const val MAIN_ACTIVITY_CLASS = "com.armsone.nasfinder.MainActivity"
@@ -54,7 +54,12 @@ internal data class AliasMutation(
 internal object AppIconSwitchPolicy {
     fun iconFor(theme: AppTheme): LauncherIconVariant = when (theme) {
         AppTheme.DIGITAL_RAIN -> LauncherIconVariant.VIBE_CODER
-        else -> LauncherIconVariant.DEFAULT
+        AppTheme.SYSTEM,
+        AppTheme.DAY,
+        AppTheme.NIGHT,
+        AppTheme.WINDY_MEADOW,
+        AppTheme.WORKBENCH,
+        -> LauncherIconVariant.DEFAULT
     }
 
     fun restoredIcon(storedName: String?, legacyTheme: AppTheme): LauncherIconVariant =

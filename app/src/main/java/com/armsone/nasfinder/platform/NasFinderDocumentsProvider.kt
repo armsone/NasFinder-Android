@@ -32,6 +32,12 @@ import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.UUID
 
+/** Backends exposed by both Android DocumentsProvider and the iOS File Provider. */
+internal val DOCUMENTS_PROVIDER_CONNECTION_KINDS = setOf(
+    ConnectionKind.SYNOLOGY,
+    ConnectionKind.SFTP,
+)
+
 /**
  * SAF bridge for backends that support reliable list and download operations.
  * Mutations are narrowly exposed for verified SFTP operations; every other
@@ -659,7 +665,10 @@ class NasFinderDocumentsProvider : DocumentsProvider() {
         const val THUMBNAIL_MAX_AGE_MILLIS = 7L * 24L * 60L * 60L * 1_000L
         val THUMBNAIL_FILENAME = Regex("^[0-9a-f]{64}\\.png$")
 
-        val READABLE_CONNECTION_KINDS = ConnectionKind.entries.toSet()
+        // Keep Android's system Files surface aligned with the iOS File Provider.
+        // The in-app browser supports more backends, but the external provider has
+        // a verified contract only for Synology and SFTP on both platforms.
+        val READABLE_CONNECTION_KINDS = DOCUMENTS_PROVIDER_CONNECTION_KINDS
 
         val DEFAULT_ROOT_PROJECTION = arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,

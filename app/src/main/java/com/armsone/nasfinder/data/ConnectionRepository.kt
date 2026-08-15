@@ -1,8 +1,11 @@
 package com.armsone.nasfinder.data
 
 import android.content.Context
+import com.armsone.nasfinder.model.BrowserPreferences
+import com.armsone.nasfinder.model.BrowserPreferencesStorage
 import com.armsone.nasfinder.model.ConnectionKind
 import com.armsone.nasfinder.model.RemoteConnection
+import com.armsone.nasfinder.model.StoredBrowserPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -30,6 +33,11 @@ class ConnectionRepository(context: Context) {
             browserPreferences.edit()
                 .remove("last_path.$removedId")
                 .remove("super_thumbnail_root.$removedId")
+                .apply {
+                    if (browserPreferences.getString(KEY_LAST_CONNECTION, null) == removedId) {
+                        remove(KEY_LAST_CONNECTION)
+                    }
+                }
                 .apply()
         }
         val array = JSONArray().apply { connections.forEach { put(it.toJson()) } }
@@ -48,9 +56,37 @@ class ConnectionRepository(context: Context) {
         .getString("last_path.$connectionId", null)
         ?.takeIf(String::isNotBlank)
 
+    fun lastConnectionId(): String? = browserPreferences
+        .getString(KEY_LAST_CONNECTION, null)
+        ?.takeIf(String::isNotBlank)
+
     fun setLastPath(connectionId: String, path: String) {
         if (connectionId.isBlank() || path.isBlank()) return
-        browserPreferences.edit().putString("last_path.$connectionId", path).apply()
+        browserPreferences.edit()
+            .putString("last_path.$connectionId", path)
+            .putString(KEY_LAST_CONNECTION, connectionId)
+            .apply()
+    }
+
+    fun browserPreferences(): BrowserPreferences = BrowserPreferencesStorage.restore(
+        StoredBrowserPreferences(
+            layout = browserPreferences.getString(KEY_BROWSER_LAYOUT, null),
+            sortField = browserPreferences.getString(KEY_BROWSER_SORT_FIELD, null),
+            sortDirection = browserPreferences.getString(KEY_BROWSER_SORT_DIRECTION, null),
+            namePriority = browserPreferences.getString(KEY_BROWSER_NAME_PRIORITY, null),
+            foldersFirst = browserPreferences.getBoolean(KEY_BROWSER_FOLDERS_FIRST, true),
+        )
+    )
+
+    fun setBrowserPreferences(value: BrowserPreferences) {
+        val stored = BrowserPreferencesStorage.store(value)
+        browserPreferences.edit()
+            .putString(KEY_BROWSER_LAYOUT, stored.layout)
+            .putString(KEY_BROWSER_SORT_FIELD, stored.sortField)
+            .putString(KEY_BROWSER_SORT_DIRECTION, stored.sortDirection)
+            .putString(KEY_BROWSER_NAME_PRIORITY, stored.namePriority)
+            .putBoolean(KEY_BROWSER_FOLDERS_FIRST, stored.foldersFirst)
+            .apply()
     }
 
     fun superThumbnailRootPath(connectionId: String): String? = browserPreferences
@@ -79,5 +115,11 @@ class ConnectionRepository(context: Context) {
     private companion object {
         const val KEY_CONNECTIONS = "connections"
         const val KEY_PREFERRED = "preferred"
+        const val KEY_LAST_CONNECTION = "last_connection"
+        const val KEY_BROWSER_LAYOUT = "fileBrowserLayoutStyle"
+        const val KEY_BROWSER_SORT_FIELD = "fileBrowserSortField"
+        const val KEY_BROWSER_SORT_DIRECTION = "fileBrowserSortDirection"
+        const val KEY_BROWSER_NAME_PRIORITY = "fileBrowserNamePriority"
+        const val KEY_BROWSER_FOLDERS_FIRST = "fileBrowserFoldersFirst"
     }
 }

@@ -216,6 +216,12 @@ class SuperThumbnailSessionStore(private val storageFile: File) {
         sessions.keys.removeAll { it.startsWith(prefix) }
     }
 
+    fun clearAll(): Int = synchronized(FILE_LOCK) {
+        val count = load().size
+        save(emptyMap())
+        count
+    }
+
     private fun mutateItem(sessionKey: String, item: RemoteFileItem, change: (ItemState) -> ItemState) = update { sessions ->
         val session = sessions[sessionKey] ?: return@update
         val state = session.items[item.id] ?: return@update

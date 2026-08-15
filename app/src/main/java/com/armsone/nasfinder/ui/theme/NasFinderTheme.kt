@@ -20,6 +20,12 @@ val NasBlue = Color(0xFF007AFF)
 val SftpGreen = Color(0xFF34C759)
 val BrowserOrange = Color(0xFFFF9500)
 val FolderBlue = Color(0xFF1478B3)
+val WorkbenchAccent = Color(red = .36f, green = .78f, blue = 1f)
+private val WorkbenchPrimaryText = Color(red = .92f, green = .95f, blue = .98f)
+private val WorkbenchSecondaryText = Color(red = .61f, green = .69f, blue = .76f)
+private val WorkbenchSurface = Color(red = .075f, green = .105f, blue = .145f)
+private val WorkbenchOutline = Color(red = .20f, green = .29f, blue = .37f)
+private val WorkbenchBackground = Color(red = .035f, green = .055f, blue = .08f)
 
 private val NasFinderTypography = Typography(
     // SwiftUI semantic counterparts: body 17, subheadline 15, footnote 13,
@@ -40,6 +46,7 @@ private val NasFinderTypography = Typography(
 fun folderColor(theme: AppTheme): Color = when (theme) {
     AppTheme.DIGITAL_RAIN -> Color(0xFF3BD6B0)
     AppTheme.WINDY_MEADOW -> Color(0xFF0A7AAD)
+    AppTheme.WORKBENCH -> WorkbenchAccent
     AppTheme.NIGHT -> Color(0xFF5CBAF0)
     AppTheme.SYSTEM -> if (isSystemInDarkTheme()) Color(0xFF5CBAF0) else FolderBlue
     AppTheme.DAY -> FolderBlue
@@ -50,23 +57,24 @@ fun NasFinderTheme(theme: AppTheme, content: @Composable () -> Unit) {
     val systemDark = isSystemInDarkTheme()
     val dark = when (theme) {
         AppTheme.DAY, AppTheme.WINDY_MEADOW -> false
-        AppTheme.NIGHT, AppTheme.DIGITAL_RAIN -> true
+        AppTheme.NIGHT, AppTheme.DIGITAL_RAIN, AppTheme.WORKBENCH -> true
         AppTheme.SYSTEM -> systemDark
     }
     val accent = when (theme) {
         AppTheme.DIGITAL_RAIN -> Color(0xFF2EE8B8)
         AppTheme.WINDY_MEADOW -> Color(0xFF0D8CC2)
+        AppTheme.WORKBENCH -> WorkbenchAccent
         else -> NasBlue
     }
     val scheme = if (dark) darkColorScheme(
         primary = accent,
-        background = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFF030B0B) else Color(0xFF09131C),
-        surface = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFF091B18) else Color(0xFF131C24),
-        surfaceVariant = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFF0C2420) else Color(0xFF182631),
-        outlineVariant = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFF1A5245) else Color(0xFF2E4757),
-        onBackground = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFFE6FAF2) else Color(0xFFF2F5F7),
-        onSurface = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFFE6FAF2) else Color(0xFFF2F5F7),
-        onSurfaceVariant = if (theme == AppTheme.DIGITAL_RAIN) Color(0xFF99BFB3) else Color(0xFFB5C1C9),
+        background = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF030B0B); AppTheme.WORKBENCH -> WorkbenchBackground; else -> Color(0xFF09131C) },
+        surface = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF091B18); AppTheme.WORKBENCH -> WorkbenchSurface; else -> Color(0xFF131C24) },
+        surfaceVariant = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF0C2420); AppTheme.WORKBENCH -> WorkbenchSurface; else -> Color(0xFF182631) },
+        outlineVariant = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF1A5245); AppTheme.WORKBENCH -> WorkbenchOutline; else -> Color(0xFF2E4757) },
+        onBackground = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFFE6FAF2); AppTheme.WORKBENCH -> WorkbenchPrimaryText; else -> Color(0xFFF2F5F7) },
+        onSurface = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFFE6FAF2); AppTheme.WORKBENCH -> WorkbenchPrimaryText; else -> Color(0xFFF2F5F7) },
+        onSurfaceVariant = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF99BFB3); AppTheme.WORKBENCH -> WorkbenchSecondaryText; else -> Color(0xFFB5C1C9) },
     ) else lightColorScheme(
         primary = accent,
         background = if (theme == AppTheme.WINDY_MEADOW) Color(0xFFEDF5D1) else Color(0xFFF4FBFE),
@@ -104,6 +112,7 @@ fun serviceColor(identifier: String, theme: AppTheme): Color {
         AppTheme.NIGHT -> Color.White to .08f
         AppTheme.DIGITAL_RAIN -> Color(0xFFBDFFE6) to .06f
         AppTheme.WINDY_MEADOW -> Color.Black to .04f
+        AppTheme.WORKBENCH -> Color(red = .72f, green = .86f, blue = 1f) to .05f
         else -> return base
     }
     return Color(

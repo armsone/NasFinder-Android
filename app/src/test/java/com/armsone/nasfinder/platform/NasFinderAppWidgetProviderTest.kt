@@ -1,34 +1,27 @@
 package com.armsone.nasfinder.platform
 
-import com.armsone.nasfinder.data.SharedInboxStore
-import org.junit.Assert.assertEquals
-import org.junit.Rule
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.rules.TemporaryFolder
-import java.io.ByteArrayInputStream
 import java.io.File
 
 class NasFinderAppWidgetProviderTest {
-    @get:Rule val temporary = TemporaryFolder()
+    @Test
+    fun `widget is a stateless app opener like the iOS accessory widget`() {
+        val source = sourceFile(
+            "app/src/main/java/com/armsone/nasfinder/platform/NasFinderAppWidgetProvider.kt",
+        ).readText()
 
-    @Test fun countUsesManifestRecordsInsteadOfEveryInboxFile() {
-        val filesDirectory = temporary.newFolder("files")
-        val store = SharedInboxStore(filesDirectory)
-        store.import("one.txt", "text/plain", ByteArrayInputStream(byteArrayOf(1)))
-        store.import("two.txt", "text/plain", ByteArrayInputStream(byteArrayOf(2)))
-        val inbox = File(filesDirectory, "SharedInbox")
-        File(inbox, "orphan.bin").writeBytes(byteArrayOf(3))
-
-        assertEquals(2, widgetInboxRecordCount(filesDirectory))
-        assertEquals(4, inbox.listFiles().orEmpty().count(File::isFile))
+        assertTrue("Missing widget open action", "setOnClickPendingIntent" in source)
+        assertFalse("Widget must not expose connection state", "ConnectionRepository" in source)
+        assertFalse("Widget must not expose inbox state", "SharedInboxStore" in source)
     }
 
-    @Test fun unreadableManifestFailsClosedToZero() {
-        val filesDirectory = temporary.newFolder("files")
-        val inbox = File(filesDirectory, "SharedInbox").apply { mkdirs() }
-        File(inbox, "manifest.json").writeText("not-json")
-        File(inbox, "orphan.bin").writeBytes(byteArrayOf(1))
-
-        assertEquals(0, widgetInboxRecordCount(filesDirectory))
+    private fun sourceFile(relativePath: String): File {
+        val working = File(System.getProperty("user.dir")).canonicalFile
+        return generateSequence(working) { it.parentFile }
+            .map { File(it, relativePath) }
+            .firstOrNull(File::isFile)
+            ?: error("Cannot locate $relativePath from $working")
     }
 }

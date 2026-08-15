@@ -27,6 +27,10 @@ class ReleasePlatformContractTest {
 
         val aliases = manifest.getElementsByTagName("activity-alias").elements()
             .associateBy { it.android("name") }
+        val launcherAliases = aliases.filterValues { alias ->
+            alias.getElementsByTagName("category").elements()
+                .any { it.android("name") == "android.intent.category.LAUNCHER" }
+        }
         assertEquals(
             setOf(
                 ".DefaultLauncherAlias",
@@ -34,15 +38,31 @@ class ReleasePlatformContractTest {
                 ".DigitalRainLauncherAlias",
                 ".PurpleNasLauncherAlias",
             ),
-            aliases.keys,
+            launcherAliases.keys,
         )
-        assertEquals(1, aliases.values.count { it.android("enabled") == "true" })
-        aliases.forEach { (name, alias) ->
+        assertEquals(1, launcherAliases.values.count { it.android("enabled") == "true" })
+        val expectedLauncherIcons = mapOf(
+            ".DefaultLauncherAlias" to "@mipmap/ic_launcher_default",
+            ".PurpleNasLauncherAlias" to "@mipmap/ic_launcher_purple_nas",
+            ".DigitalRainLauncherAlias" to "@mipmap/ic_launcher_vibe_coder",
+            ".CyberVaultLauncherAlias" to "@mipmap/ic_launcher_cyber_vault",
+        )
+        launcherAliases.forEach { (name, alias) ->
             assertEquals(".MainActivity", alias.android("targetActivity"))
             assertEquals("true", alias.android("exported"))
-            assertTrue("Missing launcher icon for $name", alias.android("icon").startsWith("@mipmap/"))
+            assertEquals(expectedLauncherIcons[name], alias.android("icon"))
             assertEquals(alias.android("icon"), alias.android("roundIcon"))
+            assertEquals("@string/app_name", alias.android("label"))
         }
+        val shareAlias = requireNotNull(aliases[".ShareReceiverAlias"])
+        assertEquals("true", shareAlias.android("exported"))
+        assertEquals("@string/share_save_label", shareAlias.android("label"))
+        assertEquals(".MainActivity", shareAlias.android("targetActivity"))
+        assertEquals(
+            setOf("android.intent.action.SEND", "android.intent.action.SEND_MULTIPLE"),
+            shareAlias.getElementsByTagName("action").elements()
+                .mapTo(mutableSetOf()) { it.android("name") },
+        )
 
         val restoreReceiver = manifest.getElementsByTagName("receiver").elements()
             .firstOrNull { it.android("name") == ".platform.AppIconRestoreReceiver" }
@@ -103,6 +123,7 @@ class ReleasePlatformContractTest {
                 .firstOrNull { it.android("name") == ".platform.NasFinderAppWidgetProvider" },
         )
         assertEquals("false", widget.android("exported"))
+        assertEquals("@string/widget_picker_title", widget.android("label"))
         assertEquals(
             setOf("android.appwidget.action.APPWIDGET_UPDATE"),
             widget.getElementsByTagName("action").elements()
@@ -126,14 +147,20 @@ class ReleasePlatformContractTest {
     }
 
     @Test
-    fun `widget text keeps scalable units and natural height for large fonts`() {
+    fun `widget mirrors the iOS single glyph open action without dashboard summaries`() {
         val layout = xml(sourceFile("app/src/main/res/layout/nasfinder_widget.xml"))
         val textViews = layout.getElementsByTagName("TextView").elements()
-        assertTrue(textViews.isNotEmpty())
-        textViews.forEach { view ->
-            assertTrue(view.android("textSize").endsWith("sp"))
-            assertEquals("wrap_content", view.android("layout_height"))
-        }
+        assertTrue(textViews.isEmpty())
+        val images = layout.getElementsByTagName("ImageView").elements()
+        assertEquals(1, images.size)
+        assertEquals("@drawable/ic_nasfinder_accessory", images.single().android("src"))
+        assertEquals("@string/widget_open_label", layout.documentElement.android("contentDescription"))
+
+        val metadata = xml(sourceFile("app/src/main/res/xml/nasfinder_widget_info.xml"))
+            .documentElement
+        assertEquals("110dp", metadata.android("minWidth"))
+        assertEquals("110dp", metadata.android("minHeight"))
+        assertEquals("none", metadata.android("resizeMode"))
     }
 
     private fun sourceFile(relativePath: String): File {

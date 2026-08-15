@@ -35,6 +35,7 @@ import com.armsone.nasfinder.data.SuperThumbnailWorkSnapshot
 import com.armsone.nasfinder.data.SuperThumbnailWorkStatus
 import com.armsone.nasfinder.data.SuperThumbnailSessionReport
 import com.armsone.nasfinder.data.SuperThumbnailDataController
+import com.armsone.nasfinder.data.SuperThumbnailCacheResetStatus
 import com.armsone.nasfinder.data.SuperThumbnailVaultOptions
 import com.armsone.nasfinder.data.SuperThumbnailVaultTiming
 import com.armsone.nasfinder.data.ScreenAwakeMode
@@ -75,6 +76,7 @@ data class AppState(
     val pendingLauncherIcon: LauncherIconVariant? = null,
     val isBusy: Boolean = false,
     val message: String? = null,
+    val inboxErrorMessage: String? = null,
     val inboxFiles: List<InboxDisplayItem> = emptyList(),
     val download: RemoteDownloadState? = null,
     val remoteFavorites: List<RemoteFavorite> = emptyList(),
@@ -227,6 +229,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var superThumbnailPickerGeneration = 0
     private val superThumbnailPreferences =
         application.getSharedPreferences("super_thumbnail_ui", android.content.Context.MODE_PRIVATE)
+    private val initialInboxLoad = runCatching { inboxFiles() }
     private val _state = MutableStateFlow(
         AppState(
             connections = repository.load(),
@@ -242,7 +245,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     superThumbnailPreferences.getString(KEY_SUPER_THUMBNAIL_VAULT_TIMING, null).orEmpty()
                 )
             }.getOrDefault(SuperThumbnailVaultTiming.NOW),
-            inboxFiles = inboxFiles(),
+            inboxFiles = initialInboxLoad.getOrDefault(emptyList()),
+            inboxErrorMessage = initialInboxLoad.exceptionOrNull()?.let {
+                "받은 파일 목록을 읽지 못했습니다: ${it.message ?: "알 수 없는 오류"}"
+            },
             remoteFavorites = favoriteRepository.remoteFavorites(),
             browserFavorites = favoriteRepository.browserFavorites(),
             oauthClientIds = CloudOAuthProvider.entries.mapNotNull { provider ->
@@ -262,6 +268,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     init {
         runCatching(::cleanupOrphanedWebDownloads)
         refreshDownloadCacheSize()
+        refreshThumbnailCacheStatistics()
         thumbnailTrafficObservation = viewModelScope.launch {
             thumbnailRepository.trafficSnapshot.collect { snapshot ->
                 _state.update { it.copy(thumbnailTraffic = snapshot) }
@@ -298,7 +305,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 )
             }
         }
-        _state.value.connections.firstOrNull { it.id == _state.value.preferredId }?.let(::resumeConnection)
+        _state.value.connections.firstOrNull { it.id == _state.value.preferredId }?.let { connection ->
+            openConnection(connection, connection.normalizedRootPath, fallbackToRoot = false)
+        }
     }
 
     fun show(screen: Screen) {
@@ -306,6 +315,22 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(screen = screen, message = null) }
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
+    fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
+
+    fun refreshInbox() {
+        runCatching { inboxFiles() }.fold(
+            onSuccess = { files ->
+                _state.update { it.copy(inboxFiles = files, inboxErrorMessage = null) }
+            },
+            onFailure = { error ->
+                _state.update {
+                    it.copy(
+                        inboxErrorMessage = "받은 파일 목록을 읽지 못했습니다: ${error.message ?: "알 수 없는 오류"}",
+                    )
+                }
+            },
+        )
+    }
 
     fun toggleBrowserFavorite(title: String, url: String) {
         val normalized = BrowserUrlPolicy.normalize(url) ?: run {
@@ -324,7 +349,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update {
             it.copy(
                 browserFavorites = values,
-                message = if (added) "웹 즐겨찾기에 추가했습니다." else "웹 즐겨찾기에서 제거했습니다.",
+                message = if (added) "즐겨찾기에 추가했습니다." else "즐겨찾기에서 제거했습니다.",
             )
         }
     }
@@ -357,7 +382,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
         favoriteRepository.saveBrowser(values)
-        _state.update { it.copy(browserFavorites = values, message = "웹 즐겨찾기를 수정했습니다.") }
+        _state.update { it.copy(browserFavorites = values, message = "즐겨찾기를 수정했습니다.") }
     }
 
     fun deleteBrowserFavorite(favorite: BrowserFavorite) {
@@ -367,7 +392,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
         favoriteRepository.saveBrowser(values)
-        _state.update { it.copy(browserFavorites = values, message = "웹 즐겨찾기를 삭제했습니다.") }
+        _state.update { it.copy(browserFavorites = values, message = "즐겨찾기를 삭제했습니다.") }
     }
 
     fun saveConnection(connection: RemoteConnection, password: String) {
@@ -477,12 +502,74 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(superThumbnailVaultResultMessage = null) }
     }
 
+    fun resetSuperCache() {
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            val result = runCatching { superThumbnailDataController.resetSuperCache() }.getOrElse { error ->
+                _state.update {
+                    it.copy(
+                        isBusy = false,
+                        message = error.message ?: "Super Cache를 초기화하지 못했습니다.",
+                    )
+                }
+                return@launch
+            }
+            when (result.status) {
+                SuperThumbnailCacheResetStatus.COMPLETED -> {
+                    superThumbnailObservation?.cancel()
+                    superThumbnailObservation = null
+                    persistSuperThumbnailWorkLocations(emptyMap())
+                    superThumbnailPreferences.edit()
+                        .remove(KEY_SUPER_THUMBNAIL_WORK_CONNECTION)
+                        .remove(KEY_SUPER_THUMBNAIL_WORK_PATH)
+                        .remove(KEY_SUPER_THUMBNAIL_WORK_TITLE)
+                        .remove(KEY_SUPER_THUMBNAIL_WORK_LOCATIONS)
+                        .apply()
+                    _state.update {
+                        it.copy(
+                            isBusy = false,
+                            message = "Super Cache ${result.removedFileCount}개와 작업 기록 ${result.clearedSessionCount}개를 초기화했습니다.",
+                            remoteThumbnails = emptyMap(),
+                            thumbnailGeneration = it.thumbnailGeneration + 1,
+                            superThumbnailWorkLocation = null,
+                            superThumbnailWorkLocations = emptyMap(),
+                            superThumbnailWork = null,
+                            superThumbnailSessionReport = null,
+                            superThumbnailReportLocationId = null,
+                        )
+                    }
+                }
+                SuperThumbnailCacheResetStatus.PARTIAL -> _state.update {
+                    it.copy(
+                        isBusy = false,
+                        message = buildString {
+                            append("Super Cache 일부만 초기화했습니다.")
+                            if (result.errors.isNotEmpty()) append(" ${result.errors.joinToString(" ")}")
+                        },
+                    )
+                }
+                SuperThumbnailCacheResetStatus.BLOCKED_RUNNING_WORK -> _state.update {
+                    it.copy(isBusy = false, message = "실행 중인 Super Thumbnail 작업이 있어 초기화할 수 없습니다.")
+                }
+                SuperThumbnailCacheResetStatus.BLOCKED_RESET_IN_PROGRESS -> _state.update {
+                    it.copy(isBusy = false, message = "Super Cache를 이미 초기화하고 있습니다.")
+                }
+                SuperThumbnailCacheResetStatus.BLOCKED_WORK_STATE_UNKNOWN -> _state.update {
+                    it.copy(isBusy = false, message = "작업 상태를 확인하지 못해 Super Cache를 초기화하지 않았습니다.")
+                }
+                SuperThumbnailCacheResetStatus.AVAILABLE -> _state.update {
+                    it.copy(isBusy = false, message = "Super Cache 초기화 결과를 확인하지 못했습니다.")
+                }
+            }
+        }
+    }
+
     fun startSuperThumbnail(
         allowsConstrainedRun: Boolean = false,
         resumeExisting: Boolean = false,
     ) {
         val connectionId = _state.value.superThumbnailConnectionId ?: run {
-            _state.update { it.copy(message = "슈퍼 썸네일을 만들 연결을 선택해 주세요.") }
+            _state.update { it.copy(message = "Super Thumbnail을 만들 연결을 선택해 주세요.") }
             return
         }
         val connection = _state.value.connections.firstOrNull { it.id == connectionId } ?: return
@@ -545,7 +632,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         _state.update {
                             it.copy(
                                 superThumbnailWork = emptySuperThumbnailSnapshot(SuperThumbnailWorkStatus.FAILED),
-                                message = "슈퍼 썸네일 작업을 시작하지 못했습니다.",
+                                message = "Super Thumbnail 작업을 시작하지 못했습니다.",
                             )
                         }
                     }
@@ -564,7 +651,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(superThumbnailWork = emptySuperThumbnailSnapshot(SuperThumbnailWorkStatus.CANCELLED)) }
         }
         runCatching { SuperThumbnailWorkController.cancel(application, connectionId) }
-            .onFailure { _state.update { it.copy(message = "슈퍼 썸네일 작업을 취소하지 못했습니다.") } }
+            .onFailure { _state.update { it.copy(message = "Super Thumbnail 작업을 취소하지 못했습니다.") } }
     }
 
     private fun emptySuperThumbnailSnapshot(status: SuperThumbnailWorkStatus) =
@@ -1067,7 +1154,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }.onSuccess { items ->
                 if (generation != thumbnailGeneration) return@onSuccess
                 repository.setLastPath(connection.id, path)
-                val preferences = (_state.value.screen as? Screen.Browser)?.preferences ?: BrowserPreferences()
+                val preferences = repository.browserPreferences()
                 _state.update { it.copy(isBusy = false, screen = Screen.Browser(connection, path, items.sortedWith(preferences), preferences)) }
             }.onFailure { error ->
                 if (generation != thumbnailGeneration) return@onFailure
@@ -1087,6 +1174,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             repository.lastPath(connection.id) ?: connection.normalizedRootPath,
             fallbackToRoot = true,
         )
+    }
+
+    fun resumeLastLocation() {
+        val connectionId = repository.lastConnectionId() ?: return
+        val connection = _state.value.connections.firstOrNull { it.id == connectionId } ?: return
+        val path = repository.lastPath(connectionId) ?: return
+        openConnection(connection, path, fallbackToRoot = true)
     }
 
     fun loadRemoteThumbnail(item: RemoteFileItem) {
@@ -1900,6 +1994,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun updateBrowserPreferences(preferences: BrowserPreferences) {
         val browser = _state.value.screen as? Screen.Browser ?: return
+        repository.setBrowserPreferences(preferences)
         _state.update { it.copy(screen = browser.copy(items = browser.items.sortedWith(preferences), preferences = preferences)) }
     }
 
@@ -2090,7 +2185,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             it.copy(
                 screen = Screen.Inbox,
                 inboxFiles = if (selected == null) files else listOf(selected) + files.filterNot { item -> item.id == id },
-                message = if (selected == null) "요청한 받은 파일을 찾을 수 없습니다." else null,
+                message = null,
+                inboxErrorMessage = if (selected == null) "요청한 받은 파일을 찾을 수 없습니다." else null,
             )
         }
     }
@@ -2121,11 +2217,18 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         screen = Screen.Inbox,
                         inboxFiles = if (selected == null) files else listOf(selected) + files.filterNot { item -> item.id == record.id },
                         message = null,
+                        inboxErrorMessage = null,
                     )
                 }
                 NasFinderAppWidgetProvider.updateAll(application)
             }.onFailure { error ->
-                _state.update { it.copy(message = error.message ?: "파일을 받은 파일로 가져오지 못했습니다.") }
+                _state.update {
+                    it.copy(
+                        screen = Screen.Inbox,
+                        message = null,
+                        inboxErrorMessage = error.message ?: "파일을 받은 파일로 가져오지 못했습니다.",
+                    )
+                }
             }
         }
     }
@@ -2143,6 +2246,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (uris.isEmpty()) return
         viewModelScope.launch {
             var count = 0
+            var failed = 0
             uris.forEachIndexed { index, uri ->
                 runCatching {
                     val name = queryName(uri) ?: "받은 파일 ${index + 1}"
@@ -2150,23 +2254,71 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         inboxStore.import(name, application.contentResolver.getType(uri), input)
                     } ?: error("파일을 열 수 없습니다")
                     count++
-                }
+                }.onFailure { failed++ }
             }
-            _state.update { it.copy(inboxFiles = inboxFiles(), message = "${count}개 파일을 받았습니다.") }
+            _state.update {
+                it.copy(
+                    screen = Screen.Inbox,
+                    inboxFiles = inboxFiles(),
+                    message = if (failed == 0) "${count}개 파일을 받았습니다." else null,
+                    inboxErrorMessage = when {
+                        failed == 0 -> null
+                        count == 0 -> "${failed}개 파일을 가져오지 못했습니다."
+                        else -> "${count}개 파일을 받았지만 ${failed}개는 가져오지 못했습니다."
+                    },
+                )
+            }
             NasFinderAppWidgetProvider.updateAll(application)
         }
     }
 
     fun deleteInboxFile(item: InboxDisplayItem) {
-        if (inboxStore.delete(item.id)) {
+        val deleted = runCatching { inboxStore.delete(item.id) }.getOrElse {
+            _state.update { state ->
+                state.copy(
+                    message = null,
+                    inboxErrorMessage = "${item.originalFilename}을(를) 삭제하지 못했습니다: ${it.message ?: "알 수 없는 오류"}",
+                )
+            }
+            false
+        }
+        if (deleted) {
             _state.update { it.copy(inboxFiles = inboxFiles()) }
             NasFinderAppWidgetProvider.updateAll(application)
+        } else if (_state.value.inboxErrorMessage == null) {
+            _state.update {
+                it.copy(
+                    message = null,
+                    inboxErrorMessage = "${item.originalFilename}을(를) 삭제하지 못했습니다.",
+                )
+            }
         }
+    }
+
+    fun previewInboxFile(item: InboxDisplayItem) {
+        val remoteItem = RemoteFileItem(
+            id = item.id.toString(),
+            name = item.originalFilename,
+            path = item.id.toString(),
+            isDirectory = false,
+            size = item.byteCount,
+            modifiedAt = item.importedAt,
+            mimeType = item.mimeType,
+        )
+        runCatching { launchPreparedFile(remoteItem, item.file, RemoteFileAction.PREVIEW) }
+            .onFailure { error ->
+                _state.update {
+                    it.copy(
+                        message = null,
+                        inboxErrorMessage = error.message ?: "파일을 열 수 없습니다.",
+                    )
+                }
+            }
     }
 
     fun deleteInboxFiles(ids: Iterable<UUID>) {
         val selected = runCatching { InboxBatchContracts.normalizeSelection(ids) }.getOrElse { error ->
-            _state.update { it.copy(message = error.message ?: "선택한 파일이 올바르지 않습니다.") }
+            _state.update { it.copy(message = null, inboxErrorMessage = error.message ?: "선택한 파일이 올바르지 않습니다.") }
             return
         }
         if (selected.isEmpty()) return
@@ -2185,8 +2337,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update {
                 it.copy(
                     inboxFiles = files,
-                    message = when {
-                        failed == 0 -> "${deleted}개 파일을 받은 파일에서 삭제했습니다."
+                    message = if (failed == 0) "${deleted}개 파일을 받은 파일에서 삭제했습니다." else null,
+                    inboxErrorMessage = when {
+                        failed == 0 -> null
                         deleted == 0 -> "${failed}개 파일을 삭제하지 못했습니다."
                         else -> "${deleted}개 파일을 삭제했고 ${failed}개는 삭제하지 못했습니다."
                     },
@@ -2198,7 +2351,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun shareInboxFiles(ids: Iterable<UUID>) {
         val items = runCatching { selectedInboxItems(ids) }.getOrElse { error ->
-            _state.update { it.copy(message = error.message ?: "선택한 파일이 올바르지 않습니다.") }
+            _state.update { it.copy(message = null, inboxErrorMessage = error.message ?: "선택한 파일이 올바르지 않습니다.") }
             return
         }
         if (items.isEmpty()) return
@@ -2209,7 +2362,24 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }.onFailure { error ->
-            _state.update { it.copy(message = error.message ?: "선택한 파일을 공유하지 못했습니다.") }
+            _state.update { it.copy(message = null, inboxErrorMessage = error.message ?: "선택한 파일을 공유하지 못했습니다.") }
+        }
+    }
+
+    fun shareInboxFile(item: InboxDisplayItem) {
+        runCatching {
+            val sendIntent = NasFinderShareIntentFactory.create(application, listOf(item.file))
+            application.startActivity(
+                Intent.createChooser(sendIntent, "받은 파일 공유")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure { error ->
+            _state.update {
+                it.copy(
+                    message = null,
+                    inboxErrorMessage = error.message ?: "${item.originalFilename}을(를) 공유하지 못했습니다.",
+                )
+            }
         }
     }
 

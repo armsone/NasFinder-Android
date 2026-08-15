@@ -87,7 +87,17 @@ enum class BrowserLayout { LIST, SMALL_GRID, LARGE_GRID }
 enum class SortField { NAME, KIND, SIZE, MODIFIED }
 enum class SortDirection { ASCENDING, DESCENDING }
 enum class NamePriority { NUMBERS_FIRST, KOREAN_FIRST, LATIN_FIRST }
-enum class AppTheme { SYSTEM, DAY, NIGHT, DIGITAL_RAIN, WINDY_MEADOW }
+enum class AppTheme {
+    SYSTEM,
+    DAY,
+    NIGHT,
+    DIGITAL_RAIN,
+    WINDY_MEADOW,
+    WORKBENCH;
+
+    val next: AppTheme
+        get() = entries[(ordinal + 1) % entries.size]
+}
 
 data class BrowserPreferences(
     val layout: BrowserLayout = BrowserLayout.LIST,

@@ -41,7 +41,9 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.LinkedHashMap
+import java.util.Collections
 import java.util.UUID
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -82,6 +84,7 @@ class RemoteThumbnailRepository(
     client: OkHttpClient = OkHttpClient(),
     private val maxPixelSize: Int = DEFAULT_MAX_PIXEL_SIZE,
     trafficLimits: RemoteThumbnailTrafficLimits = RemoteThumbnailTrafficLimits(),
+    private val onCacheCommitted: ((String) -> Unit)? = null,
 ) : Closeable {
     private val appContext = context.applicationContext
     private val httpClient = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
@@ -104,6 +107,10 @@ class RemoteThumbnailRepository(
         DISK_MAX_FILE_COUNT,
     )
 
+    init {
+        synchronized(LIVE_REPOSITORIES) { LIVE_REPOSITORIES += this }
+    }
+
     fun cacheStatistics(): RemoteThumbnailCacheStatistics = disk.statistics()
 
     fun setAutomaticCacheLimit(bytes: Long): RemoteThumbnailCacheStatistics {
@@ -117,6 +124,17 @@ class RemoteThumbnailRepository(
         negativeUntil.clear()
         disk.clear()
         return disk.statistics()
+    }
+
+    internal fun removeTrackedCache(keys: Set<String>): SuperThumbnailTrackedRemoval {
+        val repositories = synchronized(LIVE_REPOSITORIES) { LIVE_REPOSITORIES.toList() }
+        repositories.forEach { repository ->
+            keys.forEach { key ->
+                repository.memory.remove(key)
+                repository.negativeUntil.remove(key)
+            }
+        }
+        return disk.removeTracked(keys)
     }
 
     suspend fun load(
@@ -180,6 +198,7 @@ class RemoteThumbnailRepository(
             encodeThumbnail(bitmap, encoded)
             currentCoroutineContext().ensureActive()
             disk.commit(key, encoded)
+            if (disk.contains(key)) runCatching { onCacheCommitted?.invoke(key) }
             memory.put(key, bitmap)
             negativeUntil.remove(key)
             true
@@ -257,6 +276,7 @@ class RemoteThumbnailRepository(
             encodeThumbnail(bitmap, encoded)
             currentCoroutineContext().ensureActive()
             disk.commit(key, encoded)
+            if (disk.contains(key)) runCatching { onCacheCommitted?.invoke(key) }
             memory.put(key, bitmap)
             negativeUntil.remove(key)
             return bitmap
@@ -445,12 +465,15 @@ class RemoteThumbnailRepository(
     }
 
     override fun close() {
+        synchronized(LIVE_REPOSITORIES) { LIVE_REPOSITORIES -= this }
         scope.cancel()
         memory.clear()
         negativeUntil.clear()
     }
 
     private companion object {
+        val LIVE_REPOSITORIES: MutableSet<RemoteThumbnailRepository> =
+            Collections.newSetFromMap(WeakHashMap())
         const val DEFAULT_MAX_PIXEL_SIZE = 1024
         const val MAX_ALLOWED_PIXEL_SIZE = 1024
         const val MAX_SOURCE_DIMENSION = 65_536
@@ -737,6 +760,10 @@ internal class WeightedLruCache<K : Any, V : Any>(
         weight = 0
     }
 
+    @Synchronized fun remove(key: K) {
+        values.remove(key)?.let { weight -= weigh(it).coerceAtLeast(0) }
+    }
+
     @Synchronized internal fun keys(): List<K> = values.keys.toList()
 }
 
@@ -787,6 +814,30 @@ internal class ThumbnailDiskCache(
 
     @Synchronized fun remove(key: String) {
         cacheFile(key).delete()
+    }
+
+    @Synchronized fun contains(key: String): Boolean = cacheFile(key).isFile
+
+    @Synchronized fun removeTracked(keys: Set<String>): SuperThumbnailTrackedRemoval {
+        var removedFiles = 0
+        var removedBytes = 0L
+        var missing = 0
+        val failed = linkedSetOf<String>()
+        keys.forEach { key ->
+            val file = cacheFile(key)
+            if (!file.isFile) {
+                missing++
+            } else {
+                val length = file.length()
+                if (file.delete()) {
+                    removedFiles++
+                    removedBytes += length
+                } else {
+                    failed += key
+                }
+            }
+        }
+        return SuperThumbnailTrackedRemoval(removedFiles, removedBytes, missing, failed)
     }
 
     @Synchronized fun statistics(): RemoteThumbnailCacheStatistics {

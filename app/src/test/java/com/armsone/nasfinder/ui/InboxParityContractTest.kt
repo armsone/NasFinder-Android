@@ -1,0 +1,38 @@
+package com.armsone.nasfinder.ui
+
+import java.io.File
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class InboxParityContractTest {
+    @Test
+    fun `received files screen keeps the iOS visible contract`() {
+        val app = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt").readText()
+        val viewModel = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt").readText()
+
+        assertTrue(app.contains("title = { Text(\"받은 파일\") }"))
+        assertTrue(app.contains("Text(if (selectionMode) \"완료\" else \"선택\")"))
+        assertTrue(app.contains("Text(if (allSelected) \"전체 해제\" else \"전체 선택\")"))
+        assertTrue(app.contains("Text(\"NAS로 보내기\")"))
+        assertTrue(app.contains("Modifier.size(56.dp).clip(RoundedCornerShape(9.dp))"))
+        assertTrue(app.contains("modifier = Modifier.size(38.dp)"))
+        assertTrue(app.contains("value == SwipeToDismissBoxValue.EndToStart"))
+        assertTrue(app.contains("title = { Text(\"받은 파일 오류\") }"))
+        assertTrue(viewModel.contains("fun previewInboxFile(item: InboxDisplayItem)"))
+        assertTrue(viewModel.contains("fun shareInboxFile(item: InboxDisplayItem)"))
+        assertTrue(viewModel.contains("받은 파일 목록을 읽지 못했습니다:"))
+        assertTrue(viewModel.contains("${'$'}{item.originalFilename}을(를) 삭제하지 못했습니다:"))
+
+        assertFalse(app.contains("Icons.Default.Checklist, \"다중 선택\""))
+        assertFalse(app.contains("filePendingDeletion"))
+    }
+
+    private fun sourceFile(relativePath: String): File {
+        val working = File(System.getProperty("user.dir")).canonicalFile
+        return generateSequence(working) { it.parentFile }
+            .map { File(it, relativePath) }
+            .firstOrNull(File::isFile)
+            ?: error("Cannot locate ${'$'}relativePath from ${'$'}working")
+    }
+}

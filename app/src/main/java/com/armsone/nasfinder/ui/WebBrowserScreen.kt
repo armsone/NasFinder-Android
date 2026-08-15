@@ -474,7 +474,7 @@ fun WebBrowserScreen(
 
     Scaffold(
         topBar = {
-            Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), tonalElevation = 3.dp) {
+            Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface, tonalElevation = 3.dp) {
                 Column {
                     Row(
                         Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 9.dp),
@@ -774,7 +774,7 @@ fun WebBrowserScreen(
         AlertDialog(
             onDismissRequest = { error = null },
             confirmButton = { TextButton(onClick = { error = null }) { Text("확인") } },
-            title = { Text("웹 주소") },
+            title = { Text("브라우저 오류") },
             text = { Text(message) },
         )
     }
@@ -789,7 +789,7 @@ fun WebBrowserScreen(
     if (showFavorites) {
         ModalBottomSheet(onDismissRequest = { showFavorites = false }) {
             Text(
-                "웹 즐겨찾기",
+                "즐겨찾기",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
@@ -852,7 +852,7 @@ fun WebBrowserScreen(
     editingFavorite?.let { favorite ->
         AlertDialog(
             onDismissRequest = { editingFavorite = null },
-            title = { Text("웹 즐겨찾기 편집") },
+            title = { Text("즐겨찾기 편집") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(editTitle, { editTitle = it }, label = { Text("이름") }, singleLine = true)
@@ -872,7 +872,7 @@ fun WebBrowserScreen(
         AlertDialog(
             onDismissRequest = { deletingFavorite = null },
             title = { Text("즐겨찾기를 삭제할까요?") },
-            text = { Text("${favorite.title}을(를) 웹 즐겨찾기에서 삭제합니다.") },
+            text = { Text("${favorite.title}을(를) 즐겨찾기에서 삭제합니다.") },
             dismissButton = { TextButton(onClick = { deletingFavorite = null }) { Text("취소") } },
             confirmButton = {
                 TextButton(

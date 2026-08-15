@@ -48,7 +48,7 @@ object SuperThumbnailWorkController {
         allowsConstrainedRun: Boolean = false,
         vaultOptions: SuperThumbnailVaultOptions = SuperThumbnailVaultOptions(),
         resumeExisting: Boolean = false,
-    ): UUID {
+    ): UUID = SuperThumbnailCacheResetCoordinator.withEnqueueAllowed {
         require(connectionId.isNotBlank()) { "연결 ID가 필요합니다." }
         val input = Data.Builder().putString(SuperThumbnailWorker.KEY_CONNECTION_ID, connectionId).apply {
             rootPath?.takeIf(String::isNotBlank)?.let { putString(SuperThumbnailWorker.KEY_ROOT_PATH, it) }
@@ -80,7 +80,7 @@ object SuperThumbnailWorkController {
             ExistingWorkPolicy.REPLACE,
             request,
         )
-        return request.id
+        request.id
     }
 
     fun cancel(context: Context, connectionId: String): Operation =
@@ -121,7 +121,7 @@ object SuperThumbnailWorkController {
     private fun emptySnapshot(status: SuperThumbnailWorkStatus) =
         SuperThumbnailWorkSnapshot(status, 0, 0, 0, 0L, false)
 
-    private const val TAG = "super-thumbnail"
+    internal const val TAG = "super-thumbnail"
     private const val UNIQUE_PREFIX = "super-thumbnail-"
 }
 
@@ -162,7 +162,13 @@ class SuperThumbnailWorker(
         return try {
             publish(SuperThumbnailWorkStatus.RUNNING, 0, 0, 0, 0L, false)
             RemoteFileServiceFactory.create(connection, password).use { service ->
-                RemoteThumbnailRepository(applicationContext).use { thumbnails ->
+                val cacheKeyStore = SuperThumbnailCacheKeyStore(
+                    applicationContext.filesDir.resolve("super-thumbnail/cache-keys-v1.json")
+                )
+                RemoteThumbnailRepository(
+                    applicationContext,
+                    onCacheCommitted = cacheKeyStore::record,
+                ).use { thumbnails ->
                     coroutineScope {
                         val cooperation = if (vaultOptions.enabled &&
                             vaultOptions.timing == SuperThumbnailVaultTiming.NOW
