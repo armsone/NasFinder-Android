@@ -184,6 +184,12 @@ fun NasFinderApp(model: NasFinderViewModel) {
             AlertDialog(onDismissRequest = model::dismissMessage, confirmButton = { TextButton(onClick = model::dismissMessage) { Text("확인") } }, title = { Text("알림") }, text = { Text(message) })
         }
     }
+    BackHandler(enabled = state.imagePreview != null) {
+        model.closeImagePreview()
+    }
+    BackHandler(enabled = state.imagePreview == null && state.screen != Screen.Dashboard) {
+        model.show(Screen.Dashboard)
+    }
 }
 
 @Composable
@@ -3480,7 +3486,9 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
             item { SectionTitle("오픈 소스") }
             item {
                 DashboardCard {
-                    DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "OkHttp · SMBJ · JSch · Apache Commons Net") { uriHandler.openUri("https://square.github.io/okhttp/") }
+                    DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "구성요소·버전·라이선스·공식 소스 보기") {
+                        uriHandler.openUri("https://github.com/armsone/NasFinder-Android/blob/main/docs/OPEN_SOURCE.md")
+                    }
                     HorizontalDivider()
                     DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
                 }
@@ -3490,6 +3498,10 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                 DashboardCard {
                     DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
                         uriHandler.openUri("https://github.com/armsone")
+                    }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.Public, "공식 사이트 · nasfinder.com", "NasFinder 공식 홈페이지입니다.") {
+                        uriHandler.openUri("https://nasfinder.com")
                     }
                 }
             }

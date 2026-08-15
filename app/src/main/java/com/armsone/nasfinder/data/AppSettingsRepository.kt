@@ -13,16 +13,11 @@ class AppSettingsRepository(context: Context) {
     private val preferences = context.getSharedPreferences("app-settings.v1", Context.MODE_PRIVATE)
     private val appIconController = AppIconController(context)
 
-    init {
-        restoreAppIcon()
-    }
-
     fun theme(): AppTheme = preferences.getString(KEY_THEME, null)
         ?.let { stored -> AppTheme.entries.firstOrNull { it.name == stored } }
         ?: AppTheme.SYSTEM
 
     fun setTheme(theme: AppTheme): AppIconChangeResult {
-        val previousTheme = this.theme()
         val previousIcon = icon()
         val hasExplicitIcon = preferences.contains(KEY_ICON)
         val requestedIcon = if (hasExplicitIcon) previousIcon else AppIconSwitchPolicy.iconFor(theme)
@@ -34,14 +29,9 @@ class AppSettingsRepository(context: Context) {
                 iconRollbackSucceeded = true,
             )
         }
-        val iconResult = appIconController.applyIcon(requestedIcon)
-        if (iconResult.succeeded) return iconResult
-
-        val preferenceRolledBack = preferences.edit().putString(KEY_THEME, previousTheme.name).commit()
-        return if (preferenceRolledBack) iconResult else AppIconChangeResult.PreferenceWriteFailed(
-            previousIcon = previousIcon,
-            iconRollbackSucceeded = iconResult is AppIconChangeResult.RolledBack,
-        )
+        // Launcher aliases are reconciled before the next Activity is created. Applying them while
+        // Settings is visible causes some launchers to terminate the current task.
+        return AppIconChangeResult.AlreadyApplied(requestedIcon)
     }
 
     fun icon(): LauncherIconVariant = AppIconSwitchPolicy.restoredIcon(
@@ -51,24 +41,13 @@ class AppSettingsRepository(context: Context) {
 
     fun setIcon(icon: LauncherIconVariant): AppIconChangeResult {
         val previousIcon = icon()
-        val hadExplicitIcon = preferences.contains(KEY_ICON)
         if (!preferences.edit().putString(KEY_ICON, icon.name).commit()) {
             return AppIconChangeResult.PreferenceWriteFailed(
                 previousIcon = previousIcon,
                 iconRollbackSucceeded = true,
             )
         }
-        val result = appIconController.applyIcon(icon)
-        if (result.succeeded) return result
-
-        val rollbackEditor = preferences.edit()
-        if (hadExplicitIcon) rollbackEditor.putString(KEY_ICON, previousIcon.name)
-        else rollbackEditor.remove(KEY_ICON)
-        val preferenceRolledBack = rollbackEditor.commit()
-        return if (preferenceRolledBack) result else AppIconChangeResult.PreferenceWriteFailed(
-            previousIcon = previousIcon,
-            iconRollbackSucceeded = result is AppIconChangeResult.RolledBack,
-        )
+        return AppIconChangeResult.Applied(icon)
     }
 
     fun restoreAppIcon(): AppIconChangeResult = appIconController.applyIcon(icon())

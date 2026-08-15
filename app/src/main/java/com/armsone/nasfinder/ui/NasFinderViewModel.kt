@@ -2023,7 +2023,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     it.copy(
                         launcherIcon = icon,
                         pendingLauncherIcon = null,
-                        message = "앱 아이콘을 변경했습니다. 런처에 반영되기까지 잠시 걸릴 수 있습니다.",
+                        message = "앱 아이콘을 저장했습니다. 다음 앱 실행부터 적용됩니다.",
                     )
                 }
                 is AppIconChangeResult.RolledBack -> _state.update {
