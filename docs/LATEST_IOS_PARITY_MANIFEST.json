@@ -1,0 +1,101 @@
+{
+  "catalogVersion": 1,
+  "source": {
+    "platform": "iOS",
+    "repository": "../NasFinder",
+    "head": "af99e62",
+    "workingTreeReviewed": true,
+    "readOnly": true
+  },
+  "target": {
+    "platform": "Android",
+    "repository": "."
+  },
+  "routes": [
+    {
+      "id": "remote_browser.file_operations.paste",
+      "iosState": "file operations panel, remote clipboard present or empty",
+      "androidMapping": "BrowserMenu paste action",
+      "contract": "paste copied or moved remote items into the current folder; when the clipboard is empty, open the system file picker and upload the selected local file",
+      "status": "implemented"
+    },
+    {
+      "id": "thumbnail_cache.settings",
+      "iosState": "thumbnail cache settings, populated",
+      "androidMapping": "ThumbnailCacheScreen",
+      "contract": "show cache bytes and file count, choose 128/256/512 MB automatic limit, expire after 30 days, retain at most 5,000 files, and clear only thumbnail cache after confirmation",
+      "status": "implemented"
+    },
+    {
+      "id": "remote_browser.back.tap",
+      "iosState": "regular layout, no selection",
+      "androidMapping": "RemoteBrowserScreen navigation icon tap",
+      "contract": "return to the previous folder or cancel the active destination flow",
+      "status": "implemented"
+    },
+    {
+      "id": "remote_browser.back.long_press",
+      "iosState": "regular layout, 500 ms long press",
+      "androidMapping": "RemoteBrowserScreen navigation icon long click",
+      "contract": "open Dashboard directly",
+      "status": "implemented"
+    },
+    {
+      "id": "remote_browser.cover_flow.chrome",
+      "iosState": "landscape Cover Flow",
+      "androidMapping": "RemoteBrowserCoverFlow",
+      "contract": "hide the regular browser back control and use Cover Flow chrome",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.folder_selector",
+      "iosState": "setup",
+      "androidMapping": "SuperThumbnailScreen folder selection row",
+      "contract": "folder summary and subordinate-folder note form one accessible target",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.hidden_constrained_start",
+      "iosState": "requirements unavailable, taps 5 through 10",
+      "androidMapping": "SuperThumbnailScreen hidden start gesture",
+      "contract": "show countdown from tap 5 and permit constrained run on tap 10",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.history.delete",
+      "iosState": "history row menu",
+      "androidMapping": "SuperThumbnailScreen history overflow",
+      "contract": "remove one history entry without deleting NAS or local thumbnail data",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.thermal.pacing",
+      "iosState": "fair thermal state",
+      "androidMapping": "SuperThumbnailThermalPolicy and SuperThumbnailWorker",
+      "contract": "pace each work item by 500 ms",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.thermal.pause",
+      "iosState": "serious or critical thermal state",
+      "androidMapping": "SuperThumbnailThermalPolicy and WorkManager retry",
+      "contract": "stop active generation and retry after the device cools",
+      "status": "implemented"
+    },
+    {
+      "id": "super_thumbnail.vault.multi_device",
+      "iosState": "Vault NOW with another active device",
+      "androidMapping": "SuperThumbnailCooperationSession and SuperThumbnailVault",
+      "contract": "heartbeat worker presence, claim each item, defer active peer work, recover expired leases, and restore peer output",
+      "status": "implemented"
+    }
+  ],
+  "verification": {
+    "staticReview": "passed",
+    "jvmTests": "158 passed, 0 failures, 0 errors",
+    "debugBuild": "passed",
+    "releaseBuild": "passed, unsigned artifact only",
+    "device": "Samsung SM-F968N: install, launch, remote MOV thumbnails, file operations paste label and local picker fallback, thumbnail cache populated state, 500 ms browser-back long press, Super Thumbnail folder target and layout passed",
+    "androidCaptures": ["docs/ui-parity/android/thumbnail_cache.png"]
+  }
+}

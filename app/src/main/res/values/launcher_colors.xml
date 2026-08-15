@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="launcher_blue_nas_background">#00144D</color>
+    <color name="launcher_purple_nas_background">#FAFAFC</color>
+    <color name="launcher_vibe_coder_background">#000814</color>
+    <color name="launcher_cyber_vault_background">#00171E</color>
+</resources>

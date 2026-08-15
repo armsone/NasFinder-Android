@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_inbox"
+        android:shortcutId="open_inbox"
+        android:shortcutLongLabel="@string/shortcut_inbox_long"
+        android:shortcutShortLabel="@string/shortcut_inbox_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:data="nasfinder://inbox"
+            android:targetClass="com.armsone.nasfinder.MainActivity"
+            android:targetPackage="com.armsone.nasfinder" />
+    </shortcut>
+</shortcuts>

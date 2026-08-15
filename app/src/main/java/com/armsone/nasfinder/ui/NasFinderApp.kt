@@ -1,0 +1,3053 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+
+package com.armsone.nasfinder.ui
+
+import android.widget.VideoView
+import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.Configuration
+import android.media.AudioManager
+import android.os.BatteryManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.view.accessibility.AccessibilityManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.semantics
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.armsone.nasfinder.model.*
+import com.armsone.nasfinder.data.SuperThumbnailWorkStatus
+import com.armsone.nasfinder.data.SuperThumbnailVaultTiming
+import com.armsone.nasfinder.data.ScreenAwakeMode
+import com.armsone.nasfinder.data.RemoteThumbnailCachePolicy
+import com.armsone.nasfinder.platform.InboxBatchContracts
+import com.armsone.nasfinder.platform.LauncherIconVariant
+import com.armsone.nasfinder.R
+import com.armsone.nasfinder.ui.theme.NasFinderTheme
+import com.armsone.nasfinder.ui.theme.folderColor
+import com.armsone.nasfinder.ui.theme.serviceColor
+import com.armsone.nasfinder.ui.theme.serviceForegroundColor
+import java.io.File
+import java.text.DateFormat
+import java.util.Date
+import kotlinx.coroutines.delay
+
+@Composable
+fun NasFinderApp(model: NasFinderViewModel) {
+    val state by model.state.collectAsStateWithLifecycle()
+    val hostView = LocalView.current
+    val hasActiveWork = state.isBusy || state.download != null || state.pendingInboxUpload?.isUploading == true ||
+        state.pendingLocalUpload?.isUploading == true ||
+        state.imagePreview?.kind == BuiltInPreviewKind.VIDEO ||
+        (state.screen == Screen.SuperThumbnailProgress && state.superThumbnailWork?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING))
+    val keepScreenOn = state.screenAwakeMode == ScreenAwakeMode.ALWAYS ||
+        (state.screenAwakeMode == ScreenAwakeMode.AUTOMATIC && hasActiveWork)
+    DisposableEffect(hostView, keepScreenOn) {
+        hostView.keepScreenOn = keepScreenOn
+        onDispose { if (hostView.keepScreenOn == keepScreenOn) hostView.keepScreenOn = false }
+    }
+    val webBrowserSession = remember { WebBrowserSessionController() }
+    DisposableEffect(webBrowserSession) { onDispose(webBrowserSession::close) }
+    NasFinderTheme(state.theme) {
+        Box(Modifier.fillMaxSize().background(skyBrush(state.theme))) {
+            SkyThemeDecoration(state.theme)
+            when (val screen = state.screen) {
+                Screen.Dashboard -> DashboardScreen(state, model)
+                is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
+                is Screen.Browser -> BrowserScreen(screen, state, model)
+                Screen.Inbox -> InboxScreen(state, model)
+                Screen.Settings -> SettingsScreen(state, model)
+                Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
+                Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
+                Screen.SuperThumbnailFolderPicker -> SuperThumbnailFolderPickerScreen(state, model)
+                Screen.SuperThumbnailProgress -> SuperThumbnailProgressScreen(state, model)
+                Screen.SuperThumbnailReport -> SuperThumbnailReportScreen(state, model)
+                Screen.WebBrowser -> WebBrowserScreen(
+                    sessionController = webBrowserSession,
+                    initialUrl = state.browserFavorites.firstOrNull { it.isHomepage }?.url
+                        ?: state.browserFavorites.firstOrNull()?.url
+                        ?: "https://www.google.com",
+                    favorites = state.browserFavorites,
+                    connections = state.connections,
+                    preferredConnectionId = state.preferredId,
+                    resumedDownload = state.pendingLocalUpload,
+                    onClose = { model.show(Screen.Dashboard) },
+                    onToggleFavorite = model::toggleBrowserFavorite,
+                    onSetHomepage = model::setBrowserHomepage,
+                    onEditFavorite = model::editBrowserFavorite,
+                    onDeleteFavorite = model::deleteBrowserFavorite,
+                    onSaveDownloadedFile = model::importWebDownloadToInbox,
+                    onSendDownloadedFile = model::importWebDownloadToNas,
+                    onDiscardDownloadedFile = model::discardWebDownload,
+                )
+                Screen.WebHard -> WebHardScreen(onClose = { model.show(Screen.Dashboard) })
+            }
+            state.imagePreview?.let { preview ->
+                BuiltInPreviewScreen(
+                    preview = preview,
+                    onClose = model::closeImagePreview,
+                    onShare = model::shareImagePreview,
+                    onPrevious = { model.moveImagePreview(-1) },
+                    onNext = { model.moveImagePreview(1) },
+                    onPreviousPdfPage = { model.movePdfPreview(-1) },
+                    onNextPdfPage = { model.movePdfPreview(1) },
+                    onPlaybackFailure = model::fallbackPreviewToExternal,
+                )
+            }
+            if (state.isBusy) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .18f)), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            state.download?.let { download ->
+                DownloadProgressBanner(
+                    download = download,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
+            }
+        }
+        state.message?.let { message ->
+            AlertDialog(onDismissRequest = model::dismissMessage, confirmButton = { TextButton(onClick = model::dismissMessage) { Text("확인") } }, title = { Text("알림") }, text = { Text(message) })
+        }
+    }
+}
+
+@Composable
+private fun BoxScope.SkyThemeDecoration(theme: AppTheme) {
+    when (theme) {
+        AppTheme.DIGITAL_RAIN -> {
+            val columns = listOf("10110", "01A9F", "11001", "0FF10", "10101", "01110", "10C0D", "00111", "F0101", "11010", "0A011", "10100")
+            Row(Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(top = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                columns.forEachIndexed { index, code ->
+                    Text(
+                        code.toCharArray().joinToString("\n"),
+                        fontSize = 8.sp,
+                        color = Color(0xFF2EE8B8).copy(alpha = if (index % 3 == 0) .22f else .13f),
+                        lineHeight = 11.sp,
+                    )
+                }
+            }
+        }
+        AppTheme.WINDY_MEADOW -> {
+            Box(Modifier.fillMaxWidth().fillMaxHeight(.40f).align(Alignment.BottomCenter).background(Color(0xFF61AD38).copy(alpha = .16f), RoundedCornerShape(topStartPercent = 50, topEndPercent = 50)))
+            Icon(Icons.Default.Air, null, Modifier.align(Alignment.TopEnd).padding(top = 72.dp, end = 24.dp).size(86.dp), tint = Color.White.copy(alpha = .24f))
+        }
+        AppTheme.DAY, AppTheme.SYSTEM, AppTheme.NIGHT -> {
+            val dark = theme == AppTheme.NIGHT || (theme == AppTheme.SYSTEM && isSystemInDarkTheme())
+            Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopEnd).padding(top = 34.dp, end = 12.dp).size(150.dp), tint = Color.White.copy(alpha = if (dark) .06f else .38f))
+            Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopStart).padding(top = 122.dp, start = 10.dp).size(92.dp), tint = Color.White.copy(alpha = if (dark) .04f else .24f))
+            Icon(Icons.Default.Air, null, Modifier.align(Alignment.TopEnd).padding(top = 210.dp, end = 28.dp).size(78.dp), tint = MaterialTheme.colorScheme.primary.copy(alpha = .10f))
+        }
+    }
+}
+
+@Composable
+private fun rememberTouchExplorationEnabled(): Boolean {
+    val context = LocalContext.current
+    val manager = remember(context) {
+        context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
+    }
+    var enabled by remember(manager) { mutableStateOf(manager.isTouchExplorationEnabled) }
+    DisposableEffect(manager) {
+        val listener = AccessibilityManager.TouchExplorationStateChangeListener { enabled = it }
+        manager.addTouchExplorationStateChangeListener(listener)
+        onDispose { manager.removeTouchExplorationStateChangeListener(listener) }
+    }
+    return enabled
+}
+
+@Composable
+private fun BuiltInPreviewScreen(
+    preview: ImagePreviewState,
+    onClose: () -> Unit,
+    onShare: () -> Unit,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onPreviousPdfPage: () -> Unit,
+    onNextPdfPage: () -> Unit,
+    onPlaybackFailure: () -> Unit,
+) {
+    BackHandler(onBack = onClose)
+    val haptics = LocalHapticFeedback.current
+    val touchExploration = rememberTouchExplorationEnabled()
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    var controlsVisible by rememberSaveable(preview.connection.id) { mutableStateOf(true) }
+    var controlInteraction by remember(preview.connection.id) { mutableIntStateOf(0) }
+    var slideshowPlaying by rememberSaveable(preview.connection.id) { mutableStateOf(false) }
+    fun revealControls() { controlsVisible = true; controlInteraction++ }
+    LaunchedEffect(preview.cachedFile.absolutePath, controlsVisible, controlInteraction) {
+        if (controlsVisible && !touchExploration) { delay(2_500); controlsVisible = false }
+    }
+    LaunchedEffect(preview.index, slideshowPlaying) {
+        if (slideshowPlaying && preview.kind == BuiltInPreviewKind.IMAGE) {
+            delay(3_000)
+            if (preview.index < preview.images.lastIndex) onNext() else slideshowPlaying = false
+        }
+    }
+    Scaffold(
+        containerColor = Color.Black,
+        topBar = {
+            if (controlsVisible) {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(preview.images[preview.index].name, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        when {
+                            preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1 -> Text("${preview.index + 1} / ${preview.images.size}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
+                            preview.kind == BuiltInPreviewKind.PDF -> Text("${preview.pdfPageIndex + 1} / ${preview.pdfPageCount}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                },
+                navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.Default.Close, "닫기", tint = Color.White) } },
+                actions = { IconButton(onClick = onShare) { Icon(Icons.Default.Share, "공유", tint = Color.White) } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Black),
+            )
+            } else Spacer(Modifier.height(64.dp).fillMaxWidth().background(Color.Black))
+        },
+    ) { padding ->
+        Box(Modifier.padding(padding).fillMaxSize().background(Color.Black).clickable(onClick = { if (touchExploration) revealControls() else if (controlsVisible) controlsVisible = false else revealControls() }), contentAlignment = Alignment.Center) {
+            when (preview.kind) {
+                BuiltInPreviewKind.IMAGE, BuiltInPreviewKind.PDF -> preview.bitmap?.let { bitmap ->
+                    if (preview.kind == BuiltInPreviewKind.IMAGE && landscape && preview.images.size > 1) {
+                        LandscapeCoverFlowPreview(bitmap, preview.images[preview.index].name)
+                    } else ZoomablePreviewBitmap(bitmap, preview.images[preview.index].name, "${preview.cachedFile.absolutePath}:${preview.pdfPageIndex}")
+                }
+                BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> MediaPreviewContent(preview, controlsVisible, ::revealControls, onClose, onPlaybackFailure)
+            }
+            if (preview.kind == BuiltInPreviewKind.IMAGE && controlsVisible) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .10f)))
+            if (controlsVisible && preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+                FilledIconButton(
+                    onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onPrevious() },
+                    enabled = preview.index > 0,
+                    modifier = Modifier.align(Alignment.CenterStart).padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                ) { Icon(Icons.Default.ChevronLeft, "이전 이미지") }
+                FilledIconButton(
+                    onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onNext() },
+                    enabled = preview.index < preview.images.lastIndex,
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                ) { Icon(Icons.Default.ChevronRight, "다음 이미지") }
+                FilledIconButton(
+                    onClick = { slideshowPlaying = !slideshowPlaying; revealControls() },
+                    modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(14.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                ) { Icon(if (slideshowPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, if (slideshowPlaying) "슬라이드쇼 일시정지" else "슬라이드쇼 재생") }
+            }
+            if (controlsVisible && preview.kind == BuiltInPreviewKind.PDF && preview.pdfPageCount > 1) {
+                FilledIconButton(
+                    onClick = onPreviousPdfPage,
+                    enabled = preview.pdfPageIndex > 0,
+                    modifier = Modifier.align(Alignment.CenterStart).padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                ) { Icon(Icons.Default.ChevronLeft, "이전 페이지") }
+                FilledIconButton(
+                    onClick = onNextPdfPage,
+                    enabled = preview.pdfPageIndex < preview.pdfPageCount - 1,
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                ) { Icon(Icons.Default.ChevronRight, "다음 페이지") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeCoverFlowPreview(bitmap: android.graphics.Bitmap, description: String) {
+    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Image(bitmap.asImageBitmap(), description, Modifier.fillMaxWidth(.58f).weight(.68f).clip(RoundedCornerShape(18.dp)), contentScale = ContentScale.Fit)
+        Image(
+            bitmap.asImageBitmap(), null,
+            Modifier.fillMaxWidth(.58f).weight(.22f).graphicsLayer { rotationX = 180f; alpha = .20f },
+            contentScale = ContentScale.Crop,
+        )
+    }
+}
+
+@Composable
+private fun ZoomablePreviewBitmap(bitmap: android.graphics.Bitmap, description: String, stateKey: String) {
+    val touchExploration = rememberTouchExplorationEnabled()
+    var scale by remember(stateKey) { mutableFloatStateOf(1f) }
+    var translation by remember(stateKey) { mutableStateOf(Offset.Zero) }
+    Image(
+        bitmap = bitmap.asImageBitmap(),
+        contentDescription = description,
+        contentScale = ContentScale.Fit,
+        modifier = Modifier.fillMaxSize().then(if (touchExploration) Modifier else Modifier.pointerInput(stateKey) {
+            detectTransformGestures { _, pan, zoom, _ ->
+                val nextScale = (scale * zoom).coerceIn(1f, 5f)
+                scale = nextScale
+                translation = if (nextScale == 1f) Offset.Zero else translation + pan
+            }
+        }).graphicsLayer {
+            scaleX = scale
+            scaleY = scale
+            translationX = translation.x
+            translationY = translation.y
+        },
+    )
+}
+
+@Composable
+private fun MediaPreviewContent(
+    preview: ImagePreviewState,
+    controlsVisible: Boolean,
+    onInteraction: () -> Unit,
+    onDismiss: () -> Unit,
+    onPlaybackFailure: () -> Unit,
+) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    val touchExploration = rememberTouchExplorationEnabled()
+    var player by remember(preview.cachedFile.absolutePath) { mutableStateOf<VideoView?>(null) }
+    var duration by remember(preview.cachedFile.absolutePath) { mutableIntStateOf(0) }
+    var position by rememberSaveable(preview.cachedFile.absolutePath) { mutableIntStateOf(0) }
+    var playing by rememberSaveable(preview.cachedFile.absolutePath) { mutableStateOf(false) }
+    var scale by rememberSaveable(preview.cachedFile.absolutePath) { mutableFloatStateOf(1f) }
+    var translation by remember(preview.cachedFile.absolutePath) { mutableStateOf(Offset.Zero) }
+    var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    var gestureMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(player, playing) {
+        while (playing) {
+            position = player?.currentPosition?.coerceAtLeast(0) ?: position
+            delay(250)
+        }
+    }
+    LaunchedEffect(gestureMessage) { if (gestureMessage != null) { delay(850); gestureMessage = null } }
+    DisposableEffect(lifecycleOwner, preview.cachedFile.absolutePath) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                position = player?.currentPosition ?: position
+                player?.pause()
+                playing = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            position = player?.currentPosition ?: position
+            player?.stopPlayback()
+            player = null
+        }
+    }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        if (preview.kind == BuiltInPreviewKind.AUDIO) {
+            Icon(Icons.Default.Audiotrack, null, tint = Color.White.copy(alpha = .78f), modifier = Modifier.size(100.dp))
+        }
+        AndroidView(
+            modifier = if (preview.kind == BuiltInPreviewKind.VIDEO) Modifier.fillMaxSize()
+                .then(if (touchExploration) Modifier else Modifier
+                    .pointerInput(preview.cachedFile.absolutePath) {
+                        detectTapGestures(onDoubleTap = { scale = 1f; translation = Offset.Zero; onInteraction() })
+                    }
+                    .pointerInput(preview.cachedFile.absolutePath) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            var anyPressed: Boolean
+                            do {
+                                val event = awaitPointerEvent()
+                                if (event.changes.count { it.pressed } >= 2) {
+                                    val zoom = event.calculateZoom()
+                                    val pan = event.calculatePan()
+                                    scale = (scale * zoom).coerceIn(1f, 4f)
+                                    translation = if (scale == 1f) Offset.Zero else translation + pan
+                                    event.changes.forEach { it.consume() }
+                                    onInteraction()
+                                }
+                                anyPressed = event.changes.any { it.pressed }
+                            } while (anyPressed)
+                        }
+                    }
+                    .pointerInput(preview.cachedFile.absolutePath, duration) {
+                        detectDragGestures(
+                            onDragStart = { dragOffset = Offset.Zero; onInteraction() },
+                            onDrag = { change, amount ->
+                                change.consume(); dragOffset += amount
+                                if (kotlin.math.abs(dragOffset.x) > kotlin.math.abs(dragOffset.y) && duration > 0) {
+                                    val delta = (amount.x / size.width.coerceAtLeast(1)) * duration
+                                    position = (position + delta.toInt()).coerceIn(0, duration)
+                                    player?.seekTo(position)
+                                    gestureMessage = "${formatDuration(position)} / ${formatDuration(duration)}"
+                                } else if (dragOffset.y < 0) {
+                                    val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                    val current = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                    val delta = (-amount.y / size.height.coerceAtLeast(1) * max * 2).toInt()
+                                    if (delta != 0) {
+                                        val next = (current + delta).coerceIn(0, max)
+                                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, next, 0)
+                                        gestureMessage = "볼륨 ${(next * 100f / max).toInt()}%"
+                                    }
+                                } else if (dragOffset.y > 80) {
+                                    gestureMessage = "아래로 놓아 닫기"
+                                }
+                            },
+                            onDragEnd = { if (dragOffset.y > 180 && kotlin.math.abs(dragOffset.y) > kotlin.math.abs(dragOffset.x)) onDismiss(); dragOffset = Offset.Zero },
+                            onDragCancel = { dragOffset = Offset.Zero },
+                        )
+                    }
+                ).graphicsLayer {
+                    scaleX = scale; scaleY = scale
+                    translationX = translation.x; translationY = translation.y
+                } else Modifier.size(1.dp),
+            factory = { context ->
+                VideoView(context).apply {
+                    setOnPreparedListener { media ->
+                        duration = media.duration.coerceAtLeast(0)
+                        seekTo(position.coerceIn(0, duration.coerceAtLeast(0)))
+                        if (playing) start()
+                    }
+                    setOnCompletionListener { playing = false; position = duration }
+                    setOnErrorListener { _, _, _ -> onPlaybackFailure(); true }
+                    setVideoPath(preview.cachedFile.absolutePath)
+                    player = this
+                }
+            },
+            update = { player = it },
+            onRelease = { released ->
+                position = released.currentPosition.coerceAtLeast(0)
+                released.stopPlayback()
+                if (player === released) player = null
+            },
+        )
+        gestureMessage?.let { message ->
+            Text(message, color = Color.White, modifier = Modifier.background(Color.Black.copy(alpha = .72f), RoundedCornerShape(14.dp)).padding(horizontal = 16.dp, vertical = 10.dp), style = MaterialTheme.typography.labelLarge)
+        }
+        if (controlsVisible) Column(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color.Black.copy(alpha = .72f)).navigationBarsPadding().padding(16.dp),
+        ) {
+            Slider(
+                value = position.toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat()),
+                onValueChange = { value -> onInteraction(); position = value.toInt(); player?.seekTo(position) },
+                valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
+            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+                IconButton(onClick = {
+                    onInteraction()
+                    if (playing) player?.pause() else player?.start()
+                    playing = !playing
+                }, enabled = duration > 0) {
+                    Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, if (playing) "일시정지" else "재생", tint = Color.White)
+                }
+                Spacer(Modifier.width(10.dp))
+                Text("${formatDuration(position)} / ${formatDuration(duration)}", color = Color.White, style = MaterialTheme.typography.labelMedium)
+            }
+        } else if (duration > 0) {
+            LinearProgressIndicator(
+                progress = { (position.toFloat() / duration).coerceIn(0f, 1f) },
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().height(2.dp),
+                color = Color.White.copy(alpha = .82f),
+                trackColor = Color.White.copy(alpha = .18f),
+            )
+        }
+    }
+}
+
+private fun formatDuration(milliseconds: Int): String {
+    val seconds = (milliseconds.coerceAtLeast(0) / 1000)
+    return "%d:%02d".format(seconds / 60, seconds % 60)
+}
+
+@Composable
+private fun skyBrush(theme: AppTheme): Brush = Brush.linearGradient(
+    when (theme) {
+        AppTheme.DIGITAL_RAIN -> listOf(Color(0xFF010908), Color(0xFF051713), Color(0xFF030C0B))
+        AppTheme.WINDY_MEADOW -> listOf(Color(0xFF3BBDF2), Color(0xFFB8E5E0), Color(0xFFE3EFAF))
+        AppTheme.NIGHT -> listOf(Color(0xFF091F30), Color(0xFF0E1721))
+        AppTheme.SYSTEM -> if (isSystemInDarkTheme()) {
+            listOf(Color(0xFF091F30), Color(0xFF0E1721))
+        } else {
+            listOf(Color(0xFF96D9FF), Color(0xFFDBF2FF), Color.White)
+        }
+        AppTheme.DAY -> listOf(Color(0xFF96D9FF), Color(0xFFDBF2FF), Color.White)
+    }
+)
+
+@Composable
+private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
+    var connectionPendingDeletion by remember { mutableStateOf<RemoteConnection?>(null) }
+    Scaffold(containerColor = Color.Transparent, topBar = {
+        TopAppBar(title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                Image(painterResource(launcherIconDrawable(state.launcherIcon)), "NasFinder 앱 아이콘", Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)))
+                Text("NasFinder", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            }
+        }, actions = {
+            state.connections.firstOrNull { it.id == state.preferredId }?.let { connection ->
+                IconButton(onClick = { model.resumeConnection(connection) }) { Icon(Icons.Default.Home, "기본 연결의 마지막 폴더 열기") }
+            }
+        }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent))
+    }) { padding ->
+        LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            item { SectionTitle("내 파일") }
+            item {
+                FavoriteShelf(
+                    favorites = state.remoteFavorites,
+                    connections = state.connections,
+                    theme = state.theme,
+                    onOpen = model::openFavorite,
+                )
+            }
+            item {
+                DashboardCard {
+                    DashboardRow(
+                        Icons.Default.MoveToInbox,
+                        "받은 파일",
+                        "${state.inboxFiles.size}개 · ${formatBytes(state.inboxFiles.sumOf { it.byteCount.coerceAtLeast(0L) })}",
+                    ) { model.show(Screen.Inbox) }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.PhotoLibrary, "썸네일 캐시", "미리보기 저장공간 관리") { model.show(Screen.ThumbnailCache) }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.AutoAwesome, "슈퍼 썸네일", "폴더 미리 생성") { model.show(Screen.SuperThumbnail) }
+                }
+            }
+            item { SectionTitle("네트워크") }
+            item {
+                DashboardCard {
+                    state.connections.forEach { connection ->
+                        ConnectionRow(connection, state.preferredId == connection.id, state.theme,
+                            onOpen = { model.resumeConnection(connection) },
+                            onEdit = { model.show(Screen.AddConnection(connection)) },
+                            onDelete = { connectionPendingDeletion = connection },
+                            onPreferred = { model.setPreferred(if (state.preferredId == connection.id) null else connection) },
+                            onUp = { model.moveConnection(connection, -1) }, onDown = { model.moveConnection(connection, 1) })
+                        HorizontalDivider()
+                    }
+                    DashboardRow(Icons.Default.Language, "웹 브라우저", "웹 다운로드와 즐겨찾기") { model.show(Screen.WebBrowser) }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.WifiTethering, "WebHard", "같은 네트워크에서 파일 받기") { model.show(Screen.WebHard) }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.Add, if (state.connections.isEmpty()) "네트워크를 추가해 주세요" else "네트워크 추가", null) { model.show(Screen.AddConnection()) }
+                }
+            }
+            item { SectionTitle("저장공간") }
+            item { DeviceStorageCard() }
+            item {
+                Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .72f))) {
+                    DashboardRow(Icons.Default.Settings, "설정", null) { model.show(Screen.Settings) }
+                }
+            }
+        }
+    }
+    connectionPendingDeletion?.let { connection ->
+        AlertDialog(
+            onDismissRequest = { connectionPendingDeletion = null },
+            title = { Text("연결을 삭제할까요?") },
+            text = { Text("${connection.name}의 저장된 로그인 정보가 이 기기에서 제거됩니다. 서버의 파일은 삭제되지 않습니다.") },
+            dismissButton = {
+                TextButton(onClick = { connectionPendingDeletion = null }) { Text("취소") }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        connectionPendingDeletion = null
+                        model.removeConnection(connection)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("삭제") }
+            },
+        )
+    }
+}
+
+private fun launcherIconDrawable(icon: LauncherIconVariant) = when (icon) {
+    LauncherIconVariant.DEFAULT -> R.drawable.app_icon_blue_nas
+    LauncherIconVariant.CYBER_VAULT -> R.drawable.app_icon_cyber_vault
+    LauncherIconVariant.VIBE_CODER -> R.drawable.app_icon_vibe_coder
+    LauncherIconVariant.PURPLE_NAS -> R.drawable.app_icon_purple_nas
+}
+
+@Composable
+private fun FavoriteShelf(
+    favorites: List<RemoteFavorite>,
+    connections: List<RemoteConnection>,
+    theme: AppTheme,
+    onOpen: (RemoteFavorite) -> Unit,
+) {
+    if (favorites.isEmpty()) return
+
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        items(favorites, key = { it.id }) { favorite ->
+            val connection = connections.firstOrNull { it.id == favorite.connectionId }
+            val tint = connection?.let { serviceColor(it.kind.name, theme) }
+                ?: MaterialTheme.colorScheme.onSurfaceVariant
+            Column(
+                modifier = Modifier.width(56.dp).clickable { onOpen(favorite) },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box {
+                    Surface(
+                        modifier = Modifier.size(52.dp),
+                        shape = RoundedCornerShape(11.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = .90f),
+                        border = BorderStroke(1.dp, tint.copy(alpha = .28f)),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                favoriteIcon(favorite),
+                                null,
+                                tint = tint,
+                                modifier = Modifier.size(30.dp),
+                            )
+                        }
+                    }
+                    connection?.let {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .offset(x = 4.dp, y = (-4).dp)
+                                .size(17.dp)
+                                .background(tint, CircleShape),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                connectionKindBadge(it.kind),
+                                color = serviceForegroundColor(it.kind.name, theme),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    favorite.name,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
+private fun favoriteIcon(favorite: RemoteFavorite) = when {
+    favorite.isDirectory -> Icons.Default.Folder
+    favorite.name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "heic", "webp") -> Icons.Default.Image
+    favorite.name.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "avi", "webm") -> Icons.Default.Movie
+    else -> Icons.Default.InsertDriveFile
+}
+
+private fun connectionKindBadge(kind: ConnectionKind) = when (kind) {
+    ConnectionKind.SYNOLOGY -> "N"
+    ConnectionKind.SFTP -> "S"
+    ConnectionKind.SMB -> "M"
+    ConnectionKind.WEBDAV -> "W"
+    ConnectionKind.FTP -> "F"
+    ConnectionKind.DROPBOX -> "D"
+    ConnectionKind.ONEDRIVE -> "O"
+    ConnectionKind.GOOGLE_DRIVE -> "G"
+}
+
+@Composable private fun SectionTitle(text: String) { Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 4.dp)) }
+@Composable private fun DashboardCard(content: @Composable ColumnScope.() -> Unit) { Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .72f))) { Column(content = content) } }
+
+@Composable
+private fun DeviceStorageCard() {
+    val filesDir = LocalContext.current.filesDir
+    val total = filesDir.totalSpace.coerceAtLeast(0L)
+    val available = filesDir.usableSpace.coerceIn(0L, total.coerceAtLeast(1L))
+    val usedFraction = if (total > 0L) ((total - available).toDouble() / total).coerceIn(0.0, 1.0).toFloat() else 0f
+    DashboardCard {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Default.Storage, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
+                Text("Android 저장공간", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Text(if (total > 0L) "${(usedFraction * 100).toInt()}%" else "확인 불가", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text(
+                if (total > 0L) "전체 ${formatBytes(total)} · 사용 가능 ${formatBytes(available)}" else "저장공간 정보를 확인할 수 없습니다.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (total > 0L) LinearProgressIndicator(progress = { usedFraction }, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+private fun DashboardRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, detail: String?, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp)); Spacer(Modifier.width(12.dp)); Text(title, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+        detail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp)) }
+        Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ConnectionRow(connection: RemoteConnection, preferred: Boolean, theme: AppTheme, onOpen: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit, onPreferred: () -> Unit, onUp: () -> Unit, onDown: () -> Unit) {
+    val color = serviceColor(connection.kind.name, theme)
+    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onOpen).padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(32.dp).background(color, CircleShape), contentAlignment = Alignment.Center) { Text(connectionKindBadge(connection.kind), color = serviceForegroundColor(connection.kind.name, theme), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) }
+        Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(connection.name, fontWeight = FontWeight.Medium, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                Spacer(Modifier.width(6.dp))
+                Text(connection.kind.title, style = MaterialTheme.typography.labelSmall, color = color, modifier = Modifier.background(color.copy(alpha = .12f), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp))
+                if (preferred) { Spacer(Modifier.width(5.dp)); Icon(Icons.Default.Star, "기본 연결", tint = color, modifier = Modifier.size(14.dp)) }
+            }
+            Text(connection.endpoint, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        var menu by remember { mutableStateOf(false) }
+        IconButton(onClick = { menu = true }, modifier = Modifier.size(width = 44.dp, height = 54.dp)) { Icon(Icons.Default.MoreHoriz, "더 보기") }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text(if (preferred) "기본 연결 해제" else "기본 연결") }, leadingIcon = { Icon(Icons.Default.Star, null) }, onClick = { menu = false; onPreferred() })
+            DropdownMenuItem(text = { Text("위로") }, leadingIcon = { Icon(Icons.Default.ArrowUpward, null) }, onClick = { menu = false; onUp() })
+            DropdownMenuItem(text = { Text("아래로") }, leadingIcon = { Icon(Icons.Default.ArrowDownward, null) }, onClick = { menu = false; onDown() })
+            DropdownMenuItem(text = { Text("수정") }, leadingIcon = { Icon(Icons.Default.Edit, null) }, onClick = { menu = false; onEdit() })
+            DropdownMenuItem(text = { Text("삭제") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, onClick = { menu = false; onDelete() })
+        }
+    }
+}
+
+@Composable
+private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model: NasFinderViewModel) {
+    val draftId = remember { editing?.id ?: java.util.UUID.randomUUID().toString() }
+    var kind by remember { mutableStateOf(editing?.kind ?: ConnectionKind.SYNOLOGY) }
+    var name by remember { mutableStateOf(editing?.name.orEmpty()) }; var host by remember { mutableStateOf(editing?.host.orEmpty()) }
+    var port by remember { mutableStateOf((editing?.port ?: kind.defaultPort).toString()) }; var username by remember { mutableStateOf(editing?.username.orEmpty()) }
+    var password by remember { mutableStateOf("") }; var rootPath by remember { mutableStateOf(editing?.rootPath ?: kind.defaultRootPath) }
+    var synologyOtp by remember { mutableStateOf("") }
+    var tls by remember { mutableStateOf(editing?.usesTls ?: kind.supportsTls) }
+    var trustedHostKey by remember { mutableStateOf(editing?.trustedHostKey) }
+    var useSftpPrivateKey by remember { mutableStateOf(false) }
+    var pendingHostKey by remember { mutableStateOf<com.armsone.nasfinder.network.SftpHostKeyTrustRequired?>(null) }
+    val oauthProvider = CloudOAuthProvider.from(kind)
+    var oauthClientId by remember(kind) { mutableStateOf(oauthProvider?.let(state.oauthClientIds::get).orEmpty()) }
+    val oauthConnected = draftId in state.oauthConnectedConnectionIds
+    val oauthConfigured = oauthClientId.isNotBlank()
+    val oauthPending = state.oauthPendingConnectionId == draftId
+    val otpValid = synologyOtp.isEmpty() || synologyOtp.length in 6..8
+    val valid = if (kind.oauth) name.isNotBlank() && (password.isNotBlank() || oauthConnected)
+        else name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && password.isNotBlank() && port.toIntOrNull() in 1..65535 && (kind != ConnectionKind.SYNOLOGY || otpValid)
+    fun candidate() = RemoteConnection(draftId, name.trim(), kind, (host.ifBlank { cloudApiHost(kind) }).trim().removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':'), port.toIntOrNull() ?: kind.defaultPort, username.trim(), rootPath, tls, trustedHostKey, editing?.createdAt ?: System.currentTimeMillis())
+    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Text(if (editing == null) "연결 추가" else "연결 수정") }, navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.Close, "취소") } }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy) { Text(if (editing == null) "연결" else "저장") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }) { padding ->
+        LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { Text("연결 방식", style = MaterialTheme.typography.titleSmall) }
+            item {
+                ConnectionKindGrid(
+                    selected = kind,
+                    theme = state.theme,
+                    onSelected = { value ->
+                        kind = value
+                        port = value.defaultPort.toString()
+                        rootPath = value.defaultRootPath
+                        tls = value.supportsTls
+                        trustedHostKey = null
+                        useSftpPrivateKey = false
+                        password = ""
+                        synologyOtp = ""
+                        if (value.oauth) host = cloudApiHost(value)
+                    },
+                )
+            }
+            item { Text(kind.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            if (kind.oauth) {
+                item { OutlinedTextField(name, { name = it }, label = { Text("표시 이름") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(username, { username = it }, label = { Text("계정 표시 (선택)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item {
+                    OutlinedTextField(
+                        oauthClientId,
+                        { oauthClientId = it },
+                        label = { Text("${kind.title} client ID") },
+                        supportingText = { Text("공개 앱 client ID만 입력합니다. client secret은 사용하지 않습니다.") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                    )
+                }
+                item {
+                    OutlinedButton(
+                        onClick = { model.saveOAuthClientId(kind, oauthClientId) },
+                        enabled = oauthConfigured && !state.isBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("client ID 저장") }
+                }
+                if (oauthConfigured) {
+                    item {
+                        Button(
+                            onClick = { model.beginOAuthLogin(candidate(), oauthClientId) },
+                            enabled = name.isNotBlank() && !oauthPending && !state.isBusy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(if (oauthPending) "로그인 응답 대기 중" else "브라우저로 로그인") }
+                    }
+                    if (oauthPending) {
+                        item { TextButton(onClick = model::cancelOAuthLogin, modifier = Modifier.fillMaxWidth()) { Text("로그인 대기 취소") } }
+                    }
+                    if (oauthConnected) {
+                        item {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.width(8.dp))
+                                Text("로그인 토큰이 저장되어 있습니다.", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                TextButton(onClick = { model.deleteOAuthToken(candidate()) }) { Text("로그아웃") }
+                            }
+                        }
+                    }
+                } else {
+                    item { OutlinedTextField(password, { password = it }, label = { Text("수동 OAuth 액세스 토큰") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                }
+                item { OutlinedButton(onClick = { model.testConnection(candidate(), password) }, enabled = valid && !state.isBusy, modifier = Modifier.fillMaxWidth()) { Text("연결만 확인") } }
+                item { Text(if (oauthConfigured) "PKCE 브라우저 로그인으로 받은 토큰은 Android Keystore로 보호됩니다." else "client ID가 없으면 기존 수동 액세스 토큰 방식만 사용합니다. 토큰은 Android Keystore로 보호됩니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            } else {
+                item { OutlinedTextField(name, { name = it }, label = { Text("표시 이름 (예: 우리집 NAS)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(host, { host = it }, label = { Text("호스트 (예: nas.example.com)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(port, { port = it.filter(Char::isDigit) }, label = { Text("포트") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true) }
+                if (kind.supportsTls) item { Row(verticalAlignment = Alignment.CenterVertically) { Text("HTTPS 사용", Modifier.weight(1f)); Switch(tls, { tls = it; if (kind == ConnectionKind.SYNOLOGY && port in setOf("5000", "5001")) port = if (it) "5001" else "5000" }) } }
+                item { OutlinedTextField(rootPath, { rootPath = it }, label = { Text("시작 위치") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(username, { username = it }, label = { Text("사용자 이름") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                if (kind == ConnectionKind.SFTP) {
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("인증 방식", style = MaterialTheme.typography.labelLarge)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(
+                                    selected = !useSftpPrivateKey,
+                                    onClick = { useSftpPrivateKey = false; password = "" },
+                                    label = { Text("비밀번호") },
+                                    leadingIcon = { Icon(Icons.Default.Password, null, modifier = Modifier.size(18.dp)) },
+                                )
+                                FilterChip(
+                                    selected = useSftpPrivateKey,
+                                    onClick = { useSftpPrivateKey = true; password = "" },
+                                    label = { Text("개인키") },
+                                    leadingIcon = { Icon(Icons.Default.Key, null, modifier = Modifier.size(18.dp)) },
+                                )
+                            }
+                        }
+                    }
+                    item {
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = { password = it },
+                            label = { Text(if (useSftpPrivateKey) "PEM / OpenSSH 개인키 붙여넣기" else "비밀번호") },
+                            visualTransformation = if (useSftpPrivateKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = !useSftpPrivateKey,
+                            minLines = if (useSftpPrivateKey) 7 else 1,
+                            maxLines = if (useSftpPrivateKey) 12 else 1,
+                        )
+                    }
+                    if (useSftpPrivateKey) {
+                        item {
+                            Text(
+                                "암호가 없는 PEM/OpenSSH 개인키만 지원합니다. 암호화된 개인키와 passphrase는 현재 연결 모델에서 지원하지 않습니다. 개인키는 비밀번호와 같은 Keystore 보호 필드에 저장됩니다.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else {
+                    item { OutlinedTextField(password, { password = it }, label = { Text("비밀번호") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                }
+                if (kind == ConnectionKind.SYNOLOGY) {
+                    item {
+                        OutlinedTextField(
+                            value = synologyOtp,
+                            onValueChange = { synologyOtp = it.filter(Char::isDigit).take(8) },
+                            label = { Text("OTP (선택)") },
+                            supportingText = { Text("2단계 인증을 사용할 때 6~8자리 숫자를 입력하세요. OTP는 이번 연결 요청에만 사용하고 저장하지 않으므로, 나중에 다시 로그인할 때 새 OTP가 필요할 수 있습니다.") },
+                            modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            isError = synologyOtp.isNotEmpty() && !otpValid,
+                        )
+                    }
+                }
+                item { OutlinedButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) }, enabled = valid && !state.isBusy, modifier = Modifier.fillMaxWidth()) { Text("연결만 확인") } }
+                item { Text(securityGuidance(kind, tls), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+        }
+    }
+    pendingHostKey?.let { pending ->
+        AlertDialog(
+            onDismissRequest = { pendingHostKey = null },
+            title = { Text("SSH 서버 키 확인") },
+            text = { Text("${pending.message}\n\n서버 관리자에게 지문을 확인한 뒤에만 신뢰하세요.") },
+            dismissButton = { TextButton(onClick = { pendingHostKey = null }) { Text("취소") } },
+            confirmButton = {
+                TextButton(onClick = {
+                    trustedHostKey = pending.serializedHostKey
+                    pendingHostKey = null
+                }) { Text(if (pending.isChangedKey) "새 키 신뢰" else "이 키 신뢰") }
+            },
+        )
+    }
+}
+
+private fun cloudApiHost(kind: ConnectionKind): String = when (kind) {
+    ConnectionKind.DROPBOX -> "api.dropboxapi.com"
+    ConnectionKind.ONEDRIVE -> "graph.microsoft.com"
+    ConnectionKind.GOOGLE_DRIVE -> "www.googleapis.com"
+    else -> ""
+}
+
+@Composable
+private fun ConnectionKindGrid(
+    selected: ConnectionKind,
+    theme: AppTheme,
+    onSelected: (ConnectionKind) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ConnectionKind.entries.chunked(3).forEach { rowKinds ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                rowKinds.forEach { kind ->
+                    val selectedKind = kind == selected
+                    val color = serviceColor(kind.name, theme)
+                    val shape = RoundedCornerShape(11.dp)
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 64.dp)
+                            .border(
+                                width = 1.dp,
+                                color = color.copy(alpha = if (selectedKind) .55f else .18f),
+                                shape = shape,
+                            )
+                            .clickable { onSelected(kind) }
+                            .semantics(mergeDescendants = true) { this.selected = selectedKind },
+                        shape = shape,
+                        color = if (selectedKind) color.copy(alpha = .14f)
+                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .72f),
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                        ) {
+                            Icon(connectionKindIcon(kind), null, tint = color, modifier = Modifier.size(22.dp))
+                            Spacer(Modifier.height(5.dp))
+                            Text(
+                                kind.title,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = if (selectedKind) FontWeight.SemiBold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                color = color,
+                            )
+                        }
+                    }
+                }
+                repeat(3 - rowKinds.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+}
+
+private fun connectionKindIcon(kind: ConnectionKind) = when (kind) {
+    ConnectionKind.SYNOLOGY -> Icons.Default.Storage
+    ConnectionKind.SFTP -> Icons.Default.Security
+    ConnectionKind.SMB -> Icons.Default.FolderShared
+    ConnectionKind.WEBDAV -> Icons.Default.Cloud
+    ConnectionKind.FTP -> Icons.Default.SwapVert
+    ConnectionKind.DROPBOX -> Icons.Default.CloudQueue
+    ConnectionKind.ONEDRIVE -> Icons.Default.CloudCircle
+    ConnectionKind.GOOGLE_DRIVE -> Icons.Default.AddToDrive
+}
+
+private fun securityGuidance(kind: ConnectionKind, tls: Boolean) = when (kind) {
+    ConnectionKind.SYNOLOGY -> if (tls) "QuickConnect ID 대신 기기에서 접근 가능한 DDNS·도메인 또는 VPN 주소와 신뢰 가능한 인증서를 사용하세요." else "HTTP는 같은 로컬 네트워크에서만 사용하세요."
+    ConnectionKind.SFTP -> "연결 시 SSH 호스트 키 지문을 확인하고 고정해야 합니다."
+    ConnectionKind.SMB -> "SMB 2.0 이상을 사용합니다."
+    ConnectionKind.WEBDAV -> "HTTPS와 서비스에서 발급한 앱 비밀번호를 권장합니다."
+    ConnectionKind.FTP -> "FTP는 암호화되지 않습니다. 신뢰하는 로컬 네트워크에서만 사용하세요."
+    else -> "로그인 토큰은 Android Keystore로 보호됩니다."
+}
+
+@Composable
+private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFinderViewModel) {
+    var searchText by remember(browser.connection.id, browser.path) { mutableStateOf("") }
+    var searchVisible by rememberSaveable(browser.connection.id, browser.path) { mutableStateOf(false) }
+    var creatingFolder by remember { mutableStateOf(false) }
+    var folderName by remember { mutableStateOf("") }
+    var renamingItem by remember { mutableStateOf<RemoteFileItem?>(null) }
+    var renameText by remember { mutableStateOf("") }
+    var deletingItem by remember { mutableStateOf<RemoteFileItem?>(null) }
+    var actionItem by remember { mutableStateOf<RemoteFileItem?>(null) }
+    var selectionMode by remember(browser.connection.id, browser.path) { mutableStateOf(false) }
+    val selectedIds = remember(browser.connection.id, browser.path) { mutableStateListOf<String>() }
+    var batchTransfer by remember { mutableStateOf<RemoteTransferAction?>(null) }
+    var confirmBatchDelete by remember { mutableStateOf(false) }
+    val capabilities = remember(browser.connection.kind) { browserCapabilities(browser.connection.kind) }
+    val accessibilityLayout = LocalConfiguration.current.fontScale >= 1.3f
+    val showsCoverFlow = browser.preferences.layout == BrowserLayout.LARGE_GRID &&
+        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    var coverFlowDark by rememberSaveable(browser.connection.id) { mutableStateOf(false) }
+    val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(model::uploadDocument)
+    }
+    val displayedItems = remember(browser.items, searchText) {
+        val query = searchText.trim()
+        if (query.isEmpty()) browser.items
+        else browser.items.filter { it.name.containsLocalized(query) }
+    }
+    val favoritePaths = remember(state.remoteFavorites, browser.connection.id) {
+        state.remoteFavorites
+            .filter { it.connectionId == browser.connection.id }
+            .mapTo(mutableSetOf()) { it.path }
+    }
+    val parentPath = remoteParentPath(browser.path, browser.connection.normalizedRootPath)
+    val selectedItems = browser.items.filter { it.id in selectedIds }
+    LaunchedEffect(browser.items) { selectedIds.removeAll { id -> browser.items.none { it.id == id } } }
+    if (showsCoverFlow) {
+        BackHandler {
+            if (parentPath == null) model.show(Screen.Dashboard)
+            else model.openConnection(browser.connection, parentPath)
+        }
+        RemoteBrowserCoverFlow(
+            items = displayedItems,
+            thumbnails = state.remoteThumbnails,
+            theme = state.theme,
+            title = browser.connection.name,
+            usesDarkBackground = coverFlowDark,
+            onBack = {
+                if (parentPath == null) model.show(Screen.Dashboard)
+                else model.openConnection(browser.connection, parentPath)
+            },
+            onToggleBackground = { coverFlowDark = it },
+            onActivate = model::openItem,
+            onLoadThumbnail = model::loadRemoteThumbnail,
+        )
+        return
+    }
+    BackHandler(selectionMode) { selectedIds.clear(); selectionMode = false }
+    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Column { Text(if (selectionMode) "${selectedIds.size}개 선택" else browser.connection.name, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(browser.path, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis) } }, navigationIcon = {
+        CompositionLocalProvider(LocalViewConfiguration provides longPress500Configuration()) {
+        Box(
+            modifier = Modifier.size(48.dp).semantics(mergeDescendants = true) {
+                contentDescription = if (selectionMode) "선택 종료" else if (parentPath == null && (state.pendingInboxUpload != null || state.pendingLocalUpload != null)) "NAS로 보내기 취소" else "이전 폴더"
+                if (!selectionMode) {
+                    customActions = listOf(
+                        CustomAccessibilityAction("NasFinder 첫 화면") {
+                            model.show(Screen.Dashboard)
+                            true
+                        }
+                    )
+                }
+            }.combinedClickable(
+                onClick = {
+            if (selectionMode) { selectedIds.clear(); selectionMode = false }
+            else if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
+            else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
+            else if (parentPath == null) model.show(Screen.Dashboard)
+            else model.openConnection(browser.connection, parentPath)
+                },
+                onLongClick = if (selectionMode) null else ({ model.show(Screen.Dashboard) }),
+                onLongClickLabel = if (selectionMode) null else "NasFinder 첫 화면",
+            ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(
+                Modifier.size(32.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = .12f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    if (selectionMode) Icons.Default.Close else Icons.Default.ChevronLeft,
+                    null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        }
+    }, actions = {
+        if (!selectionMode) {
+            IconButton(onClick = { searchVisible = true }) { Icon(Icons.Default.Search, "현재 폴더 검색") }
+            BrowserMenu(
+                preferences = browser.preferences,
+                canCreateFolder = capabilities.createFolder,
+                canPaste = capabilities.upload || state.pendingTransfer?.connectionId == browser.connection.id,
+                onSelect = { selectionMode = true },
+                onCreateFolder = { folderName = ""; creatingFolder = true },
+                onPaste = {
+                    if (state.pendingTransfer?.connectionId == browser.connection.id) model.applyTransferDestination()
+                    else uploadLauncher.launch(arrayOf("*/*"))
+                },
+                onRefresh = model::refreshBrowser,
+                update = model::updateBrowserPreferences,
+            )
+        }
+    }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }, bottomBar = {
+        if (selectionMode) BottomAppBar {
+            IconButton(onClick = { model.shareItems(selectedItems) }, enabled = selectedItems.isNotEmpty() && selectedItems.none(RemoteFileItem::isDirectory)) { Icon(Icons.Default.Share, "선택 파일 공유") }
+            IconButton(onClick = { batchTransfer = RemoteTransferAction.COPY }, enabled = selectedItems.isNotEmpty() && capabilities.copy) { Icon(Icons.Default.ContentCopy, "선택 항목 복사") }
+            IconButton(onClick = { batchTransfer = RemoteTransferAction.MOVE }, enabled = selectedItems.isNotEmpty() && capabilities.move) { Icon(Icons.Default.DriveFileMove, "선택 항목 이동") }
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = { confirmBatchDelete = true }, enabled = selectedItems.isNotEmpty() && capabilities.delete) { Icon(Icons.Default.Delete, "선택 항목 삭제", tint = MaterialTheme.colorScheme.error) }
+        }
+    }) { padding ->
+        Column(Modifier.padding(padding).fillMaxSize()) {
+            ThumbnailTrafficStatus(state.thumbnailTraffic)
+            state.pendingInboxUpload?.let { pending ->
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = .94f),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(9.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(if (pending.isUploading) "NAS로 보내는 중…" else "NAS로 보낼 폴더를 선택하세요", style = MaterialTheme.typography.labelLarge)
+                            Text("${pending.items.size}개 파일 → ${browser.path}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                        TextButton(onClick = model::cancelInboxUpload, enabled = !pending.isUploading) { Text("취소") }
+                        Button(
+                            onClick = model::applyInboxUploadDestination,
+                            enabled = pending.connectionId == browser.connection.id && capabilities.upload && !pending.isUploading && !state.isBusy,
+                        ) { Text("여기로 보내기") }
+                    }
+                }
+            }
+            state.pendingLocalUpload?.let { pending ->
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = .94f),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(9.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(if (pending.isUploading) "네트워크에 저장하는 중…" else "저장할 폴더를 선택하세요", style = MaterialTheme.typography.labelLarge)
+                            Text("${pending.filename} → ${browser.path}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                        TextButton(onClick = model::cancelLocalUploadDestination, enabled = !pending.isUploading) { Text("취소") }
+                        Button(
+                            onClick = model::applyLocalUploadDestination,
+                            enabled = pending.connectionId == browser.connection.id && capabilities.upload && !pending.isUploading && !state.isBusy,
+                        ) { Text("여기에 저장") }
+                    }
+                }
+            }
+            state.pendingTransfer?.let { pending ->
+                val verb = if (pending.action == RemoteTransferAction.COPY) "복사" else "이동"
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = .92f),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("${pending.items.size}개 항목 $verb 대상: ${browser.path}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                        TextButton(onClick = model::cancelTransfer) { Text("취소") }
+                        Button(
+                            onClick = model::applyTransferDestination,
+                            enabled = pending.connectionId == browser.connection.id && !state.isBusy,
+                        ) { Text("여기에 $verb") }
+                    }
+                }
+            }
+            if (searchVisible || searchText.isNotEmpty()) {
+                OutlinedTextField(
+                    value = searchText,
+                    onValueChange = { searchText = it },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    placeholder = { Text("현재 폴더 검색") },
+                    leadingIcon = { Icon(Icons.Default.Search, null) },
+                    trailingIcon = {
+                        IconButton(onClick = { searchText = ""; searchVisible = false }) {
+                            Icon(Icons.Default.Cancel, "검색 닫기")
+                        }
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                )
+            }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (parentPath != null) TextButton(onClick = { model.openConnection(browser.connection, parentPath) }) { Icon(Icons.Default.ArrowUpward, null); Spacer(Modifier.width(4.dp)); Text("상위 폴더") }
+                Spacer(Modifier.weight(1f))
+                Text(if (searchText.isBlank()) "${browser.items.size}개 항목" else "${displayedItems.size}/${browser.items.size}개 검색", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            when {
+                browser.items.isEmpty() && !state.isBusy -> EmptyState(
+                    icon = Icons.Default.Folder,
+                    title = "빈 폴더",
+                    description = "이 폴더에는 표시할 파일이 없습니다.",
+                    modifier = Modifier.weight(1f),
+                )
+                displayedItems.isEmpty() -> EmptyState(
+                    icon = Icons.Default.Search,
+                    title = "검색 결과가 없습니다",
+                    description = "‘${searchText.trim()}’과 일치하는 항목을 찾지 못했습니다.",
+                    modifier = Modifier.weight(1f),
+                )
+                browser.preferences.layout == BrowserLayout.LIST -> LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(displayedItems, key = { it.id }) { item ->
+                        if (item.isImage || item.isVideo) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
+                        FileRow(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, selected = item.id in selectedIds, selectionMode = selectionMode, accessibilityLayout = accessibilityLayout, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
+                    }
+                }
+                else -> {
+                    val poster = browser.preferences.layout == BrowserLayout.LARGE_GRID
+                    val minimumCellWidth = when {
+                        poster && accessibilityLayout -> 270.dp
+                        poster -> 158.dp
+                        accessibilityLayout -> 118.dp
+                        else -> 78.dp
+                    }
+                    LazyVerticalGrid(
+                        GridCells.Adaptive(minimumCellWidth),
+                        Modifier.weight(1f).fillMaxWidth(),
+                        contentPadding = PaddingValues(if (poster) 16.dp else 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(if (poster) 20.dp else 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(if (poster) 16.dp else 8.dp),
+                    ) {
+                    items(displayedItems, key = { it.id }) { item ->
+                        if (item.isImage || item.isVideo) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
+                        FileTile(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, poster = poster, selected = item.id in selectedIds, selectionMode = selectionMode, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
+                    }
+                    }
+                }
+            }
+        }
+    }
+    if (creatingFolder) {
+        NameInputDialog(
+            title = "새 폴더",
+            value = folderName,
+            confirmLabel = "만들기",
+            onValueChange = { folderName = it },
+            onDismiss = { creatingFolder = false },
+            onConfirm = { creatingFolder = false; model.createFolder(folderName) },
+        )
+    }
+    renamingItem?.let { item ->
+        NameInputDialog(
+            title = "이름 변경",
+            value = renameText,
+            confirmLabel = "변경",
+            onValueChange = { renameText = it },
+            onDismiss = { renamingItem = null },
+            onConfirm = { renamingItem = null; model.renameItem(item, renameText) },
+        )
+    }
+    deletingItem?.let { item ->
+        AlertDialog(
+            onDismissRequest = { deletingItem = null },
+            title = { Text(if (item.isDirectory) "폴더를 삭제할까요?" else "파일을 삭제할까요?") },
+            text = { Text(if (item.isDirectory) "${item.name} 폴더와 내부의 모든 항목이 원격 서버에서 삭제됩니다. 되돌릴 수 없습니다." else "${item.name} 파일이 원격 서버에서 삭제됩니다. 되돌릴 수 없습니다.") },
+            dismissButton = { TextButton(onClick = { deletingItem = null }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { deletingItem = null; model.deleteItem(item) },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("삭제") }
+            },
+        )
+    }
+    actionItem?.let { item ->
+        ModalBottomSheet(onDismissRequest = { actionItem = null }) {
+            ListItem(
+                headlineContent = { Text(item.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                supportingContent = { Text(if (item.isDirectory) "폴더" else formatBytes(item.size)) },
+                leadingContent = { Icon(if (item.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null) },
+            )
+            ListItem(headlineContent = { Text(if (item.id in selectedIds) "선택 해제" else "선택") }, leadingContent = { Icon(Icons.Default.CheckCircle, null) }, modifier = Modifier.clickable { selectionMode = true; toggleRemoteSelection(selectedIds, item.id); actionItem = null })
+            ListItem(
+                headlineContent = { Text(if (item.path in favoritePaths) "즐겨찾기 해제" else "즐겨찾기 추가") },
+                leadingContent = { Icon(if (item.path in favoritePaths) Icons.Default.Star else Icons.Default.StarBorder, null) },
+                modifier = Modifier.clickable { actionItem = null; model.toggleFavorite(item) },
+            )
+            if (!item.isDirectory) ListItem(headlineContent = { Text("공유") }, leadingContent = { Icon(Icons.Default.Share, null) }, modifier = Modifier.clickable { actionItem = null; model.shareItem(item) })
+            if (capabilities.copy) ListItem(headlineContent = { Text("복사") }, leadingContent = { Icon(Icons.Default.ContentCopy, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.COPY) })
+            if (capabilities.move) ListItem(headlineContent = { Text("이동") }, leadingContent = { Icon(Icons.Default.DriveFileMove, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.MOVE) })
+            if (capabilities.rename) ListItem(headlineContent = { Text("이름 변경") }, leadingContent = { Icon(Icons.Default.Edit, null) }, modifier = Modifier.clickable { actionItem = null; renameText = item.name; renamingItem = item })
+            if (capabilities.delete) ListItem(headlineContent = { Text("삭제", color = MaterialTheme.colorScheme.error) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) }, modifier = Modifier.clickable { actionItem = null; deletingItem = item })
+            Spacer(Modifier.navigationBarsPadding().height(12.dp))
+        }
+    }
+    batchTransfer?.let { action ->
+        val verb = if (action == RemoteTransferAction.COPY) "복사" else "이동"
+        AlertDialog(
+            onDismissRequest = { batchTransfer = null },
+            title = { Text("${selectedItems.size}개 항목을 ${verb}할까요?") },
+            text = { Text("다음 화면에서 대상 폴더를 선택합니다.") },
+            dismissButton = { TextButton(onClick = { batchTransfer = null }) { Text("취소") } },
+            confirmButton = { TextButton(onClick = { batchTransfer = null; model.beginTransfer(selectedItems, action); selectedIds.clear(); selectionMode = false }) { Text(verb) } },
+        )
+    }
+    if (confirmBatchDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmBatchDelete = false },
+            title = { Text("${selectedItems.size}개 항목을 삭제할까요?") },
+            text = { Text("선택한 폴더의 내부 항목도 원격 서버에서 삭제되며 되돌릴 수 없습니다.") },
+            dismissButton = { TextButton(onClick = { confirmBatchDelete = false }) { Text("취소") } },
+            confirmButton = { TextButton(onClick = { confirmBatchDelete = false; model.deleteItems(selectedItems); selectedIds.clear(); selectionMode = false }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("삭제") } },
+        )
+    }
+}
+
+@Composable
+private fun RemoteBrowserCoverFlow(
+    items: List<RemoteFileItem>,
+    thumbnails: Map<String, android.graphics.Bitmap>,
+    theme: AppTheme,
+    title: String,
+    usesDarkBackground: Boolean,
+    onBack: () -> Unit,
+    onToggleBackground: (Boolean) -> Unit,
+    onActivate: (RemoteFileItem) -> Unit,
+    onLoadThumbnail: (RemoteFileItem) -> Unit,
+) {
+    var backgroundMenu by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    var selectedIndex by remember(items) { mutableIntStateOf(0) }
+    LaunchedEffect(listState, items) {
+        snapshotFlow {
+            val layout = listState.layoutInfo
+            val center = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
+            layout.visibleItemsInfo.minByOrNull { kotlin.math.abs((it.offset + it.size / 2) - center) }?.index
+        }.collect { index -> if (index != null) selectedIndex = index }
+    }
+    val background = if (usesDarkBackground) Color.Black else Color.White
+    val chromeForeground = if (usesDarkBackground) Color.White.copy(alpha = .88f) else Color.Black.copy(alpha = .82f)
+    val chromeBackground = if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.White.copy(alpha = .92f)
+    val chromeBorder = if (usesDarkBackground) Color.White.copy(alpha = .16f) else Color.Black.copy(alpha = .10f)
+
+    BoxWithConstraints(Modifier.fillMaxSize().background(background)) {
+        val cardSide = minOf(maxWidth * .38f, maxHeight * .76f).coerceIn(230.dp, 460.dp)
+        val step = (maxWidth * .055f).coerceIn(42.dp, 66.dp)
+        val reflectionHeight = if (usesDarkBackground) 44.dp else 20.dp
+        if (items.isEmpty()) {
+            EmptyState(Icons.Default.Folder, "빈 폴더", "이 폴더에는 표시할 파일이 없습니다.", Modifier.fillMaxSize())
+        } else {
+            LazyRow(
+                state = listState,
+                flingBehavior = rememberSnapFlingBehavior(listState),
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = (maxWidth - step) / 2),
+                horizontalArrangement = Arrangement.spacedBy(0.dp),
+                verticalAlignment = Alignment.Bottom,
+            ) {
+                items(items, key = { it.id }) { item ->
+                    val index = items.indexOf(item)
+                    val selected = index == selectedIndex
+                    if (item.isImage || item.isVideo) LaunchedEffect(item.id, item.size, item.modifiedAt) { onLoadThumbnail(item) }
+                    Box(Modifier.width(step).padding(bottom = 18.dp).zIndex(10f - kotlin.math.abs(index - selectedIndex).toFloat()), contentAlignment = Alignment.BottomCenter) {
+                        Column(
+                            Modifier.requiredWidth(cardSide).graphicsLayer {
+                                scaleX = if (selected) 1f else .80f
+                                scaleY = if (selected) 1f else .80f
+                                rotationY = when { selected -> 0f; index < selectedIndex -> 42f; else -> -42f }
+                                cameraDistance = 14f * density
+                                alpha = if (kotlin.math.abs(index - selectedIndex) > 7) 0f else 1f
+                            }.semantics { contentDescription = item.name }.clickable { onActivate(item) },
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Surface(
+                                modifier = Modifier.requiredSize(cardSide),
+                                shape = RoundedCornerShape(if (selected) 18.dp else 13.dp),
+                                color = Color.Black,
+                                border = BorderStroke(1.dp, if (usesDarkBackground) Color.White.copy(alpha = .16f) else Color.Black.copy(alpha = .15f)),
+                                shadowElevation = if (selected) 10.dp else 2.dp,
+                            ) {
+                                RemoteFileArtwork(item, thumbnails[item.id], theme, Modifier.fillMaxSize(), cardSide * .42f, if (selected) 18.dp else 13.dp)
+                            }
+                            RemoteFileArtwork(
+                                item,
+                                thumbnails[item.id],
+                                theme,
+                                Modifier.width(cardSide).height(reflectionHeight).graphicsLayer { rotationX = 180f; alpha = if (usesDarkBackground) .24f else .12f },
+                                22.dp,
+                                8.dp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Box(
+            Modifier.fillMaxWidth().height(if (usesDarkBackground) 72.dp else 82.dp).align(Alignment.BottomCenter)
+                .background(Brush.verticalGradient(listOf(Color.Transparent, if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.Black.copy(alpha = .06f))))
+        )
+        Row(
+            Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Surface(onClick = onBack, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
+                Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.ChevronLeft, "이전 폴더", tint = chromeForeground) }
+            }
+            Text(title, color = chromeForeground, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Box {
+                Surface(onClick = { backgroundMenu = true }, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
+                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "Cover Flow 배경", tint = MaterialTheme.colorScheme.primary) }
+                }
+                DropdownMenu(backgroundMenu, onDismissRequest = { backgroundMenu = false }) {
+                    DropdownMenuItem(text = { Text("밝은 배경") }, trailingIcon = { if (!usesDarkBackground) Icon(Icons.Default.Check, null) }, onClick = { backgroundMenu = false; onToggleBackground(false) })
+                    DropdownMenuItem(text = { Text("어두운 배경") }, trailingIcon = { if (usesDarkBackground) Icon(Icons.Default.Check, null) }, onClick = { backgroundMenu = false; onToggleBackground(true) })
+                }
+            }
+        }
+    }
+}
+
+private data class BrowserCapabilities(
+    val createFolder: Boolean,
+    val rename: Boolean,
+    val delete: Boolean,
+    val upload: Boolean,
+    val copy: Boolean,
+    val move: Boolean,
+)
+
+private fun browserCapabilities(kind: ConnectionKind): BrowserCapabilities = when (kind) {
+    ConnectionKind.SYNOLOGY, ConnectionKind.SFTP, ConnectionKind.SMB, ConnectionKind.WEBDAV,
+    ConnectionKind.FTP, ConnectionKind.DROPBOX, ConnectionKind.ONEDRIVE, ConnectionKind.GOOGLE_DRIVE ->
+        BrowserCapabilities(true, true, true, true, true, true)
+}
+
+private fun toggleRemoteSelection(selectedIds: MutableList<String>, id: String) {
+    if (id in selectedIds) selectedIds.remove(id) else selectedIds.add(id)
+}
+
+@Composable
+private fun ThumbnailTrafficStatus(traffic: com.armsone.nasfinder.data.RemoteThumbnailTrafficSnapshot) {
+    if (traffic.requestCount == 0 && !traffic.limitReached) return
+    val maxBytes = 64L * 1024 * 1024
+    val fraction = if (traffic.limitReached) 1f else
+        (maxOf(traffic.expectedBytes, traffic.actualBytes).toDouble() / maxBytes)
+            .coerceIn(0.0, 1.0).toFloat()
+    Column(Modifier.fillMaxWidth()) {
+        LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth().height(3.dp))
+        Text(
+            if (traffic.limitReached) "썸네일 사용 한도 도달 · 요청 ${traffic.requestCount}회 · 예상 ${formatBytes(traffic.expectedBytes)} · 실제 ${formatBytes(traffic.actualBytes)}"
+            else "썸네일 요청 ${traffic.requestCount}회 · 예상 ${formatBytes(traffic.expectedBytes)} · 실제 ${formatBytes(traffic.actualBytes)}",
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = if (traffic.limitReached) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private fun remoteParentPath(path: String, rootPath: String): String? {
+    val root = rootPath.trimEnd('/').ifBlank { "/" }
+    val current = path.trimEnd('/').ifBlank { "/" }
+    if (current == root || current == "/") return null
+    val parent = current.substringBeforeLast('/', "").ifBlank { "/" }
+    return if (root != "/" && !parent.startsWith(root)) root else parent
+}
+
+@Composable
+private fun FileRow(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, selected: Boolean, selectionMode: Boolean, accessibilityLayout: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) { Surface(Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "작업 보기"), color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent) {
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+            val artworkSide = if (accessibilityLayout) 50.dp else 58.dp
+            RemoteFileArtwork(item, thumbnail, theme, Modifier.size(artworkSide), 30.dp, 9.dp)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(item.name, style = MaterialTheme.typography.bodyLarge, maxLines = if (accessibilityLayout) 3 else 2, overflow = TextOverflow.Ellipsis)
+                if (!item.isDirectory) Text(
+                    listOfNotNull(item.extension.uppercase().takeIf(String::isNotBlank), formatBytes(item.size)).joinToString(" · "),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                item.modifiedAt?.let { modified ->
+                    Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(modified)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            if (selectionMode) Checkbox(selected, { onClick() })
+        }
+    } }
+}
+
+@Composable
+private fun FileTile(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, poster: Boolean, selected: Boolean, selectionMode: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    val corner = if (poster) 15.dp else 11.dp
+    CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) {
+        Column(Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "작업 보기"), verticalArrangement = Arrangement.spacedBy(if (poster) 9.dp else 6.dp)) {
+            Box {
+                Surface(Modifier.fillMaxWidth().aspectRatio(1f), shape = RoundedCornerShape(corner), color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    RemoteFileArtwork(item, thumbnail, theme, Modifier.fillMaxSize(), if (poster) 52.dp else 42.dp, corner)
+                }
+                if (selectionMode) Checkbox(selected, { onClick() }, modifier = Modifier.align(Alignment.TopEnd))
+            }
+                Text(
+                    item.name,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    style = if (poster) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelMedium,
+                    fontWeight = if (poster) FontWeight.SemiBold else FontWeight.Normal,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            if (!item.isDirectory) {
+                Text(
+                    listOfNotNull(item.extension.uppercase().takeIf(String::isNotBlank), formatBytes(item.size)).joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (poster) {
+                item.modifiedAt?.let { modified ->
+                    Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(modified)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun longPress450Configuration(): ViewConfiguration {
+    val base = LocalViewConfiguration.current
+    return remember(base) {
+        object : ViewConfiguration by base {
+            override val longPressTimeoutMillis: Long = 450L
+        }
+    }
+}
+
+@Composable
+private fun longPress500Configuration(): ViewConfiguration {
+    val base = LocalViewConfiguration.current
+    return remember(base) {
+        object : ViewConfiguration by base {
+            override val longPressTimeoutMillis: Long = 500L
+        }
+    }
+}
+
+@Composable
+private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, modifier: Modifier, iconSize: androidx.compose.ui.unit.Dp, cornerRadius: androidx.compose.ui.unit.Dp) {
+    if ((item.isImage || item.isVideo) && thumbnail != null && !thumbnail.isRecycled) {
+        Image(
+            bitmap = thumbnail.asImageBitmap(),
+            contentDescription = "${item.name} 썸네일",
+            modifier = modifier.clip(RoundedCornerShape(cornerRadius)),
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Icon(
+                if (item.isDirectory) Icons.Default.Folder else if (item.isImage) Icons.Default.Image else if (item.isVideo) Icons.Default.Movie else Icons.Default.InsertDriveFile,
+                null,
+                modifier = Modifier.size(iconSize),
+                tint = if (item.isDirectory) folderColor(theme) else MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FileActionsMenu(item: RemoteFileItem, capabilities: BrowserCapabilities, onRename: () -> Unit, onDelete: () -> Unit, onCopy: () -> Unit, onMove: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) { Icon(Icons.Default.MoreVert, "${item.name} 작업") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            if (capabilities.rename) DropdownMenuItem(text = { Text("이름 변경") }, leadingIcon = { Icon(Icons.Default.Edit, null) }, onClick = { expanded = false; onRename() })
+            if (capabilities.copy) DropdownMenuItem(text = { Text("복사") }, leadingIcon = { Icon(Icons.Default.ContentCopy, null) }, onClick = { expanded = false; onCopy() })
+            if (capabilities.move) DropdownMenuItem(text = { Text("이동") }, leadingIcon = { Icon(Icons.Default.DriveFileMove, null) }, onClick = { expanded = false; onMove() })
+            if (capabilities.delete) DropdownMenuItem(text = { Text("삭제") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, onClick = { expanded = false; onDelete() })
+        }
+    }
+}
+
+@Composable
+private fun NameInputDialog(title: String, value: String, confirmLabel: String, onValueChange: (String) -> Unit, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { OutlinedTextField(value, onValueChange, singleLine = true, label = { Text("이름") }) },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } },
+        confirmButton = { TextButton(onClick = onConfirm, enabled = value.trim().isNotEmpty()) { Text(confirmLabel) } },
+    )
+}
+
+@Composable
+private fun DownloadProgressBanner(download: RemoteDownloadState, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = .96f),
+        tonalElevation = 3.dp,
+        shadowElevation = 6.dp,
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    if (download.action == RemoteFileAction.PREVIEW) Icons.Default.Visibility else Icons.Default.Share,
+                    null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(download.action.progressTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Text(download.filename, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            download.fraction?.let { fraction ->
+                LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+            } ?: LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            Text(
+                if (download.totalBytes > 0) "${formatBytes(download.completedBytes)} / ${formatBytes(download.totalBytes)}"
+                else "${formatBytes(download.completedBytes)} 받음",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BrowserMenu(
+    preferences: BrowserPreferences,
+    canCreateFolder: Boolean,
+    canPaste: Boolean,
+    onSelect: () -> Unit,
+    onCreateFolder: () -> Unit,
+    onPaste: () -> Unit,
+    onRefresh: () -> Unit,
+    update: (BrowserPreferences) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    IconButton({ expanded = true }) { Icon(Icons.Default.MoreVert, "파일과 보기 작업") }
+    if (expanded) ModalBottomSheet(
+        onDismissRequest = { expanded = false },
+        sheetState = sheetState,
+        dragHandle = null,
+        shape = RoundedCornerShape(topStart = 30.dp, topEnd = 30.dp),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("파일 작업", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                BrowserActionTile("선택", Icons.Default.CheckCircle, Modifier.weight(1f)) { expanded = false; onSelect() }
+                if (canPaste) BrowserActionTile("붙여넣기", Icons.Default.ContentPaste, Modifier.weight(1f)) { expanded = false; onPaste() }
+                if (canCreateFolder) BrowserActionTile("새 폴더", Icons.Default.CreateNewFolder, Modifier.weight(1f)) { expanded = false; onCreateFolder() }
+                BrowserActionTile("새로고침", Icons.Default.Refresh, Modifier.weight(1f)) { expanded = false; onRefresh() }
+            }
+            BrowserMenuSection("보기") {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BrowserLayout.entries.forEach { layout ->
+                        val title = when (layout) { BrowserLayout.LIST -> "자세히"; BrowserLayout.SMALL_GRID -> "작은 썸네일"; BrowserLayout.LARGE_GRID -> "포스터" }
+                        val icon = when (layout) { BrowserLayout.LIST -> Icons.Default.List; BrowserLayout.SMALL_GRID -> Icons.Default.GridView; BrowserLayout.LARGE_GRID -> Icons.Default.GridOn }
+                        BrowserChoice(title, preferences.layout == layout, Modifier.weight(1f), icon) { update(preferences.copy(layout = layout)); expanded = false }
+                    }
+                }
+            }
+            BrowserMenuSection("정렬") {
+                Text("기준", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SortField.entries.forEach { sort -> BrowserChoice(sortTitle(sort), preferences.sortField == sort, Modifier.weight(1f)) { update(preferences.copy(sortField = sort)) } }
+                }
+                Text("순서", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BrowserChoice("오름차순", preferences.sortDirection == SortDirection.ASCENDING, Modifier.weight(1f)) { update(preferences.copy(sortDirection = SortDirection.ASCENDING)) }
+                    BrowserChoice("내림차순", preferences.sortDirection == SortDirection.DESCENDING, Modifier.weight(1f)) { update(preferences.copy(sortDirection = SortDirection.DESCENDING)) }
+                }
+                Text("이름 우선", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BrowserChoice("숫자 먼저", preferences.namePriority == NamePriority.NUMBERS_FIRST, Modifier.weight(1f)) { update(preferences.copy(namePriority = NamePriority.NUMBERS_FIRST)) }
+                    BrowserChoice("한글 먼저", preferences.namePriority == NamePriority.KOREAN_FIRST, Modifier.weight(1f)) { update(preferences.copy(namePriority = NamePriority.KOREAN_FIRST)) }
+                    BrowserChoice("외국어 먼저", preferences.namePriority == NamePriority.LATIN_FIRST, Modifier.weight(1f)) { update(preferences.copy(namePriority = NamePriority.LATIN_FIRST)) }
+                }
+                Text("폴더 먼저", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BrowserChoice("끔", !preferences.foldersFirst, Modifier.weight(1f)) { update(preferences.copy(foldersFirst = false)) }
+                    BrowserChoice("켬", preferences.foldersFirst, Modifier.weight(1f)) { update(preferences.copy(foldersFirst = true)) }
+                }
+                Text("숨김 파일", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BrowserChoice("감추기", !preferences.showHiddenFiles, Modifier.weight(1f)) { update(preferences.copy(showHiddenFiles = false)) }
+                    BrowserChoice("보기", preferences.showHiddenFiles, Modifier.weight(1f)) { update(preferences.copy(showHiddenFiles = true)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BrowserMenuSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        content()
+    }
+}
+
+@Composable
+private fun BrowserActionTile(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, modifier: Modifier, onClick: () -> Unit) {
+    Surface(onClick = onClick, modifier = modifier.height(58.dp), shape = RoundedCornerShape(11.dp), color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .72f)) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(icon, null, modifier = Modifier.size(25.dp))
+            Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        }
+    }
+}
+
+@Composable
+private fun BrowserChoice(label: String, selected: Boolean, modifier: Modifier, icon: androidx.compose.ui.graphics.vector.ImageVector? = null, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier.height(if (icon == null) 47.dp else 58.dp).semantics { this.selected = selected },
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .72f),
+        contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            icon?.let { Icon(it, null, modifier = Modifier.size(24.dp)) }
+            Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+private fun sortTitle(sort: SortField) = when (sort) {
+    SortField.NAME -> "이름"
+    SortField.KIND -> "종류"
+    SortField.SIZE -> "크기"
+    SortField.MODIFIED -> "수정일"
+}
+
+@Composable
+private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
+    val files = state.inboxFiles
+    var filePendingDeletion by remember { mutableStateOf<InboxDisplayItem?>(null) }
+    var pendingSendIds by remember { mutableStateOf<List<java.util.UUID>?>(null) }
+    var confirmBatchDelete by remember { mutableStateOf(false) }
+    var selectionMode by remember { mutableStateOf(false) }
+    val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
+    LaunchedEffect(files) {
+        val available = files.mapTo(hashSetOf()) { it.id }
+        selectedIds.removeAll { it !in available }
+        if (selectedIds.isEmpty() && files.isEmpty()) selectionMode = false
+    }
+    BackHandler(selectionMode) {
+        selectedIds.clear()
+        selectionMode = false
+    }
+    val selectableIds = files.take(InboxBatchContracts.MAX_SELECTED_ITEMS).map { it.id }
+    val allSelected = selectableIds.isNotEmpty() && selectedIds.size == selectableIds.size && selectedIds.containsAll(selectableIds)
+    Scaffold(containerColor = Color.Transparent, topBar = {
+        TopAppBar(
+            title = { Text(if (selectionMode) "${selectedIds.size}개 선택" else "받은 파일") },
+            navigationIcon = {
+                IconButton(onClick = {
+                    if (selectionMode) {
+                        selectedIds.clear()
+                        selectionMode = false
+                    } else model.show(Screen.Dashboard)
+                }) {
+                    Icon(if (selectionMode) Icons.Default.Close else Icons.Default.ArrowBack, if (selectionMode) "선택 종료" else "뒤로")
+                }
+            },
+            actions = {
+                if (selectionMode) {
+                    IconButton(onClick = {
+                        selectedIds.clear()
+                        if (!allSelected) selectedIds.addAll(selectableIds)
+                    }) { Icon(if (allSelected) Icons.Default.Deselect else Icons.Default.SelectAll, if (allSelected) "전체 선택 해제" else "전체 선택") }
+                    IconButton(
+                        onClick = {
+                            model.shareInboxFiles(selectedIds.toList())
+                            selectedIds.clear(); selectionMode = false
+                        },
+                        enabled = selectedIds.isNotEmpty(),
+                    ) { Icon(Icons.Default.Share, "선택 파일 공유") }
+                    IconButton(
+                        onClick = { pendingSendIds = selectedIds.toList() },
+                        enabled = selectedIds.isNotEmpty(),
+                    ) { Icon(Icons.Default.CloudUpload, "선택 파일 NAS로 보내기") }
+                    IconButton(
+                        onClick = { confirmBatchDelete = true },
+                        enabled = selectedIds.isNotEmpty(),
+                    ) { Icon(Icons.Default.Delete, "선택 파일 삭제") }
+                } else if (files.isNotEmpty()) {
+                    IconButton(onClick = { selectionMode = true }) { Icon(Icons.Default.Checklist, "다중 선택") }
+                }
+            },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+        )
+    }) { padding ->
+        if (files.isEmpty()) {
+            EmptyState(
+                icon = Icons.Default.MoveToInbox,
+                title = "받은 파일이 없습니다",
+                description = "다른 앱의 공유 메뉴에서 NasFinder를 선택하면 이곳에 파일이 보관됩니다.",
+                modifier = Modifier.padding(padding).fillMaxSize(),
+            )
+        } else {
+            LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(files, key = { it.id }) { file ->
+                    val selected = file.id in selectedIds
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                        modifier = Modifier.clickable(enabled = selectionMode) {
+                            if (selected) selectedIds.remove(file.id)
+                            else if (selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS) selectedIds.add(file.id)
+                        },
+                    ) {
+                        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (selectionMode) {
+                                Checkbox(
+                                    checked = selected,
+                                    onCheckedChange = { checked ->
+                                        if (checked && !selected && selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS) selectedIds.add(file.id)
+                                        else if (!checked) selectedIds.remove(file.id)
+                                    },
+                                    enabled = selected || selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS,
+                                )
+                                Spacer(Modifier.width(4.dp))
+                            }
+                            Icon(Icons.Default.InsertDriveFile, null)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(file.originalFilename, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                Text("${formatBytes(file.byteCount)} · ${DateFormat.getDateTimeInstance().format(Date.from(file.importedAt))}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            if (!selectionMode) {
+                                IconButton({ pendingSendIds = listOf(file.id) }) { Icon(Icons.Default.CloudUpload, "NAS로 보내기") }
+                                IconButton({ filePendingDeletion = file }) { Icon(Icons.Default.Delete, "삭제") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pendingSendIds?.let { ids ->
+        val selectedFiles = ids.mapNotNull { id -> files.firstOrNull { it.id == id } }
+        val connections = state.connections.sortedBy { if (it.id == state.preferredId) 0 else 1 }
+        AlertDialog(
+            onDismissRequest = { pendingSendIds = null },
+            title = { Text("NAS로 보내기") },
+            text = {
+                if (connections.isEmpty()) {
+                    Text("먼저 NAS 또는 원격 서버 연결을 저장해 주세요.")
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("${selectedFiles.size}개 파일을 보낼 연결을 선택하세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        connections.forEach { connection ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    pendingSendIds = null
+                                    selectedIds.clear(); selectionMode = false
+                                    model.beginInboxUpload(ids, connection)
+                                }.padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(connectionKindIcon(connection.kind), null, tint = serviceColor(connection.kind.name, state.theme))
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(connection.name)
+                                    Text(connection.endpoint, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                if (connection.id == state.preferredId) {
+                                    Text("기본", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            dismissButton = { TextButton(onClick = { pendingSendIds = null }) { Text("취소") } },
+            confirmButton = {
+                if (connections.isEmpty()) {
+                    TextButton(onClick = { pendingSendIds = null; model.show(Screen.AddConnection()) }) { Text("연결 추가") }
+                }
+            },
+        )
+    }
+    if (confirmBatchDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmBatchDelete = false },
+            title = { Text("선택한 파일을 삭제할까요?") },
+            text = { Text("선택한 ${selectedIds.size}개 파일을 받은 파일에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.") },
+            dismissButton = { TextButton(onClick = { confirmBatchDelete = false }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmBatchDelete = false
+                        model.deleteInboxFiles(selectedIds.toList())
+                        selectedIds.clear(); selectionMode = false
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("모두 삭제") }
+            },
+        )
+    }
+    filePendingDeletion?.let { file ->
+        AlertDialog(
+            onDismissRequest = { filePendingDeletion = null },
+            title = { Text("파일을 삭제할까요?") },
+            text = { Text("‘${file.originalFilename}’ 파일을 받은 파일에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.") },
+            dismissButton = { TextButton(onClick = { filePendingDeletion = null }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { filePendingDeletion = null; model.deleteInboxFile(file) },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("삭제") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun EmptyState(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    description: String,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+) {
+    Column(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = if (compact) 18.dp else 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, null, modifier = Modifier.size(if (compact) 34.dp else 46.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .72f))
+        Spacer(Modifier.height(10.dp))
+        Text(
+            title,
+            style = if (compact) MaterialTheme.typography.titleSmall else MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(Modifier.height(5.dp))
+        Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+    }
+}
+
+private data class SuperThumbnailRuntimeConditions(
+    val hasUnmeteredWifi: Boolean,
+    val hasExternalPower: Boolean,
+) {
+    val isReady: Boolean get() = hasUnmeteredWifi && hasExternalPower
+}
+
+@Composable
+private fun rememberSuperThumbnailRuntimeConditions(): SuperThumbnailRuntimeConditions {
+    val context = LocalContext.current
+    fun readConditions(): SuperThumbnailRuntimeConditions {
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val capabilities = connectivity.activeNetwork?.let(connectivity::getNetworkCapabilities)
+        val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val status = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val plugged = battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        return SuperThumbnailRuntimeConditions(
+            hasUnmeteredWifi = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+            hasExternalPower = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL || plugged != 0,
+        )
+    }
+    var conditions by remember { mutableStateOf(readConditions()) }
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                conditions = readConditions()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+        }
+        context.registerReceiver(receiver, filter)
+        onDispose { runCatching { context.unregisterReceiver(receiver) } }
+    }
+    return conditions
+}
+
+@Composable
+private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
+    val selected = state.connections.firstOrNull { it.id == state.superThumbnailConnectionId }
+    val selectedPath = state.superThumbnailPath ?: selected?.normalizedRootPath
+    val selectedTitle = state.superThumbnailTitle ?: selected?.name
+    val history = state.superThumbnailHistory.filter { location ->
+        state.connections.any { it.id == location.connectionId }
+    }
+    val work = state.superThumbnailWork
+    val selectedLocationId = state.superThumbnailConnectionId?.let { connectionId ->
+        selectedPath?.let { path -> "$connectionId\u0000$path" }
+    }
+    val selectedWork = work.takeIf { state.superThumbnailWorkLocation?.id == selectedLocationId }
+    val sessionReport = state.superThumbnailSessionReport.takeIf {
+        state.superThumbnailReportLocationId == selectedLocationId
+    }
+    val hasPendingSession = sessionReport?.hasWorkToResume == true
+    val active = work?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING)
+    val conditions = rememberSuperThumbnailRuntimeConditions()
+    val haptics = LocalHapticFeedback.current
+    var hiddenStartTapCount by rememberSaveable { mutableIntStateOf(0) }
+    var historyMenuId by remember { mutableStateOf<String?>(null) }
+    var confirmVaultRemoval by remember { mutableStateOf(false) }
+    var vaultTimingMenuExpanded by remember { mutableStateOf(false) }
+    val hiddenStartAvailable = selected != null && !conditions.isReady && !active
+
+    BackHandler { model.show(Screen.Dashboard) }
+
+    LaunchedEffect(selected?.id, selectedPath) { hiddenStartTapCount = 0 }
+    LaunchedEffect(conditions.isReady, active) {
+        if (conditions.isReady || active) hiddenStartTapCount = 0
+    }
+    DisposableEffect(Unit) { onDispose { hiddenStartTapCount = 0 } }
+
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Super Thumbnail", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            item {
+                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    Column {
+                        Column(
+                            Modifier.fillMaxWidth().clickable(enabled = !active, onClickLabel = "NAS에서 처리할 폴더 선택", onClick = model::openSuperThumbnailFolderPicker),
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(16.dp).heightIn(min = 40.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                Icon(Icons.Default.Folder, null, tint = MaterialTheme.colorScheme.primary)
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(selectedTitle ?: "처리할 폴더 선택", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+                                    Text(selectedPath ?: "NAS 폴더를 선택하세요", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Text("하위 폴더 포함 · 완료된 항목은 다시 만들지 않음", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp))
+                        }
+                        HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                            Surface(Modifier.size(40.dp), shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                                Icon(Icons.Default.AutoAwesome, null, Modifier.padding(8.dp), tint = MaterialTheme.colorScheme.primary)
+                            }
+                            Text("선택한 폴더의 영상과 사진 썸네일을 미리 만듭니다.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = MaterialTheme.typography.bodyMedium.lineHeight)
+                        }
+                        HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(Modifier.fillMaxWidth().heightIn(min = 36.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Storage, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(Modifier.width(8.dp))
+                                Text("NAS에도 보관", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                                Switch(
+                                    checked = state.superThumbnailVaultEnabled,
+                                    onCheckedChange = model::setSuperThumbnailVaultEnabled,
+                                    enabled = !active,
+                                )
+                            }
+                            if (state.superThumbnailVaultEnabled) {
+                                HorizontalDivider()
+                                Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text("보관 시점", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                                    Box {
+                                        TextButton(onClick = { vaultTimingMenuExpanded = true }, enabled = !active) {
+                                            Text(if (state.superThumbnailVaultTiming == SuperThumbnailVaultTiming.NOW) "즉시" else "나중에")
+                                            Icon(Icons.Default.ArrowDropDown, null)
+                                        }
+                                        DropdownMenu(expanded = vaultTimingMenuExpanded, onDismissRequest = { vaultTimingMenuExpanded = false }) {
+                                            listOf(
+                                                SuperThumbnailVaultTiming.NOW to "폴더별 완료 즉시",
+                                                SuperThumbnailVaultTiming.LATER to "작업 완료 후 한 번에",
+                                            ).forEach { (timing, label) ->
+                                                DropdownMenuItem(
+                                                    text = { Text(label) },
+                                                    leadingIcon = if (state.superThumbnailVaultTiming == timing) ({ Icon(Icons.Default.Check, null) }) else null,
+                                                    onClick = {
+                                                        vaultTimingMenuExpanded = false
+                                                        model.setSuperThumbnailVaultTiming(timing)
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Text(
+                                when {
+                                    !state.superThumbnailVaultEnabled -> "이 Android 기기의 Super Cache에만 저장합니다."
+                                    state.superThumbnailVaultTiming == SuperThumbnailVaultTiming.NOW -> "각 폴더가 완료될 때마다 NAS에 보관합니다."
+                                    else -> "모든 작업이 완료된 뒤 NAS에 한 번에 보관합니다."
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+            item {
+                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            Icon(if (conditions.isReady && selected != null) Icons.Default.CheckCircle else Icons.Default.Schedule, null, tint = if (conditions.isReady && selected != null) Color(0xFF34C759) else MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                when {
+                                    selected == null -> "먼저 처리할 폴더를 선택하세요."
+                                    hiddenStartTapCount in 5..9 -> "제한 없이 시작하려면 ${10 - hiddenStartTapCount}번 더 누르세요."
+                                    conditions.isReady -> "시작할 준비가 됐습니다."
+                                    else -> "Wi‑Fi 연결과 충전을 기다립니다."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (active) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                            Text(superThumbnailStatus(work!!.status), style = MaterialTheme.typography.bodyMedium)
+                            OutlinedButton(onClick = model::cancelSuperThumbnail, modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp), shape = RoundedCornerShape(14.dp)) { Text("작업 중단") }
+                        } else {
+                            Box(Modifier.fillMaxWidth()) {
+                                Button(
+                                    onClick = {
+                                        hiddenStartTapCount = 0
+                                        model.startSuperThumbnail(resumeExisting = hasPendingSession)
+                                    },
+                                    enabled = selected != null && conditions.isReady,
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp),
+                                    shape = RoundedCornerShape(14.dp),
+                                ) {
+                                    Icon(Icons.Default.AutoAwesome, null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(if (hasPendingSession) "미완료 작업 이어서 하기" else "시작")
+                                }
+                                if (hiddenStartAvailable) {
+                                    Box(
+                                        Modifier.matchParentSize().pointerInput(selected?.id) {
+                                            detectTapGestures {
+                                                hiddenStartTapCount += 1
+                                                if (hiddenStartTapCount >= 10) {
+                                                    hiddenStartTapCount = 0
+                                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                    model.startSuperThumbnail(
+                                                        allowsConstrainedRun = true,
+                                                        resumeExisting = hasPendingSession,
+                                                    )
+                                                } else if (hiddenStartTapCount >= 5) {
+                                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                }
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (history.isNotEmpty()) {
+                item {
+                    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("최근 작업", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            history.forEachIndexed { index, location ->
+                                Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .035f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
+                                    Row(Modifier.fillMaxWidth().padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Row(
+                                            Modifier.weight(1f).heightIn(min = 40.dp).clickable { hiddenStartTapCount = 0; model.showSuperThumbnailReport(location) },
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(11.dp),
+                                        ) {
+                                            Surface(Modifier.size(24.dp), CircleShape, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .08f)) {
+                                                Icon(if (index == 0) Icons.Default.History else Icons.Default.Schedule, null, Modifier.padding(5.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                Text(location.title, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(location.path, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .55f))
+                                        }
+                                        Box {
+                                            IconButton(onClick = { historyMenuId = location.id }, modifier = Modifier.width(40.dp).height(40.dp)) {
+                                                Icon(Icons.Default.MoreHoriz, "${location.title} 최근 작업 메뉴", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                            DropdownMenu(expanded = historyMenuId == location.id, onDismissRequest = { historyMenuId = null }) {
+                                                DropdownMenuItem(
+                                                    text = { Text("최근 작업에서 삭제", color = MaterialTheme.colorScheme.error) },
+                                                    leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                                                    onClick = { historyMenuId = null; model.removeSuperThumbnailHistory(location) },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .72f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("네트워크 ${formatBytes(selectedWork?.estimatedBytes ?: 0L)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("생성 ${selectedWork?.generated ?: 0}개", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        HorizontalDivider()
+                        Text(
+                            selectedWork?.let { "확인 ${it.visitedItems}개 · 실패 ${it.failed}개${if (it.budgetReached) " · 예산 도달" else ""}" }
+                                ?: "아직 실행하지 않았습니다.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        )
+                        if (sessionReport != null) {
+                            Text(
+                                "완료 ${sessionReport.successfulCount + sessionReport.cachedCount} · 미완료 ${sessionReport.pendingCount + sessionReport.failures.size + sessionReport.vaultPendingCount + sessionReport.vaultFailedCount} · NAS 보관 ${sessionReport.vaultUploadedCount}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { confirmVaultRemoval = true },
+                            enabled = selected != null && !active && !state.isRemovingSuperThumbnailVault,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        ) {
+                            if (state.isRemovingSuperThumbnailVault) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Default.Delete, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("선택 폴더 NAS Vault 삭제")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (confirmVaultRemoval) {
+        AlertDialog(
+            onDismissRequest = { confirmVaultRemoval = false },
+            title = { Text("선택한 폴더와 하위 폴더의 NAS 보관본을 삭제할까요?") },
+            text = { Text("원본 영상과 이 Android 기기의 Super Cache는 삭제되지 않습니다.") },
+            dismissButton = { TextButton(onClick = { confirmVaultRemoval = false }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmVaultRemoval = false; model.removeSelectedSuperThumbnailVault() },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("NAS 보관본 삭제") }
+            },
+        )
+    }
+    state.superThumbnailVaultResultMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = model::dismissSuperThumbnailVaultResult,
+            title = { Text("NAS Vault") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = model::dismissSuperThumbnailVaultResult) { Text("확인") } },
+        )
+    }
+}
+
+@Composable
+private fun SuperThumbnailFolderPickerScreen(state: AppState, model: NasFinderViewModel) {
+    val picker = state.superThumbnailPicker
+    val connection = state.connections.firstOrNull { it.id == picker.connectionId }
+    val currentTitle = picker.path?.trimEnd('/')?.substringAfterLast('/')
+        ?.takeIf(String::isNotBlank) ?: connection?.name ?: "NAS 선택"
+    BackHandler {
+        if (connection == null) model.closeSuperThumbnailFolderPicker()
+        else model.openSuperThumbnailPickerParent()
+    }
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text(if (connection == null) "NAS 선택" else currentTitle) },
+                navigationIcon = {
+                    if (connection != null) {
+                        IconButton(model::openSuperThumbnailPickerParent) { Icon(Icons.Default.ArrowBack, "상위 폴더") }
+                    }
+                },
+                actions = { TextButton(model::closeSuperThumbnailFolderPicker) { Text("취소") } },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
+            )
+        },
+        bottomBar = {
+            if (connection != null && picker.path != null && !picker.isLoading) {
+                Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), tonalElevation = 3.dp) {
+                    Button(
+                        onClick = model::selectCurrentSuperThumbnailFolder,
+                        modifier = Modifier.fillMaxWidth().padding(16.dp).heightIn(min = 54.dp),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Icon(Icons.Default.CheckCircle, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("이 폴더 선택")
+                    }
+                }
+            }
+        },
+    ) { padding ->
+        when {
+            connection == null && state.connections.isEmpty() -> EmptyState(
+                Icons.Default.CreateNewFolder,
+                "연결된 NAS가 없습니다",
+                "먼저 첫 화면에서 NAS 연결을 추가해 주세요.",
+                Modifier.padding(padding).fillMaxSize(),
+            )
+            connection == null -> LazyColumn(
+                Modifier.padding(padding).fillMaxSize(),
+                contentPadding = PaddingValues(vertical = 8.dp),
+            ) {
+                items(state.connections, key = { it.id }) { item ->
+                    ListItem(
+                        headlineContent = { Text(item.name) },
+                        supportingContent = { Text(item.normalizedRootPath, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        leadingContent = { Icon(connectionKindIcon(item.kind), null, tint = serviceColor(item.kind.name, state.theme)) },
+                        trailingContent = { Icon(Icons.Default.ChevronRight, null) },
+                        modifier = Modifier.clickable { model.openSuperThumbnailPickerConnection(item.id) },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    )
+                }
+            }
+            picker.isLoading -> Box(Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    CircularProgressIndicator()
+                    Text("폴더를 불러오는 중…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            picker.error != null -> EmptyState(
+                Icons.Default.WifiOff,
+                "폴더를 열 수 없습니다",
+                picker.error,
+                Modifier.padding(padding).fillMaxSize(),
+            )
+            else -> LazyColumn(
+                Modifier.padding(padding).fillMaxSize(),
+                contentPadding = PaddingValues(vertical = 8.dp),
+            ) {
+                if (picker.items.isEmpty()) {
+                    item { EmptyState(Icons.Default.FolderOpen, "하위 폴더 없음", "현재 폴더를 선택할 수 있습니다.") }
+                } else {
+                    items(picker.items, key = { it.id + "\u0000" + it.path }) { folder ->
+                        ListItem(
+                            headlineContent = { Text(folder.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                            leadingContent = { Icon(Icons.Default.Folder, null, tint = MaterialTheme.colorScheme.primary) },
+                            trailingContent = { Icon(Icons.Default.ChevronRight, null) },
+                            modifier = Modifier.clickable { model.openSuperThumbnailPickerFolder(folder) },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SuperThumbnailProgressScreen(state: AppState, model: NasFinderViewModel) {
+    val work = state.superThumbnailWork
+    val location = state.superThumbnailWorkLocation
+    val report = state.superThumbnailSessionReport.takeIf { state.superThumbnailReportLocationId == location?.id }
+    val active = work?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING)
+    BackHandler(enabled = active) { }
+    BackHandler(enabled = !active, onBack = model::closeSuperThumbnailProgressOrReport)
+    Scaffold(
+        containerColor = Color.Transparent,
+        bottomBar = {
+            Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), tonalElevation = 3.dp) {
+                if (active) {
+                    OutlinedButton(
+                        onClick = model::cancelSuperThumbnail,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    ) { Text("작업 중단") }
+                } else {
+                    Button(
+                        onClick = model::closeSuperThumbnailProgressOrReport,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
+                        shape = RoundedCornerShape(14.dp),
+                    ) { Text("완료") }
+                }
+            }
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 20.dp, bottom = 26.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Surface(Modifier.size(32.dp), RoundedCornerShape(8.dp), MaterialTheme.colorScheme.primaryContainer) {
+                        Icon(Icons.Default.AutoAwesome, null, Modifier.padding(6.dp), tint = MaterialTheme.colorScheme.primary)
+                    }
+                    Text(
+                        when (work?.status) {
+                            SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING -> "썸네일 만드는 중"
+                            SuperThumbnailWorkStatus.SUCCESS -> "처리 완료"
+                            SuperThumbnailWorkStatus.PARTIAL -> "일부 항목을 제외하고 완료"
+                            SuperThumbnailWorkStatus.FAILED -> "처리 실패"
+                            SuperThumbnailWorkStatus.CANCELLED -> "작업 중단"
+                            null -> "작업 준비 중"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            item {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        Icon(Icons.Default.Folder, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Text(location?.title ?: "선택한 폴더", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    location?.path?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                }
+            }
+            item {
+                Surface(Modifier.fillMaxWidth(), RoundedCornerShape(15.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    Column(Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        Text("확인 ${work?.visitedItems ?: 0}개", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+                        if (active) LinearProgressIndicator(Modifier.fillMaxWidth().height(6.dp))
+                        Text(work?.let { superThumbnailStatus(it.status) } ?: "작업 정보를 기다리는 중", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    SuperThumbnailMetric("완료", report?.successfulCount ?: work?.generated ?: 0, Modifier.weight(1f))
+                    SuperThumbnailMetric("건너뜀", report?.cachedCount ?: 0, Modifier.weight(1f))
+                    SuperThumbnailMetric("실패", report?.failures?.size ?: work?.failed ?: 0, Modifier.weight(1f))
+                }
+            }
+            item {
+                Surface(Modifier.fillMaxWidth(), RoundedCornerShape(14.dp), MaterialTheme.colorScheme.surface.copy(alpha = .82f)) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("세부 정보", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                        Text("세션 네트워크 · ${formatBytes(work?.estimatedBytes ?: 0L)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        report?.takeIf { it.vaultFolders.isNotEmpty() }?.let {
+                            Text(
+                                "NAS 보관 ${it.vaultUploadedCount} · 대기 ${it.vaultPendingCount} · 실패 ${it.vaultFailedCount}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (work?.budgetReached == true) Text("안전 예산에 도달해 일부 항목을 남겼습니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SuperThumbnailMetric(title: String, value: Int, modifier: Modifier = Modifier) {
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text("$value", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+        Text(title, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun SuperThumbnailReportScreen(state: AppState, model: NasFinderViewModel) {
+    val location = state.superThumbnailHistory.firstOrNull {
+        it.connectionId == state.superThumbnailConnectionId && it.path == state.superThumbnailPath
+    } ?: state.superThumbnailConnectionId?.let { id ->
+        state.superThumbnailPath?.let { path -> SuperThumbnailLocation(id, path, state.superThumbnailTitle ?: path.substringAfterLast('/')) }
+    }
+    val workSnapshot = state.superThumbnailWork?.takeIf { state.superThumbnailWorkLocation?.id == location?.id }
+    val report = state.superThumbnailSessionReport.takeIf { state.superThumbnailReportLocationId == location?.id }
+    BackHandler(onBack = model::closeSuperThumbnailProgressOrReport)
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Super Thumbnail") },
+                navigationIcon = { IconButton(model::closeSuperThumbnailProgressOrReport) { Icon(Icons.Default.ArrowBack, "뒤로") } },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Surface(Modifier.size(32.dp), RoundedCornerShape(8.dp), MaterialTheme.colorScheme.primaryContainer) {
+                        Icon(Icons.Default.AutoAwesome, null, Modifier.padding(6.dp), tint = MaterialTheme.colorScheme.primary)
+                    }
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("작업 보고서", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+                        Text(location?.title ?: "선택한 폴더", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(location?.path.orEmpty(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+            if (report == null) {
+                item { EmptyState(Icons.Default.FindInPage, "저장된 보고서 없음", "이 폴더의 Android Super Thumbnail 작업 기록이 없습니다.") }
+            } else {
+                item {
+                    Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f)) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Text(
+                                if (report.hasWorkToResume) {
+                                    "미완료 ${report.pendingCount + report.failures.size + report.vaultPendingCount + report.vaultFailedCount}개"
+                                } else "모두 완료",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                "실패 ${report.failures.size} · 업로드 대기 ${report.vaultPendingCount + report.vaultFailedCount}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            workSnapshot?.takeIf { it.budgetReached }?.let {
+                                Text("안전 예산에 도달했습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                            }
+                        }
+                    }
+                }
+                if (report.hasWorkToResume) {
+                    item {
+                        Button(
+                            onClick = { model.startSuperThumbnail(resumeExisting = true) },
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Icon(Icons.Default.Refresh, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("미완료 작업 이어서 하기")
+                        }
+                    }
+                }
+                item {
+                    Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f)) {
+                        Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("총계", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("${report.successfulCount + report.cachedCount + report.failures.size + report.pendingCount}개", style = MaterialTheme.typography.titleMedium)
+                            }
+                            HorizontalDivider()
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("사진 미리보기", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("성공 ${report.photoSuccessCount}개") }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("영상 미리보기", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("성공 ${report.successCounts.sum()}개") }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("이미 완료", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("${report.cachedCount}개") }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("실패", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("${report.failures.size}개") }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("미처리", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("${report.pendingCount}개") }
+                            report.successCounts.forEachIndexed { index, success ->
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text(listOf("5초", "20초", "40초").getOrElse(index) { "${index + 1}차" }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("성공 ${success}개")
+                                }
+                            }
+                            workSnapshot?.let {
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("예상 네트워크", color = MaterialTheme.colorScheme.onSurfaceVariant); Text(formatBytes(it.estimatedBytes)) }
+                            }
+                        }
+                    }
+                }
+                if (report.vaultFolders.isNotEmpty()) {
+                    item {
+                        Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f)) {
+                            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("NAS 보관 상세", fontWeight = FontWeight.Medium)
+                                    Text("보관 ${report.vaultUploadedCount} · 대기 ${report.vaultPendingCount} · 실패 ${report.vaultFailedCount}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                report.vaultFolders.forEach { folder ->
+                                    HorizontalDivider()
+                                    Text(folder.path.substringAfterLast('/').ifBlank { folder.path }, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        "보관 ${folder.uploadedCount}/${folder.totalCount} · 생성 대기 ${folder.waitingThumbnailCount} · 업로드 대기 ${folder.pendingCount} · 실패 ${folder.failedCount}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    folder.errorDescription?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary, maxLines = 2) }
+                                }
+                                report.vaultLastVerifiedAt?.let { verified ->
+                                    Text(
+                                        "마지막 전체 확인 · ${DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(verified))}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                if (report.failures.isNotEmpty()) {
+                    item {
+                        Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f)) {
+                            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("미완료 파일 ${report.failures.size}개", fontWeight = FontWeight.Medium)
+                                report.failures.forEachIndexed { index, failure ->
+                                    if (index > 0) HorizontalDivider()
+                                    Text(failure.name, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        "${failure.extension.ifBlank { "기타" }} · ${failure.size?.let(::formatBytes) ?: "크기 미상"}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(failure.reason, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                OutlinedButton(onClick = model::closeSuperThumbnailProgressOrReport, modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp), shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.Folder, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("이 폴더 다시 선택")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
+    var limitMenuExpanded by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
+    val statistics = state.thumbnailCacheStatistics
+    LaunchedEffect(Unit) { model.refreshThumbnailCacheStatistics() }
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("썸네일 캐시") },
+                navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item { SectionTitle("현재 캐시") }
+            item {
+                DashboardCard {
+                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text("사용량", Modifier.weight(1f))
+                        Text(statistics?.totalBytes?.let(::formatBytes) ?: "계산 중…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text("파일", Modifier.weight(1f))
+                        Text(statistics?.let { "${it.fileCount}개" } ?: "—", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item { SectionTitle("자동 정리") }
+            item {
+                DashboardCard {
+                    Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("자동 정리 기준", Modifier.weight(1f))
+                        Box {
+                            TextButton(onClick = { limitMenuExpanded = true }, enabled = statistics != null) {
+                                Text(statistics?.automaticLimitBytes?.let(::formatBytes) ?: "—")
+                                Icon(Icons.Default.ArrowDropDown, null)
+                            }
+                            DropdownMenu(expanded = limitMenuExpanded, onDismissRequest = { limitMenuExpanded = false }) {
+                                RemoteThumbnailCachePolicy.automaticLimitOptions.forEach { bytes ->
+                                    DropdownMenuItem(
+                                        text = { Text(formatBytes(bytes)) },
+                                        leadingIcon = if (statistics?.automaticLimitBytes == bytes) ({ Icon(Icons.Default.Check, null) }) else null,
+                                        onClick = { limitMenuExpanded = false; model.setThumbnailCacheLimit(bytes) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                Text(
+                    "캐시가 ${statistics?.automaticLimitBytes?.let(::formatBytes) ?: "선택한 용량"}를 넘으면 오래된 썸네일부터 자동으로 정리합니다. 30일이 지난 항목도 정리하며 최대 5,000개를 보관합니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+            }
+            item {
+                DashboardCard {
+                    TextButton(
+                        onClick = { confirmClear = true },
+                        enabled = (statistics?.fileCount ?: 0) > 0 && !state.isBusy,
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                    ) {
+                        Icon(Icons.Default.Delete, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("지금 캐시 비우기")
+                    }
+                }
+            }
+            item {
+                Text(
+                    "원본 영상과 받은 파일은 삭제하지 않습니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+            }
+        }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("썸네일 캐시를 비울까요?") },
+            text = { Text("현재 ${statistics?.totalBytes?.let(::formatBytes) ?: "0 B"} · 원본 파일은 삭제되지 않습니다.") },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmClear = false; model.clearThumbnailCache() },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("캐시 비우기") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
+    val uriHandler = LocalUriHandler.current
+    var confirmCacheClear by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { model.refreshDownloadCacheSize() }
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("설정") },
+                navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item { SectionTitle("테마") }
+            item {
+                val columns = if (LocalConfiguration.current.fontScale >= 1.3f) 2 else 3
+                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .40f))) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        AppTheme.entries.chunked(columns).forEach { row ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                row.forEach { theme ->
+                                    val selected = state.theme == theme
+                                    val foreground = if (theme == AppTheme.NIGHT || theme == AppTheme.DIGITAL_RAIN) Color.White else Color(0xFF1A2629)
+                                    Column(
+                                        Modifier.weight(1f).height(104.dp)
+                                            .background(themePreviewBrush(theme), RoundedCornerShape(12.dp))
+                                            .border(if (selected) 1.5.dp else .5.dp, if (selected) MaterialTheme.colorScheme.primary else foreground.copy(alpha = .18f), RoundedCornerShape(12.dp))
+                                            .clickable { model.setTheme(theme) }
+                                            .semantics(mergeDescendants = true) { this.selected = selected }
+                                            .padding(9.dp),
+                                        verticalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(themeIcon(theme), null, Modifier.size(19.dp), tint = foreground)
+                                            Spacer(Modifier.weight(1f))
+                                            if (selected) Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(17.dp), tint = if (theme == AppTheme.NIGHT || theme == AppTheme.DIGITAL_RAIN) Color.White else MaterialTheme.colorScheme.primary)
+                                        }
+                                        Text(themeTitle(theme), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = foreground, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                            listOf("SYNOLOGY", "SFTP", "FTP", "WEBDAV").forEach { service ->
+                                                Box(Modifier.size(5.dp).background(serviceColor(service, theme), CircleShape))
+                                            }
+                                        }
+                                    }
+                                }
+                                repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+                            }
+                        }
+                        HorizontalDivider()
+                        Text("선택한 테마는 앱을 다시 열어도 유지됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item { SectionTitle("앱 아이콘") }
+            item {
+                val choices = listOf(
+                    Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
+                    Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
+                    Triple(LauncherIconVariant.VIBE_CODER, "바이브 코더", R.drawable.app_icon_vibe_coder),
+                    Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
+                )
+                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .40f))) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        choices.chunked(2).forEach { row ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                                row.forEach { (variant, label, drawable) ->
+                                    val selected = state.launcherIcon == variant
+                                    Column(
+                                        Modifier.weight(1f).clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
+                                            .semantics(mergeDescendants = true) { this.selected = selected },
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(7.dp),
+                                    ) {
+                                        Image(
+                                            painter = painterResource(drawable),
+                                            contentDescription = "$label 앱 아이콘 미리보기",
+                                            modifier = Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)),
+                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            if (state.pendingLauncherIcon == variant) {
+                                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                            } else if (selected) {
+                                                Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalDivider()
+                        Text("선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item { SectionTitle("다운로드 캐시") }
+            item {
+                DashboardCard {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Cached, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("현재 사용량")
+                            Text(
+                                "${state.downloadCacheBytes?.let(::formatBytes) ?: "계산 중…"} · 7일 · 최대 512 MB",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(
+                            onClick = { confirmCacheClear = true },
+                            enabled = (state.downloadCacheBytes ?: 0L) > 0L && !state.isBusy,
+                        ) { Text("전체 지우기") }
+                    }
+                }
+            }
+            item { SectionTitle("화면 꺼짐 방지") }
+            item {
+                DashboardCard {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                            ScreenAwakeMode.entries.forEachIndexed { index, mode ->
+                                SegmentedButton(
+                                    selected = state.screenAwakeMode == mode,
+                                    onClick = { model.setScreenAwakeMode(mode) },
+                                    shape = SegmentedButtonDefaults.itemShape(index, ScreenAwakeMode.entries.size),
+                                ) { Text(when (mode) { ScreenAwakeMode.AUTOMATIC -> "오토"; ScreenAwakeMode.ALWAYS -> "항상 켜짐"; ScreenAwakeMode.OFF -> "끔" }) }
+                            }
+                        }
+                        Text(
+                            when (state.screenAwakeMode) {
+                                ScreenAwakeMode.AUTOMATIC -> "다운로드·썸네일 생성·파일 작업 중에만 화면을 켜 둡니다."
+                                ScreenAwakeMode.ALWAYS -> "NasFinder가 화면에 열려 있는 동안 화면을 켜 둡니다."
+                                ScreenAwakeMode.OFF -> "Android의 화면 자동 잠금 설정을 그대로 따릅니다."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            item { SectionTitle("슈퍼 썸네일") }
+            item {
+                DashboardCard {
+                    DashboardRow(Icons.Default.AutoAwesome, "Super Thumbnail", "폴더의 영상과 사진 미리보기를 미리 만듭니다.") {
+                        model.show(Screen.SuperThumbnail)
+                    }
+                }
+            }
+            item { SectionTitle("프로토콜 지원 상태") }
+            item {
+                DashboardCard {
+                    ConnectionKind.entries.forEachIndexed { index, kind ->
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(connectionKindIcon(kind), null, tint = serviceColor(kind.name, state.theme), modifier = Modifier.size(22.dp))
+                            Spacer(Modifier.width(11.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(kind.title, style = MaterialTheme.typography.bodyMedium)
+                                Text(protocolSupport(kind), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        if (index != ConnectionKind.entries.lastIndex) HorizontalDivider()
+                    }
+                }
+            }
+            item { SectionTitle("앱 정보") }
+            item {
+                DashboardCard {
+                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text("버전", Modifier.weight(1f))
+                        Text(state.appVersion, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text("저장된 연결", Modifier.weight(1f))
+                        Text("${state.connections.size}개", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item { SectionTitle("Android 파일 앱 연동") }
+            item {
+                DashboardCard {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                        Text(if (state.connections.isEmpty()) "먼저 NAS 또는 SFTP 연결을 추가해 주세요." else "현재 저장된 원격 위치 ${state.connections.size}개를 Android 파일 선택기에서도 열 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
+                        Text("1. 파일 앱 또는 파일 선택 화면의 저장 위치 메뉴를 엽니다.\n2. ‘NasFinder’를 선택합니다.\n3. 서버 이름을 선택해 원격 파일을 엽니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("지원되는 작업은 연결 방식과 서버 권한에 따라 달라집니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item { SectionTitle("오픈 소스") }
+            item {
+                DashboardCard {
+                    DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "OkHttp · SMBJ · JSch · Apache Commons Net") { uriHandler.openUri("https://square.github.io/okhttp/") }
+                    HorizontalDivider()
+                    DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
+                }
+            }
+            item { SectionTitle("만든 사람") }
+            item {
+                DashboardCard {
+                    DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
+                        uriHandler.openUri("https://github.com/armsone")
+                    }
+                }
+            }
+            item {
+                Text(
+                    "자격 증명은 Android Keystore로 암호화됩니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+    if (confirmCacheClear) {
+        AlertDialog(
+            onDismissRequest = { confirmCacheClear = false },
+            title = { Text("다운로드 캐시를 지울까요?") },
+            text = { Text("미리보기와 공유를 위해 내려받은 임시 파일을 모두 삭제합니다. 원격 서버의 원본은 삭제되지 않습니다.") },
+            dismissButton = { TextButton(onClick = { confirmCacheClear = false }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmCacheClear = false; model.clearDownloadCache() },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("전체 지우기") }
+            },
+        )
+    }
+}
+
+private fun superThumbnailStatus(status: SuperThumbnailWorkStatus) = when (status) {
+    SuperThumbnailWorkStatus.WAITING -> "네트워크와 충전 조건을 기다리는 중"
+    SuperThumbnailWorkStatus.RUNNING -> "원격 사진을 확인하는 중"
+    SuperThumbnailWorkStatus.SUCCESS -> "완료"
+    SuperThumbnailWorkStatus.PARTIAL -> "일부 항목을 제외하고 완료"
+    SuperThumbnailWorkStatus.FAILED -> "완료하지 못함"
+    SuperThumbnailWorkStatus.CANCELLED -> "취소됨"
+}
+
+private fun protocolSupport(kind: ConnectionKind) = when (kind) {
+    ConnectionKind.SYNOLOGY, ConnectionKind.SFTP, ConnectionKind.SMB ->
+        "탐색 · 다운로드 · 업로드 · 관리 · 복사/이동"
+    ConnectionKind.FTP -> "탐색 · 다운로드 · 업로드 · 폴더/이름/삭제"
+    ConnectionKind.WEBDAV -> "탐색 · 다운로드"
+    ConnectionKind.DROPBOX, ConnectionKind.ONEDRIVE, ConnectionKind.GOOGLE_DRIVE -> "계정 연결 준비 중"
+}
+
+private fun themeTitle(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "자동"; AppTheme.DAY -> "낮"; AppTheme.NIGHT -> "밤"; AppTheme.DIGITAL_RAIN -> "Vibe Coder"; AppTheme.WINDY_MEADOW -> "Windy Meadow" }
+private fun themeDescription(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "Android 설정"; AppTheme.DAY -> "맑고 밝게"; AppTheme.NIGHT -> "차분하고 어둡게"; AppTheme.DIGITAL_RAIN -> "Black · Mint"; AppTheme.WINDY_MEADOW -> "Sky · Meadow" }
+private fun themeIcon(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> Icons.Default.Brightness6; AppTheme.DAY -> Icons.Default.WbSunny; AppTheme.NIGHT -> Icons.Default.NightsStay; AppTheme.DIGITAL_RAIN -> Icons.Default.Code; AppTheme.WINDY_MEADOW -> Icons.Default.Air }
+private fun themePreviewBrush(theme: AppTheme): Brush = Brush.linearGradient(
+    when (theme) {
+        AppTheme.SYSTEM -> listOf(Color(0xFFF3F5F6), Color(0xFFD9E0E3))
+        AppTheme.DAY -> listOf(Color(0xFF8FD8FF), Color(0xFFF1FBFF))
+        AppTheme.NIGHT -> listOf(Color(0xFF17232D), Color(0xFF03070A))
+        AppTheme.DIGITAL_RAIN -> listOf(Color(0xFF020B0A), Color(0xFF063228))
+        AppTheme.WINDY_MEADOW -> listOf(Color(0xFF55BDD9), Color(0xFFD5ED8A))
+    },
+)
+private fun formatBytes(value: Long): String { if (value < 1024) return "$value B"; val units = arrayOf("KB", "MB", "GB", "TB"); var size = value.toDouble(); var index = -1; do { size /= 1024; index++ } while (size >= 1024 && index < units.lastIndex); return "%.1f %s".format(size, units[index]) }

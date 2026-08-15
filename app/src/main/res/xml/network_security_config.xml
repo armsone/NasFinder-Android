@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- HTTP remains available for explicitly configured local NAS endpoints. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

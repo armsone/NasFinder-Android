@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">NasFinder</string>
+    <string name="widget_title">NasFinder</string>
+    <string name="widget_description">기본 NAS 연결과 받은 파일 현황을 표시합니다.</string>
+    <string name="widget_no_default_connection">기본 연결 없음</string>
+    <string name="widget_connections_empty">연결 0개</string>
+    <string name="widget_received_empty">받은 파일 0개</string>
+    <string name="widget_content_description">NasFinder, 기본 연결 %1$s, 연결 %2$d개, 받은 파일 %3$d개. 탭하여 앱 열기.</string>
+    <string name="shortcut_inbox_short">받은 파일</string>
+    <string name="shortcut_inbox_long">NasFinder 받은 파일 열기</string>
+    <string name="shortcut_webhard_short">WebHard</string>
+    <string name="shortcut_webhard_long">WebHard 화면 열기</string>
+    <string name="shortcut_browser_short">웹 브라우저</string>
+    <string name="shortcut_browser_long">NasFinder 웹 브라우저 열기</string>
+    <string name="tile_webhard_label">WebHard 열기</string>
+    <plurals name="widget_connection_count">
+        <item quantity="one">연결 %d개</item>
+        <item quantity="other">연결 %d개</item>
+    </plurals>
+    <plurals name="widget_received_count">
+        <item quantity="one">받은 파일 %d개</item>
+        <item quantity="other">받은 파일 %d개</item>
+    </plurals>
+</resources>

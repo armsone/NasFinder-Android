@@ -1,0 +1,544 @@
+--- a/NasFinder/Features/Preview/RemoteVideoStreamingLoader.swift
++++ b/NasFinder/Features/Preview/RemoteVideoStreamingLoader.swift
+@@ -14,19 +14,22 @@
+         qos: .userInitiated
+     )
+     private let taskRegistry = RemoteVideoStreamingTaskRegistry()
+-    private let byteBudget: RemoteVideoStreamingByteBudget?
+-    private let rangeCache: RemoteVideoStreamingRangeCache?
++    private let rangeFetcher: RemoteVideoStreamingRangeFetcher?
+ 
+     init(
+         item: RemoteFileItem,
+         service: any RemoteFileService,
+-        maximumTransferredBytes: Int? = nil
++        maximumTransferredBytes: Int? = nil,
++        maximumRangeRequests: Int = RemoteVideoStreamingRequestBudget
++            .defaultMaximumRequests
+     ) {
+         self.item = item
+         self.service = service
+-        byteBudget = maximumTransferredBytes.map(RemoteVideoStreamingByteBudget.init)
+-        rangeCache = maximumTransferredBytes.map { _ in
+-            RemoteVideoStreamingRangeCache()
++        rangeFetcher = maximumTransferredBytes.map {
++            RemoteVideoStreamingRangeFetcher(
++                maximumTransferredBytes: $0,
++                maximumRangeRequests: maximumRangeRequests
++            )
+         }
+ 
+         var components = URLComponents()
+@@ -79,46 +82,33 @@
+                     try Task.checkCancellation()
+                     let preferredLength = RemoteVideoStreamingReadPolicy.preferredLength(
+                         remainingBytes: requestedEnd - offset,
+-                        isBounded: byteBudget != nil
++                        isBounded: rangeFetcher != nil
+                     )
+-                    if let cachedData = rangeCache?.data(
+-                        at: offset,
+-                        maximumLength: preferredLength
+-                    ) {
+-                        dataRequest.respond(with: cachedData)
+-                        offset += Int64(cachedData.count)
+-                        continue
+-                    }
+-                    let length = byteBudget?.reserve(upTo: preferredLength)
+-                        ?? preferredLength
+-                    guard length > 0 else {
+-                        throw RemoteVideoStreamingError.transferLimitReached
+-                    }
+-
+                     let data: Data
+-                    do {
++                    if let rangeFetcher {
++                        data = try await rangeFetcher.data(
++                            at: offset,
++                            maximumLength: preferredLength,
++                            fileSize: fileSize
++                        ) { readOffset, readLength in
++                            try await service.readRange(
++                                of: item,
++                                offset: readOffset,
++                                length: readLength
++                            )
++                        }
++                    } else {
+                         data = try await service.readRange(
+                             of: item,
+                             offset: offset,
+-                            length: length
++                            length: preferredLength
+                         )
+-                        byteBudget?.complete(
+-                            reservedBytes: length,
+-                            receivedBytes: data.count
+-                        )
+-                        rangeCache?.store(data, at: offset)
+-                    } catch {
+-                        byteBudget?.complete(
+-                            reservedBytes: length,
+-                            receivedBytes: 0
+-                        )
+-                        throw error
+                     }
+                     guard !data.isEmpty else { break }
+                     try Task.checkCancellation()
+                     dataRequest.respond(with: data)
+                     offset += Int64(data.count)
+-                    if data.count < length { break }
++                    if rangeFetcher == nil, data.count < preferredLength { break }
+                 }
+ 
+                 if offset >= requestedEnd || offset >= fileSize {
+@@ -151,15 +141,21 @@
+     }
+ 
+     var transferredByteCount: Int {
+-        byteBudget?.transferredByteCount ?? 0
++        rangeFetcher?.transferredByteCount ?? 0
+     }
+ 
+     var accountedByteCount: Int {
+-        byteBudget?.accountedByteCount ?? 0
++        rangeFetcher?.accountedByteCount ?? 0
+     }
+ }
+ 
+ enum RemoteVideoStreamingReadPolicy {
++    struct NetworkRange: Equatable {
++        let offset: Int64
++        let length: Int
++    }
++
++    static let minimumReadAheadBytes = 64 * 1_024
+     static let boundedChunkBytes = 256 * 1_024
+     static let playbackChunkBytes = 8 * 1_024 * 1_024
+ 
+@@ -169,9 +165,185 @@
+     ) -> Int {
+         let maximumChunk = isBounded ? boundedChunkBytes : playbackChunkBytes
+         return Int(min(max(remainingBytes, 0), Int64(maximumChunk)))
++    }
++
++    static func alignedNetworkRange(
++        requestedOffset: Int64,
++        requestedLength: Int,
++        fileSize: Int64,
++        maximumFetchLength: Int
++    ) -> NetworkRange? {
++        guard requestedOffset >= 0,
++              requestedOffset < fileSize,
++              requestedLength > 0,
++              maximumFetchLength > 0 else { return nil }
++        let block = Int64(minimumReadAheadBytes)
++        let alignedOffset = requestedOffset - requestedOffset % block
++        let prefixBytes = Int(requestedOffset - alignedOffset)
++        let desiredLength = max(
++            minimumReadAheadBytes,
++            min(boundedChunkBytes, requestedLength + prefixBytes)
++        )
++        let alignedLength = min(
++            desiredLength,
++            maximumFetchLength,
++            Int(min(Int64(Int.max), fileSize - alignedOffset))
++        )
++        if alignedLength > prefixBytes {
++            return NetworkRange(offset: alignedOffset, length: alignedLength)
++        }
++        let fallbackLength = min(
++            max(requestedLength, 1),
++            maximumFetchLength,
++            Int(min(Int64(Int.max), fileSize - requestedOffset))
++        )
++        return fallbackLength > 0
++            ? NetworkRange(offset: requestedOffset, length: fallbackLength)
++            : nil
++    }
++}
++
++/// Owns the bounded thumbnail fetch state for one item. Read-ahead and the
++/// request ceiling apply only to cache misses; cache hits never consume either
++/// network bytes or request attempts.
++final class RemoteVideoStreamingRangeFetcher: @unchecked Sendable {
++    typealias Reader = @Sendable (Int64, Int) async throws -> Data
++
++    private let byteBudget: RemoteVideoStreamingByteBudget
++    private let requestBudget: RemoteVideoStreamingRequestBudget
++    private let rangeCache: RemoteVideoStreamingRangeCache
++
++    init(
++        maximumTransferredBytes: Int,
++        maximumRangeRequests: Int = RemoteVideoStreamingRequestBudget
++            .defaultMaximumRequests,
++        maximumCacheEntries: Int = RemoteVideoStreamingRangeCache
++            .defaultMaximumEntryCount
++    ) {
++        byteBudget = RemoteVideoStreamingByteBudget(
++            maximumBytes: maximumTransferredBytes
++        )
++        requestBudget = RemoteVideoStreamingRequestBudget(
++            maximumRequests: maximumRangeRequests
++        )
++        rangeCache = RemoteVideoStreamingRangeCache(
++            maximumEntryCount: maximumCacheEntries
++        )
++    }
++
++    func data(
++        at offset: Int64,
++        maximumLength: Int,
++        fileSize: Int64,
++        read: Reader
++    ) async throws -> Data {
++        if let cached = rangeCache.data(
++            at: offset,
++            maximumLength: maximumLength
++        ) {
++            return cached
++        }
++        try Task.checkCancellation()
++        guard var networkRange = RemoteVideoStreamingReadPolicy
++            .alignedNetworkRange(
++                requestedOffset: offset,
++                requestedLength: maximumLength,
++                fileSize: fileSize,
++                maximumFetchLength: byteBudget.remainingByteCount
++            ) else {
++            throw RemoteVideoStreamingError.transferLimitReached
++        }
++
++        var reservedBytes = byteBudget.reserve(upTo: networkRange.length)
++        let prefixBytes = Int(offset - networkRange.offset)
++        if reservedBytes <= prefixBytes {
++            byteBudget.complete(
++                reservedBytes: reservedBytes,
++                receivedBytes: 0
++            )
++            guard let fallback = RemoteVideoStreamingReadPolicy
++                .alignedNetworkRange(
++                    requestedOffset: offset,
++                    requestedLength: maximumLength,
++                    fileSize: fileSize,
++                    maximumFetchLength: byteBudget.remainingByteCount
++                ) else {
++                throw RemoteVideoStreamingError.transferLimitReached
++            }
++            networkRange = fallback
++            reservedBytes = byteBudget.reserve(upTo: fallback.length)
++        }
++        guard reservedBytes > 0 else {
++            throw RemoteVideoStreamingError.transferLimitReached
++        }
++        guard requestBudget.claimRequest() else {
++            byteBudget.complete(
++                reservedBytes: reservedBytes,
++                receivedBytes: 0
++            )
++            throw RemoteVideoStreamingError.requestLimitReached
++        }
++
++        let received: Data
++        do {
++            received = try await read(networkRange.offset, reservedBytes)
++            byteBudget.complete(
++                reservedBytes: reservedBytes,
++                receivedBytes: received.count
++            )
++        } catch {
++            byteBudget.complete(
++                reservedBytes: reservedBytes,
++                receivedBytes: 0
++            )
++            throw error
++        }
++        try Task.checkCancellation()
++        guard received.count <= reservedBytes else {
++            throw NasFinderError.invalidResponse
++        }
++        rangeCache.store(received, at: networkRange.offset)
++        guard let result = rangeCache.data(
++            at: offset,
++            maximumLength: maximumLength
++        ) else {
++            throw RemoteVideoStreamingError.unexpectedEndOfFile
++        }
++        return result
+     }
++
++    var transferredByteCount: Int { byteBudget.transferredByteCount }
++    var accountedByteCount: Int { byteBudget.accountedByteCount }
++    var requestCount: Int { requestBudget.requestCount }
++    var cachedEntryCount: Int { rangeCache.entryCount }
+ }
+ 
++final class RemoteVideoStreamingRequestBudget: @unchecked Sendable {
++    static let defaultMaximumRequests = 256
++
++    private let maximumRequests: Int
++    private let lock = NSLock()
++    private var claimedRequests = 0
++
++    init(maximumRequests: Int) {
++        self.maximumRequests = max(maximumRequests, 0)
++    }
++
++    func claimRequest() -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        guard claimedRequests < maximumRequests else { return false }
++        claimedRequests += 1
++        return true
++    }
++
++    var requestCount: Int {
++        lock.lock()
++        defer { lock.unlock() }
++        return claimedRequests
++    }
++}
++
+ /// Keeps byte ranges already fetched for one AVAsset so duration probing and
+ /// image generation do not charge the network budget for the same bytes twice.
+ /// The cache is intentionally loader-local and therefore cannot affect another
+@@ -185,8 +357,15 @@
+     }
+ 
+     private let lock = NSLock()
++    private let maximumEntryCount: Int
+     private var entries: [Entry] = []
+ 
++    static let defaultMaximumEntryCount = 256
++
++    init(maximumEntryCount: Int = defaultMaximumEntryCount) {
++        self.maximumEntryCount = max(maximumEntryCount, 1)
++    }
++
+     func data(at offset: Int64, maximumLength: Int) -> Data? {
+         guard offset >= 0, maximumLength > 0 else { return nil }
+         lock.lock()
+@@ -206,18 +385,48 @@
+ 
+     func store(_ data: Data, at offset: Int64) {
+         guard offset >= 0, !data.isEmpty else { return }
+-        let newEntry = Entry(offset: offset, data: data)
++        var mergedEntry = Entry(offset: offset, data: data)
+         lock.lock()
+-        entries.removeAll {
+-            newEntry.offset <= $0.offset && newEntry.endOffset >= $0.endOffset
++        var retained: [Entry] = []
++        for entry in entries.sorted(by: { $0.offset < $1.offset }) {
++            guard entry.endOffset >= mergedEntry.offset,
++                  mergedEntry.endOffset >= entry.offset else {
++                retained.append(entry)
++                continue
++            }
++            let mergedOffset = min(entry.offset, mergedEntry.offset)
++            let mergedEnd = max(entry.endOffset, mergedEntry.endOffset)
++            guard let mergedCount = Int(exactly: mergedEnd - mergedOffset),
++                  let entryStart = Int(exactly: entry.offset - mergedOffset),
++                  let newStart = Int(exactly: mergedEntry.offset - mergedOffset)
++            else { continue }
++            var mergedData = Data(count: mergedCount)
++            mergedData.replaceSubrange(
++                newStart..<(newStart + mergedEntry.data.count),
++                with: mergedEntry.data
++            )
++            // Existing cache bytes already served AVFoundation and remain the
++            // source of truth if a later overlapping response disagrees.
++            mergedData.replaceSubrange(
++                entryStart..<(entryStart + entry.data.count),
++                with: entry.data
++            )
++            mergedEntry = Entry(offset: mergedOffset, data: mergedData)
+         }
+-        if !entries.contains(where: {
+-            $0.offset <= newEntry.offset && $0.endOffset >= newEntry.endOffset
+-        }) {
+-            entries.append(newEntry)
++        retained.append(mergedEntry)
++        retained.sort { $0.offset < $1.offset }
++        if retained.count > maximumEntryCount {
++            retained.removeFirst(retained.count - maximumEntryCount)
+         }
++        entries = retained
+         lock.unlock()
+     }
++
++    var entryCount: Int {
++        lock.lock()
++        defer { lock.unlock() }
++        return entries.count
++    }
+ }
+ 
+ /// Bounds the bytes fetched by a streaming asset without changing playback's
+@@ -338,6 +547,7 @@
+     case missingFileSize
+     case unexpectedEndOfFile
+     case transferLimitReached
++    case requestLimitReached
+ 
+     var errorDescription: String? {
+         switch self {
+@@ -347,6 +557,8 @@
+             "원격 영상 데이터를 끝까지 읽지 못했습니다."
+         case .transferLimitReached:
+             "원격 영상의 데이터 사용 한도에 도달했습니다."
++        case .requestLimitReached:
++            "원격 영상의 범위 요청 횟수 한도에 도달했습니다."
+         }
+     }
+ }
+--- a/NasFinderTests/RemoteVideoStreamingTaskRegistryTests.swift
++++ b/NasFinderTests/RemoteVideoStreamingTaskRegistryTests.swift
+@@ -46,8 +46,109 @@
+         cache.store(Data(repeating: 0xFF, count: 8), at: 2_016)
+ 
+         XCTAssertEqual(cache.data(at: 2_016, maximumLength: 8), source.subdata(in: 16..<24))
++    }
++
++    func testRangeCacheCapsDisjointEntryMetadata() {
++        let cache = RemoteVideoStreamingRangeCache(maximumEntryCount: 2)
++        cache.store(Data([1]), at: 0)
++        cache.store(Data([2]), at: 1_000)
++        cache.store(Data([3]), at: 2_000)
++
++        XCTAssertEqual(cache.entryCount, 2)
++        XCTAssertNil(cache.data(at: 0, maximumLength: 1))
++    }
++
++    func testSmallOverlappingReadsReuseOneAlignedFakeServiceRequest() async throws {
++        let service = FakeStreamingRangeService()
++        let fetcher = RemoteVideoStreamingRangeFetcher(
++            maximumTransferredBytes: 256 * 1_024
++        )
++
++        _ = try await fetcher.data(at: 100, maximumLength: 8, fileSize: 1_000_000) {
++            try await service.readRange(offset: $0, length: $1)
++        }
++        _ = try await fetcher.data(at: 104, maximumLength: 8, fileSize: 1_000_000) {
++            try await service.readRange(offset: $0, length: $1)
++        }
++
++        let requests = await service.requests
++        XCTAssertEqual(requests, [.init(offset: 0, length: 64 * 1_024)])
++        XCTAssertEqual(fetcher.requestCount, 1)
++    }
++
++    func testSmallDisjointReadsStayBoundedAndAdjacentBlocksCoalesce() async throws {
++        let service = FakeStreamingRangeService()
++        let fetcher = RemoteVideoStreamingRangeFetcher(
++            maximumTransferredBytes: 256 * 1_024,
++            maximumCacheEntries: 4
++        )
++
++        for offset in [Int64(0), Int64(64 * 1_024)] {
++            _ = try await fetcher.data(at: offset, maximumLength: 1, fileSize: 1_000_000) {
++                try await service.readRange(offset: $0, length: $1)
++            }
++        }
++
++        let requests = await service.requests
++        XCTAssertEqual(requests.count, 2)
++        XCTAssertEqual(fetcher.cachedEntryCount, 1)
++        XCTAssertEqual(fetcher.transferredByteCount, 128 * 1_024)
++    }
++
++    func testPerLoaderRequestHardCapRejectsFurtherDisjointReads() async throws {
++        let service = FakeStreamingRangeService()
++        let fetcher = RemoteVideoStreamingRangeFetcher(
++            maximumTransferredBytes: 512 * 1_024,
++            maximumRangeRequests: 2
++        )
++
++        for offset in [Int64(0), Int64(64 * 1_024)] {
++            _ = try await fetcher.data(at: offset, maximumLength: 1, fileSize: 1_000_000) {
++                try await service.readRange(offset: $0, length: $1)
++            }
++        }
++        do {
++            _ = try await fetcher.data(
++                at: 128 * 1_024,
++                maximumLength: 1,
++                fileSize: 1_000_000
++            ) {
++                try await service.readRange(offset: $0, length: $1)
++            }
++            XCTFail("요청 hard cap 뒤에는 새 network read가 시작되면 안 됩니다.")
++        } catch {
++            // The exact loader error is private; the fake service count proves
++            // rejection happened before another network request.
++        }
++
++        let requests = await service.requests
++        XCTAssertEqual(requests.count, 2)
++        XCTAssertEqual(fetcher.requestCount, 2)
+     }
+ 
++    func testCancellationReachesFakeServiceAndReleasesReservedBytes() async throws {
++        let service = FakeStreamingRangeService(stalls: true)
++        let fetcher = RemoteVideoStreamingRangeFetcher(
++            maximumTransferredBytes: 256 * 1_024
++        )
++        let task = Task {
++            try await fetcher.data(at: 0, maximumLength: 1, fileSize: 1_000_000) {
++                try await service.readRange(offset: $0, length: $1)
++            }
++        }
++        try await service.waitUntilRequested()
++        task.cancel()
++
++        do {
++            _ = try await task.value
++            XCTFail("취소된 fake service read는 성공하면 안 됩니다.")
++        } catch is CancellationError {
++            // Expected.
++        }
++        XCTAssertEqual(fetcher.accountedByteCount, 0)
++        XCTAssertEqual(fetcher.requestCount, 1)
++    }
++
+     func testFolderTrafficBudgetNeverOvercommitsConcurrentLeases() async {
+         let budget = RemoteVideoThumbnailTrafficBudget(
+             maximumFolderBytes: 1_000,
+@@ -220,6 +321,37 @@
+     }
+ }
+ 
++private actor FakeStreamingRangeService {
++    struct Request: Equatable {
++        let offset: Int64
++        let length: Int
++    }
++
++    private(set) var requests: [Request] = []
++    private let stalls: Bool
++
++    init(stalls: Bool = false) {
++        self.stalls = stalls
++    }
++
++    func readRange(offset: Int64, length: Int) async throws -> Data {
++        requests.append(Request(offset: offset, length: length))
++        if stalls {
++            try await Task.sleep(for: .seconds(30))
++        }
++        return Data(repeating: UInt8(truncatingIfNeeded: offset), count: length)
++    }
++
++    func waitUntilRequested() async throws {
++        let clock = ContinuousClock()
++        let deadline = clock.now.advanced(by: .seconds(1))
++        while requests.isEmpty, clock.now < deadline {
++            try await Task.sleep(for: .milliseconds(5))
++        }
++        XCTAssertFalse(requests.isEmpty)
++    }
++}
++
+ private actor StreamingTaskRecorder {
+     private(set) var startCount = 0
+     private(set) var cancellationCount = 0
+
