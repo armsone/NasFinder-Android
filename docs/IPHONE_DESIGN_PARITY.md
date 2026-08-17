@@ -433,3 +433,10 @@ Typography는 SwiftUI semantic size를 Compose `sp`로 고정 매핑했다: body
 - Android system picker/DocumentsProvider의 chrome은 앱이 임의로 바꿀 수 없어 결과 metadata와 thumbnail만 맞춘다.
 - Web Browser 즐겨찾기 전체 편집은 Android ModalBottomSheet를 유지한다. 상단 inline popover의 위치만 다르고 데이터·행 위계·동작은 유지된다.
 - Android fontScale은 iOS Dynamic Type과 단계 값이 달라 `1.3` 이상을 accessibility 재배치 기준으로 사용한다. 고정 이미지 크기보다 텍스트와 행동 노출을 우선한다.
+# 2026-08-17 iOS 작업 트리 델타
+
+| 항목 | Android 대응 | 검증 |
+|---|---|---|
+| 폰하드 전용 로고 | 대시보드에 32dp, 7dp 둥근 모서리 자산 적용 | 빌드 통과 |
+| 슈퍼썸네일 최근 작업 삭제 | 더보기 메뉴를 제거하고 오른쪽에서 왼쪽 전체 스와이프 삭제로 변경 | 빌드 통과, 실기기 제스처 대기 |
+| 브라우저 중복 뒤로가기 제거 | Android는 기존 단일 앱 상단 뒤로가기와 시스템 BackHandler 구조 유지 | 소스 역대조 |

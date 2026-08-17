@@ -759,7 +759,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     }
                     BrowserDashboardRow { model.show(Screen.WebBrowser) }
                     DashboardRowDivider()
-                    PhoneHardDashboardRow(state.theme) { model.show(Screen.WebHard) }
+                    PhoneHardDashboardRow { model.show(Screen.WebHard) }
                     DashboardRowDivider()
                     DashboardRow(
                         Icons.Default.Add,
@@ -1010,21 +1010,19 @@ private fun BrowserDashboardRow(onClick: () -> Unit) {
 }
 
 @Composable
-private fun PhoneHardDashboardRow(theme: AppTheme, onClick: () -> Unit) {
-    val tint = serviceColor("WEBHARD", theme)
+private fun PhoneHardDashboardRow(onClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onClick).padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-            Box(Modifier.size(32.dp)) {
-                Icon(Icons.Default.Storage, null, Modifier.align(Alignment.Center).size(30.dp), tint = tint)
-                Icon(Icons.Default.Wifi, null, Modifier.align(Alignment.TopEnd).size(13.dp), tint = tint)
-                Box(Modifier.align(Alignment.BottomEnd).size(13.dp).background(tint, CircleShape).border(1.dp, MaterialTheme.colorScheme.background, CircleShape), contentAlignment = Alignment.Center) {
-                    Text("H", color = serviceForegroundColor("WEBHARD", theme), fontSize = 7.sp, fontWeight = FontWeight.Bold)
-                }
-            }
+            Image(
+                painter = painterResource(R.drawable.phone_hard_logo),
+                contentDescription = null,
+                modifier = Modifier.size(32.dp).clip(RoundedCornerShape(7.dp)),
+                contentScale = ContentScale.Fit,
+            )
             Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
         }
         Box(Modifier.size(width = 44.dp, height = 48.dp), contentAlignment = Alignment.Center) {
@@ -2501,7 +2499,6 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
     val conditions = rememberSuperThumbnailRuntimeConditions()
     val haptics = LocalHapticFeedback.current
     var hiddenStartTapCount by rememberSaveable { mutableIntStateOf(0) }
-    var historyMenuId by remember { mutableStateOf<String?>(null) }
     var confirmVaultRemoval by remember { mutableStateOf(false) }
     var confirmSuperCacheReset by remember { mutableStateOf(false) }
     var vaultTimingMenuExpanded by remember { mutableStateOf(false) }
@@ -2674,10 +2671,32 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
                         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("최근 작업", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             history.forEachIndexed { index, location ->
-                                Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .035f), contentColor = MaterialTheme.colorScheme.onSurface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
-                                    Row(Modifier.fillMaxWidth().padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                val dismissState = rememberSwipeToDismissBoxState(
+                                    confirmValueChange = { value ->
+                                        if (value == SwipeToDismissBoxValue.EndToStart) {
+                                            model.removeSuperThumbnailHistory(location)
+                                            true
+                                        } else false
+                                    },
+                                )
+                                SwipeToDismissBox(
+                                    state = dismissState,
+                                    enableDismissFromStartToEnd = false,
+                                    backgroundContent = {
+                                        val deleting = dismissState.targetValue == SwipeToDismissBoxValue.EndToStart
+                                        Box(
+                                            Modifier.fillMaxSize().background(
+                                                if (deleting) MaterialTheme.colorScheme.error else Color.Transparent,
+                                            ).padding(end = 20.dp),
+                                            contentAlignment = Alignment.CenterEnd,
+                                        ) {
+                                            if (deleting) Icon(Icons.Default.Delete, "최근 작업에서 삭제", tint = MaterialTheme.colorScheme.onError)
+                                        }
+                                    },
+                                ) {
+                                    Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .035f), contentColor = MaterialTheme.colorScheme.onSurface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
                                         Row(
-                                            Modifier.weight(1f).heightIn(min = 40.dp).clickable { hiddenStartTapCount = 0; model.showSuperThumbnailReport(location) },
+                                            Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable { hiddenStartTapCount = 0; model.showSuperThumbnailReport(location) }.padding(horizontal = 12.dp, vertical = 8.dp),
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.spacedBy(11.dp),
                                         ) {
@@ -2689,18 +2708,6 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
                                                 Text(location.path, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                             }
                                             Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .55f))
-                                        }
-                                        Box {
-                                            IconButton(onClick = { historyMenuId = location.id }, modifier = Modifier.width(40.dp).height(40.dp)) {
-                                                Icon(Icons.Default.MoreHoriz, "${location.title} 최근 작업 메뉴", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-                                            DropdownMenu(expanded = historyMenuId == location.id, onDismissRequest = { historyMenuId = null }) {
-                                                DropdownMenuItem(
-                                                    text = { Text("최근 작업에서 삭제", color = MaterialTheme.colorScheme.error) },
-                                                    leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
-                                                    onClick = { historyMenuId = null; model.removeSuperThumbnailHistory(location) },
-                                                )
-                                            }
                                         }
                                     }
                                 }
