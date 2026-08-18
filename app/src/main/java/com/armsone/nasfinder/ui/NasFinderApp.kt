@@ -819,6 +819,7 @@ private fun launcherIconDrawable(icon: LauncherIconVariant) = when (icon) {
     LauncherIconVariant.CYBER_VAULT -> R.drawable.app_icon_cyber_vault
     LauncherIconVariant.VIBE_CODER -> R.drawable.app_icon_vibe_coder
     LauncherIconVariant.PURPLE_NAS -> R.drawable.app_icon_purple_nas
+    LauncherIconVariant.NAS_RADAR -> R.drawable.app_icon_nas_radar
 }
 
 @Composable
@@ -3361,6 +3362,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
                     Triple(LauncherIconVariant.VIBE_CODER, "바이브 코더", R.drawable.app_icon_vibe_coder),
                     Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
+                    Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
                 )
                 Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
                     Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {

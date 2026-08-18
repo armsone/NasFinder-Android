@@ -70,6 +70,7 @@ class AppIconSwitchPolicyTest {
                 "com.armsone.nasfinder.PurpleNasLauncherAlias",
                 "com.armsone.nasfinder.DigitalRainLauncherAlias",
                 "com.armsone.nasfinder.CyberVaultLauncherAlias",
+                "com.armsone.nasfinder.NasRadarLauncherAlias",
             ),
             AppIconComponentContract.managedAliasClassNames,
         )
@@ -94,13 +95,14 @@ class AppIconSwitchPolicyTest {
     }
 
     @Test
-    fun `all four iPhone icon choices have distinct launcher aliases`() {
+    fun `all icon choices have distinct launcher aliases`() {
         assertEquals(
             listOf(
                 LauncherIconVariant.DEFAULT,
                 LauncherIconVariant.PURPLE_NAS,
                 LauncherIconVariant.VIBE_CODER,
                 LauncherIconVariant.CYBER_VAULT,
+                LauncherIconVariant.NAS_RADAR,
             ),
             LauncherIconVariant.entries,
         )
@@ -110,6 +112,7 @@ class AppIconSwitchPolicyTest {
                 cyberVault = overrideFor(LauncherIconVariant.CYBER_VAULT, icon),
                 digitalRain = overrideFor(LauncherIconVariant.VIBE_CODER, icon),
                 purpleNas = overrideFor(LauncherIconVariant.PURPLE_NAS, icon),
+                nasRadar = overrideFor(LauncherIconVariant.NAS_RADAR, icon),
             )
             assertTrue(AppIconSwitchPolicy.isApplied(applied, icon))
             assertEquals(icon, AppIconSwitchPolicy.previousStableIcon(applied, LauncherIconVariant.DEFAULT))
@@ -121,6 +124,7 @@ class AppIconSwitchPolicyTest {
                 "com.armsone.nasfinder.PurpleNasLauncherAlias",
                 "com.armsone.nasfinder.DigitalRainLauncherAlias",
                 "com.armsone.nasfinder.CyberVaultLauncherAlias",
+                "com.armsone.nasfinder.NasRadarLauncherAlias",
             ),
             LauncherIconVariant.entries.mapTo(mutableSetOf()) {
                 AppIconComponentContract.launcherAliasClass(it)
@@ -170,7 +174,8 @@ class AppIconSwitchPolicyTest {
         digitalRain: AliasOverride,
         purpleNas: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
         cyberVault: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
-    ) = LauncherAliasState(default, cyberVault, digitalRain, purpleNas)
+        nasRadar: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
+    ) = LauncherAliasState(default, cyberVault, digitalRain, purpleNas, nasRadar)
 
     private fun overrideFor(candidate: LauncherIconVariant, selected: LauncherIconVariant) =
         if (candidate == selected) AliasOverride.ENABLED else AliasOverride.DISABLED

@@ -2,8 +2,8 @@ package com.armsone.nasfinder.platform
 
 import com.armsone.nasfinder.model.AppTheme
 
-// User-visible order matches iPhone: Blue, Purple, Vibe Coder, Cyber Vault.
-enum class LauncherIconVariant { DEFAULT, PURPLE_NAS, VIBE_CODER, CYBER_VAULT }
+// User-visible order: Blue, Purple, Vibe Coder, Cyber Vault, NAS Radar.
+enum class LauncherIconVariant { DEFAULT, PURPLE_NAS, VIBE_CODER, CYBER_VAULT, NAS_RADAR }
 
 internal object AppIconComponentContract {
     const val MAIN_ACTIVITY_CLASS = "com.armsone.nasfinder.MainActivity"
@@ -11,12 +11,14 @@ internal object AppIconComponentContract {
     const val PURPLE_NAS_ALIAS_CLASS = "com.armsone.nasfinder.PurpleNasLauncherAlias"
     const val DIGITAL_RAIN_ALIAS_CLASS = "com.armsone.nasfinder.DigitalRainLauncherAlias"
     const val CYBER_VAULT_ALIAS_CLASS = "com.armsone.nasfinder.CyberVaultLauncherAlias"
+    const val NAS_RADAR_ALIAS_CLASS = "com.armsone.nasfinder.NasRadarLauncherAlias"
 
     val managedAliasClassNames = setOf(
         DEFAULT_ALIAS_CLASS,
         CYBER_VAULT_ALIAS_CLASS,
         DIGITAL_RAIN_ALIAS_CLASS,
         PURPLE_NAS_ALIAS_CLASS,
+        NAS_RADAR_ALIAS_CLASS,
     )
 
     fun launcherAliasClass(icon: LauncherIconVariant): String = when (icon) {
@@ -24,10 +26,11 @@ internal object AppIconComponentContract {
         LauncherIconVariant.CYBER_VAULT -> CYBER_VAULT_ALIAS_CLASS
         LauncherIconVariant.VIBE_CODER -> DIGITAL_RAIN_ALIAS_CLASS
         LauncherIconVariant.PURPLE_NAS -> PURPLE_NAS_ALIAS_CLASS
+        LauncherIconVariant.NAS_RADAR -> NAS_RADAR_ALIAS_CLASS
     }
 }
 
-internal enum class LauncherAlias { DEFAULT, CYBER_VAULT, DIGITAL_RAIN, PURPLE_NAS }
+internal enum class LauncherAlias { DEFAULT, CYBER_VAULT, DIGITAL_RAIN, PURPLE_NAS, NAS_RADAR }
 
 internal enum class AliasOverride { MANIFEST_DEFAULT, ENABLED, DISABLED }
 
@@ -36,12 +39,14 @@ internal data class LauncherAliasState(
     val cyberVault: AliasOverride,
     val digitalRain: AliasOverride,
     val purpleNas: AliasOverride,
+    val nasRadar: AliasOverride,
 ) {
     fun overrideFor(alias: LauncherAlias): AliasOverride = when (alias) {
         LauncherAlias.DEFAULT -> default
         LauncherAlias.CYBER_VAULT -> cyberVault
         LauncherAlias.DIGITAL_RAIN -> digitalRain
         LauncherAlias.PURPLE_NAS -> purpleNas
+        LauncherAlias.NAS_RADAR -> nasRadar
     }
 }
 
@@ -112,6 +117,7 @@ internal object AppIconSwitchPolicy {
             LauncherIconVariant.CYBER_VAULT -> LauncherAlias.CYBER_VAULT
             LauncherIconVariant.VIBE_CODER -> LauncherAlias.DIGITAL_RAIN
             LauncherIconVariant.PURPLE_NAS -> LauncherAlias.PURPLE_NAS
+            LauncherIconVariant.NAS_RADAR -> LauncherAlias.NAS_RADAR
         }
 
     fun launcherAlias(icon: LauncherIconVariant): LauncherAlias = icon.alias

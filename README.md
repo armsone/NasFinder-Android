@@ -10,7 +10,7 @@ NasFinder iPhone 앱의 기능·화면·플랫폼 계약을 Android 네이티브
 - 목록·작은/큰 격자·Cover Flow, 정렬·검색·즐겨찾기·원격 썸네일
 - Android 공유 메뉴, 받은 파일함, Files/DocumentsProvider, 위젯·바로가기·빠른 설정
 - Super Thumbnail의 제한 실행·재개·보고서와 선택적 NAS Vault 보관
-- 사용자가 제공한 Blue·Cyber Vault·Vibe Coder·Purple 런처 아이콘 선택
+- 사용자가 제공한 Blue·Cyber Vault·Vibe Coder·Purple·네트워크 NAS 런처 아이콘 선택
 - 공식 GitHub Release만 확인하는 선택적 업데이트 안내
 
 프로토콜별 고급 기능과 Android 플랫폼 통합의 정확한 완료 상태는 기술서 체크리스트를 기준으로 추적합니다. 미구현 항목을 지원되는 것처럼 표시하지 않습니다.

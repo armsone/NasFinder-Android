@@ -1,6 +1,6 @@
 # Android 구현 상태
 
-이 문서는 iPhone 기술서의 계약을 현재 Android 소스와 대조한 스냅샷이다. `소스 구현`은 Factory 연결과 정적 의존성 확인까지 끝냈다는 뜻이며, 실제 서버·계정 E2E 완료를 뜻하지는 않는다. 2026-08-15 기준 Android 37에서 `testDebugUnitTest` 157개와 `assembleDebug`·`assembleRelease`가 통과했다. Samsung SM-F968N(Android 16)에 최신 debug APK를 재설치해 Dashboard, 실제 Synology MOV 썸네일, Browser back long-press, Super Thumbnail 폴더 선택과 보관 시점 배치를 확인했다.
+이 문서는 iPhone 기술서의 계약을 현재 Android 소스와 대조한 스냅샷이다. `소스 구현`은 Factory 연결과 정적 의존성 확인까지 끝냈다는 뜻이며, 실제 서버·계정 E2E 완료를 뜻하지는 않는다. 2026-08-18 기준 Android 37에서 `testDebugUnitTest` 169개와 `lintDebug`·`assembleDebug`가 통과했다. Samsung SM-F968N(Android 16)에 최신 debug APK를 데이터 유지 방식으로 재설치해 앱 실행까지 확인했다. 실제 Synology MOV 썸네일, Browser back long-press, Super Thumbnail 폴더 선택과 보관 시점 배치 검증은 2026-08-15 실기기 기록을 유지한다.
 
 ### Factory와 의존성
 
@@ -26,7 +26,7 @@
 
 | 영역 | 상태 | 내용 |
 |---|---|---|
-| 대시보드·테마 | 소스 구현 | iPhone 대응 구조, 5개 테마, 서비스별 색상, 사용자 제공 원본 byte의 Blue NAS/Cyber Vault/Vibe Coder/Purple 런처 아이콘 4종과 adaptive·round·monochrome wrapper, 선택 영속화·실패 rollback; 4종 picker UI 연결 후 실기기 재검증 필요 |
+| 대시보드·테마 | 소스 구현 | iPhone 대응 구조, 5개 테마, 서비스별 색상, 사용자 제공 원본 byte의 Blue NAS/Cyber Vault/Vibe Coder/Purple/네트워크 NAS 런처 아이콘 5종과 legacy·adaptive·round wrapper, 선택 영속화·실패 rollback; 5종 picker UI 연결 후 실기기 재검증 필요 |
 | 연결 편집 | 완료 | 8종 연결, SFTP 호스트키·개인키, Synology OTP, cloud client ID·PKCE login·callback·refresh·수동 token fallback·logout |
 | 파일 브라우저 | 완료 | 자연어·숫자 정렬, locale 검색, 목록·작은/큰 격자, 2줄 제목 위계, 숨김 정책, 상위 폴더 |
 | 파일 작업 UI | 부분 완료 | 생성, 이름 변경, 삭제 확인, SAF 업로드, 복사·이동 대상 선택; SMB 공유 간 copy/move와 Google Drive 폴더 copy는 backend가 명시적으로 거절 |
@@ -45,7 +45,7 @@
 ## 검증 경계
 
 - JVM 회귀 범위는 모델·URL·경로·파일명·이름 우선순위, Synology credential/OTP·multipart SID query, HTTP Range temp 재개와 bounded Content-Range·Range 무시 정책, SFTP credential 분류·암호화 키 제한, SMB·FTP 동일 서버 경로 transfer 정책, Inbox, WebHard API·PhoneHard 브라우저 기능 표식, CloudDrive pagination/upload 및 provider별 copy/move·bounded Range 요청 계약·OneDrive monitor token 경계·Google 폴더 copy/native 문서 제한, WebDAV mutation, thumbnail key/LRU·traffic budget·sparse video seek/요청/실제 byte 상한·64KiB overlapping read 병합·영상 전체 원본 차단 정책, Super Thumbnail 표준/제한 실행 조건·session 영속/재개·Vault filename/staging/검증/root 경계/부분 삭제와 worker 만료·lease 선점/회수/token release·thermal pacing/retry 계약, widget·entry route 계약을 포함한다.
-- `testDebugUnitTest` 157개는 failure/error 0으로 통과했고 `assembleDebug`·`assembleRelease`로 Android 37 APK·manifest·resource 결합을 확인했다.
+- `testDebugUnitTest` 169개는 failure/error 0으로 통과했고 `lintDebug`·`assembleDebug`로 Android 37 APK·manifest·resource 결합을 확인했다.
 - Samsung SM-F968N(Android 16, API 36)에 최종 debug APK를 설치해 cold/warm launch, Dashboard, Inbox·WebHard·Browser deep link, 8종 연결 폼, SFTP 인증 방식, Synology OTP, 설정·Super Thumbnail 빈 상태, WebHard LAN HTTP·풍부한 브라우저 UI·background 자동 정지, 런처 아이콘 전환·복원, 가로 PhoneHard Cover Flow와 Back 동작을 확인했다. 세부 결과는 `DEVICE_TEST_REPORT.md`에 남겼다.
 - 실제 NAS·SFTP·SMB·FTP·WebDAV 및 Dropbox/OneDrive/Google 계정은 자격 증명을 저장소에 넣지 않는 별도 E2E가 필요하다.
 - `MediaMetadataRetriever`의 원격 `MediaDataSource` sparse frame 추출은 순수 range adapter 계약만 JVM 검증 대상이며, 코덱별 seek 패턴과 프레임 생성 성공 여부는 실제 Android 기기·실제 서버에서 아직 확인하지 않았다. 실패 시 전체 영상을 받지 않고 negative cache로 종료한다.

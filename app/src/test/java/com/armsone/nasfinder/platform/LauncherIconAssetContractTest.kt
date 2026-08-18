@@ -22,15 +22,17 @@ class LauncherIconAssetContractTest {
         LauncherAsset("purple_nas", "purple_nas", "purple_nas_adaptive_foreground", "purple_nas_background"),
         LauncherAsset("vibe_coder", "vibe_coder", "vibe_coder_adaptive_foreground", "vibe_coder_background"),
         LauncherAsset("cyber_vault", "cyber_vault", "cyber_vault_adaptive_foreground", "cyber_vault_background"),
+        LauncherAsset("nas_radar", "nas_radar", "nas_radar_adaptive_foreground", "nas_radar_background"),
     )
 
     @Test
-    fun `launcher assets preserve the exact user supplied PNG bytes`() {
+    fun `launcher assets preserve the exact user supplied image bytes`() {
         val expected = linkedMapOf(
             "app_icon_blue_nas.png" to "281c7030e7890b8f858dd2638c489a17a193c55b1772d7f16d3a0d939e40a5ba",
             "app_icon_cyber_vault.png" to "2cd8837024481f67131ae924fcfa562a6a0fc13d0ea7e1d173b6210e8384671b",
             "app_icon_vibe_coder.png" to "302ce914160732412bbeaebd607bfe960d8ab8fdd9b82a267df27474549b0b12",
             "app_icon_purple_nas.png" to "609f5bec2d685d23e992301721724ea7c2810067dab86c34ebf118a4b49e4253",
+            "app_icon_nas_radar.jpg" to "6d0f9e5965e94de5672bec42bafe399468753dd8143f2587d3c7c73b5c23805c",
         )
         val resourceDirectory = File(locateMainResourceDirectory(), "drawable-nodpi")
 
