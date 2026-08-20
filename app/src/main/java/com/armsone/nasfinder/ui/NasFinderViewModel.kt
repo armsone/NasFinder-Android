@@ -197,6 +197,7 @@ sealed interface Screen {
         val preferences: BrowserPreferences = BrowserPreferences(),
     ) : Screen
     data object Inbox : Screen
+    data object PhotoTransfer : Screen
     data object Settings : Screen
     data object ThumbnailCache : Screen
     data object SuperThumbnail : Screen

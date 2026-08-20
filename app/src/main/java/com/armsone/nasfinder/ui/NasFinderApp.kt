@@ -46,6 +46,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.NoteAdd
+import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -104,6 +105,7 @@ import com.armsone.nasfinder.ui.theme.serviceColor
 import com.armsone.nasfinder.ui.theme.serviceForegroundColor
 import com.armsone.nasfinder.ui.theme.WorkbenchAccent
 import com.armsone.nasfinder.ui.theme.BrowserOrange
+import androidx.core.content.FileProvider
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
@@ -135,6 +137,9 @@ fun NasFinderApp(model: NasFinderViewModel) {
                 is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
                 is Screen.Browser -> BrowserScreen(screen, state, model)
                 Screen.Inbox -> InboxScreen(state, model)
+                Screen.PhotoTransfer -> PhotoTransferScreen(
+                    onBack = { model.show(Screen.Dashboard) },
+                )
                 Screen.Settings -> SettingsScreen(state, model)
                 Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
                 Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
@@ -788,11 +793,23 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     modifier = Modifier.padding(horizontal = 14.dp).offset(y = (-8).dp),
                 )
             }
+            item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
+            item {
+                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface) {
+                    DashboardRow(Icons.AutoMirrored.Filled.CompareArrows, "Live Photos & Motion Photos", null) {
+                        model.show(Screen.PhotoTransfer)
+                    }
+                }
+            }
             item { SectionTitle("저장공간", Icons.Default.Storage) }
             item { DeviceStorageCard { fileImporter.launch(arrayOf("*/*")) } }
             item {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface) {
-                    DashboardRow(Icons.Default.Settings, "설정", null) { model.show(Screen.Settings) }
+                    Column {
+                        DashboardRow(Icons.Default.Settings, "설정", null) {
+                            model.show(Screen.Settings)
+                        }
+                    }
                 }
             }
         }
@@ -2354,15 +2371,19 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
 
 @Composable
 private fun InboxLeadingPreview(file: InboxDisplayItem) {
+    val context = LocalContext.current
     val isImage = file.mimeType?.startsWith("image/") == true ||
         file.originalFilename.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "heic", "webp")
     val isVideo = file.mimeType?.startsWith("video/") == true ||
         file.originalFilename.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "avi", "webm")
     val isPdf = file.mimeType == "application/pdf" || file.originalFilename.endsWith(".pdf", ignoreCase = true)
-    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, key1 = if (isImage || isVideo || isPdf) file.file.path else null) {
+    val preview by produceState(
+        initialValue = InboxThumbnailResult(),
+        key1 = if (isImage || isVideo || isPdf) "${file.file.path}:${file.file.lastModified()}:${file.file.length()}" else null,
+    ) {
         value = if (isImage || isVideo || isPdf) withContext(Dispatchers.IO) {
-            decodeInboxThumbnail(file.file, isImage, isVideo, isPdf)
-        } else null
+            loadInboxThumbnail(context, file.file, isImage, isVideo, isPdf)
+        } else InboxThumbnailResult()
     }
     val icon = when {
         isImage -> Icons.Default.Image
@@ -2370,22 +2391,91 @@ private fun InboxLeadingPreview(file: InboxDisplayItem) {
         isPdf -> Icons.Default.PictureAsPdf
         else -> Icons.Default.InsertDriveFile
     }
+    val thumbnail = preview.bitmap
     Box(
         Modifier.size(56.dp).clip(RoundedCornerShape(9.dp))
             .background(MaterialTheme.colorScheme.onSurface.copy(alpha = .08f)),
         contentAlignment = Alignment.Center,
     ) {
-        if (bitmap != null) {
-            Image(bitmap!!.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        if (thumbnail != null) {
+            Image(thumbnail.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         } else {
             Icon(icon, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (isVideo && thumbnail != null) {
+            Icon(
+                Icons.Default.PlayCircle,
+                "영상",
+                Modifier.size(25.dp),
+                tint = Color.White.copy(alpha = .94f),
+            )
+        }
+        if (preview.isMotionPhoto) {
+            Text(
+                "Motion Photo",
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                modifier = Modifier.align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = .68f))
+                    .padding(horizontal = 3.dp, vertical = 2.dp),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
         }
     }
 }
 
-private fun decodeInboxThumbnail(file: File, isImage: Boolean, isVideo: Boolean, isPdf: Boolean): android.graphics.Bitmap? =
-    runCatching {
+private data class InboxThumbnailResult(
+    val bitmap: android.graphics.Bitmap? = null,
+    val isMotionPhoto: Boolean = false,
+)
+
+private object InboxThumbnailMemoryCache {
+    private val cache = object : android.util.LruCache<String, android.graphics.Bitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: android.graphics.Bitmap): Int = value.allocationByteCount
+    }
+
+    @Synchronized fun get(key: String): android.graphics.Bitmap? = cache.get(key)
+    @Synchronized fun put(key: String, bitmap: android.graphics.Bitmap) { cache.put(key, bitmap) }
+}
+
+private fun loadInboxThumbnail(
+    context: Context,
+    file: File,
+    isImage: Boolean,
+    isVideo: Boolean,
+    isPdf: Boolean,
+): InboxThumbnailResult {
+    val cacheKey = "${file.canonicalPath}:${file.lastModified()}:${file.length()}"
+    val cached = InboxThumbnailMemoryCache.get(cacheKey)
+    val motionPhoto = isImage && isInboxMotionPhoto(file)
+    if (cached != null && !cached.isRecycled) return InboxThumbnailResult(cached, motionPhoto)
+    val uri = runCatching {
+        FileProvider.getUriForFile(context, "${context.packageName}.sharefiles", file)
+    }.getOrNull()
+    val bitmap = decodeInboxThumbnail(context, uri, file, isImage, isVideo, isPdf)
+    if (bitmap != null) InboxThumbnailMemoryCache.put(cacheKey, bitmap)
+    return InboxThumbnailResult(bitmap, motionPhoto)
+}
+
+private fun decodeInboxThumbnail(
+    context: Context,
+    uri: android.net.Uri?,
+    file: File,
+    isImage: Boolean,
+    isVideo: Boolean,
+    isPdf: Boolean,
+): android.graphics.Bitmap? = runCatching {
+        val resolverThumbnail = if (
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && uri != null && (isImage || isVideo)
+        ) {
+            runCatching {
+                context.contentResolver.loadThumbnail(uri, android.util.Size(112, 112), null)
+            }.getOrNull()
+        } else null
         when {
+            resolverThumbnail != null -> scaleInboxThumbnail(resolverThumbnail)
             isImage -> {
                 val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 android.graphics.BitmapFactory.decodeFile(file.path, bounds)
@@ -2397,12 +2487,21 @@ private fun decodeInboxThumbnail(file: File, isImage: Boolean, isVideo: Boolean,
                 )
             }
             isVideo -> {
-                val retriever = android.media.MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(file.path)
-                    retriever.frameAtTime?.let(::scaleInboxThumbnail)
-                } finally {
-                    retriever.release()
+                val platformThumbnail = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    android.media.ThumbnailUtils.createVideoThumbnail(
+                        file,
+                        android.util.Size(112, 112),
+                        null,
+                    )
+                } else null
+                platformThumbnail?.let(::scaleInboxThumbnail) ?: android.media.MediaMetadataRetriever().run {
+                    try {
+                        setDataSource(file.path)
+                        getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ?.let(::scaleInboxThumbnail)
+                    } finally {
+                        release()
+                    }
                 }
             }
             isPdf -> android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
@@ -2424,6 +2523,24 @@ private fun decodeInboxThumbnail(file: File, isImage: Boolean, isVideo: Boolean,
             else -> null
         }
     }.getOrNull()
+
+internal fun isInboxMotionPhoto(file: File): Boolean = runCatching {
+    if (file.name.endsWith("MP.jpg")) return@runCatching true
+    val prefix = ByteArray(minOf(file.length(), 256L * 1024L).toInt())
+    val count = file.inputStream().buffered().use { input ->
+        var offset = 0
+        while (offset < prefix.size) {
+            val read = input.read(prefix, offset, prefix.size - offset)
+            if (read <= 0) break
+            offset += read
+        }
+        offset
+    }
+    if (count <= 0) return@runCatching false
+    val xmp = prefix.copyOf(count).toString(Charsets.UTF_8)
+    (xmp.contains("MotionPhoto=\"1\"") || xmp.contains("MotionPhoto='1'")) &&
+        xmp.contains("MotionPhotoVersion") && xmp.contains("MotionPhotoPresentationTimestampUs")
+}.getOrDefault(false)
 
 private fun scaleInboxThumbnail(bitmap: android.graphics.Bitmap): android.graphics.Bitmap {
     val maxSide = maxOf(bitmap.width, bitmap.height)
