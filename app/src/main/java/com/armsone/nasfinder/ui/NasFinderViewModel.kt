@@ -2244,27 +2244,40 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (isEmpty()) sharedIntent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(::add)
         }.distinct().take(50)
         if (uris.isEmpty()) return
+        importInboxUris(uris, successMessage = "받았습니다", partialMessage = "받았지만")
+    }
+
+    fun importPickedFiles(uris: List<Uri>) {
+        val selected = uris.distinct().take(InboxBatchContracts.MAX_SELECTED_ITEMS)
+        if (selected.isEmpty()) return
+        importInboxUris(selected, successMessage = "가져왔습니다", partialMessage = "가져왔지만")
+    }
+
+    private fun importInboxUris(uris: List<Uri>, successMessage: String, partialMessage: String) {
         viewModelScope.launch {
-            var count = 0
-            var failed = 0
-            uris.forEachIndexed { index, uri ->
-                runCatching {
-                    val name = queryName(uri) ?: "받은 파일 ${index + 1}"
-                    application.contentResolver.openInputStream(uri)?.use { input ->
-                        inboxStore.import(name, application.contentResolver.getType(uri), input)
-                    } ?: error("파일을 열 수 없습니다")
-                    count++
-                }.onFailure { failed++ }
+            val (count, failed, files) = withContext(Dispatchers.IO) {
+                var importedCount = 0
+                var failedCount = 0
+                uris.forEachIndexed { index, uri ->
+                    runCatching {
+                        val name = queryName(uri) ?: "받은 파일 ${index + 1}"
+                        application.contentResolver.openInputStream(uri)?.use { input ->
+                            inboxStore.import(name, application.contentResolver.getType(uri), input)
+                        } ?: error("파일을 열 수 없습니다.")
+                        importedCount++
+                    }.onFailure { failedCount++ }
+                }
+                Triple(importedCount, failedCount, inboxFiles())
             }
             _state.update {
                 it.copy(
                     screen = Screen.Inbox,
-                    inboxFiles = inboxFiles(),
-                    message = if (failed == 0) "${count}개 파일을 받았습니다." else null,
+                    inboxFiles = files,
+                    message = if (failed == 0) "${count}개 파일을 $successMessage." else null,
                     inboxErrorMessage = when {
                         failed == 0 -> null
                         count == 0 -> "${failed}개 파일을 가져오지 못했습니다."
-                        else -> "${count}개 파일을 받았지만 ${failed}개는 가져오지 못했습니다."
+                        else -> "${count}개 파일을 $partialMessage ${failed}개는 가져오지 못했습니다."
                     },
                 )
             }

@@ -45,6 +45,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -640,6 +641,9 @@ private fun skyBrush(theme: AppTheme): Brush = Brush.linearGradient(
 @Composable
 private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     var connectionPendingDeletion by remember { mutableStateOf<RemoteConnection?>(null) }
+    val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        model.importPickedFiles(uris)
+    }
     val badgeDark = when (state.theme) {
         AppTheme.SYSTEM -> isSystemInDarkTheme()
         AppTheme.NIGHT, AppTheme.DIGITAL_RAIN, AppTheme.WORKBENCH -> true
@@ -785,7 +789,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 )
             }
             item { SectionTitle("저장공간", Icons.Default.Storage) }
-            item { DeviceStorageCard() }
+            item { DeviceStorageCard { fileImporter.launch(arrayOf("*/*")) } }
             item {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface) {
                     DashboardRow(Icons.Default.Settings, "설정", null) { model.show(Screen.Settings) }
@@ -797,7 +801,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
         AlertDialog(
             onDismissRequest = { connectionPendingDeletion = null },
             title = { Text("연결을 삭제할까요?") },
-            text = { Text("${connection.name}의 저장된 로그인 정보와 파일 앱 위치가 이 iPhone에서 제거됩니다. 서버의 파일은 삭제되지 않습니다.") },
+            text = { Text("${connection.name}의 저장된 로그인 정보와 파일 앱 위치가 이 Android 기기에서 제거됩니다. 서버의 파일은 삭제되지 않습니다.") },
             dismissButton = {
                 TextButton(onClick = { connectionPendingDeletion = null }) { Text("취소") }
             },
@@ -924,21 +928,33 @@ private fun DashboardRowDivider() {
 }
 
 @Composable
-private fun DeviceStorageCard() {
+private fun DeviceStorageCard(onImportFiles: () -> Unit) {
     val filesDir = LocalContext.current.filesDir
     val total = filesDir.totalSpace.coerceAtLeast(0L)
     val available = filesDir.usableSpace.coerceIn(0L, total.coerceAtLeast(1L))
     val usedFraction = if (total > 0L) ((total - available).toDouble() / total).coerceIn(0.0, 1.0).toFloat() else 0f
     DashboardCard {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Android 저장공간", style = MaterialTheme.typography.bodyMedium)
-            Text(
-                if (total > 0L) "전체 ${formatBytes(total)} · 사용 가능 ${formatBytes(available)}" else "저장공간 정보를 확인할 수 없습니다.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (total > 0L) {
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        Row(
+            Modifier.fillMaxWidth().clickable(onClickLabel = "Android 파일 선택기에서 파일을 고릅니다.", onClick = onImportFiles)
+                .padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Default.Folder, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("Android 저장공간", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (total > 0L) "전체 ${formatBytes(total)} · 사용 가능 ${formatBytes(available)}" else "저장공간 정보를 확인할 수 없습니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("파일 선택기 열기 · 클라우드 저장소 지원", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .72f))
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (total > 0L) {
+            HorizontalDivider(Modifier.padding(horizontal = 18.dp))
+            Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("저장공간", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LinearProgressIndicator(progress = { usedFraction }, modifier = Modifier.fillMaxWidth())
                 Text("${(usedFraction * 100).toInt()}%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2077,6 +2093,9 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     var pendingSendIds by remember { mutableStateOf<List<java.util.UUID>?>(null) }
     var selectionMode by remember { mutableStateOf(false) }
     val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
+    val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        model.importPickedFiles(uris)
+    }
     LaunchedEffect(Unit) { model.refreshInbox() }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -2107,6 +2126,11 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 },
                 actions = {
+                    if (!selectionMode) {
+                        IconButton(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
+                            Icon(Icons.AutoMirrored.Filled.NoteAdd, "파일에서 가져오기")
+                        }
+                    }
                     if (files.isNotEmpty()) {
                         TextButton(
                             onClick = {
@@ -3347,7 +3371,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                         }
                         HorizontalDivider()
                         Text(
-                            if (state.theme == AppTheme.SYSTEM) "iPhone의 라이트·다크 모드에 맞춰 자동으로 바뀝니다."
+                            if (state.theme == AppTheme.SYSTEM) "Android의 라이트·다크 모드에 맞춰 자동으로 바뀝니다."
                             else "선택한 테마는 앱을 다시 열어도 유지됩니다.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3557,7 +3581,7 @@ private fun protocolSupport(kind: ConnectionKind) = when (kind) {
 }
 
 private fun themeTitle(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "자동"; AppTheme.DAY -> "낮"; AppTheme.NIGHT -> "밤"; AppTheme.DIGITAL_RAIN -> "Vibe Coder"; AppTheme.WINDY_MEADOW -> "Windy Meadow"; AppTheme.WORKBENCH -> "Workbench" }
-private fun themeDescription(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "iPhone 설정"; AppTheme.DAY -> "맑고 밝게"; AppTheme.NIGHT -> "차분하고 어둡게"; AppTheme.DIGITAL_RAIN -> "Black · Mint"; AppTheme.WINDY_MEADOW -> "Sky · Meadow"; AppTheme.WORKBENCH -> "Slate · Syntax" }
+private fun themeDescription(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "Android 설정"; AppTheme.DAY -> "맑고 밝게"; AppTheme.NIGHT -> "차분하고 어둡게"; AppTheme.DIGITAL_RAIN -> "Black · Mint"; AppTheme.WINDY_MEADOW -> "Sky · Meadow"; AppTheme.WORKBENCH -> "Slate · Syntax" }
 private fun themeIcon(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> Icons.Default.Brightness6; AppTheme.DAY -> Icons.Default.WbSunny; AppTheme.NIGHT -> Icons.Default.NightsStay; AppTheme.DIGITAL_RAIN -> Icons.Default.Code; AppTheme.WINDY_MEADOW -> Icons.Default.Air; AppTheme.WORKBENCH -> Icons.Default.Code }
 private fun themePreviewBrush(theme: AppTheme): Brush {
     val colors = when (theme) {

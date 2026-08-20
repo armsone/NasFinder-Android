@@ -12,6 +12,10 @@ class InboxParityContractTest {
         val viewModel = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt").readText()
 
         assertTrue(app.contains("title = { Text(\"받은 파일\") }"))
+        assertTrue(app.contains("ActivityResultContracts.OpenMultipleDocuments()"))
+        assertTrue(app.contains("Icon(Icons.AutoMirrored.Filled.NoteAdd, \"파일에서 가져오기\")"))
+        assertTrue(viewModel.contains("fun importPickedFiles(uris: List<Uri>)"))
+        assertTrue(viewModel.contains("uris.distinct().take(InboxBatchContracts.MAX_SELECTED_ITEMS)"))
         assertTrue(app.contains("Text(if (selectionMode) \"완료\" else \"선택\")"))
         assertTrue(app.contains("Text(if (allSelected) \"전체 해제\" else \"전체 선택\")"))
         assertTrue(app.contains("Text(\"NAS로 보내기\")"))
@@ -26,6 +30,9 @@ class InboxParityContractTest {
 
         assertFalse(app.contains("Icons.Default.Checklist, \"다중 선택\""))
         assertFalse(app.contains("filePendingDeletion"))
+        assertFalse(app.contains("이 iPhone에서 제거됩니다"))
+        assertFalse(app.contains("iPhone의 라이트·다크 모드"))
+        assertFalse(app.contains("AppTheme.SYSTEM -> \"iPhone 설정\""))
     }
 
     private fun sourceFile(relativePath: String): File {
