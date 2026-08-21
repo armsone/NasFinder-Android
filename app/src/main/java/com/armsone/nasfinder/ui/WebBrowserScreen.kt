@@ -3,8 +3,11 @@
 package com.armsone.nasfinder.ui
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
@@ -17,6 +20,10 @@ import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.WebViewDatabase
+import android.webkit.WebChromeClient
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -33,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -41,6 +49,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -69,6 +80,10 @@ private const val MAX_WEB_DOWNLOAD_REDIRECTS = 8
 private data class ActiveWebDownload(val filename: String, val received: Long, val total: Long?)
 private data class PendingWebDownload(val file: File, val filename: String, val mimeType: String?)
 private data class WebShortcut(val url: String, val isImage: Boolean)
+private data class BrowserFullscreenContent(
+    val view: View,
+    val callback: WebChromeClient.CustomViewCallback,
+)
 
 private val webDownloadClient = OkHttpClient.Builder().followRedirects(false).build()
 
@@ -357,6 +372,7 @@ fun WebBrowserScreen(
     onDiscardDownloadedFile: (File) -> Unit,
 ) {
     val context = LocalContext.current
+    val composeView = LocalView.current
     val scope = rememberCoroutineScope()
     var address by remember { mutableStateOf(BrowserUrlPolicy.normalize(initialUrl).orEmpty()) }
     var pageTitle by remember { mutableStateOf("") }
@@ -381,6 +397,8 @@ fun WebBrowserScreen(
     var downloadActionInFlight by remember { mutableStateOf(false) }
     var chooseNetworkConnection by remember { mutableStateOf(false) }
     var shortcut by remember { mutableStateOf<WebShortcut?>(null) }
+    var fullscreenContent by remember { mutableStateOf<BrowserFullscreenContent?>(null) }
+    val latestFullscreenContent by rememberUpdatedState(fullscreenContent)
     val lifecycleOwner = LocalLifecycleOwner.current
     val normalizedAddress = BrowserUrlPolicy.normalize(address)
     val currentIsFavorite = normalizedAddress != null && favorites.any { it.url == normalizedAddress }
@@ -437,8 +455,31 @@ fun WebBrowserScreen(
         }
     }
 
+    fun closeFullscreenVideo() {
+        fullscreenContent?.callback?.onCustomViewHidden()
+        fullscreenContent = null
+    }
+
     BackHandler {
-        if (webView?.canGoBack() == true) webView?.goBack() else onClose()
+        when {
+            fullscreenContent != null -> closeFullscreenVideo()
+            webView?.canGoBack() == true -> webView?.goBack()
+            else -> onClose()
+        }
+    }
+
+    DisposableEffect(fullscreenContent, composeView) {
+        val isFullscreen = fullscreenContent != null
+        val window = context.findActivity()?.window
+        val controller = window?.let { WindowInsetsControllerCompat(it, composeView) }
+        if (isFullscreen) {
+            controller?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller?.hide(WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose {
+            if (isFullscreen) controller?.show(WindowInsetsCompat.Type.systemBars())
+        }
     }
 
     DisposableEffect(lifecycleOwner, webView) {
@@ -472,6 +513,7 @@ fun WebBrowserScreen(
         }
     }
 
+    Box(Modifier.fillMaxSize()) {
     Scaffold(
         topBar = {
             Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface, tonalElevation = 3.dp) {
@@ -546,13 +588,21 @@ fun WebBrowserScreen(
                     settings.allowFileAccess = false
                     settings.allowContentAccess = false
                     settings.setSupportMultipleWindows(false)
-                    webChromeClient = object : android.webkit.WebChromeClient() {
+                    webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             progress = newProgress
                             loading = newProgress < 100
                         }
                         override fun onReceivedTitle(view: WebView?, title: String?) {
                             pageTitle = title.orEmpty()
+                        }
+                        override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                            if (view == null || callback == null) return
+                            fullscreenContent?.callback?.onCustomViewHidden()
+                            fullscreenContent = BrowserFullscreenContent(view, callback)
+                        }
+                        override fun onHideCustomView() {
+                            closeFullscreenVideo()
                         }
                     }
                     webViewClient = object : WebViewClient() {
@@ -600,6 +650,8 @@ fun WebBrowserScreen(
             },
             update = { webView = it },
             onRelease = { released ->
+                latestFullscreenContent?.callback?.onCustomViewHidden()
+                fullscreenContent = null
                 sessionController.retain(released)
                 if (webView === released) webView = null
             },
@@ -882,6 +934,45 @@ fun WebBrowserScreen(
             },
         )
     }
+    fullscreenContent?.let { content ->
+        key(content.view) {
+            BrowserFullscreenVideo(
+                modifier = Modifier.fillMaxSize().zIndex(10f),
+                content = content,
+            )
+        }
+    }
+    }
+}
+
+@Composable
+private fun BrowserFullscreenVideo(
+    modifier: Modifier,
+    content: BrowserFullscreenContent,
+) {
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            FrameLayout(context).apply {
+                setBackgroundColor(android.graphics.Color.BLACK)
+                (content.view.parent as? ViewGroup)?.removeView(content.view)
+                addView(
+                    content.view,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            }
+        },
+        onRelease = { container -> container.removeView(content.view) },
+    )
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 private fun formatWebBytes(value: Long): String = when {
