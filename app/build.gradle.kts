@@ -17,7 +17,10 @@ android {
         vectorDrawables.useSupportLibrary = true
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     buildTypes {
         release {

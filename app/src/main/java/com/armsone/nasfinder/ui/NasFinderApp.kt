@@ -102,6 +102,7 @@ import com.armsone.nasfinder.data.SuperThumbnailWorkStatus
 import com.armsone.nasfinder.data.SuperThumbnailVaultTiming
 import com.armsone.nasfinder.data.ScreenAwakeMode
 import com.armsone.nasfinder.data.RemoteThumbnailCachePolicy
+import com.armsone.nasfinder.BuildConfig
 import com.armsone.nasfinder.platform.InboxBatchContracts
 import com.armsone.nasfinder.platform.LauncherIconVariant
 import com.armsone.nasfinder.platform.WebHardFileStore
@@ -830,6 +831,14 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         DashboardRow(Icons.Default.Settings, "설정", null) {
                             model.show(Screen.Settings)
                         }
+                        Text(
+                            "버전 ${BuildConfig.VERSION_NAME} · 빌드 ${BuildConfig.VERSION_CODE}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().padding(start = 48.dp, end = 14.dp, bottom = 10.dp),
+                        )
                     }
                 }
             }
@@ -1797,7 +1806,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
 }
 
 @Composable
-private fun RemoteBrowserCoverFlow(
+internal fun RemoteBrowserCoverFlow(
     items: List<RemoteFileItem>,
     thumbnails: Map<String, android.graphics.Bitmap>,
     theme: AppTheme,

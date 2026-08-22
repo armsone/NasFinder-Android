@@ -13,12 +13,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -38,14 +36,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -54,6 +50,7 @@ import com.armsone.nasfinder.platform.WebHardFileItem
 import com.armsone.nasfinder.platform.WebHardFileStore
 import com.armsone.nasfinder.platform.WebHardHttpServer
 import com.armsone.nasfinder.model.AppTheme
+import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.ui.theme.LocalNasFinderTheme
 import com.armsone.nasfinder.ui.theme.PhoneHardMark
 import com.armsone.nasfinder.util.DownloadCacheContract
@@ -65,14 +62,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.collect
 
 private enum class WebHardLayout(val title: String) {
     LIST("자세히"), SMALL("작은 썸네일"), LARGE("포스터")
 }
 
-private val BkPanelCharcoal = Color(0xFF34383B)
+private val BkPanelCharcoal = Color(0xFF1A1C1F)
 private val BkPanelChrome = Color(0xFF8B9093)
 private val BkPanelRecessed = Color(0xFFE7E6E1)
 
@@ -134,7 +129,11 @@ internal fun PhoneHardConnectionPanel(
     val theme = LocalNasFinderTheme.current
     val enamel = theme == AppTheme.SKEUOMORPHIC
     val panelShape = RoundedCornerShape(16.dp)
-    val fieldHeight = if (largeFont) 56.dp else 48.dp
+    val fieldHeight = if (enamel) {
+        if (largeFont) 48.dp else 40.dp
+    } else {
+        if (largeFont) 56.dp else 48.dp
+    }
     val addressHeight = if (largeFont) 48.dp else 40.dp
     var passwordExpanded by rememberSaveable { mutableStateOf(false) }
     val fieldColors = if (enamel) {
@@ -161,50 +160,64 @@ internal fun PhoneHardConnectionPanel(
     }
 
     val content: @Composable () -> Unit = {
-        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(
+            Modifier.fillMaxWidth().padding(if (enamel) 14.dp else 12.dp),
+            verticalArrangement = Arrangement.spacedBy(if (enamel) 10.dp else 8.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(if (enamel) 9.dp else 10.dp),
+            ) {
                 if (enamel) {
-                    BkConnectionIcon()
+                    PhoneHardMark(28.dp)
                 } else {
                     Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.primary)
                 }
                 Text(
                     "서버 열기",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
+                    style = if (enamel) {
+                        MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp, lineHeight = 22.sp)
+                    } else MaterialTheme.typography.titleMedium,
+                    fontWeight = if (enamel) FontWeight.Bold else FontWeight.SemiBold,
                     color = if (enamel) BkPanelCharcoal else Color.Unspecified,
                 )
+                Spacer(Modifier.weight(1f))
+                if (enamel) {
+                    PhoneHardRefreshButton(
+                        onClick = connection::refreshAddresses,
+                        enabled = connection.server == null,
+                    )
+                }
             }
 
-            Surface(
-                color = if (enamel) BkPanelRecessed else MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(10.dp),
-                border = if (enamel) BorderStroke(1.dp, BkPanelChrome.copy(alpha = .72f)) else null,
-            ) {
-                Row(
-                    Modifier.fillMaxWidth().heightIn(min = addressHeight).padding(start = 12.dp, end = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+            if (enamel) {
+                PhoneHardBkAddressRow(connection, largeFont)
+            } else {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(10.dp),
                 ) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                        Text(
-                            "접속 주소",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (enamel) Color(0xFF686C6F) else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            connection.selectedAddress?.hostAddress ?: "사용 가능한 접속 주소가 없습니다",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
-                        Icon(
-                            Icons.Default.Refresh,
-                            "접속 주소 새로고침",
-                            tint = if (enamel) BkPanelCharcoal else LocalContentColor.current,
-                        )
+                    Row(
+                        Modifier.fillMaxWidth().heightIn(min = addressHeight).padding(start = 12.dp, end = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text(
+                                "접속 주소",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                connection.selectedAddress?.hostAddress ?: "사용 가능한 접속 주소가 없습니다",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
+                            Icon(Icons.Default.Refresh, "접속 주소 새로고침")
+                        }
                     }
                 }
             }
@@ -222,7 +235,7 @@ internal fun PhoneHardConnectionPanel(
                 PhoneHardConnectionButton(connection, enamel, Modifier.weight(1f).height(fieldHeight))
             }
 
-            if (connection.server != null && connection.selectedAddress != null) {
+            if (!enamel && connection.server != null && connection.selectedAddress != null) {
                 androidx.compose.foundation.text.selection.SelectionContainer {
                     Text(
                         "http://${connection.selectedAddress!!.hostAddress}:${connection.port}",
@@ -239,18 +252,21 @@ internal fun PhoneHardConnectionPanel(
     if (enamel) {
         Box(
             modifier
-                .shadow(7.dp, panelShape, ambientColor = Color(0x5534383B), spotColor = Color(0x4434383B))
+                .shadow(8.dp, panelShape, ambientColor = Color(0x24000000), spotColor = Color(0x24000000))
                 .clip(panelShape)
-                .background(Brush.verticalGradient(listOf(Color.White, Color(0xFFF7F6F2), Color(0xFFEDECE7))))
+                .background(Brush.linearGradient(listOf(Color.White, Color(0xFFF7F6F2))))
                 .border(
-                    1.dp,
-                    Brush.linearGradient(listOf(Color.White, BkPanelChrome, Color(0xFFD8DADD), Color.White)),
+                    1.25.dp,
+                    Brush.linearGradient(
+                        listOf(Color.White, Color(0xFF7A7D80), Color.White.copy(alpha = .82f)),
+                    ),
                     panelShape,
                 ),
         ) {
             content()
             HorizontalDivider(
-                Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(horizontal = 12.dp),
+                Modifier.fillMaxWidth().align(Alignment.TopCenter)
+                    .padding(horizontal = 22.dp).padding(top = 2.dp),
                 thickness = 1.dp,
                 color = Color.White.copy(alpha = .9f),
             )
@@ -270,16 +286,103 @@ internal fun PhoneHardConnectionPanel(
 }
 
 @Composable
-private fun BkConnectionIcon() {
-    val shape = CircleShape
+private fun PhoneHardRefreshButton(onClick: () -> Unit, enabled: Boolean) {
     Box(
-        Modifier.size(30.dp)
-            .clip(shape)
-            .background(Brush.verticalGradient(listOf(Color.White, Color(0xFFE5E5E1))))
-            .border(1.dp, BkPanelChrome, shape),
+        Modifier.size(44.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(Icons.Default.WifiTethering, null, tint = BkPanelCharcoal, modifier = Modifier.size(18.dp))
+        Surface(
+            modifier = Modifier.size(30.dp)
+                .shadow(2.4.dp, CircleShape, ambientColor = Color.Transparent, spotColor = Color(0x3D000000))
+                .graphicsLayer { alpha = if (enabled) 1f else .45f },
+            shape = CircleShape,
+            color = Color.Transparent,
+            border = BorderStroke(
+                1.5.dp,
+                Brush.linearGradient(listOf(Color.White, Color(0xFF5C6166))),
+            ),
+        ) {
+            Box(
+                Modifier.fillMaxSize().background(
+                    Brush.linearGradient(
+                        listOf(Color.White, Color(0xFFD1D1CC)),
+                    ),
+                ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Refresh,
+                    "접속 주소 새로고침",
+                    tint = Color(0xFF292B2E),
+                    modifier = Modifier.size(15.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhoneHardBkAddressRow(connection: WebHardConnectionState, largeFont: Boolean) {
+    val address = connection.selectedAddress
+    val value = when {
+        address == null -> "사용 가능한 접속 주소가 없습니다"
+        connection.server != null -> "http://${address.hostAddress}:${connection.port}"
+        else -> listOfNotNull(webHardNetworkKind(address), address.hostAddress).joinToString(" · ")
+    }
+    if (largeFont) {
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            PhoneHardBkAddressLabel()
+            PhoneHardBkAddressValue(value, Modifier.fillMaxWidth())
+        }
+    } else {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 32.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PhoneHardBkAddressLabel()
+            Spacer(Modifier.weight(1f))
+            PhoneHardBkAddressValue(value, Modifier.widthIn(max = 250.dp))
+        }
+    }
+}
+
+@Composable
+private fun PhoneHardBkAddressLabel() {
+    Text(
+        "접속 주소",
+        style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+        color = Color(0xFF686C6F),
+    )
+}
+
+@Composable
+private fun PhoneHardBkAddressValue(value: String, modifier: Modifier = Modifier) {
+    androidx.compose.foundation.text.selection.SelectionContainer(modifier) {
+        Text(
+            value,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp,
+            ),
+            color = BkPanelCharcoal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+private fun webHardNetworkKind(address: Inet4Address): String? {
+    val interfaceName = runCatching { NetworkInterface.getByInetAddress(address)?.name }
+        .getOrNull()
+        ?.lowercase()
+        ?: return null
+    return when {
+        interfaceName.startsWith("wlan") || interfaceName.startsWith("wifi") -> "Wi-Fi"
+        interfaceName.startsWith("eth") -> "이더넷"
+        interfaceName.startsWith("rmnet") || interfaceName.startsWith("ccmni") -> "셀룰러"
+        interfaceName.startsWith("tun") || interfaceName.startsWith("wg") ||
+            interfaceName.contains("tailscale") || interfaceName.contains("wireguard") -> "네트워크"
+        else -> null
     }
 }
 
@@ -293,14 +396,14 @@ private fun PhoneHardPasswordButton(
     OutlinedButton(
         onClick = onClick,
         modifier = modifier,
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(if (enamel) 20.dp else 12.dp),
         colors = if (enamel) {
             ButtonDefaults.outlinedButtonColors(
-                containerColor = Color.White.copy(alpha = .72f),
+                containerColor = Color(0xFFD9D9D7),
                 contentColor = BkPanelCharcoal,
             )
         } else ButtonDefaults.outlinedButtonColors(),
-        border = BorderStroke(1.dp, if (enamel) BkPanelChrome else MaterialTheme.colorScheme.outline),
+        border = BorderStroke(1.dp, if (enamel) Color(0xFFD1D1CF) else MaterialTheme.colorScheme.outline),
     ) {
         Text("비밀번호")
         Spacer(Modifier.width(4.dp))
@@ -319,6 +422,7 @@ private fun PhoneHardConnectionButton(
     modifier: Modifier = Modifier,
 ) {
     val enabled = connection.server != null || connection.selectedAddress != null
+    val isRunning = connection.server != null
     val label = if (connection.server == null) "열기" else "닫기"
     if (!enamel) {
         Button(onClick = connection::toggle, enabled = enabled, modifier = modifier) { Text(label) }
@@ -327,22 +431,35 @@ private fun PhoneHardConnectionButton(
     Surface(
         onClick = connection::toggle,
         enabled = enabled,
-        modifier = modifier.defaultMinSize(minWidth = 80.dp, minHeight = 48.dp),
-        shape = RoundedCornerShape(12.dp),
+        modifier = modifier.defaultMinSize(minWidth = 80.dp, minHeight = 40.dp)
+            .shadow(4.dp, RoundedCornerShape(10.dp)),
+        shape = RoundedCornerShape(10.dp),
         color = Color.Transparent,
-        contentColor = Color.White,
+        contentColor = if (isRunning) BkPanelCharcoal else Color.White,
         border = BorderStroke(1.dp, Color(0xFF6D7275)),
     ) {
         Box(
             Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
-                    if (enabled) listOf(Color(0xFF666B6E), BkPanelCharcoal, Color(0xFF24282B))
-                    else listOf(Color(0xFFB9BBBA), Color(0xFF8D9090)),
+                    if (!enabled) listOf(Color(0xFFB9BBBA), Color(0xFF8D9090))
+                    else if (isRunning) listOf(Color.White, Color(0xFFD4D4CF))
+                    else listOf(Color(0xFF474A4D), Color(0xFF14171A))
                 ),
             ).padding(horizontal = 20.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text(label, fontWeight = FontWeight.SemiBold, color = Color.White)
+            HorizontalDivider(
+                Modifier.fillMaxWidth().align(Alignment.TopCenter)
+                    .padding(horizontal = 12.dp).padding(top = 2.dp),
+                thickness = 1.dp,
+                color = Color.White.copy(alpha = if (isRunning) .92f else .36f),
+            )
+            Text(
+                label,
+                style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp, lineHeight = 22.sp),
+                fontWeight = FontWeight.SemiBold,
+                color = if (isRunning) BkPanelCharcoal else Color.White,
+            )
         }
     }
 }
@@ -578,128 +695,44 @@ private fun WebHardCoverFlow(
     onToggleBackground: (Boolean) -> Unit,
     onActivate: (WebHardFileItem) -> Unit,
 ) {
-    var backgroundMenu by remember { mutableStateOf(false) }
-    val listState = rememberLazyListState()
-    var selectedIndex by remember(items) { mutableIntStateOf(0) }
-    LaunchedEffect(listState, items) {
-        snapshotFlow {
-            val layout = listState.layoutInfo
-            val center = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
-            layout.visibleItemsInfo.minByOrNull { kotlin.math.abs((it.offset + it.size / 2) - center) }?.index
-        }.distinctUntilChanged().collect { index -> if (index != null) selectedIndex = index }
+    val theme = LocalNasFinderTheme.current
+    val scope = rememberCoroutineScope()
+    val requested = remember(items) { mutableSetOf<String>() }
+    val itemsByPath = remember(items) { items.associateBy(WebHardFileItem::path) }
+    val coverItems = remember(items) {
+        items.map { item ->
+            RemoteFileItem(
+                id = item.path,
+                name = item.name,
+                path = item.path,
+                isDirectory = item.isDirectory,
+                size = item.size ?: 0,
+                modifiedAt = item.modifiedAt,
+            )
+        }
     }
-    val background = if (usesDarkBackground) Color.Black else Color(0xFFF7F8FA)
-    val chromeForeground = if (usesDarkBackground) Color.White.copy(alpha = .88f) else Color.Black.copy(alpha = .82f)
-    val chromeBackground = if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.White.copy(alpha = .92f)
-    val chromeBorder = if (usesDarkBackground) Color.White.copy(alpha = .16f) else Color.Black.copy(alpha = .10f)
 
-    BoxWithConstraints(modifier.background(background)) {
-        val cardSide = minOf(maxWidth * .48f, maxHeight * .64f).coerceIn(140.dp, 330.dp)
-        val titleMaxWidth = minOf(maxWidth * .44f, 340.dp)
-        Box(
-            Modifier.fillMaxWidth().height(if (usesDarkBackground) 72.dp else 82.dp)
-                .align(Alignment.BottomCenter)
-                .background(
-                    Brush.verticalGradient(
-                        if (usesDarkBackground) listOf(Color.White.copy(alpha = .10f), Color.Transparent)
-                        else listOf(Color.White.copy(alpha = .88f), Color.Transparent)
-                    )
-                )
-        )
-        if (items.isEmpty()) {
-            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Default.MoveToInbox, null, modifier = Modifier.size(48.dp), tint = chromeForeground.copy(alpha = .7f))
-                Spacer(Modifier.height(10.dp))
-                Text("파일이 없습니다", color = chromeForeground, fontWeight = FontWeight.SemiBold)
-            }
-        } else {
-            LazyRow(
-                state = listState,
-                flingBehavior = rememberSnapFlingBehavior(listState),
-                modifier = Modifier.fillMaxSize().navigationBarsPadding(),
-                contentPadding = PaddingValues(horizontal = (maxWidth - cardSide) / 2),
-                horizontalArrangement = Arrangement.spacedBy(18.dp),
-                verticalAlignment = Alignment.Bottom,
-            ) {
-                items(items, key = { it.path }) { item ->
-                    val index = items.indexOf(item)
-                    val selected = index == selectedIndex
-                    Column(
-                        Modifier.width(cardSide).padding(bottom = 18.dp)
-                            .graphicsLayer {
-                                scaleX = if (selected) 1f else .80f
-                                scaleY = if (selected) 1f else .80f
-                                rotationY = when { selected -> 0f; index < selectedIndex -> 32f; else -> -32f }
-                                cameraDistance = 14f * density
-                                alpha = if (kotlin.math.abs(index - selectedIndex) > 3) .42f else 1f
-                            }
-                            .clearAndSetSemantics {
-                                contentDescription = item.name
-                                role = Role.Button
-                                this.selected = selected
-                            }
-                            .clickable { onActivate(item) },
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        WebHardArtwork(
-                            item,
-                            store,
-                            thumbnails,
-                            Modifier.size(cardSide).clip(RoundedCornerShape(if (selected) 18.dp else 13.dp)),
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        WebHardArtwork(
-                            item,
-                            store,
-                            thumbnails,
-                            Modifier.width(cardSide).height((cardSide * if (usesDarkBackground) .15f else .10f).coerceAtMost(44.dp))
-                                .graphicsLayer { rotationX = 180f; alpha = if (usesDarkBackground) .26f else .14f },
-                            contentDescription = null,
-                            loadThumbnail = false,
-                        )
+    Box(modifier) {
+        RemoteBrowserCoverFlow(
+            items = coverItems,
+            thumbnails = thumbnails,
+            theme = theme,
+            title = if (currentPath == "/") "폰하드" else currentPath,
+            usesDarkBackground = usesDarkBackground,
+            onBack = onBack,
+            onToggleBackground = onToggleBackground,
+            onActivate = { item -> itemsByPath[item.path]?.let(onActivate) },
+            onLoadThumbnail = { item ->
+                val webHardItem = itemsByPath[item.path] ?: return@RemoteBrowserCoverFlow
+                if (requested.add(item.id)) {
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            loadWebHardThumbnail(store.file(webHardItem.path), webHardItem)
+                        }?.let { thumbnails[item.id] = it }
                     }
                 }
-            }
-        }
-
-        Row(
-            Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Surface(
-                onClick = onBack,
-                modifier = Modifier.size(44.dp),
-                shape = androidx.compose.foundation.shape.CircleShape,
-                color = chromeBackground,
-                border = androidx.compose.foundation.BorderStroke(1.dp, chromeBorder),
-                shadowElevation = if (usesDarkBackground) 8.dp else 2.dp,
-            ) { Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.ChevronLeft, if (currentPath == "/") "폰하드 닫기" else "상위 폴더", tint = chromeForeground) } }
-            Text(
-                if (currentPath == "/") "폰하드" else currentPath,
-                color = chromeForeground,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = titleMaxWidth).heightIn(min = 44.dp).wrapContentHeight(Alignment.CenterVertically),
-            )
-            Spacer(Modifier.weight(1f))
-            Box {
-                Surface(
-                    onClick = { backgroundMenu = true },
-                    modifier = Modifier.size(44.dp),
-                    shape = androidx.compose.foundation.shape.CircleShape,
-                    color = chromeBackground,
-                    border = androidx.compose.foundation.BorderStroke(1.dp, chromeBorder),
-                    shadowElevation = if (usesDarkBackground) 8.dp else 2.dp,
-                ) { Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "오버플로우 배경", tint = MaterialTheme.colorScheme.primary) } }
-                DropdownMenu(backgroundMenu, onDismissRequest = { backgroundMenu = false }) {
-                    DropdownMenuItem(text = { Text("흰색") }, onClick = { backgroundMenu = false; onToggleBackground(false) })
-                    DropdownMenuItem(text = { Text("검정") }, onClick = { backgroundMenu = false; onToggleBackground(true) })
-                }
-            }
-        }
+            },
+        )
     }
 }
 
@@ -768,7 +801,7 @@ private fun WebHardItemMenu(item: WebHardFileItem, onShare: () -> Unit, onDelete
 
 private fun loadWebHardThumbnail(file: File, item: WebHardFileItem): Bitmap? = runCatching {
     val extension = item.name.substringAfterLast('.', "").lowercase()
-    if (extension in setOf("jpg", "jpeg", "png", "webp", "bmp", "gif")) {
+    if (extension in setOf("jpg", "jpeg", "png", "webp", "bmp", "gif", "heic", "heif")) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.path, bounds)
         var sample = 1
