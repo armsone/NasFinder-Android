@@ -777,6 +777,8 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         MaterialTheme.colorScheme.onSurfaceVariant,
                     ) { model.show(Screen.Inbox) }
                     DashboardRowDivider()
+                    PhoneHardDashboardRow { model.show(Screen.WebHard) }
+                    DashboardRowDivider()
                     DashboardRow(Icons.Default.PhotoLibrary, "썸네일 캐시", formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes), MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant) { model.show(Screen.ThumbnailCache) }
                     DashboardRowDivider()
                     SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "0 B" else "관리") { model.show(Screen.SuperThumbnail) }
@@ -799,8 +801,6 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         DashboardRowDivider()
                     }
                     BrowserDashboardRow { model.show(Screen.WebBrowser) }
-                    DashboardRowDivider()
-                    PhoneHardDashboardRow { model.show(Screen.WebHard) }
                     DashboardRowDivider()
                     DashboardRow(
                         Icons.Default.Add,
@@ -1148,26 +1148,22 @@ private fun BrowserDashboardRow(onClick: () -> Unit) {
 private fun PhoneHardDashboardRow(onClick: () -> Unit) {
     val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
     Row(
-        Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onClick).padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+        Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-            if (enamel) {
-                PhoneHardMark(DashboardIconWellSize)
-            } else {
-                Image(
-                    painter = painterResource(R.drawable.phone_hard_logo),
-                    contentDescription = null,
-                    modifier = Modifier.size(DashboardIconWellSize).clip(RoundedCornerShape(7.dp)),
-                    contentScale = ContentScale.Fit,
-                )
-            }
-            Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        if (enamel) {
+            PhoneHardMark(DashboardIconWellSize)
+        } else {
+            Image(
+                painter = painterResource(R.drawable.phone_hard_logo),
+                contentDescription = null,
+                modifier = Modifier.size(DashboardIconWellSize).clip(RoundedCornerShape(7.dp)),
+                contentScale = ContentScale.Fit,
+            )
         }
-        Box(Modifier.size(width = 44.dp, height = 48.dp), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.primary)
-        }
+        Spacer(Modifier.width(12.dp))
+        Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+        Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -2267,6 +2263,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         inboxPreferences.edit().putString("layout", value.name).apply()
     }
     var pendingSendIds by remember { mutableStateOf<List<java.util.UUID>?>(null) }
+    var confirmBatchDelete by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
     val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -2295,10 +2292,17 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         containerColor = Color.Transparent,
         topBar = {
             if (layout != InboxLayout.OVERFLOW) TopAppBar(
-                title = { Text("받은 파일") },
+                title = { Text(if (selectionMode) "${selectedIds.size}개 선택" else "받은 파일") },
                 navigationIcon = {
-                    IconButton(onClick = { model.show(Screen.Dashboard) }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
+                    if (selectionMode) {
+                        TextButton(onClick = {
+                            selectedIds.clear()
+                            if (!allSelected) selectedIds.addAll(selectableIds)
+                        }) { Text(if (allSelected) "전체 해제" else "전체 선택") }
+                    } else {
+                        IconButton(onClick = { model.show(Screen.Dashboard) }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
+                        }
                     }
                 },
                 actions = {
@@ -2331,6 +2335,14 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         }
                     }
                     if (files.isNotEmpty()) {
+                        if (selectionMode) {
+                            IconButton(
+                                onClick = { confirmBatchDelete = true },
+                                enabled = selectedIds.isNotEmpty(),
+                            ) {
+                                Icon(Icons.Default.Delete, "선택한 파일 삭제", tint = MaterialTheme.colorScheme.error)
+                            }
+                        }
                         TextButton(
                             onClick = {
                                 if (selectionMode) selectedIds.clear()
@@ -2526,6 +2538,26 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                 }
             }
         }
+    }
+    if (confirmBatchDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmBatchDelete = false },
+            title = { Text("선택한 파일을 지울까요?") },
+            text = { Text("선택한 ${selectedIds.size}개 파일이 이 기기에서 삭제됩니다.") },
+            dismissButton = { TextButton(onClick = { confirmBatchDelete = false }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val ids = selectedIds.toList()
+                        confirmBatchDelete = false
+                        selectedIds.clear()
+                        selectionMode = false
+                        model.deleteInboxFiles(ids)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("지우기") }
+            },
+        )
     }
     pendingSendIds?.let { ids ->
         val selectedFiles = ids.mapNotNull { id -> files.firstOrNull { it.id == id } }
