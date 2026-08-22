@@ -8,12 +8,12 @@ import org.junit.Test
 
 class AppIconSwitchPolicyTest {
     @Test
-    fun `only Digital Rain selects alternate icon`() {
+    fun `themed launcher icons follow Digital Rain and BK Style`() {
         AppTheme.entries.forEach { theme ->
-            val expected = if (theme == AppTheme.DIGITAL_RAIN) {
-                LauncherIconVariant.VIBE_CODER
-            } else {
-                LauncherIconVariant.DEFAULT
+            val expected = when (theme) {
+                AppTheme.DIGITAL_RAIN -> LauncherIconVariant.VIBE_CODER
+                AppTheme.SKEUOMORPHIC -> LauncherIconVariant.ENAMEL
+                else -> LauncherIconVariant.DEFAULT
             }
             assertEquals(expected, AppIconSwitchPolicy.iconFor(theme))
         }
@@ -70,7 +70,8 @@ class AppIconSwitchPolicyTest {
                 "com.armsone.nasfinder.PurpleNasLauncherAlias",
                 "com.armsone.nasfinder.DigitalRainLauncherAlias",
                 "com.armsone.nasfinder.CyberVaultLauncherAlias",
-                "com.armsone.nasfinder.NasRadarLauncherAlias",
+            "com.armsone.nasfinder.NasRadarLauncherAlias",
+            "com.armsone.nasfinder.EnamelLauncherAlias",
             ),
             AppIconComponentContract.managedAliasClassNames,
         )
@@ -103,6 +104,7 @@ class AppIconSwitchPolicyTest {
                 LauncherIconVariant.VIBE_CODER,
                 LauncherIconVariant.CYBER_VAULT,
                 LauncherIconVariant.NAS_RADAR,
+                LauncherIconVariant.ENAMEL,
             ),
             LauncherIconVariant.entries,
         )
@@ -113,6 +115,7 @@ class AppIconSwitchPolicyTest {
                 digitalRain = overrideFor(LauncherIconVariant.VIBE_CODER, icon),
                 purpleNas = overrideFor(LauncherIconVariant.PURPLE_NAS, icon),
                 nasRadar = overrideFor(LauncherIconVariant.NAS_RADAR, icon),
+                enamel = overrideFor(LauncherIconVariant.ENAMEL, icon),
             )
             assertTrue(AppIconSwitchPolicy.isApplied(applied, icon))
             assertEquals(icon, AppIconSwitchPolicy.previousStableIcon(applied, LauncherIconVariant.DEFAULT))
@@ -125,6 +128,7 @@ class AppIconSwitchPolicyTest {
                 "com.armsone.nasfinder.DigitalRainLauncherAlias",
                 "com.armsone.nasfinder.CyberVaultLauncherAlias",
                 "com.armsone.nasfinder.NasRadarLauncherAlias",
+                "com.armsone.nasfinder.EnamelLauncherAlias",
             ),
             LauncherIconVariant.entries.mapTo(mutableSetOf()) {
                 AppIconComponentContract.launcherAliasClass(it)
@@ -175,7 +179,8 @@ class AppIconSwitchPolicyTest {
         purpleNas: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
         cyberVault: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
         nasRadar: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
-    ) = LauncherAliasState(default, cyberVault, digitalRain, purpleNas, nasRadar)
+        enamel: AliasOverride = AliasOverride.MANIFEST_DEFAULT,
+    ) = LauncherAliasState(default, cyberVault, digitalRain, purpleNas, nasRadar, enamel)
 
     private fun overrideFor(candidate: LauncherIconVariant, selected: LauncherIconVariant) =
         if (candidate == selected) AliasOverride.ENABLED else AliasOverride.DISABLED

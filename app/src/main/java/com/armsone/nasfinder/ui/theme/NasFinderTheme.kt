@@ -7,7 +7,9 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
@@ -26,6 +28,7 @@ private val WorkbenchSecondaryText = Color(red = .61f, green = .69f, blue = .76f
 private val WorkbenchSurface = Color(red = .075f, green = .105f, blue = .145f)
 private val WorkbenchOutline = Color(red = .20f, green = .29f, blue = .37f)
 private val WorkbenchBackground = Color(red = .035f, green = .055f, blue = .08f)
+val LocalNasFinderTheme = staticCompositionLocalOf { AppTheme.SYSTEM }
 
 private val NasFinderTypography = Typography(
     // SwiftUI semantic counterparts: body 17, subheadline 15, footnote 13,
@@ -47,6 +50,7 @@ fun folderColor(theme: AppTheme): Color = when (theme) {
     AppTheme.DIGITAL_RAIN -> Color(0xFF3BD6B0)
     AppTheme.WINDY_MEADOW -> Color(0xFF0A7AAD)
     AppTheme.WORKBENCH -> WorkbenchAccent
+    AppTheme.SKEUOMORPHIC -> Color(0xFF383F43)
     AppTheme.NIGHT -> Color(0xFF5CBAF0)
     AppTheme.SYSTEM -> if (isSystemInDarkTheme()) Color(0xFF5CBAF0) else FolderBlue
     AppTheme.DAY -> FolderBlue
@@ -56,7 +60,7 @@ fun folderColor(theme: AppTheme): Color = when (theme) {
 fun NasFinderTheme(theme: AppTheme, content: @Composable () -> Unit) {
     val systemDark = isSystemInDarkTheme()
     val dark = when (theme) {
-        AppTheme.DAY, AppTheme.WINDY_MEADOW -> false
+        AppTheme.DAY, AppTheme.WINDY_MEADOW, AppTheme.SKEUOMORPHIC -> false
         AppTheme.NIGHT, AppTheme.DIGITAL_RAIN, AppTheme.WORKBENCH -> true
         AppTheme.SYSTEM -> systemDark
     }
@@ -64,6 +68,7 @@ fun NasFinderTheme(theme: AppTheme, content: @Composable () -> Unit) {
         AppTheme.DIGITAL_RAIN -> Color(0xFF2EE8B8)
         AppTheme.WINDY_MEADOW -> Color(0xFF0D8CC2)
         AppTheme.WORKBENCH -> WorkbenchAccent
+        AppTheme.SKEUOMORPHIC -> Color(0xFFE41E25)
         else -> NasBlue
     }
     val scheme = if (dark) darkColorScheme(
@@ -77,13 +82,13 @@ fun NasFinderTheme(theme: AppTheme, content: @Composable () -> Unit) {
         onSurfaceVariant = when (theme) { AppTheme.DIGITAL_RAIN -> Color(0xFF99BFB3); AppTheme.WORKBENCH -> WorkbenchSecondaryText; else -> Color(0xFFB5C1C9) },
     ) else lightColorScheme(
         primary = accent,
-        background = if (theme == AppTheme.WINDY_MEADOW) Color(0xFFEDF5D1) else Color(0xFFF4FBFE),
-        surface = if (theme == AppTheme.WINDY_MEADOW) Color(0xFFFBF9E8) else Color.White,
-        surfaceVariant = if (theme == AppTheme.WINDY_MEADOW) Color(0xFFF4F1D9) else Color(0xFFF4FAFD),
-        outlineVariant = if (theme == AppTheme.WINDY_MEADOW) Color(0xFF9EBA66) else Color(0xFFBFE3F2),
+        background = when (theme) { AppTheme.WINDY_MEADOW -> Color(0xFFEDF5D1); AppTheme.SKEUOMORPHIC -> Color(0xFFECE9E2); else -> Color(0xFFF4FBFE) },
+        surface = when (theme) { AppTheme.WINDY_MEADOW -> Color(0xFFFBF9E8); AppTheme.SKEUOMORPHIC -> Color(0xFFFBFAF6); else -> Color.White },
+        surfaceVariant = when (theme) { AppTheme.WINDY_MEADOW -> Color(0xFFF4F1D9); AppTheme.SKEUOMORPHIC -> Color(0xFFE5E2DA); else -> Color(0xFFF4FAFD) },
+        outlineVariant = when (theme) { AppTheme.WINDY_MEADOW -> Color(0xFF9EBA66); AppTheme.SKEUOMORPHIC -> Color(0xFF94989B); else -> Color(0xFFBFE3F2) },
         onBackground = Color(0xFF101417),
         onSurface = Color(0xFF101417),
-        onSurfaceVariant = Color(0xFF59636B),
+        onSurfaceVariant = if (theme == AppTheme.SKEUOMORPHIC) Color(0xFF575B5E) else Color(0xFF59636B),
     )
     val activity = androidx.compose.ui.platform.LocalContext.current as? Activity
     SideEffect {
@@ -96,7 +101,9 @@ fun NasFinderTheme(theme: AppTheme, content: @Composable () -> Unit) {
             }
         }
     }
-    MaterialTheme(colorScheme = scheme, typography = NasFinderTypography, content = content)
+    CompositionLocalProvider(LocalNasFinderTheme provides theme) {
+        MaterialTheme(colorScheme = scheme, typography = NasFinderTypography, content = content)
+    }
 }
 
 fun serviceColor(identifier: String, theme: AppTheme): Color {
@@ -113,6 +120,7 @@ fun serviceColor(identifier: String, theme: AppTheme): Color {
         AppTheme.DIGITAL_RAIN -> Color(0xFFBDFFE6) to .06f
         AppTheme.WINDY_MEADOW -> Color.Black to .04f
         AppTheme.WORKBENCH -> Color(red = .72f, green = .86f, blue = 1f) to .05f
+        AppTheme.SKEUOMORPHIC -> Color(0xFF474747) to .10f
         else -> return base
     }
     return Color(

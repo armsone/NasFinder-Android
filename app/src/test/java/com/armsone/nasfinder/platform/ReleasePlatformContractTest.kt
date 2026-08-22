@@ -38,6 +38,7 @@ class ReleasePlatformContractTest {
                 ".DigitalRainLauncherAlias",
                 ".PurpleNasLauncherAlias",
                 ".NasRadarLauncherAlias",
+                ".EnamelLauncherAlias",
             ),
             launcherAliases.keys,
         )
@@ -48,6 +49,7 @@ class ReleasePlatformContractTest {
             ".DigitalRainLauncherAlias" to "@mipmap/ic_launcher_vibe_coder",
             ".CyberVaultLauncherAlias" to "@mipmap/ic_launcher_cyber_vault",
             ".NasRadarLauncherAlias" to "@mipmap/ic_launcher_nas_radar",
+            ".EnamelLauncherAlias" to "@mipmap/ic_launcher_enamel",
         )
         launcherAliases.forEach { (name, alias) ->
             assertEquals(".MainActivity", alias.android("targetActivity"))

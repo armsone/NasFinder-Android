@@ -93,7 +93,8 @@ enum class AppTheme {
     NIGHT,
     DIGITAL_RAIN,
     WINDY_MEADOW,
-    WORKBENCH;
+    WORKBENCH,
+    SKEUOMORPHIC;
 
     val next: AppTheme
         get() = entries[(ordinal + 1) % entries.size]

@@ -14,6 +14,7 @@ class AppThemeParityTest {
                 AppTheme.DIGITAL_RAIN,
                 AppTheme.WINDY_MEADOW,
                 AppTheme.WORKBENCH,
+                AppTheme.SKEUOMORPHIC,
             ),
             AppTheme.entries,
         )

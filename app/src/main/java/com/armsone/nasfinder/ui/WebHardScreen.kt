@@ -49,6 +49,9 @@ import com.armsone.nasfinder.platform.NasFinderShareIntentFactory
 import com.armsone.nasfinder.platform.WebHardFileItem
 import com.armsone.nasfinder.platform.WebHardFileStore
 import com.armsone.nasfinder.platform.WebHardHttpServer
+import com.armsone.nasfinder.model.AppTheme
+import com.armsone.nasfinder.ui.theme.LocalNasFinderTheme
+import com.armsone.nasfinder.ui.theme.PhoneHardMark
 import com.armsone.nasfinder.util.DownloadCacheContract
 import java.io.File
 import java.net.Inet4Address
@@ -92,6 +95,7 @@ fun WebHardScreen(onClose: () -> Unit) {
     val configuration = LocalConfiguration.current
     val landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val largeFont = configuration.fontScale >= 1.3f
+    val theme = LocalNasFinderTheme.current
     val showsCoverFlow = layout == WebHardLayout.LARGE && landscape
 
     fun stop() {
@@ -161,7 +165,15 @@ fun WebHardScreen(onClose: () -> Unit) {
         contentWindowInsets = if (showsCoverFlow) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
             if (!showsCoverFlow) TopAppBar(
-                title = { Text("폰하드") },
+                title = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (theme == AppTheme.SKEUOMORPHIC) PhoneHardMark(28.dp)
+                        Text("폰하드")
+                    }
+                },
                 navigationIcon = { IconButton(onClick = { stop(); onClose() }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
                 actions = {
                     IconButton(
@@ -240,7 +252,11 @@ fun WebHardScreen(onClose: () -> Unit) {
             if (server != null && selectedAddress != null) item {
                 ElevatedCard(Modifier.fillMaxWidth()) {
                     Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(34.dp))
+                        if (theme == AppTheme.SKEUOMORPHIC) {
+                            PhoneHardMark(34.dp)
+                        } else {
+                            Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(34.dp))
+                        }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text("접속 주소", style = MaterialTheme.typography.labelMedium)

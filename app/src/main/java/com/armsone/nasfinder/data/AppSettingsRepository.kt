@@ -20,7 +20,13 @@ class AppSettingsRepository(context: Context) {
     fun setTheme(theme: AppTheme): AppIconChangeResult {
         val previousIcon = icon()
         val hasExplicitIcon = preferences.contains(KEY_ICON)
-        val requestedIcon = if (hasExplicitIcon) previousIcon else AppIconSwitchPolicy.iconFor(theme)
+        val requestedIcon = if (theme == AppTheme.SKEUOMORPHIC) {
+            LauncherIconVariant.ENAMEL
+        } else if (hasExplicitIcon) {
+            previousIcon
+        } else {
+            AppIconSwitchPolicy.iconFor(theme)
+        }
         // Persist the desired state before touching launcher aliases. Some OEM launchers kill the
         // app despite DONT_KILL_APP; the next process can then reconcile to the intended choice.
         if (!preferences.edit().putString(KEY_THEME, theme.name).commit()) {
@@ -34,10 +40,11 @@ class AppSettingsRepository(context: Context) {
         return AppIconChangeResult.AlreadyApplied(requestedIcon)
     }
 
-    fun icon(): LauncherIconVariant = AppIconSwitchPolicy.restoredIcon(
-        preferences.getString(KEY_ICON, null),
-        theme(),
-    )
+    fun icon(): LauncherIconVariant {
+        val theme = theme()
+        if (theme == AppTheme.SKEUOMORPHIC) return LauncherIconVariant.ENAMEL
+        return AppIconSwitchPolicy.restoredIcon(preferences.getString(KEY_ICON, null), theme)
+    }
 
     fun setIcon(icon: LauncherIconVariant): AppIconChangeResult {
         val previousIcon = icon()

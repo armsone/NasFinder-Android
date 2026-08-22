@@ -53,6 +53,7 @@ class AppIconController(context: Context) {
         LauncherAlias.DIGITAL_RAIN to ComponentName(appContext, AppIconComponentContract.DIGITAL_RAIN_ALIAS_CLASS),
         LauncherAlias.CYBER_VAULT to ComponentName(appContext, AppIconComponentContract.CYBER_VAULT_ALIAS_CLASS),
         LauncherAlias.NAS_RADAR to ComponentName(appContext, AppIconComponentContract.NAS_RADAR_ALIAS_CLASS),
+        LauncherAlias.ENAMEL to ComponentName(appContext, AppIconComponentContract.ENAMEL_ALIAS_CLASS),
     )
 
     /** Reconciles first-install/update state without touching MainActivity. */
@@ -150,6 +151,7 @@ class AppIconController(context: Context) {
         digitalRain = packageManager.getComponentEnabledSetting(requireNotNull(components[LauncherAlias.DIGITAL_RAIN])).toAliasOverride(),
         cyberVault = packageManager.getComponentEnabledSetting(requireNotNull(components[LauncherAlias.CYBER_VAULT])).toAliasOverride(),
         nasRadar = packageManager.getComponentEnabledSetting(requireNotNull(components[LauncherAlias.NAS_RADAR])).toAliasOverride(),
+        enamel = packageManager.getComponentEnabledSetting(requireNotNull(components[LauncherAlias.ENAMEL])).toAliasOverride(),
     )
 
     private fun Int.toAliasOverride(): AliasOverride = when (this) {

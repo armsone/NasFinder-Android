@@ -23,6 +23,7 @@ class LauncherIconAssetContractTest {
         LauncherAsset("vibe_coder", "vibe_coder", "vibe_coder_adaptive_foreground", "vibe_coder_background"),
         LauncherAsset("cyber_vault", "cyber_vault", "cyber_vault_adaptive_foreground", "cyber_vault_background"),
         LauncherAsset("nas_radar", "nas_radar", "nas_radar_adaptive_foreground", "nas_radar_background"),
+        LauncherAsset("enamel", "enamel", "enamel_adaptive_foreground", "enamel_background"),
     )
 
     @Test
@@ -33,6 +34,8 @@ class LauncherIconAssetContractTest {
             "app_icon_vibe_coder.png" to "302ce914160732412bbeaebd607bfe960d8ab8fdd9b82a267df27474549b0b12",
             "app_icon_purple_nas.png" to "609f5bec2d685d23e992301721724ea7c2810067dab86c34ebf118a4b49e4253",
             "app_icon_nas_radar.jpg" to "6d0f9e5965e94de5672bec42bafe399468753dd8143f2587d3c7c73b5c23805c",
+            "app_icon_enamel.png" to "6a462b60aba76192742c2986e189989447d10ce375c80f2ff3eeb437e893a6b7",
+            "app_icon_enamel_foreground.png" to "7d2eb235f183a6c4d9781b9340bc13a5087ce8f2478d1ca0746c921d1c1a8eb9",
         )
         val resourceDirectory = File(locateMainResourceDirectory(), "drawable-nodpi")
 
@@ -67,12 +70,18 @@ class LauncherIconAssetContractTest {
                 assertEquals(0, adaptive.getElementsByTagName("monochrome").length)
             }
 
-            val inset = xml(File(resources, "drawable/app_icon_${asset.foregroundName}.xml"))
+            val foregroundArtwork = xml(File(resources, "drawable/app_icon_${asset.foregroundName}.xml"))
                 .documentElement
-            assertEquals("inset", inset.tagName)
-            assertEquals(rawReference, inset.android("drawable"))
-            listOf("insetLeft", "insetTop", "insetRight", "insetBottom").forEach { side ->
-                assertEquals("16.6667%", inset.android(side))
+            if (asset.launcherName == "enamel") {
+                assertEquals("bitmap", foregroundArtwork.tagName)
+                assertEquals("fill", foregroundArtwork.android("gravity"))
+                assertEquals("@drawable/app_icon_enamel_foreground", foregroundArtwork.android("src"))
+            } else {
+                assertEquals("inset", foregroundArtwork.tagName)
+                assertEquals(rawReference, foregroundArtwork.android("drawable"))
+                listOf("insetLeft", "insetTop", "insetRight", "insetBottom").forEach { side ->
+                    assertEquals("16.6667%", foregroundArtwork.android(side))
+                }
             }
         }
 

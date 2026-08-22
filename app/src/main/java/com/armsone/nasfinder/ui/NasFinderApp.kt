@@ -45,6 +45,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.filled.*
@@ -55,8 +56,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
@@ -72,6 +76,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
@@ -100,6 +105,8 @@ import com.armsone.nasfinder.platform.InboxBatchContracts
 import com.armsone.nasfinder.platform.LauncherIconVariant
 import com.armsone.nasfinder.R
 import com.armsone.nasfinder.ui.theme.NasFinderTheme
+import com.armsone.nasfinder.ui.theme.LocalNasFinderTheme
+import com.armsone.nasfinder.ui.theme.PhoneHardMark
 import com.armsone.nasfinder.ui.theme.folderColor
 import com.armsone.nasfinder.ui.theme.serviceColor
 import com.armsone.nasfinder.ui.theme.serviceForegroundColor
@@ -111,6 +118,7 @@ import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
@@ -202,7 +210,7 @@ fun NasFinderApp(model: NasFinderViewModel) {
 private fun BoxScope.SkyThemeDecoration(theme: AppTheme) {
     when (theme) {
         AppTheme.DIGITAL_RAIN -> {
-            CodeRainDecoration(Modifier.fillMaxSize())
+            CodeRainDecoration(Modifier.fillMaxSize().graphicsLayer(alpha = .78f))
         }
         AppTheme.WINDY_MEADOW -> {
             BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -210,25 +218,40 @@ private fun BoxScope.SkyThemeDecoration(theme: AppTheme) {
                     Modifier.align(Alignment.TopCenter)
                         .offset(x = maxWidth * (-.18f), y = maxHeight * .58f)
                         .size(width = maxWidth * 1.35f, height = maxHeight * .46f)
-                        .background(Color(red = .43f, green = .68f, blue = .20f).copy(alpha = .24f), CircleShape),
+                        .background(Color(red = .43f, green = .68f, blue = .20f).copy(alpha = .18f), CircleShape),
                 )
                 Icon(
                     Icons.Default.Air,
                     null,
                     Modifier.align(Alignment.TopCenter).offset(x = maxWidth * .24f, y = 112.dp).size(minOf(maxWidth * .20f, 86.dp)),
-                    tint = Color.White.copy(alpha = .24f),
+                    tint = Color.White.copy(alpha = .18f),
                 )
             }
         }
         AppTheme.WORKBENCH -> {
-            WorkbenchDecoration(Modifier.fillMaxSize())
+            WorkbenchDecoration(Modifier.fillMaxSize().graphicsLayer(alpha = .78f))
+        }
+        AppTheme.SKEUOMORPHIC -> {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                Box(
+                    Modifier.align(Alignment.TopEnd)
+                        .offset(x = maxWidth * .18f, y = 38.dp)
+                        .size(maxWidth * .72f)
+                        .border(
+                            maxOf(maxWidth * .025f, 8.dp),
+                            Brush.linearGradient(listOf(Color.White.copy(alpha = .95f), Color.Black.copy(alpha = .18f))),
+                            CircleShape,
+                        )
+                        .graphicsLayer(alpha = .32f),
+                )
+            }
         }
         AppTheme.DAY, AppTheme.SYSTEM, AppTheme.NIGHT -> {
             val dark = theme == AppTheme.NIGHT || (theme == AppTheme.SYSTEM && isSystemInDarkTheme())
             BoxWithConstraints(Modifier.fillMaxSize()) {
-                Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * .28f, y = 34.dp).size(minOf(maxWidth * .42f, 190.dp)), tint = Color.White.copy(alpha = if (dark) .06f else .38f))
-                Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * (-.34f), y = 122.dp).size(minOf(maxWidth * .24f, 110.dp)), tint = Color.White.copy(alpha = if (dark) .04f else .24f))
-                Icon(Icons.Default.Air, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * .24f, y = 210.dp).size(minOf(maxWidth * .20f, 86.dp)), tint = MaterialTheme.colorScheme.primary.copy(alpha = .10f))
+                Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * .28f, y = 34.dp).size(minOf(maxWidth * .42f, 190.dp)), tint = Color.White.copy(alpha = if (dark) .045f else .28f))
+                Icon(Icons.Default.Cloud, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * (-.34f), y = 122.dp).size(minOf(maxWidth * .24f, 110.dp)), tint = Color.White.copy(alpha = if (dark) .03f else .17f))
+                Icon(Icons.Default.Air, null, Modifier.align(Alignment.TopCenter).offset(x = maxWidth * .24f, y = 210.dp).size(minOf(maxWidth * .20f, 86.dp)), tint = MaterialTheme.colorScheme.primary.copy(alpha = .07f))
             }
         }
     }
@@ -633,6 +656,11 @@ private fun skyBrush(theme: AppTheme): Brush = Brush.linearGradient(
             Color(red = .035f, green = .055f, blue = .08f),
             Color(red = .055f, green = .12f, blue = .18f),
         )
+        AppTheme.SKEUOMORPHIC -> listOf(
+            Color(0xFFDAD8D3),
+            Color(0xFFF8F6F0),
+            Color.White,
+        )
         AppTheme.NIGHT -> listOf(Color(red = .035f, green = .12f, blue = .19f), Color(red = .055f, green = .09f, blue = .13f))
         AppTheme.SYSTEM -> if (isSystemInDarkTheme()) {
             listOf(Color(red = .035f, green = .12f, blue = .19f), Color(red = .055f, green = .09f, blue = .13f))
@@ -652,7 +680,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     val badgeDark = when (state.theme) {
         AppTheme.SYSTEM -> isSystemInDarkTheme()
         AppTheme.NIGHT, AppTheme.DIGITAL_RAIN, AppTheme.WORKBENCH -> true
-        AppTheme.DAY, AppTheme.WINDY_MEADOW -> false
+        AppTheme.DAY, AppTheme.WINDY_MEADOW, AppTheme.SKEUOMORPHIC -> false
     }
     Scaffold(containerColor = Color.Transparent, topBar = {
         TopAppBar(title = {
@@ -725,7 +753,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 DashboardCard {
                     if (state.remoteFavorites.isEmpty()) {
                         Text(
-                            "파일이나 폴더를 길게 눌러 즐겨찾기에 추가하세요.",
+                            "길게 눌러 즐겨찾기에 추가하세요.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 23.dp),
@@ -751,10 +779,14 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     DashboardRowDivider()
                     DashboardRow(Icons.Default.PhotoLibrary, "썸네일 캐시", formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes), MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant) { model.show(Screen.ThumbnailCache) }
                     DashboardRowDivider()
-                    SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "Zero KB" else "관리") { model.show(Screen.SuperThumbnail) }
+                    SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "0 B" else "관리") { model.show(Screen.SuperThumbnail) }
                 }
             }
-            item { SectionTitle("네트워크", Icons.Default.Hub) }
+            item {
+                Box(Modifier.padding(top = 8.dp)) {
+                    SectionTitle("네트워크", Icons.Default.Hub)
+                }
+            }
             item {
                 DashboardCard {
                     state.connections.forEach { connection ->
@@ -787,7 +819,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         else -> "기본 위치 없음 · 앱 실행 시 연결 목록에서 시작"
                     },
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .72f),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .90f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 14.dp).offset(y = (-8).dp),
@@ -841,6 +873,7 @@ private fun launcherIconDrawable(icon: LauncherIconVariant) = when (icon) {
     LauncherIconVariant.VIBE_CODER -> R.drawable.app_icon_vibe_coder
     LauncherIconVariant.PURPLE_NAS -> R.drawable.app_icon_purple_nas
     LauncherIconVariant.NAS_RADAR -> R.drawable.app_icon_nas_radar
+    LauncherIconVariant.ENAMEL -> R.drawable.app_icon_enamel
 }
 
 @Composable
@@ -862,19 +895,18 @@ private fun FavoriteShelf(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box {
-                    Surface(
-                        modifier = Modifier.size(52.dp),
-                        shape = RoundedCornerShape(11.dp),
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = .90f),
-                        border = BorderStroke(1.dp, tint.copy(alpha = .28f)),
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                favoriteIcon(favorite),
-                                null,
-                                tint = tint,
-                                modifier = Modifier.size(30.dp),
-                            )
+                    if (theme == AppTheme.SKEUOMORPHIC) {
+                        EnamelIconWell(favoriteIcon(favorite), MaterialTheme.colorScheme.onSurface, 52.dp, 28.dp)
+                    } else {
+                        Surface(
+                            modifier = Modifier.size(52.dp),
+                            shape = RoundedCornerShape(11.dp),
+                            color = MaterialTheme.colorScheme.surface.copy(alpha = .90f),
+                            border = BorderStroke(1.dp, tint.copy(alpha = .28f)),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(favoriteIcon(favorite), null, tint = tint, modifier = Modifier.size(30.dp))
+                            }
                         }
                     }
                     connection?.let {
@@ -883,12 +915,17 @@ private fun FavoriteShelf(
                                 .align(Alignment.TopEnd)
                                 .offset(x = 4.dp, y = (-4).dp)
                                 .size(17.dp)
-                                .background(tint, CircleShape),
+                                .background(
+                                    if (theme == AppTheme.SKEUOMORPHIC) Brush.linearGradient(listOf(Color.White, Color(0xFFD1D0CC)))
+                                    else Brush.linearGradient(listOf(tint, tint)),
+                                    CircleShape,
+                                )
+                                .border(if (theme == AppTheme.SKEUOMORPHIC) 1.dp else 0.dp, Color(0xFF777B7E), CircleShape),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
                                 connectionKindBadge(it.kind),
-                                color = serviceForegroundColor(it.kind.name, theme),
+                                color = if (theme == AppTheme.SKEUOMORPHIC) MaterialTheme.colorScheme.onSurface else serviceForegroundColor(it.kind.name, theme),
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -928,16 +965,52 @@ private fun connectionKindBadge(kind: ConnectionKind) = when (kind) {
 
 @Composable
 private fun SectionTitle(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector? = null) {
+    val theme = LocalNasFinderTheme.current
     Row(
         Modifier.padding(horizontal = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (theme == AppTheme.SKEUOMORPHIC) 7.dp else 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        icon?.let { Icon(it, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+        icon?.let {
+            if (theme == AppTheme.SKEUOMORPHIC) EnamelIconWell(it, MaterialTheme.colorScheme.onSurfaceVariant)
+            else Icon(it, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Text(text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
-@Composable private fun DashboardCard(content: @Composable ColumnScope.() -> Unit) { Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface) { Column(content = content) } }
+
+@Composable
+private fun EnamelIconWell(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    tint: Color,
+    size: Dp = 25.dp,
+    iconSize: Dp = 13.dp,
+) {
+    Box(
+        Modifier.size(size)
+            .shadow(2.dp, CircleShape, ambientColor = Color.Black.copy(alpha = .20f), spotColor = Color.Black.copy(alpha = .24f))
+            .background(Brush.linearGradient(listOf(Color.White, Color(0xFFD1D0CC))), CircleShape)
+            .border(1.5.dp, Brush.linearGradient(listOf(Color.White, Color(0xFF5C6165))), CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, null, Modifier.size(iconSize), tint = tint)
+    }
+}
+
+private val DashboardIconWellSize = 32.dp
+private val DashboardIconGlyphSize = 17.dp
+
+@Composable
+private fun DashboardCard(content: @Composable ColumnScope.() -> Unit) {
+    val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = if (enamel) .96f else .88f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = if (enamel) BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .72f)) else null,
+        shadowElevation = if (enamel) 2.dp else 0.dp,
+    ) { Column(content = content) }
+}
 
 @Composable
 private fun DashboardRowDivider() {
@@ -956,7 +1029,16 @@ private fun DeviceStorageCard(onImportFiles: () -> Unit) {
                 .padding(horizontal = 18.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(Icons.Default.Folder, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+            if (LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC) {
+                EnamelIconWell(
+                    Icons.Default.Folder,
+                    MaterialTheme.colorScheme.onSurface,
+                    DashboardIconWellSize,
+                    DashboardIconGlyphSize,
+                )
+            } else {
+                Icon(Icons.Default.Folder, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text("Android 저장공간", style = MaterialTheme.typography.bodyMedium)
@@ -983,7 +1065,11 @@ private fun DeviceStorageCard(onImportFiles: () -> Unit) {
 @Composable
 private fun DashboardRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, detail: String?, iconTint: Color = MaterialTheme.colorScheme.primary, titleColor: Color = MaterialTheme.colorScheme.onSurface, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, null, tint = iconTint, modifier = Modifier.size(22.dp)); Spacer(Modifier.width(12.dp)); Text(title, Modifier.weight(1f), color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        if (LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC) {
+            EnamelIconWell(icon, iconTint, DashboardIconWellSize, DashboardIconGlyphSize)
+        }
+        else Icon(icon, null, tint = iconTint, modifier = Modifier.size(22.dp))
+        Spacer(Modifier.width(12.dp)); Text(title, Modifier.weight(1f), color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
         detail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp)) }
         Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
@@ -991,11 +1077,19 @@ private fun DashboardRow(icon: androidx.compose.ui.graphics.vector.ImageVector, 
 
 @Composable
 private fun SuperThumbnailDashboardRow(detail: String, onClick: () -> Unit) {
+    val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
     Row(
         Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
+        if (enamel) {
+            EnamelIconWell(
+                Icons.Default.AutoAwesome,
+                MaterialTheme.colorScheme.onSurface,
+                DashboardIconWellSize,
+                DashboardIconGlyphSize,
+            )
+        } else Box(
             Modifier.size(30.dp).background(
                 Brush.linearGradient(listOf(Color(0xFF5856D6), Color(0xFF0A84FF), Color(0xFF32ADE6))),
                 RoundedCornerShape(8.dp),
@@ -1019,15 +1113,22 @@ private fun SuperThumbnailDashboardRow(detail: String, onClick: () -> Unit) {
 
 @Composable
 private fun BrowserDashboardRow(onClick: () -> Unit) {
+    val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
     Row(
         Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onClick).padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-            Icon(Icons.Default.Language, null, Modifier.size(32.dp), tint = BrowserOrange)
+            if (enamel) EnamelIconWell(
+                Icons.Default.Language,
+                MaterialTheme.colorScheme.onSurface,
+                DashboardIconWellSize,
+                DashboardIconGlyphSize,
+            )
+            else Icon(Icons.Default.Language, null, Modifier.size(32.dp), tint = BrowserOrange)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Browser", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Browser", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
                 Text(
                     "WWW",
                     style = MaterialTheme.typography.labelSmall,
@@ -1038,29 +1139,34 @@ private fun BrowserDashboardRow(onClick: () -> Unit) {
             }
         }
         Box(Modifier.size(width = 44.dp, height = 48.dp), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.primary)
         }
     }
 }
 
 @Composable
 private fun PhoneHardDashboardRow(onClick: () -> Unit) {
+    val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
     Row(
         Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onClick).padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-            Image(
-                painter = painterResource(R.drawable.phone_hard_logo),
-                contentDescription = null,
-                modifier = Modifier.size(32.dp).clip(RoundedCornerShape(7.dp)),
-                contentScale = ContentScale.Fit,
-            )
+            if (enamel) {
+                PhoneHardMark(DashboardIconWellSize)
+            } else {
+                Image(
+                    painter = painterResource(R.drawable.phone_hard_logo),
+                    contentDescription = null,
+                    modifier = Modifier.size(DashboardIconWellSize).clip(RoundedCornerShape(7.dp)),
+                    contentScale = ContentScale.Fit,
+                )
+            }
             Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
         }
         Box(Modifier.size(width = 44.dp, height = 48.dp), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.primary)
         }
     }
 }
@@ -1070,7 +1176,16 @@ private fun ConnectionRow(connection: RemoteConnection, preferred: Boolean, them
     val color = serviceColor(connection.kind.name, theme)
     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onOpen).padding(start = 14.dp, top = 2.dp, bottom = 2.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-            Icon(connectionKindIcon(connection.kind), null, Modifier.size(32.dp), tint = color)
+            if (theme == AppTheme.SKEUOMORPHIC) {
+                EnamelIconWell(
+                    connectionKindIcon(connection.kind),
+                    MaterialTheme.colorScheme.onSurface,
+                    DashboardIconWellSize,
+                    DashboardIconGlyphSize,
+                )
+            } else {
+                Icon(connectionKindIcon(connection.kind), null, Modifier.size(32.dp), tint = color)
+            }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(connection.name, fontWeight = FontWeight.Medium, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
@@ -1125,7 +1240,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
     val valid = if (kind.oauth) name.isNotBlank() && (password.isNotBlank() || oauthConnected)
         else name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && password.isNotBlank() && port.toIntOrNull() in 1..65535 && (kind != ConnectionKind.SYNOLOGY || otpValid)
     fun candidate() = RemoteConnection(draftId, name.trim(), kind, (host.ifBlank { cloudApiHost(kind) }).trim().removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':'), port.toIntOrNull() ?: kind.defaultPort, username.trim(), rootPath, tls, trustedHostKey, editing?.createdAt ?: System.currentTimeMillis())
-    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Text(if (editing == null) "연결 추가" else "연결 수정") }, navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.Close, "취소") } }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy) { Text(if (editing == null) "연결" else "저장") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }) { padding ->
+    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Text(if (editing == null) "연결 추가" else "연결 수정") }, navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로") } }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy) { Text(if (editing == null) "연결" else "저장") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }) { padding ->
         LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { Text("연결 방식", style = MaterialTheme.typography.titleSmall) }
             item {
@@ -1147,6 +1262,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
             }
             item { Text(kind.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             if (kind.oauth) {
+                item { Text("계정 정보", style = MaterialTheme.typography.titleSmall) }
                 item { OutlinedTextField(name, { name = it }, label = { Text("표시 이름") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 item { OutlinedTextField(username, { username = it }, label = { Text("계정 표시 (선택)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 item {
@@ -1193,12 +1309,18 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
                 item { OutlinedButton(onClick = { model.testConnection(candidate(), password) }, enabled = valid && !state.isBusy, modifier = Modifier.fillMaxWidth()) { Text("연결만 확인") } }
                 item { Text(if (oauthConfigured) "PKCE 브라우저 로그인으로 받은 토큰은 Android Keystore로 보호됩니다." else "client ID가 없으면 기존 수동 액세스 토큰 방식만 사용합니다. 토큰은 Android Keystore로 보호됩니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             } else {
-                item { OutlinedTextField(name, { name = it }, label = { Text("표시 이름 (예: 우리집 NAS)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
-                item { OutlinedTextField(host, { host = it }, label = { Text("호스트 (예: nas.example.com)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
-                item { OutlinedTextField(port, { port = it.filter(Char::isDigit) }, label = { Text("포트") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true) }
-                if (kind.supportsTls) item { Row(verticalAlignment = Alignment.CenterVertically) { Text("HTTPS 사용", Modifier.weight(1f)); Switch(tls, { tls = it; if (kind == ConnectionKind.SYNOLOGY && port in setOf("5000", "5001")) port = if (it) "5001" else "5000" }) } }
-                item { OutlinedTextField(rootPath, { rootPath = it }, label = { Text("시작 위치") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
-                item { OutlinedTextField(username, { username = it }, label = { Text("사용자 이름") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("서버 정보", style = MaterialTheme.typography.titleSmall)
+                        Text("필수 항목을 입력하면 연결할 수 있습니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                item { OutlinedTextField(name, { name = it }, label = { Text("표시 이름 · 필수 (예: 우리집 NAS)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(host, { host = it }, label = { Text("서버 주소 · 필수 (예: nas.example.com)") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(port, { port = it.filter(Char::isDigit) }, label = { Text("포트 · 필수") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true) }
+                if (kind.supportsTls) item { Row(verticalAlignment = Alignment.CenterVertically) { Text("보안 연결(HTTPS)", Modifier.weight(1f)); Switch(tls, { tls = it; if (kind == ConnectionKind.SYNOLOGY && port in setOf("5000", "5001")) port = if (it) "5001" else "5000" }) } }
+                item { OutlinedTextField(rootPath, { rootPath = it }, label = { Text("시작 폴더 · 선택") }, supportingText = { Text("변경하지 않으면 서비스의 기본 위치에서 시작합니다.") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item { OutlinedTextField(username, { username = it }, label = { Text("사용자 이름 · 필수") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 if (kind == ConnectionKind.SFTP) {
                     item {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1223,7 +1345,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
                         OutlinedTextField(
                             value = password,
                             onValueChange = { password = it },
-                            label = { Text(if (useSftpPrivateKey) "PEM / OpenSSH 개인키 붙여넣기" else "비밀번호") },
+                            label = { Text(if (useSftpPrivateKey) "PEM / OpenSSH 개인키 · 필수" else "비밀번호 · 필수") },
                             visualTransformation = if (useSftpPrivateKey) VisualTransformation.None else PasswordVisualTransformation(),
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = !useSftpPrivateKey,
@@ -1241,7 +1363,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
                         }
                     }
                 } else {
-                    item { OutlinedTextField(password, { password = it }, label = { Text("비밀번호") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                    item { OutlinedTextField(password, { password = it }, label = { Text("비밀번호 · 필수") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 }
                 if (kind == ConnectionKind.SYNOLOGY) {
                     item {
@@ -1319,7 +1441,11 @@ private fun ConnectionKindGrid(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.Center,
                         ) {
-                            Icon(connectionKindIcon(kind), null, tint = color, modifier = Modifier.size(22.dp))
+                            if (theme == AppTheme.SKEUOMORPHIC) {
+                                EnamelIconWell(connectionKindIcon(kind), MaterialTheme.colorScheme.onSurface)
+                            } else {
+                                Icon(connectionKindIcon(kind), null, tint = color, modifier = Modifier.size(22.dp))
+                            }
                             Spacer(Modifier.height(5.dp))
                             Text(
                                 kind.title,
@@ -2103,10 +2229,43 @@ private fun sortTitle(sort: SortField) = when (sort) {
     SortField.MODIFIED -> "수정일"
 }
 
+private enum class InboxLayout(val title: String) {
+    DETAILS("자세히"),
+    THUMBNAILS("썸네일"),
+    POSTERS("포스터"),
+    OVERFLOW("오버플로우"),
+}
+
+private fun inboxLayoutIcon(layout: InboxLayout) = when (layout) {
+    InboxLayout.DETAILS -> Icons.Default.List
+    InboxLayout.THUMBNAILS -> Icons.Default.GridView
+    InboxLayout.POSTERS -> Icons.Default.GridOn
+    InboxLayout.OVERFLOW -> Icons.Default.ViewCarousel
+}
+
 @Composable
 private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     val files = state.inboxFiles
+    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val inboxPreferences = remember(context) {
+        context.getSharedPreferences("inbox_ui", Context.MODE_PRIVATE)
+    }
+    var layout by rememberSaveable {
+        mutableStateOf(
+            runCatching {
+                InboxLayout.valueOf(inboxPreferences.getString("layout", null).orEmpty())
+            }.getOrDefault(InboxLayout.DETAILS),
+        )
+    }
+    var layoutMenuExpanded by remember { mutableStateOf(false) }
+    var overflowUsesDarkBackground by rememberSaveable {
+        mutableStateOf(inboxPreferences.getBoolean("overflow_dark", false))
+    }
+    fun setLayout(value: InboxLayout) {
+        layout = value
+        inboxPreferences.edit().putString("layout", value.name).apply()
+    }
     var pendingSendIds by remember { mutableStateOf<List<java.util.UUID>?>(null) }
     var selectionMode by remember { mutableStateOf(false) }
     val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
@@ -2135,15 +2294,38 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            TopAppBar(
+            if (layout != InboxLayout.OVERFLOW) TopAppBar(
                 title = { Text("받은 파일") },
                 navigationIcon = {
                     IconButton(onClick = { model.show(Screen.Dashboard) }) {
-                        Icon(Icons.Default.ArrowBack, "뒤로")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
                     }
                 },
                 actions = {
                     if (!selectionMode) {
+                        if (files.isNotEmpty()) Box {
+                            IconButton(onClick = { layoutMenuExpanded = true }) {
+                                Icon(inboxLayoutIcon(layout), "보기: ${layout.title}")
+                            }
+                            DropdownMenu(
+                                expanded = layoutMenuExpanded,
+                                onDismissRequest = { layoutMenuExpanded = false },
+                            ) {
+                                InboxLayout.entries.forEach { candidate ->
+                                    DropdownMenuItem(
+                                        text = { Text(candidate.title) },
+                                        leadingIcon = { Icon(inboxLayoutIcon(candidate), null) },
+                                        trailingIcon = {
+                                            if (candidate == layout) Icon(Icons.Default.Check, null)
+                                        },
+                                        onClick = {
+                                            layoutMenuExpanded = false
+                                            setLayout(candidate)
+                                        },
+                                    )
+                                }
+                            }
+                        }
                         IconButton(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
                             Icon(Icons.AutoMirrored.Filled.NoteAdd, "파일에서 가져오기")
                         }
@@ -2201,11 +2383,47 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             EmptyState(
                 icon = Icons.Default.MoveToInbox,
                 title = "받은 파일이 없습니다",
-                description = "다른 앱의 공유 메뉴에서 NasFinder를 선택하면 이곳에 파일이 보관됩니다.",
+                description = "공유한 파일이 이곳에 보관됩니다.",
                 modifier = Modifier.padding(padding).fillMaxSize(),
+                action = {
+                    Button(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
+                        Icon(Icons.AutoMirrored.Filled.NoteAdd, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("파일 가져오기")
+                    }
+                },
             )
         } else {
-            LazyColumn(
+            when (layout) {
+                InboxLayout.THUMBNAILS, InboxLayout.POSTERS -> InboxGrid(
+                    files = files,
+                    poster = layout == InboxLayout.POSTERS,
+                    selectionMode = selectionMode,
+                    selectedIds = selectedIds,
+                    onActivate = { file ->
+                        if (selectionMode) {
+                            if (file.id in selectedIds) selectedIds.remove(file.id)
+                            else if (selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS) selectedIds.add(file.id)
+                        } else model.previewInboxFile(file)
+                    },
+                    onSend = { pendingSendIds = listOf(it.id) },
+                    onShare = model::shareInboxFile,
+                    onDelete = model::deleteInboxFile,
+                    modifier = Modifier.padding(padding).fillMaxSize(),
+                )
+                InboxLayout.OVERFLOW -> InboxOverflow(
+                    files = files,
+                    theme = state.theme,
+                    usesDarkBackground = overflowUsesDarkBackground,
+                    onBack = { setLayout(InboxLayout.POSTERS) },
+                    onToggleBackground = { dark ->
+                        overflowUsesDarkBackground = dark
+                        inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
+                    },
+                    onActivate = model::previewInboxFile,
+                    modifier = Modifier.padding(padding).fillMaxSize(),
+                )
+                InboxLayout.DETAILS -> LazyColumn(
                 Modifier.padding(padding).fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 16.dp),
             ) {
@@ -2305,6 +2523,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     }
                     HorizontalDivider()
                 }
+                }
             }
         }
     }
@@ -2332,7 +2551,11 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 }.padding(vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Icon(connectionKindIcon(connection.kind), null, tint = serviceColor(connection.kind.name, state.theme))
+                                if (state.theme == AppTheme.SKEUOMORPHIC) {
+                                    EnamelIconWell(connectionKindIcon(connection.kind), MaterialTheme.colorScheme.onSurface)
+                                } else {
+                                    Icon(connectionKindIcon(connection.kind), null, tint = serviceColor(connection.kind.name, state.theme))
+                                }
                                 Spacer(Modifier.width(12.dp))
                                 Column(Modifier.weight(1f)) {
                                     Text(connection.name)
@@ -2370,19 +2593,206 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
 }
 
 @Composable
-private fun InboxLeadingPreview(file: InboxDisplayItem) {
+private fun InboxGrid(
+    files: List<InboxDisplayItem>,
+    poster: Boolean,
+    selectionMode: Boolean,
+    selectedIds: List<java.util.UUID>,
+    onActivate: (InboxDisplayItem) -> Unit,
+    onSend: (InboxDisplayItem) -> Unit,
+    onShare: (InboxDisplayItem) -> Unit,
+    onDelete: (InboxDisplayItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(if (poster) 164.dp else 104.dp),
+        modifier = modifier,
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(if (poster) 20.dp else 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        items(files, key = { it.id }) { file ->
+            InboxGridTile(
+                file = file,
+                poster = poster,
+                selected = file.id in selectedIds,
+                selectionMode = selectionMode,
+                onActivate = { onActivate(file) },
+                onSend = { onSend(file) },
+                onShare = { onShare(file) },
+                onDelete = { onDelete(file) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun InboxGridTile(
+    file: InboxDisplayItem,
+    poster: Boolean,
+    selected: Boolean,
+    selectionMode: Boolean,
+    onActivate: () -> Unit,
+    onSend: () -> Unit,
+    onShare: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var showContextMenu by remember(file.id) { mutableStateOf(false) }
+    Column(
+        Modifier.fillMaxWidth().combinedClickable(
+            onClick = onActivate,
+            onLongClick = { if (!selectionMode) showContextMenu = true },
+            onLongClickLabel = "작업 보기",
+        ),
+        verticalArrangement = Arrangement.spacedBy(if (poster) 9.dp else 6.dp),
+    ) {
+        Box {
+            Surface(
+                Modifier.fillMaxWidth().aspectRatio(1f),
+                shape = RoundedCornerShape(if (poster) 15.dp else 11.dp),
+                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface.copy(alpha = .88f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                InboxArtwork(
+                    file = file,
+                    requestedPixels = if (poster) 420 else 240,
+                    modifier = Modifier.fillMaxSize(),
+                    cornerRadius = if (poster) 15.dp else 11.dp,
+                )
+            }
+            if (selectionMode) {
+                Icon(
+                    if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                    null,
+                    Modifier.align(Alignment.TopEnd).padding(8.dp).size(25.dp),
+                    tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            DropdownMenu(expanded = showContextMenu, onDismissRequest = { showContextMenu = false }) {
+                DropdownMenuItem(text = { Text("NAS로 보내기") }, leadingIcon = { Icon(Icons.Default.CloudUpload, null) }, onClick = { showContextMenu = false; onSend() })
+                DropdownMenuItem(text = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null) }, onClick = { showContextMenu = false; onShare() })
+                DropdownMenuItem(
+                    text = { Text("삭제") },
+                    leadingIcon = { Icon(Icons.Default.Delete, null) },
+                    colors = MenuDefaults.itemColors(textColor = MaterialTheme.colorScheme.error, leadingIconColor = MaterialTheme.colorScheme.error),
+                    onClick = { showContextMenu = false; onDelete() },
+                )
+            }
+        }
+        Text(
+            file.originalFilename,
+            style = if (poster) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelMedium,
+            fontWeight = if (poster) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(formatBytes(file.byteCount), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (poster) {
+            Text(
+                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(file.importedAt)),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun InboxOverflow(
+    files: List<InboxDisplayItem>,
+    theme: AppTheme,
+    usesDarkBackground: Boolean,
+    onBack: () -> Unit,
+    onToggleBackground: (Boolean) -> Unit,
+    onActivate: (InboxDisplayItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
-    val isImage = file.mimeType?.startsWith("image/") == true ||
-        file.originalFilename.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "heic", "webp")
-    val isVideo = file.mimeType?.startsWith("video/") == true ||
-        file.originalFilename.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "avi", "webm")
-    val isPdf = file.mimeType == "application/pdf" || file.originalFilename.endsWith(".pdf", ignoreCase = true)
+    val scope = rememberCoroutineScope()
+    val thumbnails = remember(files) { mutableStateMapOf<String, android.graphics.Bitmap>() }
+    val requested = remember(files) { mutableSetOf<String>() }
+    val items = remember(files) {
+        files.map { file ->
+            RemoteFileItem(
+                id = file.id.toString(),
+                name = file.originalFilename,
+                path = file.file.path,
+                isDirectory = false,
+                size = file.byteCount,
+                modifiedAt = file.importedAt,
+                mimeType = file.mimeType,
+            )
+        }
+    }
+    val filesByID = remember(files) { files.associateBy { it.id.toString() } }
+
+    Box(modifier) {
+        RemoteBrowserCoverFlow(
+            items = items,
+            thumbnails = thumbnails,
+            theme = theme,
+            title = "받은 파일",
+            usesDarkBackground = usesDarkBackground,
+            onBack = onBack,
+            onToggleBackground = onToggleBackground,
+            onActivate = { item -> filesByID[item.id]?.let(onActivate) },
+            onLoadThumbnail = { item ->
+                val file = filesByID[item.id] ?: return@RemoteBrowserCoverFlow
+                if (requested.add(item.id)) {
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            loadInboxThumbnail(
+                                context,
+                                file.file,
+                                file.isInboxImage,
+                                file.isInboxVideo,
+                                file.isInboxPdf,
+                                640,
+                            )
+                        }
+                        result.bitmap?.let { thumbnails[item.id] = it }
+                    }
+                }
+            },
+        )
+    }
+}
+
+private val InboxDisplayItem.isInboxImage: Boolean
+    get() = mimeType?.startsWith("image/") == true ||
+        originalFilename.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "heic", "webp")
+
+private val InboxDisplayItem.isInboxVideo: Boolean
+    get() = mimeType?.startsWith("video/") == true ||
+        originalFilename.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "avi", "webm")
+
+private val InboxDisplayItem.isInboxPdf: Boolean
+    get() = mimeType == "application/pdf" || originalFilename.endsWith(".pdf", ignoreCase = true)
+
+@Composable
+private fun InboxLeadingPreview(file: InboxDisplayItem) {
+    InboxArtwork(file, requestedPixels = 112, modifier = Modifier.size(56.dp), cornerRadius = 9.dp)
+}
+
+@Composable
+private fun InboxArtwork(
+    file: InboxDisplayItem,
+    requestedPixels: Int,
+    modifier: Modifier,
+    cornerRadius: Dp,
+) {
+    val context = LocalContext.current
+    val isImage = file.isInboxImage
+    val isVideo = file.isInboxVideo
+    val isPdf = file.isInboxPdf
     val preview by produceState(
         initialValue = InboxThumbnailResult(),
-        key1 = if (isImage || isVideo || isPdf) "${file.file.path}:${file.file.lastModified()}:${file.file.length()}" else null,
+        key1 = if (isImage || isVideo || isPdf) "${file.file.path}:${file.file.lastModified()}:${file.file.length()}:$requestedPixels" else null,
     ) {
         value = if (isImage || isVideo || isPdf) withContext(Dispatchers.IO) {
-            loadInboxThumbnail(context, file.file, isImage, isVideo, isPdf)
+            loadInboxThumbnail(context, file.file, isImage, isVideo, isPdf, requestedPixels)
         } else InboxThumbnailResult()
     }
     val icon = when {
@@ -2393,7 +2803,7 @@ private fun InboxLeadingPreview(file: InboxDisplayItem) {
     }
     val thumbnail = preview.bitmap
     Box(
-        Modifier.size(56.dp).clip(RoundedCornerShape(9.dp))
+        modifier.clip(RoundedCornerShape(cornerRadius))
             .background(MaterialTheme.colorScheme.onSurface.copy(alpha = .08f)),
         contentAlignment = Alignment.Center,
     ) {
@@ -2446,15 +2856,16 @@ private fun loadInboxThumbnail(
     isImage: Boolean,
     isVideo: Boolean,
     isPdf: Boolean,
+    maxPixelSize: Int,
 ): InboxThumbnailResult {
-    val cacheKey = "${file.canonicalPath}:${file.lastModified()}:${file.length()}"
+    val cacheKey = "${file.canonicalPath}:${file.lastModified()}:${file.length()}:$maxPixelSize"
     val cached = InboxThumbnailMemoryCache.get(cacheKey)
     val motionPhoto = isImage && isInboxMotionPhoto(file)
     if (cached != null && !cached.isRecycled) return InboxThumbnailResult(cached, motionPhoto)
     val uri = runCatching {
         FileProvider.getUriForFile(context, "${context.packageName}.sharefiles", file)
     }.getOrNull()
-    val bitmap = decodeInboxThumbnail(context, uri, file, isImage, isVideo, isPdf)
+    val bitmap = decodeInboxThumbnail(context, uri, file, isImage, isVideo, isPdf, maxPixelSize)
     if (bitmap != null) InboxThumbnailMemoryCache.put(cacheKey, bitmap)
     return InboxThumbnailResult(bitmap, motionPhoto)
 }
@@ -2466,21 +2877,22 @@ private fun decodeInboxThumbnail(
     isImage: Boolean,
     isVideo: Boolean,
     isPdf: Boolean,
+    maxPixelSize: Int,
 ): android.graphics.Bitmap? = runCatching {
         val resolverThumbnail = if (
             android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && uri != null && (isImage || isVideo)
         ) {
             runCatching {
-                context.contentResolver.loadThumbnail(uri, android.util.Size(112, 112), null)
+                context.contentResolver.loadThumbnail(uri, android.util.Size(maxPixelSize, maxPixelSize), null)
             }.getOrNull()
         } else null
         when {
-            resolverThumbnail != null -> scaleInboxThumbnail(resolverThumbnail)
+            resolverThumbnail != null -> scaleInboxThumbnail(resolverThumbnail, maxPixelSize)
             isImage -> {
                 val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 android.graphics.BitmapFactory.decodeFile(file.path, bounds)
                 var sample = 1
-                while (bounds.outWidth / sample > 112 || bounds.outHeight / sample > 112) sample *= 2
+                while (bounds.outWidth / sample > maxPixelSize || bounds.outHeight / sample > maxPixelSize) sample *= 2
                 android.graphics.BitmapFactory.decodeFile(
                     file.path,
                     android.graphics.BitmapFactory.Options().apply { inSampleSize = sample },
@@ -2490,15 +2902,15 @@ private fun decodeInboxThumbnail(
                 val platformThumbnail = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     android.media.ThumbnailUtils.createVideoThumbnail(
                         file,
-                        android.util.Size(112, 112),
+                        android.util.Size(maxPixelSize, maxPixelSize),
                         null,
                     )
                 } else null
-                platformThumbnail?.let(::scaleInboxThumbnail) ?: android.media.MediaMetadataRetriever().run {
+                platformThumbnail?.let { scaleInboxThumbnail(it, maxPixelSize) } ?: android.media.MediaMetadataRetriever().run {
                     try {
                         setDataSource(file.path)
                         getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                            ?.let(::scaleInboxThumbnail)
+                            ?.let { scaleInboxThumbnail(it, maxPixelSize) }
                     } finally {
                         release()
                     }
@@ -2508,7 +2920,7 @@ private fun decodeInboxThumbnail(
                 android.graphics.pdf.PdfRenderer(descriptor).use rendererBlock@ { renderer ->
                     if (renderer.pageCount == 0) return@rendererBlock null
                     renderer.openPage(0).use { page ->
-                        val ratio = minOf(112f / page.width, 112f / page.height, 1f)
+                        val ratio = minOf(maxPixelSize.toFloat() / page.width, maxPixelSize.toFloat() / page.height, 1f)
                         android.graphics.Bitmap.createBitmap(
                             (page.width * ratio).toInt().coerceAtLeast(1),
                             (page.height * ratio).toInt().coerceAtLeast(1),
@@ -2542,10 +2954,10 @@ internal fun isInboxMotionPhoto(file: File): Boolean = runCatching {
         xmp.contains("MotionPhotoVersion") && xmp.contains("MotionPhotoPresentationTimestampUs")
 }.getOrDefault(false)
 
-private fun scaleInboxThumbnail(bitmap: android.graphics.Bitmap): android.graphics.Bitmap {
+private fun scaleInboxThumbnail(bitmap: android.graphics.Bitmap, maxPixelSize: Int): android.graphics.Bitmap {
     val maxSide = maxOf(bitmap.width, bitmap.height)
-    if (maxSide <= 112) return bitmap
-    val ratio = 112f / maxSide
+    if (maxSide <= maxPixelSize) return bitmap
+    val ratio = maxPixelSize.toFloat() / maxSide
     return android.graphics.Bitmap.createScaledBitmap(
         bitmap,
         (bitmap.width * ratio).toInt().coerceAtLeast(1),
@@ -2561,6 +2973,7 @@ private fun EmptyState(
     description: String,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
+    action: (@Composable () -> Unit)? = null,
 ) {
     Column(
         modifier = modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = if (compact) 18.dp else 32.dp),
@@ -2577,6 +2990,10 @@ private fun EmptyState(
         )
         Spacer(Modifier.height(5.dp))
         Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        if (action != null) {
+            Spacer(Modifier.height(18.dp))
+            action()
+        }
     }
 }
 
@@ -3001,7 +3418,13 @@ private fun SuperThumbnailFolderPickerScreen(state: AppState, model: NasFinderVi
                     ListItem(
                         headlineContent = { Text(item.name) },
                         supportingContent = { Text(item.normalizedRootPath, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        leadingContent = { Icon(connectionKindIcon(item.kind), null, tint = serviceColor(item.kind.name, state.theme)) },
+                        leadingContent = {
+                            if (state.theme == AppTheme.SKEUOMORPHIC) {
+                                EnamelIconWell(connectionKindIcon(item.kind), MaterialTheme.colorScheme.onSurface)
+                            } else {
+                                Icon(connectionKindIcon(item.kind), null, tint = serviceColor(item.kind.name, state.theme))
+                            }
+                        },
                         trailingContent = { Icon(Icons.Default.ChevronRight, null) },
                         modifier = Modifier.clickable { model.openSuperThumbnailPickerConnection(item.id) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
@@ -3329,7 +3752,7 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            item { SectionTitle("현재 캐시") }
+            item { SectionTitle("현재 캐시", Icons.Default.Storage) }
             item {
                 DashboardCard {
                     Row(Modifier.fillMaxWidth().padding(14.dp)) {
@@ -3343,7 +3766,7 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("자동 정리") }
+            item { SectionTitle("자동 정리", Icons.Default.AutoDelete) }
             item {
                 DashboardCard {
                     Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -3368,12 +3791,13 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
             }
             item {
                 Text(
-                    "캐시가 ${statistics?.automaticLimitBytes?.let(::formatBytes) ?: "선택한 용량"}를 넘으면 오래된 썸네일부터 자동으로 정리합니다. 30일이 지난 항목도 정리하며 최대 5,000개를 보관합니다.",
+                    "용량을 넘거나 30일이 지나면 오래된 캐시부터 정리합니다.\n최대 5,000개를 보관합니다.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
+            item { Spacer(Modifier.height(8.dp)) }
             item {
                 DashboardCard {
                     TextButton(
@@ -3425,14 +3849,8 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
             CenterAlignedTopAppBar(
                 title = { Text("설정") },
                 navigationIcon = {
-                    Surface(
-                        onClick = { model.show(Screen.Dashboard) },
-                        modifier = Modifier.padding(start = 8.dp).size(44.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = .72f),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .70f)),
-                    ) {
-                        Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.ArrowBack, "뒤로") }
+                    IconButton(onClick = { model.show(Screen.Dashboard) }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
@@ -3444,7 +3862,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
             contentPadding = PaddingValues(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            item { SectionTitle("테마") }
+            item { SectionTitle("테마", Icons.Default.Palette) }
             item {
                 val columns = 3
                 Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
@@ -3496,31 +3914,45 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("앱 아이콘") }
+            item { SectionTitle("앱 아이콘", Icons.Default.Apps) }
             item {
                 val choices = listOf(
                     Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
                     Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
-                    Triple(LauncherIconVariant.VIBE_CODER, "바이브 코더", R.drawable.app_icon_vibe_coder),
+                    Triple(LauncherIconVariant.VIBE_CODER, "Vibe Coder", R.drawable.app_icon_vibe_coder),
                     Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
                     Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
+                    Triple(LauncherIconVariant.ENAMEL, "BK Style", R.drawable.app_icon_enamel),
                 )
                 Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
                     Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                        choices.chunked(2).forEach { row ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                        choices.chunked(3).forEach { row ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 row.forEach { (variant, label, drawable) ->
                                     val selected = state.launcherIcon == variant
                                     Column(
-                                        Modifier.weight(1f).clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
+                                        Modifier.weight(1f).height(104.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .56f))
+                                            .border(
+                                                BorderStroke(
+                                                    if (selected) 1.5.dp else 1.dp,
+                                                    if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .75f)
+                                                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f),
+                                                ),
+                                                RoundedCornerShape(12.dp),
+                                            )
+                                            .clickable(enabled = state.pendingLauncherIcon == null && !selected && state.theme != AppTheme.SKEUOMORPHIC) { model.setLauncherIcon(variant) }
+                                            .padding(8.dp)
                                             .semantics(mergeDescendants = true) { this.selected = selected },
                                         horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(7.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically),
                                     ) {
                                         Image(
-                                            painter = painterResource(drawable),
+                                            bitmap = ImageBitmap.imageResource(drawable),
                                             contentDescription = "$label 앱 아이콘 미리보기",
-                                            modifier = Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)),
+                                            modifier = Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)),
+                                            filterQuality = FilterQuality.High,
                                         )
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -3532,14 +3964,20 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                                         }
                                     }
                                 }
+                                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
                             }
                         }
                         HorizontalDivider()
-                        Text("선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            if (state.theme == AppTheme.SKEUOMORPHIC) "BK Style에서는 같은 이름의 앱 아이콘을 사용합니다."
+                            else "선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
             }
-            item { SectionTitle("다운로드 캐시") }
+            item { SectionTitle("저장공간", Icons.Default.Storage) }
             item {
                 DashboardCard {
                     Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -3560,7 +3998,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("화면 꺼짐 방지") }
+            item { SectionTitle("화면", Icons.Default.PhoneAndroid) }
             item {
                 DashboardCard {
                     Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -3585,7 +4023,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("Super Thumbnail") }
+            item { SectionTitle("Super Thumbnail", Icons.Default.AutoAwesome) }
             item {
                 DashboardCard {
                     DashboardRow(Icons.Default.AutoAwesome, "Super Thumbnail", "폴더의 영상과 사진 미리보기를 미리 만듭니다.") {
@@ -3593,12 +4031,16 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("프로토콜 지원 상태") }
+            item { SectionTitle("프로토콜", Icons.Default.Hub) }
             item {
                 DashboardCard {
                     ConnectionKind.entries.forEachIndexed { index, kind ->
                         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(connectionKindIcon(kind), null, tint = serviceColor(kind.name, state.theme), modifier = Modifier.size(22.dp))
+                            if (state.theme == AppTheme.SKEUOMORPHIC) {
+                                EnamelIconWell(connectionKindIcon(kind), MaterialTheme.colorScheme.onSurface)
+                            } else {
+                                Icon(connectionKindIcon(kind), null, tint = serviceColor(kind.name, state.theme), modifier = Modifier.size(22.dp))
+                            }
                             Spacer(Modifier.width(11.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(kind.title, style = MaterialTheme.typography.bodyMedium)
@@ -3609,7 +4051,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("앱 정보") }
+            item { SectionTitle("앱 정보", Icons.Default.Info) }
             item {
                 DashboardCard {
                     Row(Modifier.fillMaxWidth().padding(14.dp)) {
@@ -3623,7 +4065,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("Android 파일 앱 연동") }
+            item { SectionTitle("파일 앱 연동", Icons.Default.FolderOpen) }
             item {
                 DashboardCard {
                     Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -3633,7 +4075,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            item { SectionTitle("오픈 소스") }
+            item { SectionTitle("오픈 소스", Icons.Default.Code) }
             item {
                 DashboardCard {
                     DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "구성요소·버전·라이선스·공식 소스 보기") {
@@ -3643,7 +4085,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                     DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
                 }
             }
-            item { SectionTitle("만든 사람") }
+            item { SectionTitle("만든 사람", Icons.Default.Person) }
             item {
                 DashboardCard {
                     DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
@@ -3697,9 +4139,9 @@ private fun protocolSupport(kind: ConnectionKind) = when (kind) {
     ConnectionKind.DROPBOX, ConnectionKind.ONEDRIVE, ConnectionKind.GOOGLE_DRIVE -> "계정 연결 준비 중"
 }
 
-private fun themeTitle(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "자동"; AppTheme.DAY -> "낮"; AppTheme.NIGHT -> "밤"; AppTheme.DIGITAL_RAIN -> "Vibe Coder"; AppTheme.WINDY_MEADOW -> "Windy Meadow"; AppTheme.WORKBENCH -> "Workbench" }
-private fun themeDescription(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "Android 설정"; AppTheme.DAY -> "맑고 밝게"; AppTheme.NIGHT -> "차분하고 어둡게"; AppTheme.DIGITAL_RAIN -> "Black · Mint"; AppTheme.WINDY_MEADOW -> "Sky · Meadow"; AppTheme.WORKBENCH -> "Slate · Syntax" }
-private fun themeIcon(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> Icons.Default.Brightness6; AppTheme.DAY -> Icons.Default.WbSunny; AppTheme.NIGHT -> Icons.Default.NightsStay; AppTheme.DIGITAL_RAIN -> Icons.Default.Code; AppTheme.WINDY_MEADOW -> Icons.Default.Air; AppTheme.WORKBENCH -> Icons.Default.Code }
+private fun themeTitle(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "자동"; AppTheme.DAY -> "낮"; AppTheme.NIGHT -> "밤"; AppTheme.DIGITAL_RAIN -> "Vibe Coder"; AppTheme.WINDY_MEADOW -> "Windy Meadow"; AppTheme.WORKBENCH -> "Workbench"; AppTheme.SKEUOMORPHIC -> "BK Style" }
+private fun themeDescription(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> "Android 설정"; AppTheme.DAY -> "맑고 밝게"; AppTheme.NIGHT -> "차분하고 어둡게"; AppTheme.DIGITAL_RAIN -> "Black · Mint"; AppTheme.WINDY_MEADOW -> "Sky · Meadow"; AppTheme.WORKBENCH -> "Slate · Syntax"; AppTheme.SKEUOMORPHIC -> "White Enamel · Chrome" }
+private fun themeIcon(theme: AppTheme) = when (theme) { AppTheme.SYSTEM -> Icons.Default.Brightness6; AppTheme.DAY -> Icons.Default.WbSunny; AppTheme.NIGHT -> Icons.Default.NightsStay; AppTheme.DIGITAL_RAIN -> Icons.Default.Code; AppTheme.WINDY_MEADOW -> Icons.Default.Air; AppTheme.WORKBENCH -> Icons.Default.Code; AppTheme.SKEUOMORPHIC -> Icons.Default.Tune }
 private fun themePreviewBrush(theme: AppTheme): Brush {
     val colors = when (theme) {
         AppTheme.SYSTEM -> listOf(Color.White.copy(alpha = .96f), Color.Black.copy(alpha = .18f))
@@ -3711,6 +4153,7 @@ private fun themePreviewBrush(theme: AppTheme): Brush {
             Color(red = .08f, green = .12f, blue = .18f),
             Color(red = .025f, green = .04f, blue = .065f),
         )
+        AppTheme.SKEUOMORPHIC -> listOf(Color(0xFFC7C7C4), Color(0xFFF5F3ED), Color.White)
     }
     return if (theme == AppTheme.WINDY_MEADOW) Brush.verticalGradient(colors) else Brush.linearGradient(colors)
 }
@@ -3733,14 +4176,16 @@ private fun AutoShrinkThemeTitle(text: String, color: Color) {
 }
 private fun themePreviewAccentColors(theme: AppTheme): List<Color> = when (theme) {
     AppTheme.WORKBENCH -> listOf(Color(0xFF5CC8FF), Color(0xFF65D6AD), Color(0xFFF4C76B), Color(0xFFC792EA))
+    AppTheme.SKEUOMORPHIC -> listOf(Color(0xFFE41E25), Color(0xFF6F7478), Color(0xFFB7BBC0), Color(0xFF34383B))
     else -> listOf("SYNOLOGY", "SFTP", "FTP", "WEBDAV").map { serviceColor(it, theme) }
 }
 private fun themePreviewSecondaryColor(theme: AppTheme): Color = when (theme) {
     AppTheme.DIGITAL_RAIN -> Color(0xFF99BFB3)
     AppTheme.WINDY_MEADOW -> Color(0xFF59636B)
     AppTheme.WORKBENCH -> Color(red = .61f, green = .69f, blue = .76f)
+    AppTheme.SKEUOMORPHIC -> Color(0xFF575B5E)
     AppTheme.NIGHT -> Color(0xFFB5C1C9)
     AppTheme.SYSTEM, AppTheme.DAY -> Color(0xFF59636B)
 }
-private fun formatDashboardCacheBytes(value: Long?): String = if (value == null || value <= 0L) "Zero KB" else formatBytes(value)
+private fun formatDashboardCacheBytes(value: Long?): String = if (value == null || value <= 0L) "0 B" else formatBytes(value)
 private fun formatBytes(value: Long): String { if (value < 1024) return "$value B"; val units = arrayOf("KB", "MB", "GB", "TB"); var size = value.toDouble(); var index = -1; do { size /= 1024; index++ } while (size >= 1024 && index < units.lastIndex); return "%.1f %s".format(size, units[index]) }
