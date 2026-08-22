@@ -38,6 +38,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -2245,9 +2246,15 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         mutableStateOf(
             runCatching {
                 InboxLayout.valueOf(inboxPreferences.getString("layout", null).orEmpty())
-            }.getOrDefault(InboxLayout.DETAILS),
+            }.getOrDefault(InboxLayout.DETAILS).let {
+                if (it == InboxLayout.OVERFLOW) InboxLayout.POSTERS else it
+            },
         )
     }
+    val configuredLayout = if (layout == InboxLayout.OVERFLOW) InboxLayout.POSTERS else layout
+    val inboxLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val showsAutomaticOverflow = configuredLayout == InboxLayout.POSTERS && inboxLandscape
+    val displayedLayout = if (showsAutomaticOverflow) InboxLayout.OVERFLOW else configuredLayout
     var layoutMenuExpanded by remember { mutableStateOf(false) }
     var overflowUsesDarkBackground by rememberSaveable {
         mutableStateOf(inboxPreferences.getBoolean("overflow_dark", false))
@@ -2262,6 +2269,14 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         model.importPickedFiles(uris)
+    }
+    LaunchedEffect(layout) {
+        if (layout == InboxLayout.OVERFLOW ||
+            inboxPreferences.getString("layout", null) == InboxLayout.OVERFLOW.name
+        ) {
+            layout = InboxLayout.POSTERS
+            inboxPreferences.edit().putString("layout", InboxLayout.POSTERS.name).apply()
+        }
     }
     LaunchedEffect(Unit) { model.refreshInbox() }
     DisposableEffect(lifecycleOwner) {
@@ -2295,7 +2310,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            if (layout != InboxLayout.OVERFLOW) TopAppBar(
+            if (!showsAutomaticOverflow) TopAppBar(
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -2321,18 +2336,22 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     if (!selectionMode) {
                         if (files.isNotEmpty()) Box {
                             IconButton(onClick = { layoutMenuExpanded = true }) {
-                                Icon(inboxLayoutIcon(layout), "보기: ${layout.title}")
+                                Icon(inboxLayoutIcon(configuredLayout), "보기: ${configuredLayout.title}")
                             }
                             DropdownMenu(
                                 expanded = layoutMenuExpanded,
                                 onDismissRequest = { layoutMenuExpanded = false },
                             ) {
-                                InboxLayout.entries.forEach { candidate ->
+                                listOf(
+                                    InboxLayout.DETAILS,
+                                    InboxLayout.THUMBNAILS,
+                                    InboxLayout.POSTERS,
+                                ).forEach { candidate ->
                                     DropdownMenuItem(
                                         text = { Text(candidate.title) },
                                         leadingIcon = { Icon(inboxLayoutIcon(candidate), null) },
                                         trailingIcon = {
-                                            if (candidate == layout) Icon(Icons.Default.Check, null)
+                                            if (candidate == configuredLayout) Icon(Icons.Default.Check, null)
                                         },
                                         onClick = {
                                             layoutMenuExpanded = false
@@ -2403,30 +2422,32 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             }
         },
     ) { padding ->
-        if (files.isEmpty()) {
-            Column(Modifier.padding(padding).fillMaxSize()) {
-                PhoneHardConnectionHeader(webHardConnection)
-                EmptyState(
-                    icon = Icons.Default.MoveToInbox,
-                    title = "폰하드가 비어 있습니다",
-                    description = "내가 저장하거나 다른 기기에서 보낸 파일이 이곳에 모입니다.",
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    action = {
-                        Button(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
-                            Icon(Icons.AutoMirrored.Filled.NoteAdd, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("파일 가져오기")
-                        }
-                    },
-                )
+        if (files.isEmpty() && !showsAutomaticOverflow) {
+            LazyColumn(Modifier.padding(padding).fillMaxSize()) {
+                item { PhoneHardConnectionHeader(webHardConnection) }
+                item {
+                    EmptyState(
+                        icon = Icons.Default.MoveToInbox,
+                        title = "폰하드가 비어 있습니다",
+                        description = "내가 저장하거나 다른 기기에서 보낸 파일이 이곳에 모입니다.",
+                        modifier = Modifier.fillParentMaxWidth().fillParentMaxHeight(),
+                        action = {
+                            Button(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
+                                Icon(Icons.AutoMirrored.Filled.NoteAdd, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("파일 가져오기")
+                            }
+                        },
+                    )
+                }
             }
         } else {
-            when (layout) {
-                InboxLayout.THUMBNAILS, InboxLayout.POSTERS -> Column(Modifier.padding(padding).fillMaxSize()) {
-                    PhoneHardConnectionHeader(webHardConnection)
+            when (displayedLayout) {
+                InboxLayout.THUMBNAILS, InboxLayout.POSTERS ->
                     InboxGrid(
+                        connection = webHardConnection,
                         files = files,
-                        poster = layout == InboxLayout.POSTERS,
+                        poster = displayedLayout == InboxLayout.POSTERS,
                         selectionMode = selectionMode,
                         selectedIds = selectedIds,
                         onActivate = { file ->
@@ -2438,30 +2459,27 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         onSend = { pendingSendIds = listOf(it.id) },
                         onShare = model::shareInboxFile,
                         onDelete = model::deleteInboxFile,
-                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        modifier = Modifier.padding(padding).fillMaxSize(),
                     )
-                }
-                InboxLayout.OVERFLOW -> Column(Modifier.padding(padding).fillMaxSize()) {
-                    PhoneHardConnectionHeader(webHardConnection)
+                InboxLayout.OVERFLOW ->
                     InboxOverflow(
                         files = files,
                         theme = state.theme,
                         usesDarkBackground = overflowUsesDarkBackground,
-                        onBack = { setLayout(InboxLayout.POSTERS) },
+                        onBack = { model.show(Screen.Dashboard) },
                         onToggleBackground = { dark ->
                             overflowUsesDarkBackground = dark
                             inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
                         },
                         onActivate = model::previewInboxFile,
-                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        modifier = Modifier.padding(padding).fillMaxSize(),
                     )
-                }
                 InboxLayout.DETAILS -> LazyColumn(
-                Modifier.padding(padding).fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 16.dp),
-            ) {
-                item { PhoneHardConnectionHeader(webHardConnection, horizontalPadding = 0.dp) }
-                items(files, key = { it.id }) { file ->
+                    Modifier.padding(padding).fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                ) {
+                    item { PhoneHardConnectionHeader(webHardConnection, horizontalPadding = 0.dp) }
+                    items(files, key = { it.id }) { file ->
                     val selected = file.id in selectedIds
                     var showContextMenu by remember(file.id) { mutableStateOf(false) }
                     val dismissState = rememberSwipeToDismissBoxState(
@@ -2653,7 +2671,7 @@ private fun PhoneHardConnectionHeader(
     horizontalPadding: Dp = 16.dp,
 ) {
     Box(
-        modifier.fillMaxWidth().padding(start = horizontalPadding, top = 10.dp, end = horizontalPadding, bottom = 12.dp),
+        modifier.fillMaxWidth().padding(start = horizontalPadding, top = 8.dp, end = horizontalPadding, bottom = 10.dp),
         contentAlignment = Alignment.TopCenter,
     ) {
         PhoneHardConnectionPanel(connection, Modifier.fillMaxWidth().widthIn(max = 720.dp))
@@ -2662,6 +2680,7 @@ private fun PhoneHardConnectionHeader(
 
 @Composable
 private fun InboxGrid(
+    connection: WebHardConnectionState,
     files: List<InboxDisplayItem>,
     poster: Boolean,
     selectionMode: Boolean,
@@ -2679,6 +2698,9 @@ private fun InboxGrid(
         verticalArrangement = Arrangement.spacedBy(if (poster) 20.dp else 14.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            PhoneHardConnectionHeader(connection, horizontalPadding = 0.dp)
+        }
         items(files, key = { it.id }) { file ->
             InboxGridTile(
                 file = file,

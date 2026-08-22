@@ -75,7 +75,6 @@ private enum class WebHardLayout(val title: String) {
 private val BkPanelCharcoal = Color(0xFF34383B)
 private val BkPanelChrome = Color(0xFF8B9093)
 private val BkPanelRecessed = Color(0xFFE7E6E1)
-private val BkPanelStatusRed = Color(0xFFE41E25)
 
 @Stable
 internal class WebHardConnectionState(private val store: WebHardFileStore) {
@@ -134,7 +133,10 @@ internal fun PhoneHardConnectionPanel(
     val largeFont = configuration.fontScale >= 1.3f
     val theme = LocalNasFinderTheme.current
     val enamel = theme == AppTheme.SKEUOMORPHIC
-    val panelShape = RoundedCornerShape(20.dp)
+    val panelShape = RoundedCornerShape(16.dp)
+    val fieldHeight = if (largeFont) 56.dp else 48.dp
+    val addressHeight = if (largeFont) 48.dp else 40.dp
+    var passwordExpanded by rememberSaveable { mutableStateOf(false) }
     val fieldColors = if (enamel) {
         OutlinedTextFieldDefaults.colors(
             focusedTextColor = BkPanelCharcoal,
@@ -159,87 +161,43 @@ internal fun PhoneHardConnectionPanel(
     }
 
     val content: @Composable () -> Unit = {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (enamel) {
                     BkConnectionIcon()
                 } else {
                     Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.primary)
                 }
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "다른 기기 연결",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (enamel) BkPanelCharcoal else Color.Unspecified,
-                    )
-                    Text(
-                        if (connection.server == null) "같은 Wi-Fi·핫스팟·VPN에서 연결할 수 있습니다."
-                        else "폰하드가 열려 있습니다.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (enamel) Color(0xFF686C6F) else MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                if (enamel) {
-                    BkConnectionStatus(connection.server != null)
-                } else {
-                    Text(
-                        if (connection.server == null) "닫힘" else "열림",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (connection.server == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
-                    )
-                }
+                Text(
+                    "서버 열기",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (enamel) BkPanelCharcoal else Color.Unspecified,
+                )
             }
 
-            if (connection.networkAddresses.isEmpty()) {
-                ListItem(
-                    headlineContent = { Text("사용 가능한 접속 주소가 없습니다") },
-                    leadingContent = { Icon(Icons.Default.WifiOff, null) },
-                    trailingContent = {
-                        IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
-                            Icon(
-                                Icons.Default.Refresh,
-                                "접속 주소 새로고침",
-                                tint = if (enamel) BkPanelCharcoal else LocalContentColor.current,
-                            )
-                        }
-                    },
-                    colors = if (enamel) {
-                        ListItemDefaults.colors(
-                            containerColor = Color.Transparent,
-                            headlineColor = BkPanelCharcoal,
-                            leadingIconColor = Color(0xFF686C6F),
+            Surface(
+                color = if (enamel) BkPanelRecessed else MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+                border = if (enamel) BorderStroke(1.dp, BkPanelChrome.copy(alpha = .72f)) else null,
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = addressHeight).padding(start = 12.dp, end = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Text(
+                            "접속 주소",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (enamel) Color(0xFF686C6F) else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                    } else ListItemDefaults.colors(),
-                )
-            } else {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    var expanded by remember { mutableStateOf(false) }
-                    ExposedDropdownMenuBox(
-                        expanded = expanded,
-                        onExpandedChange = { if (connection.server == null) expanded = it },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        OutlinedTextField(
-                            value = connection.selectedAddress?.hostAddress.orEmpty(),
-                            onValueChange = {},
-                            readOnly = true,
-                            label = { Text("접속 주소") },
-                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-                            modifier = Modifier.menuAnchor().fillMaxWidth(),
-                            enabled = connection.server == null,
-                            singleLine = true,
-                            shape = if (enamel) RoundedCornerShape(10.dp) else OutlinedTextFieldDefaults.shape,
-                            colors = fieldColors,
+                        Text(
+                            connection.selectedAddress?.hostAddress ?: "사용 가능한 접속 주소가 없습니다",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
-                        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                            connection.networkAddresses.forEach { address ->
-                                DropdownMenuItem(
-                                    text = { Text(address.hostAddress.orEmpty()) },
-                                    onClick = { connection.selectedAddress = address; expanded = false },
-                                )
-                            }
-                        }
                     }
                     IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
                         Icon(
@@ -251,26 +209,24 @@ internal fun PhoneHardConnectionPanel(
                 }
             }
 
-            BoxWithConstraints {
-                val stacksControls = maxWidth < 360.dp || largeFont
-                if (stacksControls) {
-                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PhoneHardPasswordField(connection, Modifier.fillMaxWidth(), fieldColors, enamel)
-                        PhoneHardConnectionButton(connection, enamel, Modifier.fillMaxWidth())
-                    }
-                } else {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        PhoneHardPasswordField(connection, Modifier.weight(1f), fieldColors, enamel)
-                        PhoneHardConnectionButton(connection, enamel)
-                    }
-                }
+            if (passwordExpanded) {
+                PhoneHardPasswordField(connection, Modifier.fillMaxWidth().height(fieldHeight), fieldColors, enamel)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                PhoneHardPasswordButton(
+                    expanded = passwordExpanded,
+                    enamel = enamel,
+                    onClick = { passwordExpanded = !passwordExpanded },
+                    modifier = Modifier.weight(1f).height(fieldHeight),
+                )
+                PhoneHardConnectionButton(connection, enamel, Modifier.weight(1f).height(fieldHeight))
             }
 
             if (connection.server != null && connection.selectedAddress != null) {
                 androidx.compose.foundation.text.selection.SelectionContainer {
                     Text(
                         "http://${connection.selectedAddress!!.hostAddress}:${connection.port}",
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodySmall,
                         color = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.primary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -328,17 +284,31 @@ private fun BkConnectionIcon() {
 }
 
 @Composable
-private fun BkConnectionStatus(open: Boolean) {
-    Row(
-        Modifier.clearAndSetSemantics { contentDescription = if (open) "폰하드 열림" else "폰하드 닫힘" },
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+private fun PhoneHardPasswordButton(
+    expanded: Boolean,
+    enamel: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        colors = if (enamel) {
+            ButtonDefaults.outlinedButtonColors(
+                containerColor = Color.White.copy(alpha = .72f),
+                contentColor = BkPanelCharcoal,
+            )
+        } else ButtonDefaults.outlinedButtonColors(),
+        border = BorderStroke(1.dp, if (enamel) BkPanelChrome else MaterialTheme.colorScheme.outline),
     ) {
-        Box(
-            Modifier.size(8.dp).clip(CircleShape)
-                .background(if (open) BkPanelStatusRed else BkPanelChrome.copy(alpha = .58f)),
+        Text("비밀번호")
+        Spacer(Modifier.width(4.dp))
+        Icon(
+            if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+            if (expanded) "비밀번호 입력 접기" else "비밀번호 입력 펼치기",
+            Modifier.size(18.dp),
         )
-        Text(if (open) "열림" else "닫힘", style = MaterialTheme.typography.labelMedium, color = BkPanelCharcoal)
     }
 }
 
@@ -364,7 +334,7 @@ private fun PhoneHardConnectionButton(
         border = BorderStroke(1.dp, Color(0xFF6D7275)),
     ) {
         Box(
-            Modifier.defaultMinSize(minWidth = 80.dp, minHeight = 48.dp).background(
+            Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
                     if (enabled) listOf(Color(0xFF666B6E), BkPanelCharcoal, Color(0xFF24282B))
                     else listOf(Color(0xFFB9BBBA), Color(0xFF8D9090)),
@@ -388,9 +358,10 @@ private fun PhoneHardPasswordField(
         value = connection.password,
         onValueChange = { if (connection.server == null) connection.password = it },
         enabled = connection.server == null,
-        label = { Text("비밀번호 (선택)") },
+        label = { Text("비밀번호 (선택)", style = MaterialTheme.typography.labelSmall) },
         visualTransformation = PasswordVisualTransformation(),
         singleLine = true,
+        textStyle = MaterialTheme.typography.bodySmall,
         modifier = modifier,
         shape = if (enamel) RoundedCornerShape(10.dp) else OutlinedTextFieldDefaults.shape,
         colors = colors,
