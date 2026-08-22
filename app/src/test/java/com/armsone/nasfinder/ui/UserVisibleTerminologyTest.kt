@@ -22,7 +22,7 @@ class UserVisibleTerminologyTest {
         assertTrue(app.contains("DashboardRow(Icons.Default.AutoAwesome, \"Super Thumbnail\""))
         assertTrue(app.contains("DashboardRow(Icons.Default.PhotoLibrary, \"썸네일 캐시\""))
         val settingsRow = app.indexOf("DashboardRow(Icons.Default.Settings, \"설정\", null)")
-        val dashboardVersion = app.indexOf("\"버전 ${'$'}{BuildConfig.VERSION_NAME} · 빌드 ${'$'}{BuildConfig.VERSION_CODE}\"", settingsRow)
+        val dashboardVersion = app.indexOf("\"버전 ${'$'}{BuildConfig.VERSION_NAME} · 빌드 ${'$'}{BuildConfig.BUILD_NUMBER}\"", settingsRow)
         assertTrue(settingsRow >= 0 && dashboardVersion > settingsRow)
         assertTrue(app.contains("import com.armsone.nasfinder.BuildConfig"))
         assertTrue(app.contains("BrowserActionTile(\"붙여넣기\""))

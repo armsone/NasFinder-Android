@@ -832,7 +832,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                             model.show(Screen.Settings)
                         }
                         Text(
-                            "버전 ${BuildConfig.VERSION_NAME} · 빌드 ${BuildConfig.VERSION_CODE}",
+                            "버전 ${BuildConfig.VERSION_NAME} · 빌드 ${BuildConfig.BUILD_NUMBER}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
