@@ -712,7 +712,7 @@ fun WebBrowserScreen(
                                 downloadActionInFlight = false
                             }
                         },
-                    ) { Text("받은 파일에 저장") }
+                    ) { Text("폰하드에 저장") }
                     TextButton(
                         enabled = !downloadActionInFlight && connections.isNotEmpty(),
                         onClick = { chooseNetworkConnection = true },

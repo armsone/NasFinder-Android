@@ -16,15 +16,6 @@ object NasFinderShortcuts {
         val shortcuts = listOf(
             shortcut(
                 context,
-                ID_WEB_HARD,
-                R.string.shortcut_webhard_short,
-                R.string.shortcut_webhard_long,
-                R.drawable.ic_shortcut_webhard,
-                ExternalEntryRouteParser.WEB_HARD_URI,
-                launcherActivity,
-            ),
-            shortcut(
-                context,
                 ID_WEB_BROWSER,
                 R.string.shortcut_browser_short,
                 R.string.shortcut_browser_long,
@@ -57,6 +48,5 @@ object NasFinderShortcuts {
         .apply { if (launcherActivity != null) setActivity(launcherActivity) }
         .build()
 
-    private const val ID_WEB_HARD = "open_webhard"
     private const val ID_WEB_BROWSER = "open_browser"
 }

@@ -42,7 +42,7 @@ class InboxBatchContractsTest {
         assertEquals(2, summary.successCount)
         assertEquals(0, summary.failureCount)
         assertFalse(summary.isPartialSuccess)
-        assertEquals("2개 파일을 NAS로 보냈습니다. 받은 파일은 기기에 유지됩니다.", summary.message)
+        assertEquals("2개 파일을 NAS로 보냈습니다. 폰하드 파일은 기기에 유지됩니다.", summary.message)
     }
 
     @Test fun allFailureAndPartialSuccessHaveDistinctMessages() {
@@ -62,7 +62,7 @@ class InboxBatchContractsTest {
             ),
         )
         assertTrue(partial.isPartialSuccess)
-        assertEquals("2개 중 1개를 NAS로 보냈고 1개는 실패했습니다. 받은 파일은 기기에 유지됩니다.", partial.message)
+        assertEquals("2개 중 1개를 NAS로 보냈고 1개는 실패했습니다. 폰하드 파일은 기기에 유지됩니다.", partial.message)
         assertEquals(listOf(first, second), partial.outcomes.map { it.id })
     }
 

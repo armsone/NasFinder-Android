@@ -1,6 +1,7 @@
 package com.armsone.nasfinder.platform
 
 import android.content.Context
+import com.armsone.nasfinder.data.SharedInboxStore
 import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
@@ -54,7 +55,7 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
     val rootDirectory: File
     private val reservations = mutableSetOf<String>()
 
-    constructor(context: Context) : this(File(context.filesDir, "WebHard"), Unit)
+    constructor(context: Context) : this(SharedInboxStore.phoneHardRoot(context.filesDir), Unit)
 
     /** Visible for local tests and non-Android hosts; callers must supply an app-private root. */
     constructor(root: File) : this(root, Unit)
@@ -72,6 +73,9 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
     fun list(path: String): List<WebHardFileItem> {
         val directory = existing(path, expectDirectory = true)
         return directory.listFiles().orEmpty().mapNotNull { child ->
+            if (directory == rootDirectory && child.name == SharedInboxStore.LEGACY_MANIFEST_NAME) {
+                return@mapNotNull null
+            }
             if (child.name.startsWith('.') || child.isHidden || Files.isSymbolicLink(child.toPath())) {
                 return@mapNotNull null
             }

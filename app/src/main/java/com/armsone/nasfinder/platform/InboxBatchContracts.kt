@@ -37,10 +37,10 @@ class InboxUploadSummary internal constructor(
         get() = when {
             totalCount == 0 -> "선택한 파일이 없습니다."
             failureCount == 0 ->
-                "${successCount}개 파일을 NAS로 보냈습니다. 받은 파일은 기기에 유지됩니다."
+                "${successCount}개 파일을 NAS로 보냈습니다. 폰하드 파일은 기기에 유지됩니다."
             successCount == 0 -> "${failureCount}개 파일을 NAS로 보내지 못했습니다."
             else ->
-                "${totalCount}개 중 ${successCount}개를 NAS로 보냈고 ${failureCount}개는 실패했습니다. 받은 파일은 기기에 유지됩니다."
+                "${totalCount}개 중 ${successCount}개를 NAS로 보냈고 ${failureCount}개는 실패했습니다. 폰하드 파일은 기기에 유지됩니다."
         }
 }
 
@@ -62,7 +62,7 @@ object InboxBatchContracts {
     fun summarizeSequential(outcomes: Iterable<InboxUploadOutcome>): InboxUploadSummary {
         val values = outcomes.toList()
         require(values.map { it.id }.distinct().size == values.size) {
-            "같은 받은 파일의 업로드 결과가 중복되었습니다."
+            "같은 폰하드 파일의 업로드 결과가 중복되었습니다."
         }
         return InboxUploadSummary(values)
     }

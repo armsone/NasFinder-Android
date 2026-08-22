@@ -1,17 +1,47 @@
 package com.armsone.nasfinder.ui
 
 import java.io.File
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InboxParityContractTest {
     @Test
-    fun `received files screen keeps the iOS visible contract`() {
+    fun `phonehard screen keeps the iOS visible contract`() {
         val app = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt").readText()
         val viewModel = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt").readText()
+        val webHard = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/WebHardScreen.kt").readText()
 
-        assertTrue(app.contains("if (selectionMode) \"${'$'}{selectedIds.size}개 선택\" else \"받은 파일\""))
+        assertTrue(app.contains("if (selectionMode) \"${'$'}{selectedIds.size}개 선택\" else \"폰하드\""))
+        assertTrue(app.contains("PhoneHardConnectionHeader(webHardConnection)"))
+        assertTrue(app.contains("InboxLayout.OVERFLOW -> Column(Modifier.padding(padding).fillMaxSize())"))
+        assertTrue(app.contains("Screen.Inbox, Screen.WebHard -> InboxScreen(state, model)"))
+        assertFalse(app.contains("model.show(Screen.WebHard)"))
+        assertTrue(webHard.contains("internal fun PhoneHardConnectionPanel"))
+        assertTrue(webHard.contains("label = { Text(\"접속 주소\") }"))
+        assertTrue(webHard.contains("label = { Text(\"비밀번호 (선택)\") }"))
+        assertTrue(webHard.contains("val label = if (connection.server == null) \"열기\" else \"닫기\""))
+        assertTrue(webHard.contains("private val BkPanelCharcoal = Color(0xFF34383B)"))
+        assertTrue(webHard.contains("private val BkPanelRecessed = Color(0xFFE7E6E1)"))
+        assertTrue(webHard.contains("private val BkPanelStatusRed = Color(0xFFE41E25)"))
+        assertEquals(1, Regex("0xFFE41E25").findAll(webHard).count())
+        assertTrue(webHard.contains("background(if (open) BkPanelStatusRed else BkPanelChrome"))
+        assertTrue(webHard.contains("Brush.linearGradient(listOf(Color.White, BkPanelChrome"))
+        assertTrue(webHard.contains("if (enabled) listOf(Color(0xFF666B6E), BkPanelCharcoal"))
+        assertTrue(webHard.contains("ElevatedCard(modifier) { content() }"))
+        assertTrue(webHard.contains("val stacksControls = maxWidth < 360.dp || largeFont"))
+        assertTrue(app.contains("while (webHardConnection.server != null)"))
+        val phoneHardRow = app.indexOf("PhoneHardDashboardRow(\"${'$'}{state.inboxFiles.size}개\")")
+        val photoTransferRow = app.indexOf(
+            "DashboardRow(Icons.AutoMirrored.Filled.CompareArrows, \"Live Photos & Motion Photos\"",
+            phoneHardRow,
+        )
+        val thumbnailCacheRow = app.indexOf(
+            "DashboardRow(Icons.Default.PhotoLibrary, \"썸네일 캐시\"",
+            photoTransferRow,
+        )
+        assertTrue(phoneHardRow >= 0 && photoTransferRow > phoneHardRow && thumbnailCacheRow > photoTransferRow)
         assertTrue(app.contains("ActivityResultContracts.OpenMultipleDocuments()"))
         assertTrue(app.contains("Icon(Icons.AutoMirrored.Filled.NoteAdd, \"파일에서 가져오기\")"))
         assertTrue(viewModel.contains("fun importPickedFiles(uris: List<Uri>)"))
@@ -35,10 +65,10 @@ class InboxParityContractTest {
         assertTrue(app.contains("InboxThumbnailMemoryCache"))
         assertTrue(app.contains("modifier = Modifier.size(38.dp)"))
         assertTrue(app.contains("value == SwipeToDismissBoxValue.EndToStart"))
-        assertTrue(app.contains("title = { Text(\"받은 파일 오류\") }"))
+        assertTrue(app.contains("title = { Text(\"폰하드 오류\") }"))
         assertTrue(viewModel.contains("fun previewInboxFile(item: InboxDisplayItem)"))
         assertTrue(viewModel.contains("fun shareInboxFile(item: InboxDisplayItem)"))
-        assertTrue(viewModel.contains("받은 파일 목록을 읽지 못했습니다:"))
+        assertTrue(viewModel.contains("폰하드 파일 목록을 읽지 못했습니다:"))
         assertTrue(viewModel.contains("${'$'}{item.originalFilename}을(를) 삭제하지 못했습니다:"))
 
         assertFalse(app.contains("Icons.Default.Checklist, \"다중 선택\""))

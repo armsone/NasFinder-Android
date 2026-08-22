@@ -103,6 +103,7 @@ import com.armsone.nasfinder.data.ScreenAwakeMode
 import com.armsone.nasfinder.data.RemoteThumbnailCachePolicy
 import com.armsone.nasfinder.platform.InboxBatchContracts
 import com.armsone.nasfinder.platform.LauncherIconVariant
+import com.armsone.nasfinder.platform.WebHardFileStore
 import com.armsone.nasfinder.R
 import com.armsone.nasfinder.ui.theme.NasFinderTheme
 import com.armsone.nasfinder.ui.theme.LocalNasFinderTheme
@@ -144,7 +145,7 @@ fun NasFinderApp(model: NasFinderViewModel) {
                 Screen.Dashboard -> DashboardScreen(state, model)
                 is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
                 is Screen.Browser -> BrowserScreen(screen, state, model)
-                Screen.Inbox -> InboxScreen(state, model)
+                Screen.Inbox, Screen.WebHard -> InboxScreen(state, model)
                 Screen.PhotoTransfer -> PhotoTransferScreen(
                     onBack = { model.show(Screen.Dashboard) },
                 )
@@ -172,7 +173,6 @@ fun NasFinderApp(model: NasFinderViewModel) {
                     onSendDownloadedFile = model::importWebDownloadToNas,
                     onDiscardDownloadedFile = model::discardWebDownload,
                 )
-                Screen.WebHard -> WebHardScreen(onClose = { model.show(Screen.Dashboard) })
             }
             state.imagePreview?.let { preview ->
                 BuiltInPreviewScreen(
@@ -769,15 +769,11 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         }
                     }
                     HorizontalDivider(Modifier.padding(horizontal = 16.dp))
-                    DashboardRow(
-                        Icons.Default.MoveToInbox,
-                        "받은 파일",
-                        "${state.inboxFiles.size}개",
-                        MaterialTheme.colorScheme.onSurfaceVariant,
-                        MaterialTheme.colorScheme.onSurfaceVariant,
-                    ) { model.show(Screen.Inbox) }
+                    PhoneHardDashboardRow("${state.inboxFiles.size}개") { model.show(Screen.Inbox) }
                     DashboardRowDivider()
-                    PhoneHardDashboardRow { model.show(Screen.WebHard) }
+                    DashboardRow(Icons.AutoMirrored.Filled.CompareArrows, "Live Photos & Motion Photos", null) {
+                        model.show(Screen.PhotoTransfer)
+                    }
                     DashboardRowDivider()
                     DashboardRow(Icons.Default.PhotoLibrary, "썸네일 캐시", formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes), MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant) { model.show(Screen.ThumbnailCache) }
                     DashboardRowDivider()
@@ -824,14 +820,6 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 14.dp).offset(y = (-8).dp),
                 )
-            }
-            item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
-            item {
-                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface) {
-                    DashboardRow(Icons.AutoMirrored.Filled.CompareArrows, "Live Photos & Motion Photos", null) {
-                        model.show(Screen.PhotoTransfer)
-                    }
-                }
             }
             item { SectionTitle("저장공간", Icons.Default.Storage) }
             item { DeviceStorageCard { fileImporter.launch(arrayOf("*/*")) } }
@@ -1145,7 +1133,7 @@ private fun BrowserDashboardRow(onClick: () -> Unit) {
 }
 
 @Composable
-private fun PhoneHardDashboardRow(onClick: () -> Unit) {
+private fun PhoneHardDashboardRow(detail: String? = null, onClick: () -> Unit) {
     val enamel = LocalNasFinderTheme.current == AppTheme.SKEUOMORPHIC
     Row(
         Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
@@ -1163,6 +1151,10 @@ private fun PhoneHardDashboardRow(onClick: () -> Unit) {
         }
         Spacer(Modifier.width(12.dp))
         Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+        detail?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(8.dp))
+        }
         Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
@@ -2244,6 +2236,8 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     val files = state.inboxFiles
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val webHardStore = remember(context) { WebHardFileStore(context.applicationContext) }
+    val webHardConnection = rememberWebHardConnectionState(webHardStore)
     val inboxPreferences = remember(context) {
         context.getSharedPreferences("inbox_ui", Context.MODE_PRIVATE)
     }
@@ -2273,9 +2267,19 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) model.refreshInbox()
+            if (event == Lifecycle.Event.ON_STOP) webHardConnection.stop()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            webHardConnection.stop()
+        }
+    }
+    LaunchedEffect(webHardConnection.server) {
+        while (webHardConnection.server != null) {
+            delay(900)
+            model.refreshInbox()
+        }
     }
     LaunchedEffect(files) {
         val available = files.mapTo(hashSetOf()) { it.id }
@@ -2292,7 +2296,15 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         containerColor = Color.Transparent,
         topBar = {
             if (layout != InboxLayout.OVERFLOW) TopAppBar(
-                title = { Text(if (selectionMode) "${selectedIds.size}개 선택" else "받은 파일") },
+                title = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (!selectionMode && state.theme == AppTheme.SKEUOMORPHIC) PhoneHardMark(28.dp)
+                        Text(if (selectionMode) "${selectedIds.size}개 선택" else "폰하드")
+                    }
+                },
                 navigationIcon = {
                     if (selectionMode) {
                         TextButton(onClick = {
@@ -2392,53 +2404,63 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         },
     ) { padding ->
         if (files.isEmpty()) {
-            EmptyState(
-                icon = Icons.Default.MoveToInbox,
-                title = "받은 파일이 없습니다",
-                description = "공유한 파일이 이곳에 보관됩니다.",
-                modifier = Modifier.padding(padding).fillMaxSize(),
-                action = {
-                    Button(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
-                        Icon(Icons.AutoMirrored.Filled.NoteAdd, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("파일 가져오기")
-                    }
-                },
-            )
+            Column(Modifier.padding(padding).fillMaxSize()) {
+                PhoneHardConnectionHeader(webHardConnection)
+                EmptyState(
+                    icon = Icons.Default.MoveToInbox,
+                    title = "폰하드가 비어 있습니다",
+                    description = "내가 저장하거나 다른 기기에서 보낸 파일이 이곳에 모입니다.",
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    action = {
+                        Button(onClick = { fileImporter.launch(arrayOf("*/*")) }) {
+                            Icon(Icons.AutoMirrored.Filled.NoteAdd, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("파일 가져오기")
+                        }
+                    },
+                )
+            }
         } else {
             when (layout) {
-                InboxLayout.THUMBNAILS, InboxLayout.POSTERS -> InboxGrid(
-                    files = files,
-                    poster = layout == InboxLayout.POSTERS,
-                    selectionMode = selectionMode,
-                    selectedIds = selectedIds,
-                    onActivate = { file ->
-                        if (selectionMode) {
-                            if (file.id in selectedIds) selectedIds.remove(file.id)
-                            else if (selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS) selectedIds.add(file.id)
-                        } else model.previewInboxFile(file)
-                    },
-                    onSend = { pendingSendIds = listOf(it.id) },
-                    onShare = model::shareInboxFile,
-                    onDelete = model::deleteInboxFile,
-                    modifier = Modifier.padding(padding).fillMaxSize(),
-                )
-                InboxLayout.OVERFLOW -> InboxOverflow(
-                    files = files,
-                    theme = state.theme,
-                    usesDarkBackground = overflowUsesDarkBackground,
-                    onBack = { setLayout(InboxLayout.POSTERS) },
-                    onToggleBackground = { dark ->
-                        overflowUsesDarkBackground = dark
-                        inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
-                    },
-                    onActivate = model::previewInboxFile,
-                    modifier = Modifier.padding(padding).fillMaxSize(),
-                )
+                InboxLayout.THUMBNAILS, InboxLayout.POSTERS -> Column(Modifier.padding(padding).fillMaxSize()) {
+                    PhoneHardConnectionHeader(webHardConnection)
+                    InboxGrid(
+                        files = files,
+                        poster = layout == InboxLayout.POSTERS,
+                        selectionMode = selectionMode,
+                        selectedIds = selectedIds,
+                        onActivate = { file ->
+                            if (selectionMode) {
+                                if (file.id in selectedIds) selectedIds.remove(file.id)
+                                else if (selectedIds.size < InboxBatchContracts.MAX_SELECTED_ITEMS) selectedIds.add(file.id)
+                            } else model.previewInboxFile(file)
+                        },
+                        onSend = { pendingSendIds = listOf(it.id) },
+                        onShare = model::shareInboxFile,
+                        onDelete = model::deleteInboxFile,
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                    )
+                }
+                InboxLayout.OVERFLOW -> Column(Modifier.padding(padding).fillMaxSize()) {
+                    PhoneHardConnectionHeader(webHardConnection)
+                    InboxOverflow(
+                        files = files,
+                        theme = state.theme,
+                        usesDarkBackground = overflowUsesDarkBackground,
+                        onBack = { setLayout(InboxLayout.POSTERS) },
+                        onToggleBackground = { dark ->
+                            overflowUsesDarkBackground = dark
+                            inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
+                        },
+                        onActivate = model::previewInboxFile,
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                    )
+                }
                 InboxLayout.DETAILS -> LazyColumn(
                 Modifier.padding(padding).fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 16.dp),
             ) {
+                item { PhoneHardConnectionHeader(webHardConnection, horizontalPadding = 0.dp) }
                 items(files, key = { it.id }) { file ->
                     val selected = file.id in selectedIds
                     var showContextMenu by remember(file.id) { mutableStateOf(false) }
@@ -2617,10 +2639,24 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     state.inboxErrorMessage?.let { message ->
         AlertDialog(
             onDismissRequest = model::dismissInboxError,
-            title = { Text("받은 파일 오류") },
+            title = { Text("폰하드 오류") },
             text = { Text(message) },
             confirmButton = { TextButton(onClick = model::dismissInboxError) { Text("확인") } },
         )
+    }
+}
+
+@Composable
+private fun PhoneHardConnectionHeader(
+    connection: WebHardConnectionState,
+    modifier: Modifier = Modifier,
+    horizontalPadding: Dp = 16.dp,
+) {
+    Box(
+        modifier.fillMaxWidth().padding(start = horizontalPadding, top = 10.dp, end = horizontalPadding, bottom = 12.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        PhoneHardConnectionPanel(connection, Modifier.fillMaxWidth().widthIn(max = 720.dp))
     }
 }
 
@@ -2765,7 +2801,7 @@ private fun InboxOverflow(
             items = items,
             thumbnails = thumbnails,
             theme = theme,
-            title = "받은 파일",
+            title = "폰하드",
             usesDarkBackground = usesDarkBackground,
             onBack = onBack,
             onToggleBackground = onToggleBackground,
@@ -3846,7 +3882,7 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
             }
             item {
                 Text(
-                    "원본 영상과 받은 파일은 삭제하지 않습니다.",
+                    "원본 영상과 폰하드 파일은 삭제하지 않습니다.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp),

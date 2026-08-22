@@ -248,7 +248,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }.getOrDefault(SuperThumbnailVaultTiming.NOW),
             inboxFiles = initialInboxLoad.getOrDefault(emptyList()),
             inboxErrorMessage = initialInboxLoad.exceptionOrNull()?.let {
-                "받은 파일 목록을 읽지 못했습니다: ${it.message ?: "알 수 없는 오류"}"
+                "폰하드 파일 목록을 읽지 못했습니다: ${it.message ?: "알 수 없는 오류"}"
             },
             remoteFavorites = favoriteRepository.remoteFavorites(),
             browserFavorites = favoriteRepository.browserFavorites(),
@@ -326,7 +326,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             onFailure = { error ->
                 _state.update {
                     it.copy(
-                        inboxErrorMessage = "받은 파일 목록을 읽지 못했습니다: ${error.message ?: "알 수 없는 오류"}",
+                        inboxErrorMessage = "폰하드 파일 목록을 읽지 못했습니다: ${error.message ?: "알 수 없는 오류"}",
                     )
                 }
             },
@@ -1437,7 +1437,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
         if (items.isEmpty() || items.any { !it.file.isFile }) {
-            _state.update { it.copy(message = "보낼 받은 파일을 찾을 수 없습니다.") }
+            _state.update { it.copy(message = "보낼 폰하드 파일을 찾을 수 없습니다.") }
             return
         }
         _state.update {
@@ -1507,7 +1507,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         inboxFiles = files,
                         pendingLocalUpload = null,
                         screen = if (connection == null) Screen.Inbox else it.screen,
-                        message = if (connection == null) "받은 파일에 저장했습니다." else null,
+                        message = if (connection == null) "폰하드에 저장했습니다." else null,
                     )
                 }
                 NasFinderAppWidgetProvider.updateAll(application)
@@ -1637,7 +1637,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             for (item in pending.items) {
                 var stagedDirectory: File? = null
                 val uploaded = runCatching {
-                    require(item.file.isFile) { "보낼 받은 파일을 찾을 수 없습니다." }
+                    require(item.file.isFile) { "보낼 폰하드 파일을 찾을 수 없습니다." }
                     val stagedFile = withContext(Dispatchers.IO) {
                         val uploadsRoot = File(application.cacheDir, "inbox-uploads").canonicalFile
                         check(uploadsRoot.mkdirs() || uploadsRoot.isDirectory) { "업로드 준비 공간을 만들 수 없습니다." }
@@ -1646,7 +1646,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         check(directory.mkdirs() || directory.isDirectory) { "업로드 준비 폴더를 만들 수 없습니다." }
                         stagedDirectory = directory
                         val file = File(directory, item.originalFilename).canonicalFile
-                        check(file.parentFile == directory) { "안전하지 않은 받은 파일 이름입니다." }
+                        check(file.parentFile == directory) { "안전하지 않은 폰하드 파일 이름입니다." }
                         item.file.inputStream().buffered().use { input ->
                             file.outputStream().buffered().use(input::copyTo)
                         }
@@ -2187,7 +2187,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 screen = Screen.Inbox,
                 inboxFiles = if (selected == null) files else listOf(selected) + files.filterNot { item -> item.id == id },
                 message = null,
-                inboxErrorMessage = if (selected == null) "요청한 받은 파일을 찾을 수 없습니다." else null,
+                inboxErrorMessage = if (selected == null) "요청한 폰하드 파일을 찾을 수 없습니다." else null,
             )
         }
     }
@@ -2204,7 +2204,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')
-                        ?.takeIf { it.isNotBlank() } ?: "받은 파일"
+                        ?.takeIf { it.isNotBlank() } ?: "폰하드 파일"
                     application.contentResolver.openInputStream(uri)?.use { input ->
                         inboxStore.import(name, application.contentResolver.getType(uri), input)
                     } ?: error("파일을 열 수 없습니다.")
@@ -2227,7 +2227,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     it.copy(
                         screen = Screen.Inbox,
                         message = null,
-                        inboxErrorMessage = error.message ?: "파일을 받은 파일로 가져오지 못했습니다.",
+                        inboxErrorMessage = error.message ?: "파일을 폰하드로 가져오지 못했습니다.",
                     )
                 }
             }
@@ -2261,7 +2261,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 var failedCount = 0
                 uris.forEachIndexed { index, uri ->
                     runCatching {
-                        val name = queryName(uri) ?: "받은 파일 ${index + 1}"
+                        val name = queryName(uri) ?: "폰하드 파일 ${index + 1}"
                         application.contentResolver.openInputStream(uri)?.use { input ->
                             inboxStore.import(name, application.contentResolver.getType(uri), input)
                         } ?: error("파일을 열 수 없습니다.")
@@ -2351,7 +2351,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update {
                 it.copy(
                     inboxFiles = files,
-                    message = if (failed == 0) "${deleted}개 파일을 받은 파일에서 삭제했습니다." else null,
+                    message = if (failed == 0) "${deleted}개 파일을 폰하드에서 삭제했습니다." else null,
                     inboxErrorMessage = when {
                         failed == 0 -> null
                         deleted == 0 -> "${failed}개 파일을 삭제하지 못했습니다."
@@ -2372,7 +2372,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         runCatching {
             val sendIntent = NasFinderShareIntentFactory.createMultiple(application, items.map { it.file })
             application.startActivity(
-                Intent.createChooser(sendIntent, "받은 파일 공유")
+                Intent.createChooser(sendIntent, "폰하드 파일 공유")
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }.onFailure { error ->
@@ -2384,7 +2384,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         runCatching {
             val sendIntent = NasFinderShareIntentFactory.create(application, listOf(item.file))
             application.startActivity(
-                Intent.createChooser(sendIntent, "받은 파일 공유")
+                Intent.createChooser(sendIntent, "폰하드 파일 공유")
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }.onFailure { error ->
@@ -2401,7 +2401,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val normalized = InboxBatchContracts.normalizeSelection(ids)
         val available = _state.value.inboxFiles.associateBy(InboxDisplayItem::id)
         return normalized.map { id ->
-            available[id] ?: throw IllegalArgumentException("선택한 받은 파일을 찾을 수 없습니다.")
+            available[id] ?: throw IllegalArgumentException("선택한 폰하드 파일을 찾을 수 없습니다.")
         }
     }
 
@@ -2521,7 +2521,7 @@ internal object AppEntryRouteParser {
         }
         if (query.keys.any { it != "id" }) return AppEntryRoute.Rejected("허용되지 않은 NasFinder 주소입니다.")
         val id = query["id"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-            ?: return AppEntryRoute.Rejected("받은 파일 ID가 올바르지 않습니다.")
+            ?: return AppEntryRoute.Rejected("폰하드 파일 ID가 올바르지 않습니다.")
         return AppEntryRoute.Inbox(id)
     }
 

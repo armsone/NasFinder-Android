@@ -70,7 +70,7 @@ class MainActivity : ComponentActivity() {
                     val entry = incomingIntent.value
                     when (ExternalEntryRouteParser.parse(entry?.action, entry?.dataString)) {
                         ExternalEntryRoute.Inbox -> model.show(Screen.Inbox)
-                        ExternalEntryRoute.WebHard -> model.show(Screen.WebHard)
+                        ExternalEntryRoute.WebHard -> model.show(Screen.Inbox)
                         ExternalEntryRoute.WebBrowser -> model.show(Screen.WebBrowser)
                         ExternalEntryRoute.PassThrough, ExternalEntryRoute.Rejected -> model.handleEntryIntent(entry)
                     }

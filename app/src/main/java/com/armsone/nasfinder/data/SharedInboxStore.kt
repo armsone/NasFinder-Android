@@ -28,7 +28,7 @@ class SharedInboxStore private constructor(
     filesDirectory: File,
     private val hooks: Hooks,
 ) {
-    val rootDirectory: File = File(filesDirectory, DIRECTORY_NAME)
+    val rootDirectory: File = phoneHardRoot(filesDirectory)
     private val manifestFile: File
     @Volatile private var snapshot: List<SharedInboxRecord> = emptyList()
 
@@ -39,12 +39,13 @@ class SharedInboxStore private constructor(
 
     init {
         if (!rootDirectory.exists() && !rootDirectory.mkdirs()) {
-            throw IllegalStateException("받은 파일 저장소를 만들 수 없습니다.")
+            throw IllegalStateException("폰하드 저장소를 만들 수 없습니다.")
         }
         require(rootDirectory.isDirectory && !Files.isSymbolicLink(rootDirectory.toPath())) {
-            "받은 파일 저장소가 안전한 폴더가 아닙니다."
+            "폰하드 저장소가 안전한 폴더가 아닙니다."
         }
         manifestFile = File(rootDirectory, MANIFEST_NAME)
+        if (!manifestFile.exists()) atomicWrite(manifestFile, encodeManifest(emptyList()))
         synchronized(PROCESS_LOCK) { snapshot = readManifest() }
     }
 
@@ -56,10 +57,10 @@ class SharedInboxStore private constructor(
         validateRecord(record)
         val current = readManifest()
         require(current.any { it.id == record.id && it.storedFilename == record.storedFilename }) {
-            "받은 파일 기록이 현재 manifest에 없습니다."
+            "폰하드 파일 기록이 현재 manifest에 없습니다."
         }
         payloadFile(record.storedFilename).also {
-            if (!it.isFile) throw IllegalStateException("받은 파일 payload가 없습니다.")
+            if (!it.isFile) throw IllegalStateException("폰하드 파일 payload가 없습니다.")
         }
     }
 
@@ -72,12 +73,12 @@ class SharedInboxStore private constructor(
     ): SharedInboxRecord = synchronized(PROCESS_LOCK) {
         val current = readManifest()
         val original = safeBasename(originalFilename)
-        val stored = storedFilename(id, original)
-        require(current.none { it.id == id }) { "중복된 받은 파일 UUID입니다." }
-        require(current.none { it.storedFilename == stored }) { "중복된 받은 파일 저장 이름입니다." }
+        val stored = uniqueStoredFilename(original)
+        require(current.none { it.id == id }) { "중복된 폰하드 파일 UUID입니다." }
+        require(current.none { it.storedFilename == stored }) { "중복된 폰하드 파일 저장 이름입니다." }
         val safeMime = validateMimeType(mimeType)
         val destination = payloadFile(stored)
-        require(!destination.exists()) { "받은 파일 payload가 이미 있습니다." }
+        require(!destination.exists()) { "폰하드 파일 payload가 이미 있습니다." }
         val temporary = File(rootDirectory, ".import-$id.tmp")
         var payloadCommitted = false
         try {
@@ -86,7 +87,7 @@ class SharedInboxStore private constructor(
                 output.fd.sync()
                 copied
             }
-            atomicMove(temporary, destination)
+            moveWithoutReplacing(temporary, destination)
             payloadCommitted = true
             val record = SharedInboxRecord(id, original, stored, safeMime, bytes, importedAt)
             val updated = current + record
@@ -107,7 +108,7 @@ class SharedInboxStore private constructor(
         val payload = payloadFile(record.storedFilename)
         if (payload.exists() && !hooks.deletePayload(payload)) {
             snapshot = readManifest()
-            throw IllegalStateException("받은 파일 payload를 삭제하지 못했습니다.")
+            throw IllegalStateException("폰하드 파일 payload를 삭제하지 못했습니다.")
         }
         val updated = current.filterNot { it.id == id }
         try {
@@ -121,18 +122,18 @@ class SharedInboxStore private constructor(
     }
 
     private fun readManifest(): List<SharedInboxRecord> {
-        if (!manifestFile.exists()) return emptyList()
-        if (!manifestFile.isFile) throw IllegalStateException("받은 파일 manifest가 파일이 아닙니다.")
+        if (!manifestFile.exists()) return reconcileManifest(emptyList())
+        if (!manifestFile.isFile) throw IllegalStateException("폰하드 manifest가 파일이 아닙니다.")
         val root = JsonReader(manifestFile.readText(StandardCharsets.UTF_8)).readValue() as? Map<*, *>
-            ?: throw IllegalStateException("받은 파일 manifest 형식이 올바르지 않습니다.")
+            ?: throw IllegalStateException("폰하드 manifest 형식이 올바르지 않습니다.")
         require(root["version"].asLong() == MANIFEST_VERSION.toLong()) { "지원하지 않는 manifest 버전입니다." }
         val values = root["records"] as? List<*>
-            ?: throw IllegalStateException("받은 파일 manifest records가 없습니다.")
+            ?: throw IllegalStateException("폰하드 manifest records가 없습니다.")
         val records = values.map { value ->
-            val item = value as? Map<*, *> ?: throw IllegalStateException("받은 파일 record가 올바르지 않습니다.")
-            val id = item["id"] as? String ?: throw IllegalStateException("받은 파일 UUID가 없습니다.")
+            val item = value as? Map<*, *> ?: throw IllegalStateException("폰하드 record가 올바르지 않습니다.")
+            val id = item["id"] as? String ?: throw IllegalStateException("폰하드 파일 UUID가 없습니다.")
             val importedAt = item["importedAt"] as? String
-                ?: throw IllegalStateException("받은 파일 시각이 없습니다.")
+                ?: throw IllegalStateException("폰하드 파일 시각이 없습니다.")
             SharedInboxRecord(
                 id = UUID.fromString(id),
                 originalFilename = item["originalFilename"] as? String
@@ -144,29 +145,81 @@ class SharedInboxStore private constructor(
                 importedAt = Instant.parse(importedAt),
             ).also(::validateRecord)
         }
-        require(records.map { it.id }.distinct().size == records.size) { "중복된 받은 파일 UUID입니다." }
+        require(records.map { it.id }.distinct().size == records.size) { "중복된 폰하드 파일 UUID입니다." }
         require(records.map { it.storedFilename }.distinct().size == records.size) {
-            "중복된 받은 파일 저장 이름입니다."
+            "중복된 폰하드 파일 저장 이름입니다."
         }
-        return records
+        return reconcileManifest(records)
+    }
+
+    private fun reconcileManifest(records: List<SharedInboxRecord>): List<SharedInboxRecord> {
+        val current = records.filter { record ->
+            record.storedFilename != LEGACY_MANIFEST_NAME &&
+                runCatching { payloadFile(record.storedFilename).exists() }.getOrDefault(false)
+        }.toMutableList()
+        val represented = current.mapTo(hashSetOf()) { it.storedFilename }
+
+        rootDirectory.walkTopDown()
+            .onEnter { directory ->
+                directory == rootDirectory ||
+                    (!directory.name.startsWith('.') && !Files.isSymbolicLink(directory.toPath()))
+            }
+            .filter { file ->
+                file.isFile && !file.name.startsWith('.') &&
+                    file.canonicalFile.relativeTo(rootDirectory.canonicalFile).invariantSeparatorsPath != LEGACY_MANIFEST_NAME &&
+                    !Files.isSymbolicLink(file.toPath())
+            }
+            .forEach { file ->
+                val relative = file.canonicalFile.relativeTo(rootDirectory.canonicalFile)
+                    .invariantSeparatorsPath
+                if (relative !in represented) {
+                    current += SharedInboxRecord(
+                        id = UUID.randomUUID(),
+                        originalFilename = file.name,
+                        storedFilename = relative,
+                        mimeType = null,
+                        byteCount = file.length(),
+                        importedAt = Instant.ofEpochMilli(file.lastModified()),
+                    )
+                    represented += relative
+                }
+            }
+
+        if (current != records) hooks.commitManifest(manifestFile, encodeManifest(current))
+        return current
     }
 
     private fun validateRecord(record: SharedInboxRecord) {
         require(safeBasename(record.originalFilename) == record.originalFilename) { "원본 파일명이 안전하지 않습니다." }
-        require(record.storedFilename == storedFilename(record.id, record.originalFilename)) {
-            "저장 파일명이 UUID/확장자 계약과 맞지 않습니다."
-        }
         payloadFile(record.storedFilename)
         validateMimeType(record.mimeType)
         require(record.byteCount >= 0) { "파일 크기가 올바르지 않습니다." }
     }
 
     private fun payloadFile(storedFilename: String): File {
-        require(storedFilename == storedFilename.substringAfterLast('/') &&
-            storedFilename == storedFilename.substringAfterLast('\\')) { "저장 경로가 안전하지 않습니다." }
-        return File(rootDirectory, storedFilename).canonicalFile.also {
-            require(it.parentFile == rootDirectory.canonicalFile) { "저장 경로가 받은 파일 폴더 밖입니다." }
+        val components = storedFilename.split('/')
+        require(storedFilename.isNotBlank() && '\\' !in storedFilename &&
+            components.all { it.isNotBlank() && it != "." && it != ".." }) {
+            "저장 경로가 안전하지 않습니다."
         }
+        return File(rootDirectory, storedFilename).canonicalFile.also {
+            val rootPath = rootDirectory.canonicalPath.trimEnd(File.separatorChar)
+            require(it.path.startsWith("$rootPath${File.separator}")) {
+                "저장 경로가 폰하드 폴더 밖입니다."
+            }
+        }
+    }
+
+    private fun uniqueStoredFilename(original: String): String {
+        val requested = File(rootDirectory, original)
+        if (!requested.exists()) return original
+        val extension = requested.extension.takeIf(String::isNotEmpty)
+        val stem = if (extension == null) requested.name else requested.name.removeSuffix(".$extension")
+        for (index in 1..9_999) {
+            val candidate = if (extension == null) "$stem ($index)" else "$stem ($index).$extension"
+            if (!File(rootDirectory, candidate).exists()) return candidate
+        }
+        return "${UUID.randomUUID()}-$original"
     }
 
     internal data class Hooks(
@@ -178,26 +231,21 @@ class SharedInboxStore private constructor(
         }
     }
 
-    private companion object {
+    companion object {
         const val DIRECTORY_NAME = "SharedInbox"
-        const val MANIFEST_NAME = "manifest.json"
-        const val MANIFEST_VERSION = 1
-        val PROCESS_LOCK = Any()
+        private const val MANIFEST_NAME = ".nasfinder-manifest.json"
+        internal const val LEGACY_MANIFEST_NAME = "manifest.json"
+        private const val MANIFEST_VERSION = 1
+        private val PROCESS_LOCK = Any()
+
+        internal fun phoneHardRoot(filesDirectory: File): File = File(filesDirectory, DIRECTORY_NAME)
     }
 }
 
 private fun safeBasename(value: String): String {
     val candidate = value.substringAfterLast('/').substringAfterLast('\\').trim()
     return candidate.takeUnless { it.isBlank() || it == "." || it == ".." || it.any(Char::isISOControl) }
-        ?: "받은 파일"
-}
-
-private fun storedFilename(id: UUID, original: String): String {
-    val dot = original.lastIndexOf('.')
-    val extension = if (dot > 0 && dot < original.lastIndex) original.substring(dot + 1) else ""
-    val safeExtension = extension.takeIf { it.length <= 16 && it.all(Char::isLetterOrDigit) }
-        ?.lowercase().orEmpty()
-    return if (safeExtension.isEmpty()) id.toString() else "$id.$safeExtension"
+        ?: "폰하드 파일"
 }
 
 private fun validateMimeType(value: String?): String? {
@@ -264,6 +312,10 @@ private fun atomicMove(source: File, destination: File) {
     } catch (_: AtomicMoveNotSupportedException) {
         Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
     }
+}
+
+private fun moveWithoutReplacing(source: File, destination: File) {
+    Files.move(source.toPath(), destination.toPath())
 }
 
 private fun Any?.asLong(): Long = (this as? Number)?.toLong()
