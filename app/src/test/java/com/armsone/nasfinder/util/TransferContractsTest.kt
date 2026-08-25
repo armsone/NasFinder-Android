@@ -78,6 +78,12 @@ class TransferContractsTest {
         assertNotEquals(first, DownloadCacheContract.key("other", "/photo.jpg", 12, 1_000))
     }
 
+    @Test fun downloadCacheRejectsIncompleteKnownSizeFiles() {
+        assertTrue(DownloadCacheContract.isComplete(64_000, 64_000))
+        assertFalse(DownloadCacheContract.isComplete(65_940, 64_300_000))
+        assertTrue(DownloadCacheContract.isComplete(65_940, 0))
+    }
+
     @Test fun downloadCacheFilenameRemovesTraversalAndHonorsUtf8Limit() {
         assertEquals("passwd", DownloadCacheContract.safeFilename("../../etc/passwd"))
         assertEquals("bad_name_.txt", DownloadCacheContract.safeFilename("bad:name?.txt"))

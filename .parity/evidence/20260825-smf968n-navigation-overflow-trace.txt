@@ -1,0 +1,32 @@
+Device: Samsung SM-F968N, ADB 192.168.0.199:35361
+Build: local debug APK installed after the 2026-08-25 navigation/Overflow changes
+
+Saved connection versus dashboard logo
+1. Input: tap the saved `hastree` connection on the dashboard.
+2. Transition: dashboard -> remote browser.
+3. Observed side effect: browser path is `/` and the root listing contains 9 items.
+4. Input: open `photo`, long-press the browser back control to return to the dashboard, then tap the NasFinder logo.
+5. Transition: dashboard -> remote browser.
+6. Observed side effect: browser path resumes at `/photo`.
+
+Overflow More menu
+1. Input: open the wide Overflow view, then tap the top-right More control.
+2. Transition: the Overflow popup menu opens.
+3. Observed side effect: the menu contains Details, Small thumbnails and Posters together with Light and Dark background choices; Posters and Dark background are selected.
+
+Overflow back long press
+1. Input: dismiss the menu, then press the top-left back control for 700 ms.
+2. Transition: Overflow -> dashboard.
+3. Observed side effect: the dashboard is shown once; no short-tap back action fires afterward.
+
+Overflow system status bar
+1. Input: enter Overflow after installing the status-bar change.
+2. Transition: browser -> immersive Overflow.
+3. Observed side effect: time, network, Wi-Fi and battery icons are absent; Overflow's own back, title and More controls remain visible.
+
+Capture SHA-256
+- saved root: a2020fcdaefe51b9b98cb76256078b74f7713b5d5e5b669edac01692ac12d6f9
+- logo resume: 573e3dd89aca7a274bda2d9e6508562e5ff679e05bf23b0e58354e7808f877fa
+- Overflow menu: 9aabcd606489d8a1b74bcf83d9e4205c601fcef5dff5b505be6ea08413b89c34
+- Overflow long press: afd7ea97e5495b558bd9fe8a7ac602b607781b11e966a444dda373ee4395d2a9
+- Overflow status bar hidden: de905af7569158c94199a2aaaa34302b3b1a2aed3b07653bcfd09d8949dce503

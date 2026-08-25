@@ -77,8 +77,8 @@ data class RemoteFileItem(
             "tif", "tiff", "avif", "svg",
         )
         val VIDEO_EXTENSIONS = setOf(
-            "mp4", "mov", "m4v", "mkv", "avi", "webm", "ts", "mts", "m2ts", "mpeg", "mpg",
-            "3gp", "3g2", "wmv", "flv", "ogv",
+            "3g2", "3gp", "asf", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mpe",
+            "mpeg", "mpg", "mp4", "mts", "ogv", "qt", "ts", "vob", "webm", "wmv",
         )
     }
 }

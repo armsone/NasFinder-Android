@@ -1,5 +1,7 @@
 package com.armsone.nasfinder.network
 
+import com.armsone.nasfinder.model.ConnectionKind
+import com.armsone.nasfinder.model.RemoteConnection
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -10,6 +12,19 @@ import java.nio.ByteBuffer
 import java.util.Base64
 
 class SftpAndSmbPolicyTest {
+    @Test
+    fun `Synology service advertises bounded range streaming`() {
+        val connection = RemoteConnection(name = "NAS", kind = ConnectionKind.SYNOLOGY, host = "nas.test", username = "user")
+        val service = SynologyFileService(connection, "password")
+        assertTrue(service.supportsRangeStreaming)
+    }
+
+    @Test
+    fun `SFTP service does not advertise range streaming until persistent session is supported`() {
+        val connection = RemoteConnection(name = "SFTP", kind = ConnectionKind.SFTP, host = "sftp.test", username = "user")
+        val service = SftpFileService(connection, "password")
+        assertFalse(service.supportsRangeStreaming)
+    }
     @Test
     fun `SFTP credential keeps ordinary values as passwords`() {
         val credential = SftpCredential.parse("  ordinary password  ") as SftpCredential.Password

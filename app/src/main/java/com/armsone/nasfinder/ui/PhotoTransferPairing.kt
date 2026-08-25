@@ -798,7 +798,18 @@ private fun remuxQuickTimeToMp4(context: Context, source: File): ByteArray {
             buffer.clear()
             val sampleSize = extractor.readSampleData(buffer, 0)
             require(sampleSize >= 0) { "Live Photo 영상 샘플을 읽지 못했습니다." }
-            info.set(0, sampleSize, extractor.sampleTime, extractor.sampleFlags)
+            val extractorFlags = extractor.sampleFlags
+            require(extractorFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0) {
+                "암호화된 Live Photo 영상 샘플은 변환할 수 없습니다."
+            }
+            val codecFlags =
+                (if (extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                } else 0) or
+                (if (extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0) {
+                    MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+                } else 0)
+            info.set(0, sampleSize, extractor.sampleTime, codecFlags)
             activeMuxer.writeSampleData(trackMap[trackIndex], buffer, info)
             require(extractor.advance() || extractor.sampleTrackIndex < 0) { "Live Photo 영상 진행에 실패했습니다." }
         }

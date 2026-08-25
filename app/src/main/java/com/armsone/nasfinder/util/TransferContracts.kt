@@ -133,6 +133,9 @@ internal data class WebHardTarget(val route: String, val query: Map<String, Stri
 
 /** Pure filename and identity contract used by DownloadCache. */
 internal object DownloadCacheContract {
+    fun isComplete(actualBytes: Long, expectedBytes: Long): Boolean =
+        expectedBytes <= 0L || actualBytes == expectedBytes
+
     fun key(connectionId: String, path: String, size: Long, modifiedAtEpochMillis: Long): String {
         val value = "$connectionId\u0000$path\u0000$size\u0000$modifiedAtEpochMillis"
         return MessageDigest.getInstance("SHA-256")

@@ -26,6 +26,38 @@ class SuperThumbnailVaultAndSessionTest {
         assertTrue(SuperThumbnailVault.filename(item).matches(Regex("v1-[0-9a-f]{64}\\.jpg")))
     }
 
+    @Test fun vaultFilenameUsesIosUnknownSizeSentinelAndKeepsLegacyAndroidLookup() {
+        val unknown = media("/photos/photo.jpg", size = 0, modifiedAt = Instant.ofEpochMilli(500))
+        val canonical = "v1-a08c1b186cb93cafccda2ba5658212d90b5b013d8398eb25b45058931fc6af19.jpg"
+        val legacy = "v1-aafd20184b6067ea8b6da81ac96207d83b6022131580a12506906dd6be4cbfcc.jpg"
+
+        assertEquals(canonical, SuperThumbnailVault.filename(unknown))
+        assertEquals(listOf(canonical, legacy), SuperThumbnailVault.compatibleFilenames(unknown))
+        assertEquals(
+            listOf(SuperThumbnailVault.filename(unknown.copy(size = 1))),
+            SuperThumbnailVault.compatibleFilenames(unknown.copy(size = 1)),
+        )
+    }
+
+    @Test fun vaultReadsLegacyUnknownSizeEntryWithoutDuplicatingIt() = runBlocking {
+        val unknown = media("/photos/photo.jpg", size = 0, modifiedAt = Instant.ofEpochMilli(500))
+        val names = SuperThumbnailVault.compatibleFilenames(unknown)
+        val validJpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 1, 0xff.toByte(), 0xd9.toByte())
+        val service = FakeVaultService().apply {
+            directories += "/photos"
+            directories += "/photos/${SuperThumbnailVault.DIRECTORY_NAME}"
+            files["/photos/${SuperThumbnailVault.DIRECTORY_NAME}/${names[1]}"] = validJpeg
+        }
+        val vault = SuperThumbnailVault(temporary.newFolder("legacy-restore-work"))
+
+        org.junit.Assert.assertArrayEquals(validJpeg, vault.restoredData(unknown, "/photos", service))
+        val result = vault.storeFolder(listOf(unknown), "/photos", service) { validJpeg }
+
+        assertEquals(setOf(unknown.id), result.storedItemIds)
+        assertFalse(service.files.containsKey("/photos/${SuperThumbnailVault.DIRECTORY_NAME}/${names[0]}"))
+        assertTrue(service.files.containsKey("/photos/${SuperThumbnailVault.DIRECTORY_NAME}/${names[1]}"))
+    }
+
     @Test fun cooperativeNowUploadPublishesImmediatelyAndNeverJoinsFolderBatch() {
         assertEquals(
             SuperThumbnailVaultPublishMode.IMMEDIATE,
@@ -175,6 +207,79 @@ class SuperThumbnailVaultAndSessionTest {
 
         assertEquals(SuperThumbnailCooperativeClaimType.ACQUIRED, reclaimed.type)
         assertNotEquals(first.lease!!.token, reclaimed.lease!!.token)
+    }
+
+    @Test fun vaultRestoredDataReturnsJpegOnHitAndSafelyFallsBackOnMissOrCorrupt() = runBlocking {
+        val service = FakeVaultService().apply { directories += "/photos" }
+        val vault = SuperThumbnailVault(temporary.newFolder("restore-work"))
+        val item = media("/photos/photo.jpg", size = 100, modifiedAt = Instant.ofEpochMilli(500))
+
+        assertNull(vault.restoredData(item, "/photos", service))
+
+        val validJpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 1, 2, 3, 0xff.toByte(), 0xd9.toByte())
+        val storeResult = vault.storeFolder(listOf(item), "/photos", service) { validJpeg }
+        assertEquals(setOf(item.id), storeResult.storedItemIds)
+
+        val restored = vault.restoredData(item, "/photos", service)
+        assertNotNull(restored)
+        org.junit.Assert.assertArrayEquals(validJpeg, restored)
+
+        val changedItem = item.copy(size = 200)
+        assertNull(vault.restoredData(changedItem, "/photos", service))
+    }
+
+    @Test fun vaultFilenameSupportsFolderIdentityAndNfcPrecomposition() {
+        val folder = RemoteFileItem("f1", "photos", "/photos", true)
+        val nfcName = java.text.Normalizer.normalize("한글폴더", java.text.Normalizer.Form.NFC)
+        val nfdName = java.text.Normalizer.normalize("한글폴더", java.text.Normalizer.Form.NFD)
+
+        val folderNfc = RemoteFileItem("f2", nfcName, "/$nfcName", true)
+        val folderNfd = RemoteFileItem("f3", nfdName, "/$nfdName", true)
+
+        assertEquals(SuperThumbnailVault.filename(folderNfc), SuperThumbnailVault.filename(folderNfd))
+        assertTrue(SuperThumbnailVault.filename(folder).startsWith("v1-folder-"))
+        assertTrue(SuperThumbnailVault.filename(folder).endsWith(".jpg"))
+        assertTrue(SuperThumbnailVault.folderEmptyMarkerFilename("photos").startsWith("v1-folder-"))
+        assertTrue(SuperThumbnailVault.folderEmptyMarkerFilename("photos").endsWith(".empty"))
+        assertTrue(SuperThumbnailVault.leaseDirectoryName(folder).startsWith(".claim-v1-folder-"))
+
+        val fileItem = media("/photos/photos.jpg")
+        assertTrue(SuperThumbnailVault.filename(fileItem).startsWith("v1-"))
+        assertFalse(SuperThumbnailVault.filename(fileItem).startsWith("v1-folder-"))
+    }
+
+    @Test fun vaultStoresAndRestoresFolderSuperThumbnailAndEmptyMarker() = runBlocking {
+        val folder = RemoteFileItem("/photos/subfolder", "subfolder", "/photos/subfolder", true)
+        val emptyFolder = RemoteFileItem("/photos/empty", "empty", "/photos/empty", true)
+        val validJpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 1, 2, 3, 0xff.toByte(), 0xd9.toByte())
+
+        val service = FakeVaultService().apply {
+            directories += "/photos"
+            directories += "/photos/subfolder"
+            directories += "/photos/empty"
+        }
+        val vault = SuperThumbnailVault(temporary.newFolder("folder-vault-work"))
+
+        // Store folder thumbnail
+        val stored = vault.storeFolderThumbnail(folder, "/photos", service, validJpeg)
+        assertTrue(stored)
+        val expectedJpegName = SuperThumbnailVault.folderFilename(folder.name)
+        assertTrue(service.files.containsKey("/photos/${SuperThumbnailVault.DIRECTORY_NAME}/$expectedJpegName"))
+
+        // Restore folder thumbnail
+        val restored = vault.restoredData(folder, "/photos", service)
+        assertNotNull(restored)
+        org.junit.Assert.assertArrayEquals(validJpeg, restored)
+
+        // Store folder empty marker
+        val emptyStored = vault.storeFolderEmptyMarker(emptyFolder, "/photos", service)
+        assertTrue(emptyStored)
+        val expectedEmptyName = SuperThumbnailVault.folderEmptyMarkerFilename(emptyFolder.name)
+        assertTrue(service.files.containsKey("/photos/${SuperThumbnailVault.DIRECTORY_NAME}/$expectedEmptyName"))
+
+        // Verify stored items
+        val verified = vault.verifyStoredItemIds(listOf(folder, emptyFolder), "/photos", service)
+        assertEquals(setOf(folder.id, emptyFolder.id), verified)
     }
 
     private fun media(path: String, size: Long = 10, modifiedAt: Instant = Instant.ofEpochMilli(10)) = RemoteFileItem(

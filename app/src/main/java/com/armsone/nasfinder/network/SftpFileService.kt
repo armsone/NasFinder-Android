@@ -39,7 +39,7 @@ class SftpFileService(
     private val connection: RemoteConnection,
     private val credentialValue: String,
 ) : RemoteFileService {
-    override val supportsRangeStreaming: Boolean = true
+    override val supportsRangeStreaming: Boolean = false
 
     override suspend fun testConnection() = withSftp { channel ->
         requireExistingInsideRoot(channel, connection.normalizedRootPath)

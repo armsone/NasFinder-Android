@@ -39,6 +39,8 @@ class ModelsTest {
     @Test fun mediaClassificationIsCaseInsensitive() {
         assertTrue(RemoteFileItem("1", "PHOTO.HEIC", "/PHOTO.HEIC", false).isImage)
         assertTrue(RemoteFileItem("2", "movie.MKV", "/movie.MKV", false).isVideo)
+        assertTrue(RemoteFileItem("3", "legacy.ASF", "/legacy.ASF", false).isVideo)
+        assertTrue(RemoteFileItem("4", "disc.VOB", "/disc.VOB", false).isVideo)
         assertTrue(RemoteFileItem("3", "paper.PDF", "/paper.PDF", false).isPdf)
     }
 }

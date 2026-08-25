@@ -45,7 +45,8 @@ class PhotoTransferExifContractTest {
         assertTrue(source.contains("MediaExtractor()"))
         assertTrue(source.contains("MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4"))
         assertTrue(source.contains("mimeType.startsWith(\"video/\")"))
-        assertTrue(source.contains("info.set(0, sampleSize, extractor.sampleTime, extractor.sampleFlags)"))
+        assertTrue(source.contains("extractorFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0"))
+        assertTrue(source.contains("info.set(0, sampleSize, extractor.sampleTime, codecFlags)"))
         assertTrue(source.contains("activeMuxer.setOrientationHint"))
         assertTrue(source.contains("videoMimeType = \"video/mp4\""))
     }

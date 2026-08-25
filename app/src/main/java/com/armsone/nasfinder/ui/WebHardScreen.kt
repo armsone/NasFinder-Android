@@ -3,7 +3,6 @@
 package com.armsone.nasfinder.ui
 
 import android.content.Intent
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
@@ -33,14 +32,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -506,10 +508,20 @@ fun WebHardScreen(onClose: () -> Unit) {
         mutableStateOf(preferences.getBoolean("cover_flow_dark", false))
     }
     val configuration = LocalConfiguration.current
-    val landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val largeFont = configuration.fontScale >= 1.3f
     val theme = LocalNasFinderTheme.current
-    val showsCoverFlow = layout == WebHardLayout.LARGE && landscape
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current.density
+    var coverFlowSelectedIndex by rememberSaveable(currentPath) { mutableIntStateOf(0) }
+    val wideContent = viewportSize.height > 0 &&
+        viewportSize.width.toFloat() / viewportSize.height >= AdaptiveOverflowPolicy.MIN_LANDSCAPE_ASPECT
+    val showsCoverFlow = layout == WebHardLayout.LARGE &&
+        AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
+            contentWidthDp = viewportSize.width / density,
+            contentHeightDp = viewportSize.height / density,
+            itemCount = fileItems.size,
+            selectionActive = false,
+        )
 
     fun stop() {
         connection.stop()
@@ -560,7 +572,7 @@ fun WebHardScreen(onClose: () -> Unit) {
     }
 
     BackHandler {
-        if (showsCoverFlow && currentPath != "/") navigateUp()
+        if (currentPath != "/") navigateUp()
         else { stop(); onClose() }
     }
 
@@ -575,6 +587,7 @@ fun WebHardScreen(onClose: () -> Unit) {
     LaunchedEffect(currentPath) { thumbnails.clear() }
 
     Scaffold(
+        modifier = Modifier.onSizeChanged { viewportSize = it },
         contentWindowInsets = if (showsCoverFlow) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
             if (!showsCoverFlow) TopAppBar(
@@ -587,7 +600,11 @@ fun WebHardScreen(onClose: () -> Unit) {
                         Text("폰하드")
                     }
                 },
-                navigationIcon = { IconButton(onClick = { stop(); onClose() }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
+                navigationIcon = {
+                    IconButton(onClick = { if (currentPath == "/") { stop(); onClose() } else navigateUp() }) {
+                        Icon(Icons.Default.ArrowBack, if (currentPath == "/") "뒤로" else "상위 폴더")
+                    }
+                },
                 actions = {
                     IconButton(
                         onClick = connection::refreshAddresses,
@@ -602,15 +619,20 @@ fun WebHardScreen(onClose: () -> Unit) {
                 items = fileItems,
                 currentPath = currentPath,
                 usesDarkBackground = coverFlowDark,
+                layout = layout,
+                onSelectLayout = ::selectLayout,
                 store = store,
                 thumbnails = thumbnails,
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 onBack = { if (currentPath == "/") { stop(); onClose() } else navigateUp() },
+                onDashboard = { stop(); onClose() },
                 onToggleBackground = { dark ->
                     coverFlowDark = dark
                     preferences.edit().putBoolean("cover_flow_dark", dark).apply()
                 },
                 onActivate = ::openFolder,
+                initialSelectedIndex = coverFlowSelectedIndex,
+                onSelectedIndexChange = { coverFlowSelectedIndex = it },
             )
         } else {
         LazyColumn(
@@ -651,7 +673,7 @@ fun WebHardScreen(onClose: () -> Unit) {
                 layout == WebHardLayout.LIST -> items(fileItems, key = { it.path }) { item ->
                     WebHardListRow(item, store, thumbnails, onOpen = { openFolder(item) }, onShare = { share(item) }, onDelete = { deleteCandidate = item })
                 }
-                layout == WebHardLayout.LARGE && landscape -> item {
+                layout == WebHardLayout.LARGE && wideContent -> item {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(vertical = 4.dp)) {
                         items(fileItems, key = { it.path }) { item ->
                             WebHardGridCard(item, store, thumbnails, Modifier.width(190.dp), onOpen = { openFolder(item) }, onShare = { share(item) }, onDelete = { deleteCandidate = item })
@@ -688,12 +710,17 @@ private fun WebHardCoverFlow(
     items: List<WebHardFileItem>,
     currentPath: String,
     usesDarkBackground: Boolean,
+    layout: WebHardLayout = WebHardLayout.LARGE,
+    onSelectLayout: (WebHardLayout) -> Unit = {},
     store: WebHardFileStore,
     thumbnails: MutableMap<String, Bitmap>,
     modifier: Modifier = Modifier,
     onBack: () -> Unit,
+    onDashboard: (() -> Unit)? = null,
     onToggleBackground: (Boolean) -> Unit,
     onActivate: (WebHardFileItem) -> Unit,
+    initialSelectedIndex: Int,
+    onSelectedIndexChange: (Int) -> Unit,
 ) {
     val theme = LocalNasFinderTheme.current
     val scope = rememberCoroutineScope()
@@ -711,6 +738,28 @@ private fun WebHardCoverFlow(
             )
         }
     }
+    val webHardViewModes = remember(layout) {
+        listOf(
+            CoverFlowViewModeOption(
+                title = WebHardLayout.LIST.title,
+                selected = layout == WebHardLayout.LIST,
+                icon = Icons.Default.ViewList,
+                onSelect = { onSelectLayout(WebHardLayout.LIST) },
+            ),
+            CoverFlowViewModeOption(
+                title = WebHardLayout.SMALL.title,
+                selected = layout == WebHardLayout.SMALL,
+                icon = Icons.Default.GridView,
+                onSelect = { onSelectLayout(WebHardLayout.SMALL) },
+            ),
+            CoverFlowViewModeOption(
+                title = WebHardLayout.LARGE.title,
+                selected = layout == WebHardLayout.LARGE,
+                icon = Icons.Default.ViewModule,
+                onSelect = { onSelectLayout(WebHardLayout.LARGE) },
+            ),
+        )
+    }
 
     Box(modifier) {
         RemoteBrowserCoverFlow(
@@ -720,8 +769,12 @@ private fun WebHardCoverFlow(
             title = if (currentPath == "/") "폰하드" else currentPath,
             usesDarkBackground = usesDarkBackground,
             onBack = onBack,
+            onDashboard = onDashboard,
+            viewModes = webHardViewModes,
             onToggleBackground = onToggleBackground,
             onActivate = { item -> itemsByPath[item.path]?.let(onActivate) },
+            initialSelectedIndex = initialSelectedIndex,
+            onSelectedIndexChange = onSelectedIndexChange,
             onLoadThumbnail = { item ->
                 val webHardItem = itemsByPath[item.path] ?: return@RemoteBrowserCoverFlow
                 if (requested.add(item.id)) {

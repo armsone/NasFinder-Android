@@ -85,6 +85,7 @@ class RemoteThumbnailRepository(
     private val maxPixelSize: Int = DEFAULT_MAX_PIXEL_SIZE,
     trafficLimits: RemoteThumbnailTrafficLimits = RemoteThumbnailTrafficLimits(),
     private val onCacheCommitted: ((String) -> Unit)? = null,
+    diskCacheDir: File? = null,
 ) : Closeable {
     private val appContext = context.applicationContext
     private val httpClient = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
@@ -97,11 +98,12 @@ class RemoteThumbnailRepository(
     private val negativeUntil = ConcurrentHashMap<String, Long>()
     private val trafficBudget = RemoteThumbnailTrafficBudget(trafficLimits)
     val trafficSnapshot: StateFlow<RemoteThumbnailTrafficSnapshot> = trafficBudget.snapshot.asStateFlow()
+    private val vaultDirectoryCache = RemoteThumbnailVaultDirectoryCache()
     private val memory = WeightedLruCache<String, Bitmap>(MEMORY_CACHE_BYTES) { bitmap ->
         bitmap.allocationByteCount.coerceAtLeast(1).toLong()
     }
     private val disk = ThumbnailDiskCache(
-        File(context.cacheDir, "remote-thumbnails"),
+        diskCacheDir ?: File(context.cacheDir, "remote-thumbnails"),
         RemoteThumbnailCachePolicy.automaticLimitBytes(appContext),
         DISK_MAX_AGE_MILLIS,
         DISK_MAX_FILE_COUNT,
@@ -123,6 +125,7 @@ class RemoteThumbnailRepository(
         memory.clear()
         negativeUntil.clear()
         disk.clear()
+        vaultDirectoryCache.clear()
         return disk.statistics()
     }
 
@@ -216,7 +219,145 @@ class RemoteThumbnailRepository(
     suspend fun resetTrafficBudget(): Boolean = inFlightMutex.withLock {
         if (inFlight.isNotEmpty()) false else {
             trafficBudget.reset()
+            vaultDirectoryCache.clear()
             true
+        }
+    }
+
+    internal suspend fun restoreFromVault(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+    ): Bitmap? {
+        val rootPath = connection.normalizedRootPath
+        val parent = parentDirectory(item.path)
+        val boundary = runCatching { SuperThumbnailTraversal(rootPath, SuperThumbnailBudget()) }.getOrNull()
+            ?: return null
+        val safeParent = runCatching { boundary.requireInsideRoot(parent) }.getOrNull()
+            ?: return null
+        val vaultPath = runCatching { boundary.requireInsideRoot(appendVaultDirectory(safeParent)) }.getOrNull()
+            ?: return null
+
+        val targetFilenames = SuperThumbnailVault.compatibleFilenames(item)
+        val vaultItems = vaultDirectoryCache.listVault(
+            cacheKey = "${connection.id}\u0000$vaultPath",
+            vaultPath = vaultPath,
+            service = activeService,
+            scope = scope,
+        )
+            ?: return null
+        val storedItem = targetFilenames.firstNotNullOfOrNull(vaultItems::get) ?: return null
+
+        val tempFile = disk.temporaryFile("vault-restore")
+        return try {
+            currentCoroutineContext().ensureActive()
+            val downloaded = RemoteThumbnailVaultDownload.download(
+                item = storedItem,
+                destination = tempFile,
+                service = activeService,
+                trafficBudget = trafficBudget,
+                maxBytes = MAX_VAULT_JPEG_BYTES.toLong(),
+            )
+            currentCoroutineContext().ensureActive()
+            if (!downloaded) return null
+            val bytes = tempFile.readBytes()
+            if (!RemoteThumbnailPayloadPolicy.isVaultJpeg(bytes)) return null
+            decodeBounded(tempFile)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (limit: RemoteThumbnailTrafficLimitReached) {
+            throw limit
+        } catch (_: Throwable) {
+            null
+        } finally {
+            tempFile.delete()
+        }
+    }
+
+    internal suspend fun restoreFolderFromVault(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+        key: String,
+    ): Bitmap? {
+        val rootPath = connection.normalizedRootPath
+        val parent = parentDirectory(item.path)
+        val boundary = runCatching { SuperThumbnailTraversal(rootPath, SuperThumbnailBudget()) }.getOrNull()
+            ?: run {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                return null
+            }
+        val safeParent = runCatching { boundary.requireInsideRoot(parent) }.getOrNull()
+            ?: run {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                return null
+            }
+        val vaultPath = runCatching { boundary.requireInsideRoot(appendVaultDirectory(safeParent)) }.getOrNull()
+            ?: run {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                return null
+            }
+
+        val folderJpegName = SuperThumbnailVault.folderFilename(item.name)
+        val folderEmptyName = SuperThumbnailVault.folderEmptyMarkerFilename(item.name)
+        val vaultItems = vaultDirectoryCache.listVault(
+            cacheKey = "${connection.id}\u0000$vaultPath",
+            vaultPath = vaultPath,
+            service = activeService,
+            scope = scope,
+        )
+        if (vaultItems == null) {
+            negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+            return null
+        }
+
+        if (vaultItems.containsKey(folderEmptyName)) {
+            negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.EMPTY_MARKER_NEGATIVE_MILLIS
+            return null
+        }
+
+        val storedItem = vaultItems[folderJpegName]
+        if (storedItem == null) {
+            negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+            return null
+        }
+
+        val tempFile = disk.temporaryFile("vault-folder-restore")
+        return try {
+            currentCoroutineContext().ensureActive()
+            val downloaded = RemoteThumbnailVaultDownload.download(
+                item = storedItem,
+                destination = tempFile,
+                service = activeService,
+                trafficBudget = trafficBudget,
+                maxBytes = MAX_VAULT_JPEG_BYTES.toLong(),
+            )
+            currentCoroutineContext().ensureActive()
+            if (!downloaded) {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                return null
+            }
+            val bytes = tempFile.readBytes()
+            if (!RemoteThumbnailPayloadPolicy.isVaultJpeg(bytes)) {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                return null
+            }
+            val decoded = decodeBounded(tempFile)
+            if (decoded == null) {
+                negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+                null
+            } else {
+                decoded
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (limit: RemoteThumbnailTrafficLimitReached) {
+            throw limit
+        } catch (_: Throwable) {
+            negativeUntil[key] = System.currentTimeMillis() + FolderSuperThumbnailPolicy.MISSING_FOLDER_NEGATIVE_MILLIS
+            null
+        } finally {
+            tempFile.delete()
         }
     }
 
@@ -241,35 +382,52 @@ class RemoteThumbnailRepository(
             currentCoroutineContext().ensureActive()
             val sourcePolicy = RemoteThumbnailFetchPolicy.source(item, activeService.supportsRangeStreaming)
             val bitmap = thumbnailFetchPermits.withPermit { when (sourcePolicy) {
-                RemoteThumbnailSource.SPARSE_VIDEO -> sparseVideoFrame(item, activeService)
-                RemoteThumbnailSource.SERVER_THUMBNAIL -> try {
-                    fetchSource(connection, item, activeService, source, sourcePolicy)
-                    currentCoroutineContext().ensureActive()
-                    decodeBounded(source) ?: throw IOException("썸네일 이미지 형식을 읽지 못했습니다.")
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: RemoteThumbnailTrafficLimitReached) {
-                    throw error
-                } catch (serverError: Throwable) {
-                    // DSM and other backends do not produce previews for every media codec.
-                    // Match the iPhone app: keep the server thumbnail as the first choice,
-                    // then use a bounded sparse video reader (or the bounded image original)
-                    // instead of turning a missing optimized preview into a permanent icon.
-                    source.delete()
-                    when (val fallback = RemoteThumbnailFetchPolicy.fallbackAfterServerFailure(item, activeService.supportsRangeStreaming)) {
-                        RemoteThumbnailSource.SPARSE_VIDEO -> sparseVideoFrame(item, activeService)
-                        RemoteThumbnailSource.ORIGINAL_IMAGE -> {
-                            fetchSource(connection, item, activeService, source, fallback)
-                            currentCoroutineContext().ensureActive()
-                            decodeBounded(source) ?: throw IOException("원격 이미지에서 썸네일을 만들지 못했습니다.", serverError)
-                        }
-                        else -> throw serverError
+                RemoteThumbnailSource.FOLDER_VAULT -> {
+                    restoreFolderFromVault(connection, item, activeService, key)
+                        ?: return null
+                }
+                RemoteThumbnailSource.SPARSE_VIDEO -> {
+                    restoreFromVault(connection, item, activeService)
+                        ?: sparseVideoFrame(item, activeService)
+                }
+                RemoteThumbnailSource.SERVER_THUMBNAIL -> {
+                    var serverResult: Bitmap? = null
+                    var serverError: Throwable? = null
+                    try {
+                        fetchSource(connection, item, activeService, source, sourcePolicy)
+                        currentCoroutineContext().ensureActive()
+                        serverResult = decodeBounded(source)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        serverError = error
+                    } finally {
+                        source.delete()
+                    }
+                    if (serverResult != null) {
+                        serverResult
+                    } else {
+                        restoreFromVault(connection, item, activeService)
+                            ?: if (serverError is RemoteThumbnailTrafficLimitReached) {
+                                throw serverError
+                            } else when (val fallback = RemoteThumbnailFetchPolicy.fallbackAfterServerFailure(item, activeService.supportsRangeStreaming)) {
+                                RemoteThumbnailSource.SPARSE_VIDEO -> sparseVideoFrame(item, activeService)
+                                RemoteThumbnailSource.ORIGINAL_IMAGE -> {
+                                    fetchSource(connection, item, activeService, source, fallback)
+                                    currentCoroutineContext().ensureActive()
+                                    decodeBounded(source) ?: throw IOException("원격 이미지에서 썸네일을 만들지 못했습니다.")
+                                }
+                                else -> throw IOException("썸네일 생성에 실패했습니다.")
+                            }
                     }
                 }
                 RemoteThumbnailSource.ORIGINAL_IMAGE -> {
-                    fetchSource(connection, item, activeService, source, sourcePolicy)
-                    currentCoroutineContext().ensureActive()
-                    decodeBounded(source) ?: throw IOException("썸네일 이미지 형식을 읽지 못했습니다.")
+                    restoreFromVault(connection, item, activeService)
+                        ?: run {
+                            fetchSource(connection, item, activeService, source, sourcePolicy)
+                            currentCoroutineContext().ensureActive()
+                            decodeBounded(source) ?: throw IOException("썸네일 이미지 형식을 읽지 못했습니다.")
+                        }
                 }
                 RemoteThumbnailSource.NONE -> throw IOException("이 파일은 썸네일을 지원하지 않습니다.")
             } }
@@ -464,11 +622,21 @@ class RemoteThumbnailRepository(
         }
     }
 
+    private fun parentDirectory(path: String): String =
+        path.substringBeforeLast('/', "").ifBlank { if (path.startsWith('/')) "/" else "." }
+
+    private fun appendVaultDirectory(parent: String): String = when (parent) {
+        "/" -> "/${SuperThumbnailVault.DIRECTORY_NAME}"
+        "." -> "./${SuperThumbnailVault.DIRECTORY_NAME}"
+        else -> "${parent.trimEnd('/')}/${SuperThumbnailVault.DIRECTORY_NAME}"
+    }
+
     override fun close() {
         synchronized(LIVE_REPOSITORIES) { LIVE_REPOSITORIES -= this }
         scope.cancel()
         memory.clear()
         negativeUntil.clear()
+        vaultDirectoryCache.clear()
     }
 
     private companion object {
@@ -676,13 +844,47 @@ internal class RemoteThumbnailTrafficBudget(private val limits: RemoteThumbnailT
         )
 }
 
-private class RemoteThumbnailTrafficLimitReached : IOException("썸네일 네트워크 예산에 도달했습니다.")
+internal class RemoteThumbnailTrafficLimitReached : IOException("썸네일 네트워크 예산에 도달했습니다.")
 
-internal enum class RemoteThumbnailSource { NONE, SERVER_THUMBNAIL, ORIGINAL_IMAGE, SPARSE_VIDEO }
+internal object RemoteThumbnailVaultDownload {
+    suspend fun download(
+        item: RemoteFileItem,
+        destination: File,
+        service: RemoteFileService,
+        trafficBudget: RemoteThumbnailTrafficBudget,
+        maxBytes: Long,
+    ): Boolean {
+        require(maxBytes > 0)
+        if (item.size > maxBytes) return false
+        val expectedBytes = item.size.takeIf { it > 0 } ?: maxBytes
+        val ticket = trafficBudget.reserve(expectedBytes) ?: throw RemoteThumbnailTrafficLimitReached()
+        var accounted = 0L
+        service.download(item, destination) { completed, _ ->
+            val safeCompleted = completed.coerceAtLeast(0)
+            val delta = (safeCompleted - accounted).coerceAtLeast(0)
+            accounted = maxOf(accounted, safeCompleted)
+            if (delta > 0 && !trafficBudget.recordActual(ticket, delta)) {
+                throw RemoteThumbnailTrafficLimitReached()
+            }
+            if (safeCompleted > maxBytes) {
+                throw IOException("NAS Vault 썸네일이 너무 큽니다.")
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        val remaining = (destination.length() - accounted).coerceAtLeast(0)
+        if (remaining > 0 && !trafficBudget.recordActual(ticket, remaining)) {
+            throw RemoteThumbnailTrafficLimitReached()
+        }
+        currentCoroutineContext().ensureActive()
+        return destination.isFile && destination.length() in 1..maxBytes
+    }
+}
+
+internal enum class RemoteThumbnailSource { NONE, SERVER_THUMBNAIL, ORIGINAL_IMAGE, SPARSE_VIDEO, FOLDER_VAULT }
 
 internal object RemoteThumbnailFetchPolicy {
     fun source(item: RemoteFileItem, supportsRangeStreaming: Boolean = false): RemoteThumbnailSource = when {
-        item.isDirectory -> RemoteThumbnailSource.NONE
+        item.isDirectory -> RemoteThumbnailSource.FOLDER_VAULT
         item.isImage && item.thumbnailUrl != null -> RemoteThumbnailSource.SERVER_THUMBNAIL
         item.isImage -> RemoteThumbnailSource.ORIGINAL_IMAGE
         item.isVideo && item.thumbnailUrl != null -> RemoteThumbnailSource.SERVER_THUMBNAIL
@@ -694,7 +896,7 @@ internal object RemoteThumbnailFetchPolicy {
         item: RemoteFileItem,
         supportsRangeStreaming: Boolean,
     ): RemoteThumbnailSource = when {
-        item.isDirectory -> RemoteThumbnailSource.NONE
+        item.isDirectory -> RemoteThumbnailSource.FOLDER_VAULT
         item.isVideo && supportsRangeStreaming && item.size > 0 -> RemoteThumbnailSource.SPARSE_VIDEO
         item.isImage -> RemoteThumbnailSource.ORIGINAL_IMAGE
         else -> RemoteThumbnailSource.NONE
@@ -890,4 +1092,79 @@ internal class ThumbnailDiskCache(
     }
 
     private companion object { const val CACHE_EXTENSION = "thumb" }
+}
+
+internal class RemoteThumbnailVaultDirectoryCache(
+    private val maxEntries: Int = 128,
+    private val ttlMillis: Long = 30_000L,
+    private val now: () -> Long = System::currentTimeMillis,
+) {
+    private val lock = Any()
+    private val inFlight = mutableMapOf<String, Deferred<Map<String, RemoteFileItem>?>>()
+    private val entries = LinkedHashMap<String, Pair<Long, Map<String, RemoteFileItem>?>>(16, 0.75f, true)
+
+    suspend fun listVault(
+        cacheKey: String,
+        vaultPath: String,
+        service: RemoteFileService,
+        scope: CoroutineScope,
+    ): Map<String, RemoteFileItem>? {
+        val currentNow = now()
+        synchronized(lock) {
+            val cached = entries[cacheKey]
+            if (cached != null && currentNow - cached.first < ttlMillis) {
+                return cached.second
+            }
+        }
+
+        val deferred = synchronized(lock) {
+            val cached = entries[cacheKey]
+            if (cached != null && now() - cached.first < ttlMillis) {
+                return cached.second
+            }
+            inFlight.getOrPut(cacheKey) {
+                scope.async(Dispatchers.IO) {
+                    try {
+                        val items = service.list(vaultPath)
+                        items.filter { !it.isDirectory }.associateBy { it.name }
+                    } catch (cancellation: CancellationException) {
+                        throw cancellation
+                    } catch (_: Throwable) {
+                        null
+                    }
+                }.also { job ->
+                    job.invokeOnCompletion {
+                        synchronized(lock) {
+                            if (inFlight[cacheKey] === job) {
+                                inFlight.remove(cacheKey)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return try {
+            val result = deferred.await()
+            synchronized(lock) {
+                entries[cacheKey] = now() to result
+                while (entries.size > maxEntries) {
+                    entries.remove(entries.entries.first().key)
+                }
+            }
+            result
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        }
+    }
+
+    fun clear() {
+        val running = synchronized(lock) {
+            val list = inFlight.values.toList()
+            inFlight.clear()
+            entries.clear()
+            list
+        }
+        running.forEach { it.cancel() }
+    }
 }

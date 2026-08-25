@@ -1,0 +1,23 @@
+Fixture: remote_media_range_seek_cancel_v1
+Date: 2026-08-25 KST
+Device: SM-F968N, Android real device
+Backend: Synology File Station bounded HTTP range
+Media: MP4 selected from the hastree connection
+
+Observed transition:
+1. Overflow center item activation opened the common video viewer.
+2. Media3 requested the Synology range-backed source; no whole-file cache was created.
+3. Audio playback entered started state at 09:24:37.
+4. Hardware AVC decoder reported continuous 23.98 fps output at 09:24:42, 09:24:47 and 09:24:52.
+5. No Unexpected exception loading stream, InterruptedException, PlaybackException or fatal exception was emitted during the post-fix observation.
+6. The app window filled 2160x1584 and requested non-default visibility for statusBars, navigationBars and captionBar.
+
+Source policy:
+- Playback remote reads are capped at 8 MiB, matching iOS RemoteVideoStreamingReadPolicy.playbackChunkBytes.
+- Consecutive Media3 consumer reads reuse the fetched in-session range.
+- Cancelled/interrupted reads are normalized to InterruptedIOException.
+
+Verification:
+- RemoteRangeMediaSourceTest passed.
+- Full testDebugUnitTest passed.
+- assembleDebug passed and the resulting APK was installed on the device.

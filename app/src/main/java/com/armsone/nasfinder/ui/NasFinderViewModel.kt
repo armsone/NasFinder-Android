@@ -2,15 +2,18 @@ package com.armsone.nasfinder.ui
 
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
+import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkInfo
@@ -50,6 +53,11 @@ import com.armsone.nasfinder.platform.AppIconChangeResult
 import com.armsone.nasfinder.platform.LauncherIconVariant
 import com.armsone.nasfinder.platform.OAuthCallbackActivity
 import com.armsone.nasfinder.platform.OAuthCoordinator
+import com.armsone.nasfinder.googlephotos.GooglePhotosAccountController
+import com.armsone.nasfinder.googlephotos.GooglePhotosContentDownloader
+import com.armsone.nasfinder.googlephotos.GooglePhotosImportCoordinator
+import com.armsone.nasfinder.googlephotos.GooglePhotosImportOutcome
+import com.armsone.nasfinder.googlephotos.GooglePhotosPickerFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +66,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -109,7 +118,13 @@ data class AppState(
     val thumbnailTraffic: RemoteThumbnailTrafficSnapshot = RemoteThumbnailTrafficSnapshot(),
     val thumbnailCacheStatistics: RemoteThumbnailCacheStatistics? = null,
     val screenAwakeMode: ScreenAwakeMode = ScreenAwakeMode.AUTOMATIC,
+    val googlePhotosConnected: Boolean = false,
+    val googlePhotosDisclosureRequired: Boolean = false,
+    val googlePhotosPhase: GooglePhotosPhase = GooglePhotosPhase.IDLE,
+    val googlePhotosImportedCount: Int = 0,
 )
+
+enum class GooglePhotosPhase { IDLE, AUTHORIZING, PREPARING, WAITING_FOR_SELECTION, IMPORTING, FINISHED, CANCELLED, ERROR }
 
 data class SuperThumbnailLocation(
     val connectionId: String,
@@ -175,12 +190,14 @@ data class RemoteDownloadState(
 }
 
 data class ImagePreviewState(
-    val connection: RemoteConnection,
+    val connection: RemoteConnection?,
     val images: List<RemoteFileItem>,
     val index: Int,
     val kind: BuiltInPreviewKind,
     val bitmap: Bitmap? = null,
     val cachedFile: File,
+    val localFiles: List<File> = emptyList(),
+    val remoteStream: RemoteMediaStreamSpec? = null,
     val pdfPageIndex: Int = 0,
     val pdfPageCount: Int = 0,
 )
@@ -198,6 +215,7 @@ sealed interface Screen {
     ) : Screen
     data object Inbox : Screen
     data object PhotoTransfer : Screen
+    data object GooglePhotos : Screen
     data object Settings : Screen
     data object ThumbnailCache : Screen
     data object SuperThumbnail : Screen
@@ -222,6 +240,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var previewRequestGeneration = 0L
     private var previewJob: Job? = null
     private var connectionOpenJob: Job? = null
+    private var googlePhotosJob: Job? = null
+    private val googlePhotosAccount = GooglePhotosAccountController(application)
     private var thumbnailTrafficObservation: Job? = null
     private var superThumbnailObservation: Job? = null
     private var superThumbnailStartJob: Job? = null
@@ -255,6 +275,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             oauthClientIds = CloudOAuthProvider.entries.mapNotNull { provider ->
                 repository.oauthClients.clientId(provider)?.let { provider to it }
             }.toMap(),
+            googlePhotosConnected = googlePhotosAccount.isConnected(),
             oauthConnectedConnectionIds = repository.load().mapNotNull { connection ->
                 connection.id.takeIf { repository.oauthTokens.read(it) != null }
             }.toSet(),
@@ -317,6 +338,95 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
+
+    fun requestGooglePhotosImport() {
+        _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosDisclosureRequired = true, message = null) }
+    }
+
+    fun dismissGooglePhotosDisclosure() {
+        _state.update { it.copy(googlePhotosDisclosureRequired = false) }
+    }
+
+    fun confirmGooglePhotosDisclosure() {
+        _state.update { it.copy(googlePhotosDisclosureRequired = false) }
+        if (_state.value.googlePhotosConnected) startGooglePhotosPicker() else beginGooglePhotosAuthorization()
+    }
+
+    fun beginGooglePhotosAuthorization() {
+        runCatching {
+            val url = googlePhotosAccount.beginAuthorization()
+            application.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.AUTHORIZING, message = null) }
+        }.onFailure { error ->
+            _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google Photos 로그인을 시작하지 못했습니다. Google Drive client ID를 먼저 설정해 주세요.")) }
+        }
+    }
+
+    fun disconnectGooglePhotos() {
+        googlePhotosJob?.cancel()
+        googlePhotosJob = viewModelScope.launch {
+            googlePhotosAccount.disconnect()
+            _state.update { it.copy(googlePhotosConnected = false, googlePhotosPhase = GooglePhotosPhase.IDLE, googlePhotosImportedCount = 0, message = "Google Photos 연결을 해제했습니다.") }
+        }
+    }
+
+    fun cancelGooglePhotosImport() {
+        googlePhotosJob?.cancel()
+        googlePhotosJob = null
+        _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.CANCELLED, message = "Google Photos 가져오기를 취소했습니다.") }
+    }
+
+    fun retryGooglePhotosImport() = startGooglePhotosPicker()
+
+    private fun startGooglePhotosPicker() {
+        googlePhotosJob?.cancel()
+        googlePhotosJob = viewModelScope.launch {
+            var sessionId: String? = null
+            try {
+                _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.PREPARING, googlePhotosImportedCount = 0, message = null) }
+                val picker = googlePhotosAccount.pickerClient()
+                val session = picker.createSession()
+                sessionId = session.id
+                val pickerUri = session.pickerUri?.takeIf { URI(it).scheme == "https" } ?: error("Google Photos 선택 화면 주소가 올바르지 않습니다.")
+                application.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(pickerUri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.WAITING_FOR_SELECTION) }
+                GooglePhotosPickerFlow(picker).awaitSelection(session) { googlePhotosJob?.isActive == true }
+                val items = picker.allMediaItems(session.id)
+                _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.IMPORTING) }
+                val downloader = GooglePhotosContentDownloader()
+                val coordinator = GooglePhotosImportCoordinator(
+                    download = { item ->
+                        val suffix = item.mediaFile?.filename?.substringAfterLast('.', "")?.takeIf { it.length in 1..10 && it.all(Char::isLetterOrDigit) }?.let { ".$it" }.orEmpty()
+                        val target = File(application.cacheDir, "google-photos/${UUID.randomUUID()}$suffix")
+                        downloader.download(picker.contentRequest(item), target)
+                    },
+                    importFile = { file, item ->
+                        try {
+                            file.inputStream().use { input -> inboxStore.import(item.mediaFile?.filename ?: "Google Photos 파일", item.mediaFile?.mimeType, input) }
+                        } finally { file.delete() }
+                    },
+                )
+                val summary = coordinator.import(items)
+                val failed = summary.outcomes.count { it is GooglePhotosImportOutcome.Failed || it is GooglePhotosImportOutcome.Skipped }
+                val files = inboxFiles()
+                _state.update { it.copy(screen = Screen.Inbox, inboxFiles = files, googlePhotosPhase = GooglePhotosPhase.FINISHED, googlePhotosImportedCount = summary.importedCount,
+                    message = if (failed == 0) "Google Photos에서 ${summary.importedCount}개를 폰하드로 가져왔습니다." else "${summary.importedCount}개를 가져왔고 ${failed}개는 가져오지 못했습니다.") }
+                NasFinderAppWidgetProvider.updateAll(application)
+            } catch (_: CancellationException) {
+                _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.CANCELLED) }
+            } catch (error: Throwable) {
+                _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google Photos 가져오기를 완료하지 못했습니다. 다시 시도해 주세요.")) }
+            } finally {
+                sessionId?.let { id -> withContext(NonCancellable) { runCatching { googlePhotosAccount.pickerClient().deleteSession(id) } } }
+            }
+        }
+    }
+
+    private fun safeGooglePhotosMessage(error: Throwable, fallback: String): String = when (error) {
+        is ActivityNotFoundException -> "브라우저를 열 수 없습니다. 브라우저 앱을 확인해 주세요."
+        is com.armsone.nasfinder.googlephotos.GooglePhotosOAuthException.ReauthorizationRequired -> "Google Photos에 다시 로그인해 주세요."
+        else -> fallback
+    }
 
     fun refreshInbox() {
         runCatching { inboxFiles() }.fold(
@@ -1172,8 +1282,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun resumeConnection(connection: RemoteConnection) {
         openConnection(
             connection,
-            repository.lastPath(connection.id) ?: connection.normalizedRootPath,
-            fallbackToRoot = true,
+            connection.normalizedRootPath,
+            fallbackToRoot = false,
         )
     }
 
@@ -1185,7 +1295,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun loadRemoteThumbnail(item: RemoteFileItem) {
-        if (item.isDirectory || (!item.isImage && !item.isVideo)) return
+        if (!item.isDirectory && !item.isImage && !item.isVideo) return
         val browser = _state.value.screen as? Screen.Browser ?: return
         if (browser.items.none { it.id == item.id && it.path == item.path }) return
         val activeService = service ?: return
@@ -1241,23 +1351,39 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    fun selectImagePreviewIndex(targetIndex: Int) {
+        val preview = _state.value.imagePreview ?: return
+        if (preview.images.isEmpty()) return
+        val index = targetIndex.coerceIn(0, preview.images.lastIndex)
+        if (index == preview.index) return
+        val connection = preview.connection
+        if (connection != null) {
+            prepareRemoteFile(
+                item = preview.images[index],
+                action = RemoteFileAction.PREVIEW,
+                connection = connection,
+                imageSequence = preview.images,
+            )
+        } else {
+            prepareLocalPreview(preview.images, preview.localFiles, index)
+        }
+    }
+
     fun moveImagePreview(offset: Int) {
         val preview = _state.value.imagePreview ?: return
-        if (preview.kind != BuiltInPreviewKind.IMAGE) return
-        val targetIndex = (preview.index + offset).coerceIn(0, preview.images.lastIndex)
-        if (targetIndex == preview.index) return
-        prepareRemoteFile(
-            item = preview.images[targetIndex],
-            action = RemoteFileAction.PREVIEW,
-            connection = preview.connection,
-            imageSequence = preview.images,
-        )
+        selectImagePreviewIndex(preview.index + offset)
     }
 
     fun shareImagePreview() {
         val preview = _state.value.imagePreview ?: return
+        val item = preview.images.getOrNull(preview.index) ?: return
+        preview.remoteStream?.let {
+            val connection = preview.connection ?: return
+            prepareRemoteFile(item, RemoteFileAction.SHARE, connection = connection)
+            return
+        }
         runCatching {
-            launchPreparedFile(preview.images[preview.index], preview.cachedFile, RemoteFileAction.SHARE)
+            launchPreparedFile(item, preview.cachedFile, RemoteFileAction.SHARE)
         }.onFailure { error ->
             _state.update { it.copy(message = error.message ?: "이미지를 공유할 수 없습니다.") }
         }
@@ -1285,7 +1411,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun fallbackPreviewToExternal() {
         val preview = _state.value.imagePreview ?: return
-        val item = preview.images[preview.index]
+        val item = preview.images.getOrNull(preview.index) ?: return
+        val connection = preview.connection
+        if (preview.remoteStream != null && connection != null) {
+            invalidateImagePreviewRequests()
+            prepareRemoteFile(item, RemoteFileAction.PREVIEW, connection = connection, forceExternal = true)
+            return
+        }
         val file = preview.cachedFile
         invalidateImagePreviewRequests()
         runCatching { launchPreparedFile(item, file, RemoteFileAction.PREVIEW) }
@@ -1782,6 +1914,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         action: RemoteFileAction,
         connection: RemoteConnection? = null,
         imageSequence: List<RemoteFileItem>? = null,
+        forceExternal: Boolean = false,
     ) {
         val browser = _state.value.screen as? Screen.Browser
         val activeConnection = connection ?: browser?.connection ?: return
@@ -1797,13 +1930,39 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
         val previewKind = item.builtInPreviewKind()
         val internalPreview = action == RemoteFileAction.PREVIEW && previewKind != null
-        val previewImages = if (internalPreview && previewKind == BuiltInPreviewKind.IMAGE) {
-            imageSequence ?: browser?.items?.filter { !it.isDirectory && it.isImage }.orEmpty()
+        val previewImages = if (internalPreview) {
+            imageSequence ?: browser?.items
+                ?.filter { candidate -> !candidate.isDirectory && candidate.builtInPreviewKind() != null }
+                .orEmpty()
                 .ifEmpty { listOf(item) }
-        } else if (internalPreview) listOf(item) else emptyList()
+        } else emptyList()
         val previewIndex = previewImages.indexOfFirst { it.id == item.id && it.path == item.path }
             .takeIf { it >= 0 } ?: 0
-        val requestGeneration = if (internalPreview) {
+        val mediaRoute = if (previewKind in setOf(BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO)) {
+            RemoteMediaRoutePolicy.route(item.name, activeService.supportsRangeStreaming && item.size > 0)
+        } else null
+        if (!forceExternal && internalPreview && mediaRoute == RemoteMediaRoute.RANGE_MEDIA3) {
+            previewJob?.cancel()
+            ++previewRequestGeneration
+            val subtitle = RemoteSubtitlePolicy.match(item, browser?.items.orEmpty())
+            _state.update {
+                it.copy(
+                    message = null,
+                    download = null,
+                    imagePreview = ImagePreviewState(
+                        connection = activeConnection,
+                        images = previewImages,
+                        index = previewIndex,
+                        kind = previewKind!!,
+                        cachedFile = File(application.cacheDir, "remote-stream-${item.id}"),
+                        remoteStream = RemoteMediaStreamSpec(item, subtitle, activeService),
+                    ),
+                )
+            }
+            return
+        }
+        val usesInternalDownloadedPreview = internalPreview && !forceExternal && mediaRoute != RemoteMediaRoute.EXTERNAL_PLAYER
+        val requestGeneration = if (usesInternalDownloadedPreview) {
             previewJob?.cancel()
             ++previewRequestGeneration
         } else 0L
@@ -1828,7 +1987,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             ?: item.size.takeIf { it > 0 }
                             ?: 0L
                         _state.update { current ->
-                            if (internalPreview && requestGeneration != previewRequestGeneration) return@update current
+                            if (usesInternalDownloadedPreview && requestGeneration != previewRequestGeneration) return@update current
                             current.copy(
                                 download = current.download?.copy(
                                     completedBytes = completed.coerceAtLeast(0),
@@ -1842,16 +2001,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     },
                 )
             }.onSuccess { file ->
-                if (internalPreview) {
+                if (usesInternalDownloadedPreview) {
                     if (requestGeneration != previewRequestGeneration) return@onSuccess
-                    val decoded = withContext(Dispatchers.IO) {
-                        when (previewKind) {
-                            BuiltInPreviewKind.IMAGE -> decodePreviewBitmap(file)?.let { PreviewDecode(it) }
-                            BuiltInPreviewKind.PDF -> renderPdfPage(file, 0)?.let { PreviewDecode(it.first, it.second) }
-                            BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> if (validateMedia(file)) PreviewDecode() else null
-                            null -> null
-                        }
-                    }
+                    val decoded = withContext(Dispatchers.IO) { decodeBuiltInPreview(file, previewKind) }
                     if (requestGeneration != previewRequestGeneration) return@onSuccess
                     if (decoded != null) {
                         _state.update {
@@ -1861,7 +2013,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                     connection = activeConnection,
                                     images = previewImages,
                                     index = previewIndex,
-                                    kind = previewKind!!,
+                                    kind = previewKind,
                                     bitmap = decoded.bitmap,
                                     cachedFile = file,
                                     pdfPageCount = decoded.pageCount,
@@ -1883,7 +2035,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         }
                 }
             }.onFailure { error ->
-                if (internalPreview && requestGeneration != previewRequestGeneration) return@onFailure
+                if (usesInternalDownloadedPreview && requestGeneration != previewRequestGeneration) return@onFailure
                 _state.update {
                     it.copy(
                         download = null,
@@ -1892,17 +2044,61 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 }
             }
         }
-        if (internalPreview) previewJob = job
+        if (usesInternalDownloadedPreview) previewJob = job
     }
 
     private data class PreviewDecode(val bitmap: Bitmap? = null, val pageCount: Int = 0)
 
-    private fun RemoteFileItem.builtInPreviewKind(): BuiltInPreviewKind? = when {
-        isImage -> BuiltInPreviewKind.IMAGE
-        isVideo -> BuiltInPreviewKind.VIDEO
-        isPdf -> BuiltInPreviewKind.PDF
-        extension in setOf("mp3", "m4a", "aac", "wav", "ogg", "oga", "flac", "opus", "amr") -> BuiltInPreviewKind.AUDIO
-        else -> null
+    private fun RemoteFileItem.builtInPreviewKind(): BuiltInPreviewKind? =
+        BuiltInPreviewPolicy.kind(name, mimeType)
+
+    private fun prepareLocalPreview(
+        items: List<RemoteFileItem>,
+        files: List<File>,
+        index: Int,
+    ) {
+        val item = items.getOrNull(index) ?: return
+        val file = files.getOrNull(index)?.takeIf(File::isFile) ?: run {
+            _state.update { it.copy(inboxErrorMessage = "폰하드 파일을 찾을 수 없습니다.") }
+            return
+        }
+        val kind = item.builtInPreviewKind() ?: run {
+            runCatching { launchPreparedFile(item, file, RemoteFileAction.PREVIEW) }
+                .onFailure { error -> _state.update { it.copy(inboxErrorMessage = error.message ?: "파일을 열 수 없습니다.") } }
+            return
+        }
+        val requestGeneration = ++previewRequestGeneration
+        previewJob?.cancel()
+        previewJob = viewModelScope.launch {
+            val decoded = withContext(Dispatchers.IO) { decodeBuiltInPreview(file, kind) }
+            if (requestGeneration != previewRequestGeneration) return@launch
+            if (decoded == null) {
+                runCatching { launchPreparedFile(item, file, RemoteFileAction.PREVIEW) }
+                    .onFailure { error -> _state.update { it.copy(inboxErrorMessage = error.message ?: "파일을 열 수 없습니다.") } }
+                return@launch
+            }
+            _state.update {
+                it.copy(
+                    inboxErrorMessage = null,
+                    imagePreview = ImagePreviewState(
+                        connection = null,
+                        images = items,
+                        index = index,
+                        kind = kind,
+                        bitmap = decoded.bitmap,
+                        cachedFile = file,
+                        localFiles = files,
+                        pdfPageCount = decoded.pageCount,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun decodeBuiltInPreview(file: File, kind: BuiltInPreviewKind): PreviewDecode? = when (kind) {
+        BuiltInPreviewKind.IMAGE -> decodePreviewBitmap(file)?.let { PreviewDecode(it) }
+        BuiltInPreviewKind.PDF -> renderPdfPage(file, 0)?.let { PreviewDecode(it.first, it.second) }
+        BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> if (validateMedia(file)) PreviewDecode() else null
     }
 
     private fun validateMedia(file: File): Boolean = runCatching {
@@ -1941,10 +2137,26 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
         var sample = 1
         while (bounds.outWidth / sample > 4096 || bounds.outHeight / sample > 4096) sample *= 2
-        BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply {
+        val decoded = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
-        })
+        }) ?: return@runCatching null
+        val orientation = runCatching {
+            ExifInterface(file).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL,
+            )
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+        val transform = exifPixelTransform(orientation)
+        if (transform == ExifPixelTransform.NORMAL) decoded else {
+            val matrix = Matrix().apply {
+                if (transform.rotationDegrees != 0f) postRotate(transform.rotationDegrees)
+                if (transform.mirrorHorizontal) postScale(-1f, 1f)
+            }
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
+                if (it !== decoded) decoded.recycle()
+            }
+        }
     }.getOrNull()
 
     private fun launchPreparedFile(item: RemoteFileItem, file: File, action: RemoteFileAction) {
@@ -1967,14 +2179,21 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     clipData = ClipData.newUri(application.contentResolver, file.name, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                if (viewIntent.resolveActivity(application.packageManager) == null) {
+                val self = ComponentName(application, com.armsone.nasfinder.MainActivity::class.java)
+                val hasExternalHandler = application.packageManager
+                    .queryIntentActivities(viewIntent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+                    .any { info -> ComponentName(info.activityInfo.packageName, info.activityInfo.name) != self }
+                if (!hasExternalHandler) {
                     throw IllegalStateException("이 파일 형식을 열 수 있는 앱이 설치되어 있지 않습니다.")
                 }
                 try {
-                    application.startActivity(
-                        Intent.createChooser(viewIntent, "${item.name} 열기")
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    )
+                    val chooser = Intent.createChooser(viewIntent, "${item.name} 열기")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .putExtra(
+                            Intent.EXTRA_EXCLUDE_COMPONENTS,
+                            arrayOf(self),
+                        )
+                    application.startActivity(chooser)
                 } catch (_: ActivityNotFoundException) {
                     throw IllegalStateException("이 파일 형식을 열 수 있는 앱이 설치되어 있지 않습니다.")
                 }
@@ -2144,6 +2363,18 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         if (incoming.hasExtra(OAuthCallbackActivity.EXTRA_OAUTH_SUCCEEDED)) {
             val succeeded = incoming.getBooleanExtra(OAuthCallbackActivity.EXTRA_OAUTH_SUCCEEDED, false)
+            if (incoming.getBooleanExtra(OAuthCallbackActivity.EXTRA_GOOGLE_PHOTOS_CALLBACK, false)) {
+                _state.update {
+                    it.copy(
+                        screen = Screen.GooglePhotos,
+                        googlePhotosConnected = succeeded && googlePhotosAccount.isConnected(),
+                        googlePhotosPhase = if (succeeded) GooglePhotosPhase.IDLE else GooglePhotosPhase.ERROR,
+                        message = if (succeeded) "Google Photos 연결이 완료되었습니다. 사진 선택을 시작해 주세요."
+                        else "Google Photos 로그인이 취소되었거나 완료되지 않았습니다.",
+                    )
+                }
+                return
+            }
             val pendingConnectionId = _state.value.oauthPendingConnectionId
             val connectedIds = _state.value.connections.mapNotNull { connection ->
                 connection.id.takeIf { repository.oauthTokens.read(it) != null }
@@ -2205,8 +2436,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 runCatching {
                     val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')
                         ?.takeIf { it.isNotBlank() } ?: "폰하드 파일"
+                    val mimeType = application.contentResolver.getType(uri)
+                    require(BuiltInPreviewPolicy.kind(name, mimeType) != null) {
+                        "NasFinder 내장 뷰어가 지원하지 않는 파일입니다."
+                    }
                     application.contentResolver.openInputStream(uri)?.use { input ->
-                        inboxStore.import(name, application.contentResolver.getType(uri), input)
+                        inboxStore.import(name, mimeType, input)
                     } ?: error("파일을 열 수 없습니다.")
                 }
             }
@@ -2221,6 +2456,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         inboxErrorMessage = null,
                     )
                 }
+                selected?.let(::previewInboxFile)
                 NasFinderAppWidgetProvider.updateAll(application)
             }.onFailure { error ->
                 _state.update {
@@ -2310,25 +2546,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun previewInboxFile(item: InboxDisplayItem) {
-        val remoteItem = RemoteFileItem(
-            id = item.id.toString(),
-            name = item.originalFilename,
-            path = item.id.toString(),
-            isDirectory = false,
-            size = item.byteCount,
-            modifiedAt = item.importedAt,
-            mimeType = item.mimeType,
-        )
-        runCatching { launchPreparedFile(remoteItem, item.file, RemoteFileAction.PREVIEW) }
-            .onFailure { error ->
-                _state.update {
-                    it.copy(
-                        message = null,
-                        inboxErrorMessage = error.message ?: "파일을 열 수 없습니다.",
-                    )
+        val supported = _state.value.inboxFiles.mapNotNull { candidate ->
+            val remote = candidate.asPreviewItem()
+            if (remote.builtInPreviewKind() == null) null else remote to candidate.file
+        }
+        val index = supported.indexOfFirst { (remote, _) -> remote.id == item.id.toString() }
+        if (index >= 0) {
+            prepareLocalPreview(supported.map { it.first }, supported.map { it.second }, index)
+        } else {
+            val remote = item.asPreviewItem()
+            runCatching { launchPreparedFile(remote, item.file, RemoteFileAction.PREVIEW) }
+                .onFailure { error ->
+                    _state.update { it.copy(message = null, inboxErrorMessage = error.message ?: "파일을 열 수 없습니다.") }
                 }
-            }
+        }
     }
+
+    private fun InboxDisplayItem.asPreviewItem() = RemoteFileItem(
+        id = id.toString(),
+        name = originalFilename,
+        path = id.toString(),
+        isDirectory = false,
+        size = byteCount,
+        modifiedAt = importedAt,
+        mimeType = mimeType,
+    )
 
     fun deleteInboxFiles(ids: Iterable<UUID>) {
         val selected = runCatching { InboxBatchContracts.normalizeSelection(ids) }.getOrElse { error ->

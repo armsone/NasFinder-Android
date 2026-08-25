@@ -41,11 +41,13 @@ internal object SuperThumbnailEligibility {
     private const val SERVER_THUMBNAIL_ESTIMATE = 512L * 1024L
     private const val UNKNOWN_IMAGE_ESTIMATE = 4L * 1024L * 1024L
     private const val SPARSE_VIDEO_ESTIMATE = 8L * 1024L * 1024L
+    private const val FOLDER_ESTIMATE = 256L * 1024L
 
     /** Returns a bounded traffic estimate, or null when the repository cannot load the item. */
     fun estimatedBytes(item: RemoteFileItem, supportsRangeStreaming: Boolean): Long? =
         when (RemoteThumbnailFetchPolicy.source(item, supportsRangeStreaming)) {
             RemoteThumbnailSource.NONE -> null
+            RemoteThumbnailSource.FOLDER_VAULT -> FOLDER_ESTIMATE
             RemoteThumbnailSource.SERVER_THUMBNAIL -> SERVER_THUMBNAIL_ESTIMATE
             RemoteThumbnailSource.ORIGINAL_IMAGE -> item.size.takeIf { it > 0 } ?: UNKNOWN_IMAGE_ESTIMATE
             RemoteThumbnailSource.SPARSE_VIDEO -> minOf(item.size, SPARSE_VIDEO_ESTIMATE).coerceAtLeast(1L)

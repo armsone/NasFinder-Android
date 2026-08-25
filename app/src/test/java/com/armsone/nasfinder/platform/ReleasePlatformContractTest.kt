@@ -142,12 +142,36 @@ class ReleasePlatformContractTest {
         assertEquals("singleTask", main.android("launchMode"))
         val filters = main.getElementsByTagName("intent-filter").elements()
         assertTrue(filters.all { it.android("priority").isBlank() })
+        val viewMimeTypes = filters.filter { filter ->
+            filter.getElementsByTagName("action").elements()
+                .any { it.android("name") == "android.intent.action.VIEW" }
+        }.flatMap { filter -> filter.getElementsByTagName("data").elements() }
+            .mapNotNull { it.android("mimeType").takeIf(String::isNotBlank) }
+            .toSet()
+        assertFalse("*/*" in viewMimeTypes)
+        assertTrue("application/pdf" in viewMimeTypes)
+        assertTrue("video/mp4" in viewMimeTypes)
+        assertTrue("audio/mpeg" in viewMimeTypes)
         val nasFinderHosts = filters.flatMap { filter ->
             filter.getElementsByTagName("data").elements()
                 .filter { it.android("scheme") == "nasfinder" }
                 .map { it.android("host") }
         }.toSet()
         assertEquals(setOf("inbox", "webhard", "browser"), nasFinderHosts)
+    }
+
+    @Test fun `external file integration is package neutral and excludes only recursive self fallback`() {
+        val sources = listOf(
+            sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt"),
+            sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt"),
+            sourceFile("app/src/main/java/com/armsone/nasfinder/platform/NasFinderShareIntentFactory.kt"),
+        ).joinToString("\n") { it.readText() }
+        assertFalse(sources.contains("setPackage("))
+        assertFalse(sources.contains("com.lonelycatgames"))
+        assertFalse(sources.contains("cx.file"))
+        assertTrue(sources.contains("Intent.EXTRA_EXCLUDE_COMPONENTS"))
+        assertTrue(sources.contains("ComponentName(application, com.armsone.nasfinder.MainActivity::class.java)"))
+        assertTrue(sources.contains("queryIntentActivities(viewIntent"))
     }
 
     @Test

@@ -1,13 +1,17 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+)
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 
 package com.armsone.nasfinder.ui
 
-import android.widget.VideoView
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.res.Configuration
 import android.media.AudioManager
 import android.os.BatteryManager
 import android.net.ConnectivityManager
@@ -32,9 +36,23 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
+import kotlin.math.hypot
+import kotlin.math.roundToInt
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -55,8 +73,11 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -75,6 +96,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
@@ -86,6 +108,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
@@ -93,7 +116,19 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.ui.PlayerView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -127,6 +162,15 @@ import kotlinx.coroutines.withContext
 @Composable
 fun NasFinderApp(model: NasFinderViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
+    var showBusyOverlay by remember { mutableStateOf(false) }
+    LaunchedEffect(state.isBusy) {
+        if (state.isBusy) {
+            delay(180)
+            showBusyOverlay = true
+        } else {
+            showBusyOverlay = false
+        }
+    }
     val hostView = LocalView.current
     val hasActiveWork = state.isBusy || state.download != null || state.pendingInboxUpload?.isUploading == true ||
         state.pendingLocalUpload?.isUploading == true ||
@@ -140,6 +184,12 @@ fun NasFinderApp(model: NasFinderViewModel) {
     }
     val webBrowserSession = remember { WebBrowserSessionController() }
     DisposableEffect(webBrowserSession) { onDispose(webBrowserSession::close) }
+    BackHandler(enabled = state.imagePreview != null) {
+        model.closeImagePreview()
+    }
+    BackHandler(enabled = state.imagePreview == null && state.screen != Screen.Dashboard) {
+        model.show(Screen.Dashboard)
+    }
     NasFinderTheme(state.theme) {
         Box(Modifier.fillMaxSize().background(skyBrush(state.theme))) {
             SkyThemeDecoration(state.theme)
@@ -151,6 +201,7 @@ fun NasFinderApp(model: NasFinderViewModel) {
                 Screen.PhotoTransfer -> PhotoTransferScreen(
                     onBack = { model.show(Screen.Dashboard) },
                 )
+                Screen.GooglePhotos -> GooglePhotosScreen(state, model)
                 Screen.Settings -> SettingsScreen(state, model)
                 Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
                 Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
@@ -183,28 +234,30 @@ fun NasFinderApp(model: NasFinderViewModel) {
                     onShare = model::shareImagePreview,
                     onPrevious = { model.moveImagePreview(-1) },
                     onNext = { model.moveImagePreview(1) },
+                    onSelectIndex = model::selectImagePreviewIndex,
                     onPreviousPdfPage = { model.movePdfPreview(-1) },
                     onNextPdfPage = { model.movePdfPreview(1) },
                     onPlaybackFailure = model::fallbackPreviewToExternal,
                 )
             }
-            if (state.isBusy) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .18f)), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-            state.download?.let { download ->
-                DownloadProgressBanner(
-                    download = download,
-                    modifier = Modifier.align(Alignment.BottomCenter),
+            if (showBusyOverlay) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(2.dp).align(Alignment.TopCenter),
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = .42f),
+                    trackColor = Color.Transparent,
                 )
+            }
+            state.download?.let { download ->
+                if (download.action == RemoteFileAction.PREVIEW) {
+                    PreviewLoadProgressStrip(download, Modifier.align(Alignment.BottomCenter))
+                } else {
+                    DownloadProgressBanner(download, Modifier.align(Alignment.BottomCenter))
+                }
             }
         }
         state.message?.let { message ->
             AlertDialog(onDismissRequest = model::dismissMessage, confirmButton = { TextButton(onClick = model::dismissMessage) { Text("확인") } }, title = { Text("알림") }, text = { Text(message) })
         }
-    }
-    BackHandler(enabled = state.imagePreview != null) {
-        model.closeImagePreview()
-    }
-    BackHandler(enabled = state.imagePreview == null && state.screen != Screen.Dashboard) {
-        model.show(Screen.Dashboard)
     }
 }
 
@@ -347,6 +400,12 @@ private fun rememberTouchExplorationEnabled(): Boolean {
     return enabled
 }
 
+private tailrec fun Context.findHostActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findHostActivity()
+    else -> null
+}
+
 @Composable
 private fun BuiltInPreviewScreen(
     preview: ImagePreviewState,
@@ -354,76 +413,256 @@ private fun BuiltInPreviewScreen(
     onShare: () -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
+    onSelectIndex: (Int) -> Unit,
     onPreviousPdfPage: () -> Unit,
     onNextPdfPage: () -> Unit,
     onPlaybackFailure: () -> Unit,
 ) {
     BackHandler(onBack = onClose)
+    val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
+    val hostView = LocalView.current
     val touchExploration = rememberTouchExplorationEnabled()
-    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    var controlsVisible by rememberSaveable(preview.connection.id) { mutableStateOf(true) }
-    var controlInteraction by remember(preview.connection.id) { mutableIntStateOf(0) }
-    var slideshowPlaying by rememberSaveable(preview.connection.id) { mutableStateOf(false) }
+    val edgeToEdgePreview = preview.kind == BuiltInPreviewKind.IMAGE || preview.kind == BuiltInPreviewKind.VIDEO
+    val previewSourceKey = preview.connection?.id ?: "phonehard"
+    var playbackMode by rememberSaveable(previewSourceKey) {
+        mutableStateOf(MediaViewerPreferences.getPlaybackMode(context))
+    }
+    var slideshowInterval by rememberSaveable(previewSourceKey) {
+        mutableIntStateOf(MediaViewerPreferences.getSlideshowInterval(context))
+    }
+    var controlsVisible by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
+    var controlInteraction by remember(previewSourceKey) { mutableIntStateOf(0) }
+    var slideshowPlaying by rememberSaveable(previewSourceKey) { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+
     fun revealControls() { controlsVisible = true; controlInteraction++ }
+
+    LaunchedEffect(Unit) {
+        runCatching { focusRequester.requestFocus() }
+    }
+
+    val activeKeepAwake = slideshowPlaying || (preview.kind == BuiltInPreviewKind.VIDEO)
+    DisposableEffect(hostView, activeKeepAwake) {
+        if (activeKeepAwake) {
+            val previous = hostView.keepScreenOn
+            hostView.keepScreenOn = true
+            onDispose { hostView.keepScreenOn = previous }
+        } else {
+            onDispose { }
+        }
+    }
+
+    DisposableEffect(context, hostView, preview.kind) {
+        if (preview.kind == BuiltInPreviewKind.IMAGE || preview.kind == BuiltInPreviewKind.VIDEO) {
+            val window = context.findHostActivity()?.window
+            val insetsController = window?.let { WindowInsetsControllerCompat(it, hostView) }
+            val hiddenInsets = if (preview.kind == BuiltInPreviewKind.VIDEO) {
+                WindowInsetsCompat.Type.systemBars()
+            } else {
+                WindowInsetsCompat.Type.statusBars()
+            }
+            insetsController?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController?.hide(hiddenInsets)
+            onDispose { insetsController?.show(hiddenInsets) }
+        } else {
+            onDispose { }
+        }
+    }
+
     LaunchedEffect(preview.cachedFile.absolutePath, controlsVisible, controlInteraction) {
         if (controlsVisible && !touchExploration) { delay(2_500); controlsVisible = false }
     }
-    LaunchedEffect(preview.index, slideshowPlaying) {
+
+    LaunchedEffect(preview.index, slideshowPlaying, slideshowInterval, playbackMode) {
         if (slideshowPlaying && preview.kind == BuiltInPreviewKind.IMAGE) {
-            delay(3_000)
-            if (preview.index < preview.images.lastIndex) onNext() else slideshowPlaying = false
+            delay(slideshowInterval * 1000L)
+            val nextIdx = MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)
+            if (preview.images.size > 1 || playbackMode == MediaPlaybackMode.ONE_REPEAT) {
+                onSelectIndex(nextIdx)
+            } else {
+                slideshowPlaying = false
+            }
         }
     }
+
     Scaffold(
         containerColor = Color.Black,
         topBar = {
             if (controlsVisible) {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(preview.images[preview.index].name, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        when {
-                            preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1 -> Text("${preview.index + 1} / ${preview.images.size}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
-                            preview.kind == BuiltInPreviewKind.PDF -> Text("${preview.pdfPageIndex + 1} / ${preview.pdfPageCount}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text(preview.images[preview.index].name, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            when {
+                                preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1 -> {
+                                    Text(
+                                        "${preview.index + 1} / ${preview.images.size} • ${playbackMode.title} • ${slideshowInterval}초",
+                                        color = Color.White.copy(alpha = .68f),
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                }
+                                preview.kind == BuiltInPreviewKind.PDF -> {
+                                    Text("${preview.pdfPageIndex + 1} / ${preview.pdfPageCount}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
                         }
-                    }
-                },
-                navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.Default.Close, "닫기", tint = Color.White) } },
-                actions = { IconButton(onClick = onShare) { Icon(Icons.Default.Share, "공유", tint = Color.White) } },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Black),
-            )
-            } else Spacer(Modifier.height(64.dp).fillMaxWidth().background(Color.Black))
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onClose) {
+                            Icon(Icons.Default.Close, "닫기", tint = Color.White)
+                        }
+                    },
+                    actions = {
+                        if (preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+                            IconButton(
+                                onClick = {
+                                    val nextMode = playbackMode.next()
+                                    playbackMode = nextMode
+                                    MediaViewerPreferences.setPlaybackMode(context, nextMode)
+                                    revealControls()
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = when (playbackMode) {
+                                        MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
+                                        MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
+                                        MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                                    },
+                                    contentDescription = "재생 모드: ${playbackMode.title}",
+                                    tint = Color.White,
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    val nextSec = MediaSlideshowPolicy.nextInterval(slideshowInterval)
+                                    slideshowInterval = nextSec
+                                    MediaViewerPreferences.setSlideshowInterval(context, nextSec)
+                                    revealControls()
+                                },
+                            ) {
+                                Text(
+                                    "${slideshowInterval}초",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                        }
+                        IconButton(onClick = onShare) {
+                            Icon(Icons.Default.Share, "공유", tint = Color.White)
+                        }
+                        if (preview.kind == BuiltInPreviewKind.PDF && preview.images.size > 1) {
+                            IconButton(onClick = onPrevious, enabled = preview.index > 0) {
+                                Icon(Icons.Default.SkipPrevious, "이전 파일", tint = Color.White)
+                            }
+                            IconButton(onClick = onNext, enabled = preview.index < preview.images.lastIndex) {
+                                Icon(Icons.Default.SkipNext, "다음 파일", tint = Color.White)
+                            }
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = if (edgeToEdgePreview) Color.Transparent else Color.Black),
+                )
+            } else if (!edgeToEdgePreview) Spacer(Modifier.height(64.dp).fillMaxWidth().background(Color.Black))
         },
     ) { padding ->
-        Box(Modifier.padding(padding).fillMaxSize().background(Color.Black).clickable(onClick = { if (touchExploration) revealControls() else if (controlsVisible) controlsVisible = false else revealControls() }), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .then(if (edgeToEdgePreview) Modifier else Modifier.padding(padding))
+                .fillMaxSize()
+                .background(Color.Black)
+                .focusRequester(focusRequester)
+                .focusable()
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.type == KeyEventType.KeyDown) {
+                        when (keyEvent.key) {
+                            Key.Escape, Key.Back -> { onClose(); true }
+                            Key.DirectionLeft -> {
+                                if (preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) { onPrevious(); true }
+                                else if (preview.kind == BuiltInPreviewKind.PDF) { onPreviousPdfPage(); true }
+                                else false
+                            }
+                            Key.DirectionRight -> {
+                                if (preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) { onNext(); true }
+                                else if (preview.kind == BuiltInPreviewKind.PDF) { onNextPdfPage(); true }
+                                else false
+                            }
+                            Key.Spacebar, Key.MediaPlayPause -> {
+                                if (preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+                                    slideshowPlaying = !slideshowPlaying
+                                    revealControls()
+                                    true
+                                } else false
+                            }
+                            else -> false
+                        }
+                    } else false
+                },
+            contentAlignment = Alignment.Center,
+        ) {
             when (preview.kind) {
                 BuiltInPreviewKind.IMAGE, BuiltInPreviewKind.PDF -> preview.bitmap?.let { bitmap ->
-                    if (preview.kind == BuiltInPreviewKind.IMAGE && landscape && preview.images.size > 1) {
-                        LandscapeCoverFlowPreview(bitmap, preview.images[preview.index].name)
-                    } else ZoomablePreviewBitmap(bitmap, preview.images[preview.index].name, "${preview.cachedFile.absolutePath}:${preview.pdfPageIndex}")
+                    ZoomablePreviewBitmap(
+                        bitmap = bitmap,
+                        description = preview.images[preview.index].name,
+                        stateKey = "${preview.cachedFile.absolutePath}:${preview.pdfPageIndex}",
+                        onPrevious = onPrevious,
+                        onNext = onNext,
+                        onClose = onClose,
+                        onToggleControls = {
+                            if (touchExploration) revealControls()
+                            else if (controlsVisible) controlsVisible = false
+                            else revealControls()
+                        },
+                    )
                 }
-                BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> MediaPreviewContent(preview, controlsVisible, ::revealControls, onClose, onPlaybackFailure)
+                BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> {
+                    MediaPreviewContent(
+                        preview = preview,
+                        controlsVisible = controlsVisible,
+                        playbackMode = playbackMode,
+                        onPlaybackModeChange = { nextMode ->
+                            playbackMode = nextMode
+                            MediaViewerPreferences.setPlaybackMode(context, nextMode)
+                            revealControls()
+                        },
+                        onInteraction = ::revealControls,
+                        onDismiss = onClose,
+                        onPlaybackFailure = onPlaybackFailure,
+                        onNextMedia = if (preview.images.size > 1) {
+                            { onSelectIndex(MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)) }
+                        } else null,
+                    )
+                }
             }
-            if (preview.kind == BuiltInPreviewKind.IMAGE && controlsVisible) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .10f)))
-            if (controlsVisible && preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+            if (preview.kind == BuiltInPreviewKind.IMAGE && controlsVisible) {
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .10f)))
+            }
+            if (controlsVisible && preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) {
                 FilledIconButton(
                     onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onPrevious() },
                     enabled = preview.index > 0,
                     modifier = Modifier.align(Alignment.CenterStart).padding(12.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                ) { Icon(Icons.Default.ChevronLeft, "이전 이미지") }
+                ) { Icon(Icons.Default.ChevronLeft, "이전 파일") }
                 FilledIconButton(
                     onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onNext() },
                     enabled = preview.index < preview.images.lastIndex,
                     modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                ) { Icon(Icons.Default.ChevronRight, "다음 이미지") }
-                FilledIconButton(
-                    onClick = { slideshowPlaying = !slideshowPlaying; revealControls() },
-                    modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(14.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                ) { Icon(if (slideshowPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, if (slideshowPlaying) "슬라이드쇼 일시정지" else "슬라이드쇼 재생") }
+                ) { Icon(Icons.Default.ChevronRight, "다음 파일") }
+                if (preview.kind == BuiltInPreviewKind.IMAGE) {
+                    FilledIconButton(
+                        onClick = { slideshowPlaying = !slideshowPlaying; revealControls() },
+                        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(14.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                    ) {
+                        Icon(
+                            if (slideshowPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            if (slideshowPlaying) "슬라이드쇼 일시정지" else "슬라이드쇼 재생",
+                        )
+                    }
+                }
             }
             if (controlsVisible && preview.kind == BuiltInPreviewKind.PDF && preview.pdfPageCount > 1) {
                 FilledIconButton(
@@ -444,190 +683,653 @@ private fun BuiltInPreviewScreen(
 }
 
 @Composable
-private fun LandscapeCoverFlowPreview(bitmap: android.graphics.Bitmap, description: String) {
-    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Image(bitmap.asImageBitmap(), description, Modifier.fillMaxWidth(.58f).weight(.68f).clip(RoundedCornerShape(18.dp)), contentScale = ContentScale.Fit)
-        Image(
-            bitmap.asImageBitmap(), null,
-            Modifier.fillMaxWidth(.58f).weight(.22f).graphicsLayer { rotationX = 180f; alpha = .20f },
-            contentScale = ContentScale.Crop,
-        )
-    }
-}
-
-@Composable
-private fun ZoomablePreviewBitmap(bitmap: android.graphics.Bitmap, description: String, stateKey: String) {
+private fun ZoomablePreviewBitmap(
+    bitmap: android.graphics.Bitmap,
+    description: String,
+    stateKey: String,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onClose: () -> Unit,
+    onToggleControls: () -> Unit,
+) {
     val touchExploration = rememberTouchExplorationEnabled()
     var scale by remember(stateKey) { mutableFloatStateOf(1f) }
     var translation by remember(stateKey) { mutableStateOf(Offset.Zero) }
-    Image(
-        bitmap = bitmap.asImageBitmap(),
-        contentDescription = description,
-        contentScale = ContentScale.Fit,
-        modifier = Modifier.fillMaxSize().then(if (touchExploration) Modifier else Modifier.pointerInput(stateKey) {
-            detectTransformGestures { _, pan, zoom, _ ->
-                val nextScale = (scale * zoom).coerceIn(1f, 5f)
-                scale = nextScale
-                translation = if (nextScale == 1f) Offset.Zero else translation + pan
-            }
-        }).graphicsLayer {
-            scaleX = scale
-            scaleY = scale
-            translationX = translation.x
-            translationY = translation.y
-        },
-    )
+    var dismissTranslationY by remember(stateKey) { mutableFloatStateOf(0f) }
+    var dismissOpacity by remember(stateKey) { mutableFloatStateOf(1f) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    val haptics = LocalHapticFeedback.current
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { containerSize = it }
+            .then(
+                if (touchExploration) {
+                    Modifier.clickable(onClick = onToggleControls)
+                } else {
+                    Modifier
+                        .pointerInput(stateKey) {
+                            detectTapGestures(
+                                onTap = { onToggleControls() },
+                                onDoubleTap = {
+                                    if (scale > 1.05f) {
+                                        scale = 1.0f
+                                        translation = Offset.Zero
+                                    } else {
+                                        scale = MediaViewerGesturePolicy.DOUBLE_TAP_ZOOM_SCALE
+                                        translation = Offset.Zero
+                                    }
+                                },
+                            )
+                        }
+                        .pointerInput(stateKey, containerSize) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                var totalDrag = Offset.Zero
+                                var isMultiTouch = false
+                                var gestureMode = MediaViewerGestureMode.NONE
+                                val touchSlop = MediaViewerGesturePolicy.logicalDistancePx(
+                                    MediaViewerGesturePolicy.DEFAULT_TOUCH_SLOP_DP,
+                                    density,
+                                )
+                                val dismissThreshold = MediaViewerGesturePolicy.logicalDistancePx(
+                                    MediaViewerGesturePolicy.DEFAULT_DISMISS_THRESHOLD_DP,
+                                    density,
+                                )
+                                val navigationThreshold = MediaViewerGesturePolicy.logicalDistancePx(
+                                    MediaViewerGesturePolicy.DEFAULT_IMAGE_NAVIGATION_THRESHOLD_DP,
+                                    density,
+                                )
+
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pointerCount = event.changes.count { it.pressed }
+
+                                    if (pointerCount >= 2) {
+                                        isMultiTouch = true
+                                        val zoom = event.calculateZoom()
+                                        val pan = event.calculatePan()
+                                        val nextScale = (scale * zoom).coerceIn(
+                                            MediaViewerGesturePolicy.MIN_IMAGE_SCALE,
+                                            MediaViewerGesturePolicy.MAX_IMAGE_SCALE,
+                                        )
+                                        scale = nextScale
+                                        if (nextScale <= 1.0f) {
+                                            translation = Offset.Zero
+                                        } else {
+                                            translation = MediaViewerGesturePolicy.clampImageTranslation(
+                                                translation + pan,
+                                                nextScale,
+                                                containerSize.width.toFloat(),
+                                                containerSize.height.toFloat(),
+                                            )
+                                        }
+                                        dismissTranslationY = 0f
+                                        dismissOpacity = 1f
+                                        event.changes.forEach { it.consume() }
+                                    } else if (pointerCount == 1 && !isMultiTouch) {
+                                        val change = event.changes.firstOrNull { it.pressed } ?: break
+                                        val dragDelta = change.positionChange()
+                                        totalDrag += dragDelta
+
+                                        if (scale > 1.05f) {
+                                            translation = MediaViewerGesturePolicy.clampImageTranslation(
+                                                translation + dragDelta,
+                                                scale,
+                                                containerSize.width.toFloat(),
+                                                containerSize.height.toFloat(),
+                                            )
+                                            change.consume()
+                                        } else {
+                                            if (hypot(totalDrag.x, totalDrag.y) >= touchSlop) {
+                                                if (gestureMode == MediaViewerGestureMode.NONE) {
+                                                    gestureMode = MediaViewerGesturePolicy.determineGestureMode(
+                                                        totalDrag.x, totalDrag.y, touchSlop,
+                                                    )
+                                                }
+                                                when (gestureMode) {
+                                                    MediaViewerGestureMode.DISMISS -> {
+                                                        if (totalDrag.y > 0) {
+                                                            dismissTranslationY = totalDrag.y
+                                                            dismissOpacity = MediaViewerGesturePolicy.computeDismissProgress(
+                                                                dismissTranslationY,
+                                                                dismissThreshold,
+                                                            )
+                                                            change.consume()
+                                                        }
+                                                    }
+                                                    MediaViewerGestureMode.SEEK -> {
+                                                        change.consume()
+                                                    }
+                                                    else -> Unit
+                                                }
+                                            }
+                                        }
+                                    }
+                                } while (event.changes.any { it.pressed })
+
+                                if (!isMultiTouch && scale <= 1.05f) {
+                                    if (gestureMode == MediaViewerGestureMode.DISMISS) {
+                                        if (MediaViewerGesturePolicy.shouldDismiss(dismissTranslationY, dismissThreshold)) {
+                                            onClose()
+                                        } else {
+                                            dismissTranslationY = 0f
+                                            dismissOpacity = 1f
+                                        }
+                                    } else if (gestureMode == MediaViewerGestureMode.SEEK) {
+                                        val nav = MediaViewerGesturePolicy.shouldNavigateImage(
+                                            totalDrag.x,
+                                            scale,
+                                            navigationThreshold,
+                                        )
+                                        if (nav < 0) {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onPrevious()
+                                        } else if (nav > 0) {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onNext()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                }
+            )
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = translation.x
+                translationY = translation.y + dismissTranslationY
+                alpha = dismissOpacity
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = description,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
 }
 
 @Composable
 private fun MediaPreviewContent(
     preview: ImagePreviewState,
     controlsVisible: Boolean,
+    playbackMode: MediaPlaybackMode,
+    onPlaybackModeChange: (MediaPlaybackMode) -> Unit,
     onInteraction: () -> Unit,
     onDismiss: () -> Unit,
     onPlaybackFailure: () -> Unit,
+    onNextMedia: (() -> Unit)? = null,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
     val touchExploration = rememberTouchExplorationEnabled()
-    var player by remember(preview.cachedFile.absolutePath) { mutableStateOf<VideoView?>(null) }
-    var duration by remember(preview.cachedFile.absolutePath) { mutableIntStateOf(0) }
-    var position by rememberSaveable(preview.cachedFile.absolutePath) { mutableIntStateOf(0) }
-    var playing by rememberSaveable(preview.cachedFile.absolutePath) { mutableStateOf(false) }
-    var scale by rememberSaveable(preview.cachedFile.absolutePath) { mutableFloatStateOf(1f) }
-    var translation by remember(preview.cachedFile.absolutePath) { mutableStateOf(Offset.Zero) }
-    var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
+    val mediaSourceKey = preview.remoteStream?.sourceKey ?: preview.cachedFile.absolutePath
+    var retryTrigger by remember(mediaSourceKey) { mutableIntStateOf(0) }
+    var isBuffering by remember(mediaSourceKey, retryTrigger) { mutableStateOf(true) }
+    var playbackError by remember(mediaSourceKey, retryTrigger) { mutableStateOf<String?>(null) }
+    var player by remember(mediaSourceKey, retryTrigger) { mutableStateOf<ExoPlayer?>(null) }
+    var duration by remember(mediaSourceKey, retryTrigger) { mutableIntStateOf(0) }
+    var position by rememberSaveable(mediaSourceKey) { mutableIntStateOf(0) }
+    var playing by rememberSaveable(mediaSourceKey) { mutableStateOf(true) }
+    var scale by rememberSaveable(mediaSourceKey) { mutableFloatStateOf(1f) }
+    var translation by remember(mediaSourceKey) { mutableStateOf(Offset.Zero) }
+    var dismissTranslationY by remember(mediaSourceKey) { mutableFloatStateOf(0f) }
+    var dismissOpacity by remember(mediaSourceKey) { mutableFloatStateOf(1f) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var gestureMessage by remember { mutableStateOf<String?>(null) }
+
+    val focusChangeListener = remember {
+        AudioManager.OnAudioFocusChangeListener { focusChange ->
+            if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                player?.pause()
+                playing = false
+            }
+        }
+    }
 
     LaunchedEffect(player, playing) {
         while (playing) {
-            position = player?.currentPosition?.coerceAtLeast(0) ?: position
+            position = player?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
             delay(250)
         }
     }
-    LaunchedEffect(gestureMessage) { if (gestureMessage != null) { delay(850); gestureMessage = null } }
+
+    LaunchedEffect(gestureMessage) {
+        if (gestureMessage != null) {
+            delay(850)
+            gestureMessage = null
+        }
+    }
+
     DisposableEffect(lifecycleOwner, preview.cachedFile.absolutePath) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
-                position = player?.currentPosition ?: position
+                position = player?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
                 player?.pause()
                 playing = false
+                audioManager.abandonAudioFocus(focusChangeListener)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            position = player?.currentPosition ?: position
-            player?.stopPlayback()
-            player = null
+            audioManager.abandonAudioFocus(focusChangeListener)
+            position = player?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
+            player?.pause()
         }
     }
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { containerSize = it },
+        contentAlignment = Alignment.Center,
+    ) {
         if (preview.kind == BuiltInPreviewKind.AUDIO) {
-            Icon(Icons.Default.Audiotrack, null, tint = Color.White.copy(alpha = .78f), modifier = Modifier.size(100.dp))
+            Icon(
+                Icons.Default.Audiotrack,
+                null,
+                tint = Color.White.copy(alpha = .78f),
+                modifier = Modifier.size(100.dp),
+            )
         }
+        key(mediaSourceKey, retryTrigger) {
         AndroidView(
-            modifier = if (preview.kind == BuiltInPreviewKind.VIDEO) Modifier.fillMaxSize()
-                .then(if (touchExploration) Modifier else Modifier
-                    .pointerInput(preview.cachedFile.absolutePath) {
-                        detectTapGestures(onDoubleTap = { scale = 1f; translation = Offset.Zero; onInteraction() })
-                    }
-                    .pointerInput(preview.cachedFile.absolutePath) {
-                        awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false)
-                            var anyPressed: Boolean
-                            do {
-                                val event = awaitPointerEvent()
-                                if (event.changes.count { it.pressed } >= 2) {
-                                    val zoom = event.calculateZoom()
-                                    val pan = event.calculatePan()
-                                    scale = (scale * zoom).coerceIn(1f, 4f)
-                                    translation = if (scale == 1f) Offset.Zero else translation + pan
-                                    event.changes.forEach { it.consume() }
-                                    onInteraction()
+            modifier = if (preview.kind == BuiltInPreviewKind.VIDEO) {
+                Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (touchExploration) {
+                            Modifier.clickable(onClick = onInteraction)
+                        } else {
+                            Modifier
+                                .pointerInput(mediaSourceKey, retryTrigger) {
+                                    detectTapGestures(
+                                        onTap = { onInteraction() },
+                                        onDoubleTap = {
+                                            scale = 1f
+                                            translation = Offset.Zero
+                                            onInteraction()
+                                        },
+                                    )
                                 }
-                                anyPressed = event.changes.any { it.pressed }
-                            } while (anyPressed)
-                        }
-                    }
-                    .pointerInput(preview.cachedFile.absolutePath, duration) {
-                        detectDragGestures(
-                            onDragStart = { dragOffset = Offset.Zero; onInteraction() },
-                            onDrag = { change, amount ->
-                                change.consume(); dragOffset += amount
-                                if (kotlin.math.abs(dragOffset.x) > kotlin.math.abs(dragOffset.y) && duration > 0) {
-                                    val delta = (amount.x / size.width.coerceAtLeast(1)) * duration
-                                    position = (position + delta.toInt()).coerceIn(0, duration)
-                                    player?.seekTo(position)
-                                    gestureMessage = "${formatDuration(position)} / ${formatDuration(duration)}"
-                                } else if (dragOffset.y < 0) {
-                                    val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                                    val current = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
-                                    val delta = (-amount.y / size.height.coerceAtLeast(1) * max * 2).toInt()
-                                    if (delta != 0) {
-                                        val next = (current + delta).coerceIn(0, max)
-                                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, next, 0)
-                                        gestureMessage = "볼륨 ${(next * 100f / max).toInt()}%"
+                                .pointerInput(mediaSourceKey, retryTrigger, containerSize, duration) {
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        var totalDrag = Offset.Zero
+                                        var isMultiTouch = false
+                                        var gestureMode = MediaViewerGestureMode.NONE
+                                        val touchSlop = MediaViewerGesturePolicy.logicalDistancePx(
+                                            MediaViewerGesturePolicy.DEFAULT_TOUCH_SLOP_DP,
+                                            density,
+                                        )
+                                        val dismissThreshold = MediaViewerGesturePolicy.logicalDistancePx(
+                                            MediaViewerGesturePolicy.DEFAULT_DISMISS_THRESHOLD_DP,
+                                            density,
+                                        )
+                                        val startPosition = position
+                                        val startVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+
+                                        do {
+                                            val event = awaitPointerEvent()
+                                            val pointerCount = event.changes.count { it.pressed }
+
+                                            if (pointerCount >= 2) {
+                                                isMultiTouch = true
+                                                val zoom = event.calculateZoom()
+                                                val pan = event.calculatePan()
+                                                val nextScale = (scale * zoom).coerceIn(1f, 4f)
+                                                scale = nextScale
+                                                translation = MediaViewerGesturePolicy.clampImageTranslation(
+                                                    currentTranslation = if (nextScale == 1f) Offset.Zero else translation + pan,
+                                                    scale = nextScale,
+                                                    containerWidth = containerSize.width.toFloat(),
+                                                    containerHeight = containerSize.height.toFloat(),
+                                                )
+                                                dismissTranslationY = 0f
+                                                dismissOpacity = 1f
+                                                event.changes.forEach { it.consume() }
+                                                onInteraction()
+                                            } else if (pointerCount == 1 && !isMultiTouch) {
+                                                val change = event.changes.firstOrNull { it.pressed } ?: break
+                                                val dragDelta = change.positionChange()
+                                                totalDrag += dragDelta
+
+                                                if (scale > 1.05f) {
+                                                    translation = MediaViewerGesturePolicy.clampImageTranslation(
+                                                        currentTranslation = translation + dragDelta,
+                                                        scale = scale,
+                                                        containerWidth = containerSize.width.toFloat(),
+                                                        containerHeight = containerSize.height.toFloat(),
+                                                    )
+                                                    change.consume()
+                                                } else {
+                                                    if (hypot(totalDrag.x, totalDrag.y) >= touchSlop) {
+                                                        if (gestureMode == MediaViewerGestureMode.NONE) {
+                                                            gestureMode = MediaViewerGesturePolicy.determineGestureMode(
+                                                                totalDrag.x, totalDrag.y, touchSlop,
+                                                            )
+                                                        }
+                                                        when (gestureMode) {
+                                                            MediaViewerGestureMode.SEEK -> {
+                                                                if (duration > 0) {
+                                                                    val seekPos = MediaViewerGesturePolicy.computeSeekPosition(
+                                                                        startPosition,
+                                                                        duration,
+                                                                        totalDrag.x,
+                                                                        containerSize.width.toFloat(),
+                                                                    )
+                                                                    position = seekPos
+                                                                    player?.seekTo(seekPos.toLong())
+                                                                    gestureMessage = "${formatDuration(seekPos)} / ${formatDuration(duration)}"
+                                                                    change.consume()
+                                                                }
+                                                            }
+                                                            MediaViewerGestureMode.VOLUME -> {
+                                                                val newVol = MediaViewerGesturePolicy.computeVolume(
+                                                                    startVolume,
+                                                                    maxVolume,
+                                                                    totalDrag.y,
+                                                                    containerSize.height.toFloat(),
+                                                                )
+                                                                val percent = MediaViewerGesturePolicy.computeVolumePercent(
+                                                                    startVolume,
+                                                                    maxVolume,
+                                                                    totalDrag.y,
+                                                                    containerSize.height.toFloat(),
+                                                                )
+                                                                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVol, 0)
+                                                                gestureMessage = "볼륨 ${percent}%"
+                                                                change.consume()
+                                                            }
+                                                            MediaViewerGestureMode.DISMISS -> {
+                                                                if (totalDrag.y > 0) {
+                                                                    dismissTranslationY = totalDrag.y
+                                                                    dismissOpacity = MediaViewerGesturePolicy.computeDismissProgress(
+                                                                        dismissTranslationY,
+                                                                        dismissThreshold,
+                                                                    )
+                                                                    gestureMessage = "아래로 놓아 닫기"
+                                                                    change.consume()
+                                                                }
+                                                            }
+                                                            else -> Unit
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } while (event.changes.any { it.pressed })
+
+                                        if (!isMultiTouch && scale <= 1.05f && gestureMode == MediaViewerGestureMode.DISMISS) {
+                                            if (MediaViewerGesturePolicy.shouldDismiss(dismissTranslationY, dismissThreshold)) {
+                                                onDismiss()
+                                            } else {
+                                                dismissTranslationY = 0f
+                                                dismissOpacity = 1f
+                                                gestureMessage = null
+                                            }
+                                        }
                                     }
-                                } else if (dragOffset.y > 80) {
-                                    gestureMessage = "아래로 놓아 닫기"
                                 }
-                            },
-                            onDragEnd = { if (dragOffset.y > 180 && kotlin.math.abs(dragOffset.y) > kotlin.math.abs(dragOffset.x)) onDismiss(); dragOffset = Offset.Zero },
-                            onDragCancel = { dragOffset = Offset.Zero },
-                        )
+                        }
+                    )
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = translation.x
+                        translationY = translation.y + dismissTranslationY
+                        alpha = dismissOpacity
                     }
-                ).graphicsLayer {
-                    scaleX = scale; scaleY = scale
-                    translationX = translation.x; translationY = translation.y
-                } else Modifier.size(1.dp),
-            factory = { context ->
-                VideoView(context).apply {
-                    setOnPreparedListener { media ->
-                        duration = media.duration.coerceAtLeast(0)
-                        seekTo(position.coerceIn(0, duration.coerceAtLeast(0)))
-                        if (playing) start()
+            } else Modifier.size(1.dp),
+            factory = { ctx ->
+                var initialPositionRestored = false
+                val exoPlayer = ExoPlayer.Builder(ctx).build().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),
+                        true,
+                    )
+                    playWhenReady = true
+                    addListener(object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            isBuffering = playbackState == Player.STATE_BUFFERING
+                            if (playbackState == Player.STATE_READY) {
+                                duration = this@apply.duration.coerceIn(0, Int.MAX_VALUE.toLong()).toInt()
+                                if (!initialPositionRestored) {
+                                    initialPositionRestored = true
+                                    if (position > 0) {
+                                        seekTo(position.toLong().coerceAtMost(this@apply.duration.coerceAtLeast(0)))
+                                    }
+                                }
+                                isBuffering = false
+                                playbackError = null
+                            } else if (playbackState == Player.STATE_ENDED) {
+                                if (playbackMode == MediaPlaybackMode.ONE_REPEAT) {
+                                    seekTo(0)
+                                    play()
+                                } else {
+                                    playing = false
+                                    position = duration
+                                    onNextMedia?.invoke()
+                                }
+                            }
+                        }
+
+                        override fun onIsPlayingChanged(isPlaying: Boolean) {
+                            playing = isPlaying
+                            if (isPlaying) {
+                                isBuffering = false
+                                playbackError = null
+                            }
+                        }
+
+                        override fun onPlayerError(error: PlaybackException) {
+                            isBuffering = false
+                            playing = false
+                            playbackError = error.localizedMessage ?: "동영상을 재생할 수 없습니다."
+                        }
+                    })
+                    preview.remoteStream?.let { setMediaSource(it.createMediaSource()) } ?: run {
+                        val factory = ProgressiveMediaSource.Factory(DefaultDataSource.Factory(ctx))
+                        setMediaSource(factory.createMediaSource(MediaItem.fromUri(preview.cachedFile.toURI().toString())))
                     }
-                    setOnCompletionListener { playing = false; position = duration }
-                    setOnErrorListener { _, _, _ -> onPlaybackFailure(); true }
-                    setVideoPath(preview.cachedFile.absolutePath)
-                    player = this
+                    prepare()
+                }
+                player = exoPlayer
+                PlayerView(ctx).apply {
+                    useController = false
+                    this.player = exoPlayer
                 }
             },
-            update = { player = it },
+            update = { view -> player = view.player as? ExoPlayer },
             onRelease = { released ->
-                position = released.currentPosition.coerceAtLeast(0)
-                released.stopPlayback()
-                if (player === released) player = null
+                audioManager.abandonAudioFocus(focusChangeListener)
+                val releasedPlayer = released.player as? ExoPlayer
+                position = releasedPlayer?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
+                released.player = null
+                releasedPlayer?.release()
+                if (player === releasedPlayer) player = null
             },
         )
-        gestureMessage?.let { message ->
-            Text(message, color = Color.White, modifier = Modifier.background(Color.Black.copy(alpha = .72f), RoundedCornerShape(14.dp)).padding(horizontal = 16.dp, vertical = 10.dp), style = MaterialTheme.typography.labelLarge)
         }
-        if (controlsVisible) Column(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color.Black.copy(alpha = .72f)).navigationBarsPadding().padding(16.dp),
-        ) {
-            Slider(
-                value = position.toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat()),
-                onValueChange = { value -> onInteraction(); position = value.toInt(); player?.seekTo(position) },
-                valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
-            )
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-                IconButton(onClick = {
-                    onInteraction()
-                    if (playing) player?.pause() else player?.start()
-                    playing = !playing
-                }, enabled = duration > 0) {
-                    Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, if (playing) "일시정지" else "재생", tint = Color.White)
+        if (isBuffering && playbackError == null) {
+            Box(
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = .55f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        modifier = Modifier.size(24.dp),
+                        strokeWidth = 2.5.dp,
+                    )
+                    Text(
+                        "동영상 준비 중…",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
-                Spacer(Modifier.width(10.dp))
-                Text("${formatDuration(position)} / ${formatDuration(duration)}", color = Color.White, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        playbackError?.let { errorMessage ->
+            Surface(
+                modifier = Modifier
+                    .padding(24.dp)
+                    .widthIn(max = 420.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = Color(0xFF1E1E1E),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = .18f)),
+                shadowElevation = 8.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Icon(
+                        Icons.Default.ErrorOutline,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(36.dp),
+                    )
+                    Text(
+                        "재생 오류",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        errorMessage,
+                        color = Color.White.copy(alpha = .80f),
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = TextAlign.Center,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = .80f)),
+                        ) {
+                            Text("닫기")
+                        }
+                        OutlinedButton(
+                            onClick = onPlaybackFailure,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = .90f)),
+                        ) {
+                            Text("외부 앱으로 열기")
+                        }
+                        Button(
+                            onClick = {
+                                playbackError = null
+                                isBuffering = true
+                                retryTrigger++
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        ) {
+                            Text("다시 시도")
+                        }
+                    }
+                }
+            }
+        }
+        gestureMessage?.let { message ->
+            Text(
+                message,
+                color = Color.White,
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = .72f), RoundedCornerShape(14.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                style = MaterialTheme.typography.labelLarge,
+            )
+        }
+        if (controlsVisible) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = .72f))
+                    .navigationBarsPadding()
+                    .padding(16.dp),
+            ) {
+                Slider(
+                    value = position.toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat()),
+                    onValueChange = { value ->
+                        onInteraction()
+                        position = value.toInt()
+                        player?.seekTo(position.toLong())
+                    },
+                    valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        "${formatDuration(position)} / ${formatDuration(duration)}",
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                onInteraction()
+                                if (playing) {
+                                    player?.pause()
+                                    audioManager.abandonAudioFocus(focusChangeListener)
+                                    playing = false
+                                } else {
+                                    audioManager.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+                                    player?.play()
+                                    playing = true
+                                }
+                            },
+                            enabled = duration > 0,
+                        ) {
+                            Icon(
+                                if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                if (playing) "일시정지" else "재생",
+                                tint = Color.White,
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = { onPlaybackModeChange(playbackMode.next()) },
+                    ) {
+                        Icon(
+                            imageVector = when (playbackMode) {
+                                MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
+                                MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
+                                MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                            },
+                            contentDescription = "재생 모드: ${playbackMode.title}",
+                            tint = Color.White,
+                        )
+                    }
+                }
             }
         } else if (duration > 0) {
             LinearProgressIndicator(
                 progress = { (position.toFloat() / duration).coerceIn(0f, 1f) },
-                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().height(2.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .height(2.dp),
                 color = Color.White.copy(alpha = .82f),
                 trackColor = Color.White.copy(alpha = .18f),
             )
@@ -822,6 +1524,18 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 14.dp).offset(y = (-8).dp),
                 )
+            }
+            item { SectionTitle("Google Photos", Icons.Default.PhotoLibrary) }
+            item {
+                DashboardCard {
+                    DashboardRow(Icons.Default.PhotoLibrary, if (state.googlePhotosConnected) "Google Photos 연결됨" else "Google Photos 연결", "선택한 사진·영상을 폰하드로 가져옵니다.") {
+                        model.requestGooglePhotosImport()
+                    }
+                    if (state.googlePhotosConnected) {
+                        HorizontalDivider()
+                        TextButton(model::disconnectGooglePhotos, Modifier.fillMaxWidth().padding(horizontal = 8.dp)) { Text("연결 해제") }
+                    }
+                }
             }
             item { SectionTitle("저장공간", Icons.Default.Storage) }
             item { DeviceStorageCard { fileImporter.launch(arrayOf("*/*")) } }
@@ -1494,13 +2208,21 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     var actionItem by remember { mutableStateOf<RemoteFileItem?>(null) }
     var selectionMode by remember(browser.connection.id, browser.path) { mutableStateOf(false) }
     val selectedIds = remember(browser.connection.id, browser.path) { mutableStateListOf<String>() }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current.density
+    var coverFlowSelectedIndex by rememberSaveable(browser.connection.id, browser.path) { mutableIntStateOf(0) }
     var batchTransfer by remember { mutableStateOf<RemoteTransferAction?>(null) }
     var confirmBatchDelete by remember { mutableStateOf(false) }
     val capabilities = remember(browser.connection.kind) { browserCapabilities(browser.connection.kind) }
     val accessibilityLayout = LocalConfiguration.current.fontScale >= 1.3f
     val showsCoverFlow = browser.preferences.layout == BrowserLayout.LARGE_GRID &&
-        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    var coverFlowDark by rememberSaveable(browser.connection.id) { mutableStateOf(false) }
+        AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
+            contentWidthDp = viewportSize.width / density,
+            contentHeightDp = viewportSize.height / density,
+            itemCount = browser.items.size,
+            selectionActive = selectionMode,
+        )
+    var coverFlowDark by rememberSaveable(browser.connection.id) { mutableStateOf(true) }
     val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::uploadDocument)
     }
@@ -1522,6 +2244,28 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             if (parentPath == null) model.show(Screen.Dashboard)
             else model.openConnection(browser.connection, parentPath)
         }
+        val browserViewModes = remember(browser.preferences.layout) {
+            listOf(
+                CoverFlowViewModeOption(
+                    title = "자세히",
+                    selected = browser.preferences.layout == BrowserLayout.LIST,
+                    icon = Icons.Default.List,
+                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LIST)) },
+                ),
+                CoverFlowViewModeOption(
+                    title = "작은 썸네일",
+                    selected = browser.preferences.layout == BrowserLayout.SMALL_GRID,
+                    icon = Icons.Default.GridView,
+                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.SMALL_GRID)) },
+                ),
+                CoverFlowViewModeOption(
+                    title = "포스터",
+                    selected = browser.preferences.layout == BrowserLayout.LARGE_GRID,
+                    icon = Icons.Default.GridOn,
+                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LARGE_GRID)) },
+                ),
+            )
+        }
         RemoteBrowserCoverFlow(
             items = displayedItems,
             thumbnails = state.remoteThumbnails,
@@ -1532,14 +2276,25 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 if (parentPath == null) model.show(Screen.Dashboard)
                 else model.openConnection(browser.connection, parentPath)
             },
+            onDashboard = { model.show(Screen.Dashboard) },
+            viewModes = browserViewModes,
             onToggleBackground = { coverFlowDark = it },
             onActivate = model::openItem,
             onLoadThumbnail = model::loadRemoteThumbnail,
+            initialSelectedIndex = coverFlowSelectedIndex,
+            onSelectedIndexChange = { coverFlowSelectedIndex = it },
+            modifier = Modifier.fillMaxSize().onSizeChanged { viewportSize = it },
         )
         return
     }
     BackHandler(selectionMode) { selectedIds.clear(); selectionMode = false }
-    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Column { Text(if (selectionMode) "${selectedIds.size}개 선택" else browser.connection.name, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(browser.path, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis) } }, navigationIcon = {
+    BackHandler(!selectionMode) {
+        if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
+        else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
+        else if (parentPath == null) model.show(Screen.Dashboard)
+        else model.openConnection(browser.connection, parentPath)
+    }
+    Scaffold(modifier = Modifier.onSizeChanged { viewportSize = it }, containerColor = Color.Transparent, topBar = { TopAppBar(title = { Column { Text(if (selectionMode) "${selectedIds.size}개 선택" else browser.connection.name, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(browser.path, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis) } }, navigationIcon = {
         CompositionLocalProvider(LocalViewConfiguration provides longPress500Configuration()) {
         Box(
             modifier = Modifier.size(48.dp).semantics(mergeDescendants = true) {
@@ -1701,7 +2456,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 )
                 browser.preferences.layout == BrowserLayout.LIST -> LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(displayedItems, key = { it.id }) { item ->
-                        if (item.isImage || item.isVideo) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
+                        if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
                         FileRow(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, selected = item.id in selectedIds, selectionMode = selectionMode, accessibilityLayout = accessibilityLayout, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
                     }
                 }
@@ -1721,7 +2476,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                         horizontalArrangement = Arrangement.spacedBy(if (poster) 16.dp else 8.dp),
                     ) {
                     items(displayedItems, key = { it.id }) { item ->
-                        if (item.isImage || item.isVideo) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
+                        if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
                         FileTile(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, poster = poster, selected = item.id in selectedIds, selectionMode = selectionMode, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
                     }
                     }
@@ -1805,6 +2560,13 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }
 }
 
+internal data class CoverFlowViewModeOption(
+    val title: String,
+    val selected: Boolean,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    val onSelect: () -> Unit,
+)
+
 @Composable
 internal fun RemoteBrowserCoverFlow(
     items: List<RemoteFileItem>,
@@ -1813,29 +2575,114 @@ internal fun RemoteBrowserCoverFlow(
     title: String,
     usesDarkBackground: Boolean,
     onBack: () -> Unit,
+    onDashboard: (() -> Unit)? = null,
+    viewModes: List<CoverFlowViewModeOption> = emptyList(),
     onToggleBackground: (Boolean) -> Unit,
     onActivate: (RemoteFileItem) -> Unit,
     onLoadThumbnail: (RemoteFileItem) -> Unit,
+    initialSelectedIndex: Int = 0,
+    onSelectedIndexChange: (Int) -> Unit = {},
+    modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
+    val hostView = LocalView.current
+    val statusBarController = remember(context, hostView) {
+        context.findHostActivity()?.window?.let { WindowInsetsControllerCompat(it, hostView) }
+    }
+    SideEffect {
+        statusBarController?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        statusBarController?.hide(WindowInsetsCompat.Type.statusBars())
+    }
+    DisposableEffect(statusBarController) {
+        statusBarController?.hide(WindowInsetsCompat.Type.statusBars())
+        onDispose { statusBarController?.show(WindowInsetsCompat.Type.statusBars()) }
+    }
     var backgroundMenu by remember { mutableStateOf(false) }
-    val listState = rememberLazyListState()
-    var selectedIndex by remember(items) { mutableIntStateOf(0) }
-    LaunchedEffect(listState, items) {
-        snapshotFlow {
+    val boundedInitialIndex = initialSelectedIndex.coerceIn(0, items.lastIndex.coerceAtLeast(0))
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = boundedInitialIndex)
+    val scope = rememberCoroutineScope()
+    val focusRequester = remember { FocusRequester() }
+    val scrollPosition by remember(listState) {
+        derivedStateOf {
             val layout = listState.layoutInfo
-            val center = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
-            layout.visibleItemsInfo.minByOrNull { kotlin.math.abs((it.offset + it.size / 2) - center) }?.index
-        }.collect { index -> if (index != null) selectedIndex = index }
+            val viewportCenter = (layout.viewportStartOffset + layout.viewportEndOffset) / 2f
+            val anchor = layout.visibleItemsInfo.minByOrNull {
+                kotlin.math.abs((it.offset + it.size / 2f) - viewportCenter)
+            }
+            if (anchor == null) boundedInitialIndex.toFloat() else {
+                CoverFlowLayoutPolicy.continuousPosition(
+                    itemIndex = anchor.index,
+                    itemCenter = anchor.offset + anchor.size / 2f,
+                    viewportCenter = viewportCenter,
+                    itemSize = anchor.size.toFloat(),
+                )
+            }
+        }
+    }
+    val selectedIndex = scrollPosition.roundToInt().coerceIn(0, items.lastIndex.coerceAtLeast(0))
+    LaunchedEffect(listState, items) {
+        snapshotFlow { scrollPosition.roundToInt().coerceIn(0, items.lastIndex.coerceAtLeast(0)) }
+            .collect(onSelectedIndexChange)
+    }
+    LaunchedEffect(items, boundedInitialIndex) {
+        if (items.isNotEmpty() && selectedIndex != boundedInitialIndex) {
+            listState.scrollToItem(boundedInitialIndex)
+        }
+        runCatching { focusRequester.requestFocus() }
     }
     val background = if (usesDarkBackground) Color.Black else Color.White
     val chromeForeground = if (usesDarkBackground) Color.White.copy(alpha = .88f) else Color.Black.copy(alpha = .82f)
     val chromeBackground = if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.White.copy(alpha = .92f)
     val chromeBorder = if (usesDarkBackground) Color.White.copy(alpha = .16f) else Color.Black.copy(alpha = .10f)
 
-    BoxWithConstraints(Modifier.fillMaxSize().background(background)) {
-        val cardSide = minOf(maxWidth * .38f, maxHeight * .76f).coerceIn(230.dp, 460.dp)
-        val step = (maxWidth * .055f).coerceIn(42.dp, 66.dp)
-        val reflectionHeight = if (usesDarkBackground) 44.dp else 20.dp
+    fun moveSelection(offset: Int): Boolean {
+        if (items.isEmpty()) return false
+        val target = (selectedIndex + offset).coerceIn(0, items.lastIndex)
+        if (target == selectedIndex) return false
+        val itemSize = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.size?.toFloat() ?: 1f
+        scope.launch { listState.animateScrollBy((target - scrollPosition) * itemSize) }
+        return true
+    }
+
+    BoxWithConstraints(
+        modifier
+            .fillMaxSize()
+            .background(background)
+            .semantics {
+                contentDescription = "오버플로우 보기"
+                customActions = listOf(
+                    CustomAccessibilityAction("이전 항목") { moveSelection(-1) },
+                    CustomAccessibilityAction("다음 항목") { moveSelection(1) },
+                )
+            }
+            .focusRequester(focusRequester)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) false
+                else when (event.key) {
+                    Key.DirectionLeft -> moveSelection(-1)
+                    Key.DirectionRight -> moveSelection(1)
+                    Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
+                        items.getOrNull(selectedIndex)?.let(onActivate) != null
+                    }
+                    Key.Escape, Key.Back -> { onBack(); true }
+                    else -> false
+                }
+            },
+    ) {
+        val widthValue = maxWidth.value
+        val heightValue = maxHeight.value
+        val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding().value
+        val bottomInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding().value
+        val centralCardSide = CoverFlowLayoutPolicy.centralCardSide(
+            containerWidth = widthValue,
+            containerHeight = heightValue,
+            topContentInset = topInset,
+            bottomContentInset = bottomInset,
+        )
+        val baseCardSide = CoverFlowLayoutPolicy.baseCardSide(widthValue, centralCardSide)
+        val step = CoverFlowLayoutPolicy.cardStep(widthValue).dp
         if (items.isEmpty()) {
             EmptyState(Icons.Default.Folder, "빈 폴더", "이 폴더에는 표시할 파일이 없습니다.", Modifier.fillMaxSize())
         } else {
@@ -1845,37 +2692,89 @@ internal fun RemoteBrowserCoverFlow(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = (maxWidth - step) / 2),
                 horizontalArrangement = Arrangement.spacedBy(0.dp),
-                verticalAlignment = Alignment.Bottom,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 items(items, key = { it.id }) { item ->
                     val index = items.indexOf(item)
                     val selected = index == selectedIndex
-                    if (item.isImage || item.isVideo) LaunchedEffect(item.id, item.size, item.modifiedAt) { onLoadThumbnail(item) }
-                    Box(Modifier.width(step).padding(bottom = 18.dp).zIndex(10f - kotlin.math.abs(index - selectedIndex).toFloat()), contentAlignment = Alignment.BottomCenter) {
+                    val distance = index - scrollPosition
+                    val absoluteDistance = kotlin.math.abs(distance)
+                    val renderedSide = CoverFlowLayoutPolicy.renderedCardSide(
+                        distance,
+                        baseCardSide,
+                        centralCardSide,
+                    )
+                    val horizontalPush = CoverFlowLayoutPolicy.horizontalPush(
+                        distance,
+                        baseCardSide,
+                        centralCardSide,
+                    )
+                    val reflectionHeight = minOf(
+                        renderedSide * if (usesDarkBackground) .15f else .10f,
+                        if (usesDarkBackground) 44f else 20f,
+                    ).dp
+                    if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(item.id, item.size, item.modifiedAt) { onLoadThumbnail(item) }
+                    Box(
+                        Modifier
+                            .width(step)
+                            .fillParentMaxHeight()
+                            .zIndex(20f - absoluteDistance),
+                        contentAlignment = Alignment.Center,
+                    ) {
                         Column(
-                            Modifier.requiredWidth(cardSide).graphicsLayer {
-                                scaleX = if (selected) 1f else .80f
-                                scaleY = if (selected) 1f else .80f
-                                rotationY = when { selected -> 0f; index < selectedIndex -> 42f; else -> -42f }
+                            Modifier.requiredWidth(centralCardSide.dp).graphicsLayer {
+                                rotationY = when { kotlin.math.abs(distance) < .02f -> 0f; distance < 0f -> 42f; else -> -42f }
                                 cameraDistance = 14f * density
-                                alpha = if (kotlin.math.abs(index - selectedIndex) > 7) 0f else 1f
-                            }.semantics { contentDescription = item.name }.clickable { onActivate(item) },
+                                translationX = horizontalPush * density
+                                alpha = if (absoluteDistance > CoverFlowLayoutPolicy.VISIBLE_CARD_COUNT_PER_SIDE) {
+                                    0f
+                                } else {
+                                    CoverFlowLayoutPolicy.opacity(distance)
+                                }
+                            }.semantics {
+                                contentDescription = item.name
+                                this.selected = selected
+                                role = Role.Button
+                            }.clickable(role = Role.Button) {
+                                if (selected || index == selectedIndex) {
+                                    onActivate(item)
+                                } else {
+                                    scope.launch { listState.animateScrollToItem(index) }
+                                }
+                            },
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
+                            Spacer(Modifier.height(reflectionHeight))
                             Surface(
-                                modifier = Modifier.requiredSize(cardSide),
+                                modifier = Modifier.requiredSize(renderedSide.dp),
                                 shape = RoundedCornerShape(if (selected) 18.dp else 13.dp),
                                 color = Color.Black,
                                 border = BorderStroke(1.dp, if (usesDarkBackground) Color.White.copy(alpha = .16f) else Color.Black.copy(alpha = .15f)),
                                 shadowElevation = if (selected) 10.dp else 2.dp,
                             ) {
-                                RemoteFileArtwork(item, thumbnails[item.id], theme, Modifier.fillMaxSize(), cardSide * .42f, if (selected) 18.dp else 13.dp)
+                                RemoteFileArtwork(item, thumbnails[item.id], theme, Modifier.fillMaxSize(), renderedSide.dp * .42f, if (selected) 18.dp else 13.dp)
                             }
                             RemoteFileArtwork(
                                 item,
                                 thumbnails[item.id],
                                 theme,
-                                Modifier.width(cardSide).height(reflectionHeight).graphicsLayer { rotationX = 180f; alpha = if (usesDarkBackground) .24f else .12f },
+                                Modifier
+                                    .width(renderedSide.dp)
+                                    .height(reflectionHeight)
+                                    .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                                    .drawWithContent {
+                                        drawContent()
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(Color.Black, Color.Transparent),
+                                            ),
+                                            blendMode = BlendMode.DstIn,
+                                        )
+                                    }
+                                    .graphicsLayer {
+                                        rotationX = 180f
+                                        alpha = if (usesDarkBackground) .24f else .12f
+                                    },
                                 22.dp,
                                 8.dp,
                             )
@@ -1893,15 +2792,55 @@ internal fun RemoteBrowserCoverFlow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Surface(onClick = onBack, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
-                Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.ChevronLeft, "이전 폴더", tint = chromeForeground) }
+            CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) {
+                Surface(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .semantics(mergeDescendants = true) {
+                            contentDescription = "이전 폴더"
+                            customActions = listOf(
+                                CustomAccessibilityAction("NasFinder 첫 화면") {
+                                    (onDashboard ?: onBack)()
+                                    true
+                                },
+                            )
+                        }
+                        .clip(CircleShape)
+                        .combinedClickable(
+                            onClick = onBack,
+                            onLongClick = onDashboard ?: onBack,
+                            onLongClickLabel = "NasFinder 첫 화면",
+                        ),
+                    shape = CircleShape,
+                    color = chromeBackground,
+                    border = BorderStroke(1.dp, chromeBorder),
+                    shadowElevation = 2.dp,
+                ) {
+                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.ChevronLeft, null, tint = chromeForeground) }
+                }
             }
             Text(title, color = chromeForeground, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             Box {
                 Surface(onClick = { backgroundMenu = true }, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
-                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "Cover Flow 배경", tint = MaterialTheme.colorScheme.primary) }
+                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "오버플로우 배경", tint = MaterialTheme.colorScheme.primary) }
                 }
                 DropdownMenu(backgroundMenu, onDismissRequest = { backgroundMenu = false }) {
+                    if (viewModes.isNotEmpty()) {
+                        viewModes.forEach { mode ->
+                            DropdownMenuItem(
+                                text = { Text(mode.title) },
+                                leadingIcon = mode.icon?.let { icon -> { Icon(icon, null) } },
+                                trailingIcon = {
+                                    if (mode.selected) Icon(Icons.Default.Check, null)
+                                },
+                                onClick = {
+                                    backgroundMenu = false
+                                    mode.onSelect()
+                                },
+                            )
+                        }
+                        HorizontalDivider()
+                    }
                     DropdownMenuItem(text = { Text("밝은 배경") }, trailingIcon = { if (!usesDarkBackground) Icon(Icons.Default.Check, null) }, onClick = { backgroundMenu = false; onToggleBackground(false) })
                     DropdownMenuItem(text = { Text("어두운 배경") }, trailingIcon = { if (usesDarkBackground) Icon(Icons.Default.Check, null) }, onClick = { backgroundMenu = false; onToggleBackground(true) })
                 }
@@ -2040,7 +2979,7 @@ private fun longPress500Configuration(): ViewConfiguration {
 
 @Composable
 private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, modifier: Modifier, iconSize: androidx.compose.ui.unit.Dp, cornerRadius: androidx.compose.ui.unit.Dp) {
-    if ((item.isImage || item.isVideo) && thumbnail != null && !thumbnail.isRecycled) {
+    if (thumbnail != null && !thumbnail.isRecycled) {
         Image(
             bitmap = thumbnail.asImageBitmap(),
             contentDescription = "${item.name} 썸네일",
@@ -2117,6 +3056,26 @@ private fun DownloadProgressBanner(download: RemoteDownloadState, modifier: Modi
             )
         }
     }
+}
+
+@Composable
+private fun PreviewLoadProgressStrip(download: RemoteDownloadState, modifier: Modifier = Modifier) {
+    val progressModifier = modifier
+        .fillMaxWidth()
+        .navigationBarsPadding()
+        .height(2.dp)
+    download.fraction?.let { fraction ->
+        LinearProgressIndicator(
+            progress = { fraction },
+            modifier = progressModifier,
+            color = Color.White,
+            trackColor = Color.Black,
+        )
+    } ?: LinearProgressIndicator(
+        modifier = progressModifier,
+        color = Color.White,
+        trackColor = Color.Black,
+    )
 }
 
 @Composable
@@ -2261,12 +3220,9 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         )
     }
     val configuredLayout = if (layout == InboxLayout.OVERFLOW) InboxLayout.POSTERS else layout
-    val inboxLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    val showsAutomaticOverflow = configuredLayout == InboxLayout.POSTERS && inboxLandscape
-    val displayedLayout = if (showsAutomaticOverflow) InboxLayout.OVERFLOW else configuredLayout
     var layoutMenuExpanded by remember { mutableStateOf(false) }
     var overflowUsesDarkBackground by rememberSaveable {
-        mutableStateOf(inboxPreferences.getBoolean("overflow_dark", false))
+        mutableStateOf(inboxPreferences.getBoolean("overflow_dark", true))
     }
     fun setLayout(value: InboxLayout) {
         layout = value
@@ -2276,6 +3232,17 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     var confirmBatchDelete by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
     val selectedIds = remember { mutableStateListOf<java.util.UUID>() }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current.density
+    var overflowSelectedIndex by rememberSaveable { mutableIntStateOf(0) }
+    val showsAutomaticOverflow = configuredLayout == InboxLayout.POSTERS &&
+        AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
+            contentWidthDp = viewportSize.width / density,
+            contentHeightDp = viewportSize.height / density,
+            itemCount = files.size,
+            selectionActive = selectionMode,
+        )
+    val displayedLayout = if (showsAutomaticOverflow) InboxLayout.OVERFLOW else configuredLayout
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         model.importPickedFiles(uris)
     }
@@ -2317,6 +3284,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     val selectableIds = files.take(InboxBatchContracts.MAX_SELECTED_ITEMS).map { it.id }
     val allSelected = selectableIds.isNotEmpty() && selectedIds.size == selectableIds.size && selectedIds.containsAll(selectableIds)
     Scaffold(
+        modifier = Modifier.onSizeChanged { viewportSize = it },
         containerColor = Color.Transparent,
         topBar = {
             if (!showsAutomaticOverflow) TopAppBar(
@@ -2476,11 +3444,16 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         theme = state.theme,
                         usesDarkBackground = overflowUsesDarkBackground,
                         onBack = { model.show(Screen.Dashboard) },
+                        onDashboard = { model.show(Screen.Dashboard) },
+                        configuredLayout = configuredLayout,
+                        onSelectLayout = ::setLayout,
                         onToggleBackground = { dark ->
                             overflowUsesDarkBackground = dark
                             inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
                         },
                         onActivate = model::previewInboxFile,
+                        initialSelectedIndex = overflowSelectedIndex,
+                        onSelectedIndexChange = { overflowSelectedIndex = it },
                         modifier = Modifier.padding(padding).fillMaxSize(),
                     )
                 InboxLayout.DETAILS -> LazyColumn(
@@ -2804,8 +3777,13 @@ private fun InboxOverflow(
     theme: AppTheme,
     usesDarkBackground: Boolean,
     onBack: () -> Unit,
+    onDashboard: (() -> Unit)? = null,
+    configuredLayout: InboxLayout = InboxLayout.POSTERS,
+    onSelectLayout: (InboxLayout) -> Unit = {},
     onToggleBackground: (Boolean) -> Unit,
     onActivate: (InboxDisplayItem) -> Unit,
+    initialSelectedIndex: Int,
+    onSelectedIndexChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -2826,6 +3804,28 @@ private fun InboxOverflow(
         }
     }
     val filesByID = remember(files) { files.associateBy { it.id.toString() } }
+    val inboxViewModes = remember(configuredLayout) {
+        listOf(
+            CoverFlowViewModeOption(
+                title = InboxLayout.DETAILS.title,
+                selected = configuredLayout == InboxLayout.DETAILS,
+                icon = inboxLayoutIcon(InboxLayout.DETAILS),
+                onSelect = { onSelectLayout(InboxLayout.DETAILS) },
+            ),
+            CoverFlowViewModeOption(
+                title = InboxLayout.THUMBNAILS.title,
+                selected = configuredLayout == InboxLayout.THUMBNAILS,
+                icon = inboxLayoutIcon(InboxLayout.THUMBNAILS),
+                onSelect = { onSelectLayout(InboxLayout.THUMBNAILS) },
+            ),
+            CoverFlowViewModeOption(
+                title = InboxLayout.POSTERS.title,
+                selected = configuredLayout == InboxLayout.POSTERS,
+                icon = inboxLayoutIcon(InboxLayout.POSTERS),
+                onSelect = { onSelectLayout(InboxLayout.POSTERS) },
+            ),
+        )
+    }
 
     Box(modifier) {
         RemoteBrowserCoverFlow(
@@ -2835,8 +3835,12 @@ private fun InboxOverflow(
             title = "폰하드",
             usesDarkBackground = usesDarkBackground,
             onBack = onBack,
+            onDashboard = onDashboard,
+            viewModes = inboxViewModes,
             onToggleBackground = onToggleBackground,
             onActivate = { item -> filesByID[item.id]?.let(onActivate) },
+            initialSelectedIndex = initialSelectedIndex,
+            onSelectedIndexChange = onSelectedIndexChange,
             onLoadThumbnail = { item ->
                 val file = filesByID[item.id] ?: return@RemoteBrowserCoverFlow
                 if (requested.add(item.id)) {
@@ -3938,6 +4942,64 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
 }
 
 @Composable
+private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
+    val working = state.googlePhotosPhase in setOf(GooglePhotosPhase.AUTHORIZING, GooglePhotosPhase.PREPARING, GooglePhotosPhase.WAITING_FOR_SELECTION, GooglePhotosPhase.IMPORTING)
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = { CenterAlignedTopAppBar(
+            title = { Text("Google Photos") },
+            navigationIcon = { IconButton(onClick = { if (working) model.cancelGooglePhotosImport(); model.show(Screen.Dashboard) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로") } },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+        ) },
+    ) { padding ->
+        Column(Modifier.padding(padding).fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            DashboardCard {
+                Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Icon(Icons.Default.PhotoLibrary, null, tint = Color(0xFF4285F4), modifier = Modifier.size(30.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(if (state.googlePhotosConnected) "Google Photos 연결됨" else "Google Photos 연결 필요", fontWeight = FontWeight.SemiBold)
+                            Text("선택한 사진과 영상만 폰하드에 저장합니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    if (working) {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text(when (state.googlePhotosPhase) {
+                            GooglePhotosPhase.AUTHORIZING -> "브라우저에서 Google 로그인을 완료해 주세요."
+                            GooglePhotosPhase.PREPARING -> "사진 선택 화면을 준비하고 있습니다."
+                            GooglePhotosPhase.WAITING_FOR_SELECTION -> "Google Photos에서 사진을 선택해 주세요."
+                            GooglePhotosPhase.IMPORTING -> "선택한 파일을 폰하드로 가져오고 있습니다."
+                            else -> "처리 중입니다."
+                        }, style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(model::cancelGooglePhotosImport, Modifier.fillMaxWidth()) { Text("취소") }
+                    } else {
+                        Button(
+                            onClick = model::requestGooglePhotosImport,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(if (state.googlePhotosConnected) "사진 선택" else "Google Photos 연결") }
+                        if (state.googlePhotosPhase == GooglePhotosPhase.ERROR) {
+                            OutlinedButton(model::retryGooglePhotosImport, Modifier.fillMaxWidth(), enabled = state.googlePhotosConnected) { Text("다시 시도") }
+                        }
+                        if (state.googlePhotosConnected) TextButton(model::disconnectGooglePhotos, Modifier.fillMaxWidth()) { Text("연결 해제") }
+                    }
+                }
+            }
+            Text("NasFinder는 선택을 시작할 때 Google에 접속합니다. 선택한 원본은 Google에서 이 기기로 내려받아 폰하드에 보관하며, NasFinder 서버로 보내지 않습니다. 모바일 데이터 사용량이 발생할 수 있습니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+    if (state.googlePhotosDisclosureRequired) {
+        AlertDialog(
+            onDismissRequest = model::dismissGooglePhotosDisclosure,
+            icon = { Icon(Icons.Default.PhotoLibrary, null) },
+            title = { Text("Google Photos에서 가져오기") },
+            text = { Text("Google에 접속해 선택 화면을 엽니다. 선택한 사진·영상 원본을 이 기기로 내려받아 폰하드에 저장합니다. 모바일 데이터가 사용될 수 있습니다.") },
+            confirmButton = { TextButton(model::confirmGooglePhotosDisclosure) { Text("계속") } },
+            dismissButton = { TextButton(model::dismissGooglePhotosDisclosure) { Text("취소") } },
+        )
+    }
+}
+
+@Composable
 private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
     val uriHandler = LocalUriHandler.current
     var confirmCacheClear by remember { mutableStateOf(false) }
@@ -4073,6 +5135,16 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                }
+            }
+            item { SectionTitle("Google Photos", Icons.Default.PhotoLibrary) }
+            item {
+                DashboardCard {
+                    DashboardRow(Icons.Default.PhotoLibrary, if (state.googlePhotosConnected) "연결됨" else "연결 필요", "선택한 사진·영상을 폰하드로 가져옵니다.") { model.requestGooglePhotosImport() }
+                    if (state.googlePhotosConnected) {
+                        HorizontalDivider()
+                        TextButton(model::disconnectGooglePhotos, Modifier.fillMaxWidth().padding(horizontal = 8.dp)) { Text("연결 해제") }
                     }
                 }
             }

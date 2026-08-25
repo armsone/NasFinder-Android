@@ -83,7 +83,8 @@ class SuperThumbnailVault(private val workDirectory: File) {
         boundary.requireInsideRoot(parent)
         val vaultPath = boundary.requireInsideRoot(append(DIRECTORY_NAME, parent))
         return runCatching {
-            val stored = service.list(vaultPath).firstOrNull { !it.isDirectory && it.name == filename(item) }
+            val compatibleNames = compatibleFilenames(item).toSet()
+            val stored = service.list(vaultPath).firstOrNull { !it.isDirectory && it.name in compatibleNames }
                 ?: return null
             val local = ownedTemporary("restore", ".jpg")
             try {
@@ -172,17 +173,19 @@ class SuperThumbnailVault(private val workDirectory: File) {
             boundary.requireInsideRoot(mediaDirectory)
             val vaultPath = ensureVaultDirectory(mediaDirectory, boundary, service)
             var entries = service.list(vaultPath)
-            if (entries.any { !it.isDirectory && it.name == filename(item) }) {
+            val compatibleNames = compatibleFilenames(item).toSet()
+            if (entries.any { !it.isDirectory && it.name in compatibleNames }) {
                 return SuperThumbnailCooperativeClaim(SuperThumbnailCooperativeClaimType.DEFERRED)
             }
             val directoryName = leaseDirectoryName(item)
-            entries.firstOrNull { it.isDirectory && it.name == directoryName }?.let { existing ->
+            val compatibleLeaseNames = compatibleNames.mapTo(mutableSetOf()) { ".claim-${it.removeSuffix(".jpg")}" }
+            entries.firstOrNull { it.isDirectory && it.name in compatibleLeaseNames }?.let { existing ->
                 if (leaseIsActive(existing, service, now)) {
                     return SuperThumbnailCooperativeClaim(SuperThumbnailCooperativeClaimType.DEFERRED)
                 }
                 runCatching { service.delete(listOf(existing)) }
                 entries = service.list(vaultPath)
-                if (entries.any { !it.isDirectory && it.name == filename(item) }) {
+                if (entries.any { !it.isDirectory && it.name in compatibleNames }) {
                     return SuperThumbnailCooperativeClaim(SuperThumbnailCooperativeClaimType.DEFERRED)
                 }
             }
@@ -258,7 +261,8 @@ class SuperThumbnailVault(private val workDirectory: File) {
                 val jpeg = localData(item) ?: continue
                 if (jpeg.isEmpty() || jpeg.size > MAX_JPEG_BYTES) continue
                 val finalName = filename(item)
-                if (service.list(vaultPath).any { !it.isDirectory && it.name == finalName }) {
+                val compatibleNames = compatibleFilenames(item).toSet()
+                if (service.list(vaultPath).any { !it.isDirectory && it.name in compatibleNames }) {
                     stored += item.id
                     continue
                 }
@@ -294,6 +298,81 @@ class SuperThumbnailVault(private val workDirectory: File) {
         return latest
     }
 
+    suspend fun storeFolderThumbnail(
+        folderItem: RemoteFileItem,
+        rootPath: String,
+        service: RemoteFileService,
+        jpegData: ByteArray,
+    ): Boolean {
+        if (jpegData.isEmpty() || jpegData.size > MAX_JPEG_BYTES) return false
+        val boundary = SuperThumbnailTraversal(rootPath, SuperThumbnailBudget())
+        val parent = parentDirectory(folderItem.path)
+        return try {
+            boundary.requireInsideRoot(parent)
+            val vaultPath = ensureVaultDirectory(parent, boundary, service)
+            val targetName = folderFilename(folderItem.name)
+            val current = service.list(vaultPath)
+            if (current.any { !it.isDirectory && it.name == targetName }) return true
+            atomicallyUpload(jpegData, targetName, vaultPath, boundary, service)
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun storeFolderEmptyMarker(
+        folderItem: RemoteFileItem,
+        rootPath: String,
+        service: RemoteFileService,
+    ): Boolean {
+        val boundary = SuperThumbnailTraversal(rootPath, SuperThumbnailBudget())
+        val parent = parentDirectory(folderItem.path)
+        return try {
+            boundary.requireInsideRoot(parent)
+            val vaultPath = ensureVaultDirectory(parent, boundary, service)
+            val targetName = folderEmptyMarkerFilename(folderItem.name)
+            val current = service.list(vaultPath)
+            if (current.any { !it.isDirectory && it.name == targetName }) return true
+            atomicallyUpload(ByteArray(0), targetName, vaultPath, boundary, service)
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun storeFolderThumbnailWithRetry(
+        folderItem: RemoteFileItem,
+        rootPath: String,
+        service: RemoteFileService,
+        jpegData: ByteArray,
+    ): Boolean {
+        repeat(MAX_UPLOAD_ATTEMPTS) { attempt ->
+            currentCoroutineContext().ensureActive()
+            val success = storeFolderThumbnail(folderItem, rootPath, service, jpegData)
+            if (success) return true
+            if (attempt + 1 < MAX_UPLOAD_ATTEMPTS) delay(RETRY_DELAY_MILLIS)
+        }
+        return false
+    }
+
+    suspend fun storeFolderEmptyMarkerWithRetry(
+        folderItem: RemoteFileItem,
+        rootPath: String,
+        service: RemoteFileService,
+    ): Boolean {
+        repeat(MAX_UPLOAD_ATTEMPTS) { attempt ->
+            currentCoroutineContext().ensureActive()
+            val success = storeFolderEmptyMarker(folderItem, rootPath, service)
+            if (success) return true
+            if (attempt + 1 < MAX_UPLOAD_ATTEMPTS) delay(RETRY_DELAY_MILLIS)
+        }
+        return false
+    }
+
     suspend fun verifyStoredItemIds(
         items: List<RemoteFileItem>,
         rootPath: String,
@@ -308,7 +387,13 @@ class SuperThumbnailVault(private val workDirectory: File) {
             if (siblings.none { it.isDirectory && it.name == DIRECTORY_NAME }) return@forEach
             val vaultPath = boundary.requireInsideRoot(append(DIRECTORY_NAME, parent))
             val names = service.list(vaultPath).asSequence().filterNot(RemoteFileItem::isDirectory).mapTo(hashSetOf()) { it.name }
-            folderItems.filterTo(mutableListOf()) { filename(it) in names }.forEach { stored += it.id }
+            folderItems.filterTo(mutableListOf()) {
+                if (it.isDirectory) {
+                    folderFilename(it.name) in names || folderEmptyMarkerFilename(it.name) in names
+                } else {
+                    filename(it) in names
+                }
+            }.forEach { stored += it.id }
         }
         return stored
     }
@@ -508,16 +593,43 @@ class SuperThumbnailVault(private val workDirectory: File) {
         private const val APPLE_REFERENCE_EPOCH_SECONDS = 978_307_200.0
         private const val MAX_RECORD_BYTES = 64L * 1024L
 
-        fun filename(item: RemoteFileItem): String {
+        fun folderFilename(folderName: String): String = FolderSuperThumbnailPolicy.jpegFilename(folderName)
+
+        fun folderEmptyMarkerFilename(folderName: String): String = FolderSuperThumbnailPolicy.emptyMarkerFilename(folderName)
+
+        fun folderDigest(folderName: String): String = FolderSuperThumbnailPolicy.digest(folderName)
+
+        fun filename(item: RemoteFileItem): String =
+            if (item.isDirectory) folderFilename(item.name)
+            else filename(item, item.size.takeIf { it > 0 } ?: UNKNOWN_SIZE_SENTINEL)
+
+        /**
+         * iOS signs an unavailable size as -1. Older Android builds used the model's 0 default,
+         * so readers keep accepting that legacy name without mutating or deleting NAS data.
+         */
+        fun compatibleFilenames(item: RemoteFileItem): List<String> = buildList {
+            if (item.isDirectory) {
+                add(folderFilename(item.name))
+            } else {
+                add(filename(item))
+                if (item.size == 0L) {
+                    val legacy = filename(item, 0L)
+                    if (legacy != first()) add(legacy)
+                }
+            }
+        }
+
+        private fun filename(item: RemoteFileItem, signatureSize: Long): String {
             val normalizedName = Normalizer.normalize(item.name, Normalizer.Form.NFC)
-            val identity = "engine=$ENGINE_VERSION|name=$normalizedName|size=${item.size}|modified=${item.modifiedAt?.toEpochMilli() ?: 0}"
+            val identity = "engine=$ENGINE_VERSION|name=$normalizedName|size=$signatureSize|modified=${item.modifiedAt?.toEpochMilli() ?: 0}"
             val digest = MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it) }
             return "v$ENGINE_VERSION-$digest.jpg"
         }
 
         fun leaseDirectoryName(item: RemoteFileItem): String =
-            ".claim-${filename(item).removeSuffix(".jpg")}"
+            if (item.isDirectory) FolderSuperThumbnailPolicy.leaseDirectoryName(item.name)
+            else ".claim-${filename(item).removeSuffix(".jpg")}"
 
         private fun workerFilename(workerId: String) = "worker-$workerId.json"
 
@@ -527,6 +639,8 @@ class SuperThumbnailVault(private val workDirectory: File) {
 
         private fun isValidWorkerId(workerId: String): Boolean =
             workerId.matches(Regex("[A-Za-z0-9-]{1,64}"))
+
+        private const val UNKNOWN_SIZE_SENTINEL = -1L
 
         private fun appleDate(instant: Instant): Double =
             instant.epochSecond.toDouble() + instant.nano / 1_000_000_000.0 - APPLE_REFERENCE_EPOCH_SECONDS

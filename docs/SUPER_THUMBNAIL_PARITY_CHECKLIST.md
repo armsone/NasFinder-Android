@@ -35,6 +35,7 @@ Android는 WorkManager unique work, 연결별 작업 식별자, 표준/제한 �
 - 업로드 성공은 원격 listing으로 파일 존재를 확인한 뒤 기록한다. 취소·부분 실패를 uploaded로 표시하지 않는다.
 - verification에서 사라진 과거 uploaded 항목은 pending으로 되돌리고 verified timestamp를 기록한다.
 - Vault 읽기는 동일 NAS 경로와 content signature를 기준으로 하므로 다른 connection ID로 같은 NAS에 연결해도 복원할 수 있어야 한다.
+- Foreground 썸네일 로딩 시 `.NasFinder-Vault` 폴더 listing을 부모 디렉터리별로 30초간 메모리에 캐싱 및 요청 병합(coalescing)하여 N+1 listing 부하를 방지하고, signature 일치 시 로컬 LRU 디스크·메모리 캐시로 복원하여 원격 썸네일 재생성·다운로드를 생략한다.
 - NAS Vault 삭제는 Vault 파일만 지우고 로컬 thumbnail/cache, 원본 미디어, queue report를 임의로 삭제하지 않는다. root 및 symlink 경계를 재확인한다.
 
 ## WorkManager와 프로세스 재시작 경계
@@ -70,4 +71,4 @@ Android는 WorkManager unique work, 연결별 작업 식별자, 표준/제한 �
 6. 프로세스 재시작 instrumentation: 실행 중 process kill 후 observer·selection·progress 복원, terminal result 복원, 중복 enqueue 없음, queue/Vault resume.
 7. 접근성 Compose test: 모든 action semantics, progress range/state description, failure disclosure, stable focus/item key, touch exploration에서 숨김 gesture의 명시적 대체 경로.
 
-현재 JVM의 `SuperThumbnailWorkContractTest`, `SuperThumbnailVaultAndSessionTest`, `RemoteThumbnailCacheTest`는 WorkManager Data 재관찰과 손상 값 fail-closed, 연결별 private unique identity, signature queue/report/resume, Vault staging·검증·삭제 경계와 Vault JPEG 입력 경계를 고정한다. 프로세스 재시작 instrumentation과 실제 NAS E2E는 정식 후보에서 별도로 확인한다.
+현재 JVM의 `SuperThumbnailWorkContractTest`, `SuperThumbnailVaultAndSessionTest`, `RemoteThumbnailCacheTest`, `DocumentsThumbnailPolicyTest`는 WorkManager Data 재관찰과 손상 값 fail-closed, 연결별 private unique identity, signature queue/report/resume, Vault staging·검증·삭제 경계와 Vault JPEG 복원/fallback, N+1 Vault listing 병합 캐시, 미디어 뷰어 제스처·재생 모드 정책을 고정한다. 프로세스 재시작 instrumentation과 실제 NAS E2E는 정식 후보에서 별도로 확인한다.

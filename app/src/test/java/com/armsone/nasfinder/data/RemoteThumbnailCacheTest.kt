@@ -1,7 +1,9 @@
 package com.armsone.nasfinder.data
 
 import com.armsone.nasfinder.model.RemoteFileItem
+import com.armsone.nasfinder.network.RemoteFileService
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -136,10 +138,109 @@ class RemoteThumbnailCacheTest {
     }
 
     @Test
+    fun `vault download reserves expected bytes and records successful transfer`() = runBlocking {
+        val payload = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte())
+        val budget = RemoteThumbnailTrafficBudget(
+            RemoteThumbnailTrafficLimits(maxRequests = 2, maxExpectedBytes = 16, maxActualBytes = 16),
+        )
+        val destination = temporary.newFile("vault-success.jpg")
+
+        assertTrue(
+            RemoteThumbnailVaultDownload.download(
+                item = RemoteFileItem("vault", "stored.jpg", "/vault/stored.jpg", false, size = payload.size.toLong()),
+                destination = destination,
+                service = vaultDownloadService(payload),
+                trafficBudget = budget,
+                maxBytes = 8,
+            )
+        )
+        assertEquals(1, budget.snapshot.value.requestCount)
+        assertEquals(payload.size.toLong(), budget.snapshot.value.expectedBytes)
+        assertEquals(payload.size.toLong(), budget.snapshot.value.actualBytes)
+    }
+
+    @Test
+    fun `vault download accounts partial bytes on failure and cancellation`() {
+        val failedBudget = RemoteThumbnailTrafficBudget(
+            RemoteThumbnailTrafficLimits(maxRequests = 2, maxExpectedBytes = 16, maxActualBytes = 16),
+        )
+        assertThrows(IOException::class.java) {
+            runBlocking {
+                RemoteThumbnailVaultDownload.download(
+                    item = RemoteFileItem("failed", "failed.jpg", "/vault/failed.jpg", false, size = 4),
+                    destination = temporary.newFile("vault-failed.jpg"),
+                    service = vaultDownloadService(byteArrayOf(1, 2), IOException("network failed")),
+                    trafficBudget = failedBudget,
+                    maxBytes = 8,
+                )
+            }
+        }
+        assertEquals(4L, failedBudget.snapshot.value.expectedBytes)
+        assertEquals(2L, failedBudget.snapshot.value.actualBytes)
+
+        val cancelledBudget = RemoteThumbnailTrafficBudget(
+            RemoteThumbnailTrafficLimits(maxRequests = 2, maxExpectedBytes = 16, maxActualBytes = 16),
+        )
+        assertThrows(CancellationException::class.java) {
+            runBlocking {
+                RemoteThumbnailVaultDownload.download(
+                    item = RemoteFileItem("cancelled", "cancelled.jpg", "/vault/cancelled.jpg", false, size = 4),
+                    destination = temporary.newFile("vault-cancelled.jpg"),
+                    service = vaultDownloadService(byteArrayOf(1, 2), CancellationException("cancelled")),
+                    trafficBudget = cancelledBudget,
+                    maxBytes = 8,
+                )
+            }
+        }
+        assertEquals(4L, cancelledBudget.snapshot.value.expectedBytes)
+        assertEquals(2L, cancelledBudget.snapshot.value.actualBytes)
+    }
+
+    @Test
+    fun `vault download stops at traffic and payload boundaries`() {
+        val trafficBudget = RemoteThumbnailTrafficBudget(
+            RemoteThumbnailTrafficLimits(maxRequests = 2, maxExpectedBytes = 16, maxActualBytes = 3),
+        )
+        assertThrows(RemoteThumbnailTrafficLimitReached::class.java) {
+            runBlocking {
+                RemoteThumbnailVaultDownload.download(
+                    item = RemoteFileItem("limited", "limited.jpg", "/vault/limited.jpg", false, size = 4),
+                    destination = temporary.newFile("vault-limited.jpg"),
+                    service = vaultDownloadService(byteArrayOf(1, 2, 3, 4)),
+                    trafficBudget = trafficBudget,
+                    maxBytes = 8,
+                )
+            }
+        }
+        assertEquals(4L, trafficBudget.snapshot.value.actualBytes)
+        assertTrue(trafficBudget.snapshot.value.limitReached)
+
+        val payloadBudget = RemoteThumbnailTrafficBudget(
+            RemoteThumbnailTrafficLimits(maxRequests = 2, maxExpectedBytes = 16, maxActualBytes = 16),
+        )
+        assertFalse(
+            runBlocking {
+                RemoteThumbnailVaultDownload.download(
+                    item = RemoteFileItem("oversize", "oversize.jpg", "/vault/oversize.jpg", false, size = 9),
+                    destination = temporary.newFile("vault-oversize.jpg"),
+                    service = vaultDownloadService(ByteArray(9)),
+                    trafficBudget = payloadBudget,
+                    maxBytes = 8,
+                )
+            }
+        )
+        assertEquals(0, payloadBudget.snapshot.value.requestCount)
+        assertEquals(0L, payloadBudget.snapshot.value.actualBytes)
+    }
+
+    @Test
     fun `video prefers server thumbnail then sparse range while image keeps original fallback`() {
         val video = RemoteFileItem("v", "movie.mp4", "/movie.mp4", false, size = 1_000_000)
         val image = RemoteFileItem("i", "photo.jpg", "/photo.jpg", false, size = 1_000_000)
+        val folder = RemoteFileItem("f", "photos", "/photos", true)
 
+        assertEquals(RemoteThumbnailSource.FOLDER_VAULT, RemoteThumbnailFetchPolicy.source(folder))
+        assertEquals(RemoteThumbnailSource.FOLDER_VAULT, RemoteThumbnailFetchPolicy.source(folder, true))
         assertEquals(RemoteThumbnailSource.NONE, RemoteThumbnailFetchPolicy.source(video))
         assertEquals(RemoteThumbnailSource.SPARSE_VIDEO, RemoteThumbnailFetchPolicy.source(video, true))
         assertEquals(
@@ -237,4 +338,73 @@ class RemoteThumbnailCacheTest {
         assertEquals(1, traffic.snapshot.value.requestCount)
         session.close()
     }
+
+    @Test
+    fun `vault directory cache coalesces concurrent requests and caches within ttl`() = runBlocking {
+        var clock = 1000L
+        val listCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val cache = RemoteThumbnailVaultDirectoryCache(maxEntries = 10, ttlMillis = 10_000, now = { clock })
+
+        val fakeService = object : com.armsone.nasfinder.network.RemoteFileService {
+            override suspend fun testConnection() = Unit
+            override suspend fun list(path: String): List<RemoteFileItem> {
+                listCount.incrementAndGet()
+                kotlinx.coroutines.delay(50)
+                return listOf(
+                    RemoteFileItem("1", "v1-thumb.jpg", "$path/v1-thumb.jpg", false, size = 100),
+                    RemoteFileItem("2", "subfolder", "$path/subfolder", true),
+                )
+            }
+            override suspend fun download(item: RemoteFileItem, destination: java.io.File, progress: (Long, Long) -> Unit) = Unit
+            override suspend fun createFolder(parent: String, name: String) = Unit
+            override suspend fun upload(parent: String, source: java.io.File) = Unit
+            override suspend fun rename(item: RemoteFileItem, newName: String) = Unit
+            override suspend fun delete(items: List<RemoteFileItem>) = Unit
+            override fun close() = Unit
+        }
+
+        val deferred1 = async { cache.listVault("connection-a", "/vault", fakeService, this) }
+        val deferred2 = async { cache.listVault("connection-a", "/vault", fakeService, this) }
+        val results = kotlinx.coroutines.awaitAll(deferred1, deferred2)
+
+        assertEquals(1, listCount.get())
+        assertEquals(1, results[0]?.size)
+        assertTrue(results[0]?.containsKey("v1-thumb.jpg") == true)
+        assertEquals(results[0], results[1])
+
+        clock += 5_000
+        val cached = cache.listVault("connection-a", "/vault", fakeService, this)
+        assertEquals(1, listCount.get())
+        assertEquals(1, cached?.size)
+
+        clock += 15_000
+        val expired = cache.listVault("connection-a", "/vault", fakeService, this)
+        assertEquals(2, listCount.get())
+        assertEquals(1, expired?.size)
+
+        cache.clear()
+        val afterClear = cache.listVault("connection-a", "/vault", fakeService, this)
+        assertEquals(3, listCount.get())
+        assertEquals(1, afterClear?.size)
+    }
+
+    private fun vaultDownloadService(payload: ByteArray, failure: Throwable? = null): RemoteFileService =
+        object : RemoteFileService {
+            override suspend fun testConnection() = Unit
+            override suspend fun list(path: String): List<RemoteFileItem> = emptyList()
+            override suspend fun download(
+                item: RemoteFileItem,
+                destination: java.io.File,
+                progress: (Long, Long) -> Unit,
+            ) {
+                destination.writeBytes(payload)
+                progress(payload.size.toLong(), item.size)
+                if (failure != null) throw failure
+            }
+            override suspend fun createFolder(parent: String, name: String) = Unit
+            override suspend fun upload(parent: String, source: java.io.File) = Unit
+            override suspend fun rename(item: RemoteFileItem, newName: String) = Unit
+            override suspend fun delete(items: List<RemoteFileItem>) = Unit
+            override fun close() = Unit
+        }
 }

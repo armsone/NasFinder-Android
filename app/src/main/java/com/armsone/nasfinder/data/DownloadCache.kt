@@ -2,6 +2,7 @@ package com.armsone.nasfinder.data
 
 import android.content.Context
 import com.armsone.nasfinder.model.RemoteFileItem
+import com.armsone.nasfinder.util.DownloadCacheContract
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,12 +34,13 @@ class DownloadCache(context: Context) {
             val destination = File(entryDirectory, safeFilename(item.name)).canonicalFile
             require(destination.parentFile == entryDirectory) { "안전하지 않은 파일명입니다." }
 
-            if (destination.isFile) {
+            if (destination.isFile && DownloadCacheContract.isComplete(destination.length(), item.size)) {
                 destination.setLastModified(System.currentTimeMillis())
                 entryDirectory.setLastModified(System.currentTimeMillis())
                 progress(destination.length(), destination.length())
                 return@withLock destination
             }
+            if (destination.exists()) destination.delete()
 
             check(entryDirectory.mkdirs() || entryDirectory.isDirectory) {
                 "다운로드 캐시를 만들 수 없습니다."
@@ -48,6 +50,9 @@ class DownloadCache(context: Context) {
             try {
                 download(partial, progress)
                 check(partial.isFile) { "다운로드한 파일을 찾을 수 없습니다." }
+                check(DownloadCacheContract.isComplete(partial.length(), item.size)) {
+                    "다운로드 크기가 원격 파일과 다릅니다. 다시 시도해 주세요."
+                }
                 if (!partial.renameTo(destination)) {
                     partial.copyTo(destination, overwrite = true)
                     partial.delete()

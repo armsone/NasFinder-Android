@@ -35,6 +35,7 @@ data class SuperThumbnailVaultFolderReport(
 data class SuperThumbnailSessionReport(
     val successCounts: List<Int>,
     val photoSuccessCount: Int,
+    val folderSuccessCount: Int = 0,
     val failures: List<SuperThumbnailFailureRecord>,
     val pendingCount: Int,
     val cachedCount: Int,
@@ -42,7 +43,7 @@ data class SuperThumbnailSessionReport(
     val vaultLastVerifiedAt: Instant?,
     val mediaScope: SuperThumbnailMediaScope,
 ) {
-    val successfulCount: Int get() = successCounts.sum() + photoSuccessCount
+    val successfulCount: Int get() = successCounts.sum() + photoSuccessCount + folderSuccessCount
     val vaultUploadedCount: Int get() = vaultFolders.sumOf { it.uploadedCount }
     val vaultPendingCount: Int get() = vaultFolders.sumOf { it.pendingCount }
     val vaultFailedCount: Int get() = vaultFolders.sumOf { it.failedCount }
@@ -83,7 +84,11 @@ class SuperThumbnailSessionStore(private val storageFile: File) {
     fun recordSuccess(sessionKey: String, item: RemoteFileItem, attempt: Int = 0, photo: Boolean = item.isImage) =
         mutateItem(sessionKey, item) {
             it.copy(
-                outcome = if (photo) Outcome.PHOTO_SUCCESS else Outcome.SUCCESS,
+                outcome = when {
+                    item.isDirectory -> Outcome.FOLDER_SUCCESS
+                    photo -> Outcome.PHOTO_SUCCESS
+                    else -> Outcome.SUCCESS
+                },
                 successAttempt = attempt.coerceIn(0, 2),
                 failure = null,
             )
@@ -184,6 +189,7 @@ class SuperThumbnailSessionStore(private val storageFile: File) {
         SuperThumbnailSessionReport(
             successCounts = successCounts,
             photoSuccessCount = states.count { it.outcome == Outcome.PHOTO_SUCCESS },
+            folderSuccessCount = states.count { it.outcome == Outcome.FOLDER_SUCCESS },
             failures = states.mapNotNull { it.failure }.sortedBy { it.name },
             pendingCount = states.count { it.outcome == Outcome.PENDING },
             cachedCount = states.count { it.outcome == Outcome.CACHED },
@@ -324,7 +330,7 @@ class SuperThumbnailSessionStore(private val storageFile: File) {
     private fun signature(item: RemoteFileItem): String = "${item.id}|${item.size}|${item.modifiedAt?.toEpochMilli() ?: 0}"
     private fun parentDirectory(path: String): String = path.substringBeforeLast('/', "").ifBlank { if (path.startsWith('/')) "/" else "." }
 
-    private enum class Outcome { PENDING, CACHED, SUCCESS, PHOTO_SUCCESS, FAILURE }
+    private enum class Outcome { PENDING, CACHED, SUCCESS, PHOTO_SUCCESS, FOLDER_SUCCESS, FAILURE }
     private data class ItemState(
         val item: RemoteFileItem,
         val signature: String,

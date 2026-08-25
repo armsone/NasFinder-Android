@@ -15,6 +15,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import android.graphics.Bitmap
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.network.RemoteFileServiceFactory
@@ -25,6 +26,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -217,10 +219,13 @@ class SuperThumbnailWorker(
         var listingFailed = false
         val observedMedia = mutableListOf<RemoteFileItem>()
         val delayedVaultItems = mutableListOf<RemoteFileItem>()
+        val visitedDirectoryNodes = mutableListOf<String>()
+        val dirChildrenMap = mutableMapOf<String, List<RemoteFileItem>>()
 
         while (true) {
             currentCoroutineContext().ensureActive()
             val directory = traversal.nextDirectory() ?: break
+            visitedDirectoryNodes += directory.path
             val items = runCatching { service.list(directory.path) }.getOrElse {
                 if (directory.depth == 0 && visited == 0) throw it
                 listingFailed = true
@@ -229,6 +234,7 @@ class SuperThumbnailWorker(
                 continue
             }
             val visibleItems = items.filterNot { it.name.startsWith('.') }
+            dirChildrenMap[directory.path] = visibleItems
             val completedInFolder = mutableListOf<RemoteFileItem>()
             itemLoop@ for (item in visibleItems) {
                 currentCoroutineContext().ensureActive()
@@ -246,6 +252,8 @@ class SuperThumbnailWorker(
                     continue
                 }
                 if (item.isDirectory) {
+                    val safeItem = item.copy(path = safePath)
+                    observedMedia += safeItem
                     if (!traversal.enqueueDirectory(safePath, directory.depth) && directory.depth >= budget.maxDepth) {
                         budgetReached = true
                     }
@@ -364,6 +372,67 @@ class SuperThumbnailWorker(
                     }
                     sessionStore.recordVaultResult(sessionKey, result)
                 }
+        }
+        // Bottom-up folder Super Thumbnail production
+        for (dirPath in visitedDirectoryNodes.asReversed()) {
+            val childFolders = dirChildrenMap[dirPath].orEmpty().filter { it.isDirectory }
+            for (folderItem in childFolders) {
+                currentCoroutineContext().ensureActive()
+                if (resumeItemIds != null && folderItem.id !in resumeItemIds) continue
+                if (!allowsThermalWork()) return Result.retry()
+                val folderChildren = dirChildrenMap[folderItem.path] ?: continue
+                sessionStore.prepare(
+                    sessionKey = sessionKey,
+                    rootPath = rootPath,
+                    items = listOf(folderItem),
+                    vaultEnabled = vaultOptions.enabled,
+                )
+                if (folderChildren.isEmpty()) {
+                    if (vaultOptions.enabled) {
+                        vault.storeFolderEmptyMarkerWithRetry(folderItem, rootPath, service)
+                    }
+                    sessionStore.recordSuccess(sessionKey, folderItem)
+                } else {
+                    var wasCached = thumbnails.hasCached(connection, folderItem)
+                    if (!wasCached && vaultOptions.enabled) {
+                        val restored = vault.restoredData(folderItem, rootPath, service)
+                        if (restored != null && thumbnails.storeJpegData(connection, folderItem, restored)) {
+                            wasCached = true
+                        }
+                    }
+                    if (wasCached) {
+                        sessionStore.markCached(sessionKey, folderItem)
+                    } else {
+                        val selected = FolderSuperThumbnailPolicy.selectChildren(folderChildren)
+                        val tileBitmaps = selected.associateWith { child ->
+                            if (thumbnails.hasCached(connection, child)) {
+                                thumbnails.load(connection, child, service)
+                            } else null
+                        }
+                        val sheet = FolderSuperThumbnailComposer.composeSheet(selected, tileBitmaps::get)
+                        val out = ByteArrayOutputStream()
+                        if (sheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
+                            val jpegBytes = out.toByteArray()
+                            sheet.recycle()
+                            if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
+                                thumbnails.storeJpegData(connection, folderItem, jpegBytes)
+                                if (vaultOptions.enabled) {
+                                    vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
+                                }
+                                generated++
+                                sessionStore.recordSuccess(sessionKey, folderItem)
+                            } else {
+                                failed++
+                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
+                            }
+                        } else {
+                            sheet.recycle()
+                            failed++
+                            sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
+                        }
+                    }
+                }
+            }
         }
         if (vaultOptions.enabled && observedMedia.isNotEmpty()) {
             runCatching { vault.verifyStoredItemIds(observedMedia, rootPath, service) }
