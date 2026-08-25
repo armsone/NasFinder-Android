@@ -108,7 +108,7 @@ class GitHubAppUpdateService(context: Context, private val currentVersionCode: I
         if (!GitHubUpdatePolicy.isApprovedApkAsset(
                 release.assetName,
                 release.apkUrl.toExternalForm(),
-                release.versionCode,
+                GitHubUpdatePolicy.productVersion(release.tagName) ?: throw IOException("Invalid release tag"),
                 release.assetSizeBytes,
             )
         ) throw IOException("Release asset is no longer approved")
@@ -234,14 +234,15 @@ internal object GitHubReleaseDecoder {
         val root = JSONObject(payload)
         if (root.optBoolean("draft", true) || root.optBoolean("prerelease", true)) return null
         val tag = root.optString("tag_name")
-        val versionCode = GitHubUpdatePolicy.versionCode(tag) ?: return null
+        val productVersion = GitHubUpdatePolicy.productVersion(tag) ?: return null
+        val versionCode = GitHubUpdatePolicy.versionCode(root.optString("body")) ?: return null
         val assets = root.optJSONArray("assets") ?: return null
         for (index in 0 until assets.length()) {
             val asset = assets.optJSONObject(index) ?: continue
             val name = asset.optString("name")
             val url = asset.optString("browser_download_url")
             val size = asset.optLong("size", -1L)
-            if (GitHubUpdatePolicy.isApprovedApkAsset(name, url, versionCode, size)) {
+            if (GitHubUpdatePolicy.isApprovedApkAsset(name, url, productVersion, size)) {
                 return GitHubAppRelease(versionCode, tag, name, URL(url), size)
             }
         }
@@ -250,17 +251,20 @@ internal object GitHubReleaseDecoder {
 }
 
 internal object GitHubUpdatePolicy {
-    private val tagPattern = Regex("^android-v([1-9]\\d*)$")
+    private val tagPattern = Regex("^android-v(\\d+\\.\\d+\\.\\d+)$")
+    private val versionCodePattern = Regex("(?m)^Android-Version-Code:\\s*([1-9]\\d*)\\s*$")
 
-    fun versionCode(tagName: String): Int? = tagPattern.matchEntire(tagName)
+    fun productVersion(tagName: String): String? = tagPattern.matchEntire(tagName)
+        ?.groupValues?.get(1)
+    fun versionCode(releaseNotes: String): Int? = versionCodePattern.find(releaseNotes)
         ?.groupValues?.get(1)?.toIntOrNull()
 
-    fun isApprovedApkAsset(assetName: String, urlText: String, versionCode: Int, sizeBytes: Long): Boolean {
-        if (assetName != "NasFinder-Android-v$versionCode.apk") return false
+    fun isApprovedApkAsset(assetName: String, urlText: String, productVersion: String, sizeBytes: Long): Boolean {
+        if (assetName != "NasFinder-Android-$productVersion.apk") return false
         if (sizeBytes <= 0 || sizeBytes > 250L * 1_024L * 1_024L) return false
         val url = runCatching { URL(urlText) }.getOrNull() ?: return false
         return isStandardHttps(url) && url.host.equals("github.com", ignoreCase = true) &&
-            url.path == "/armsone/NasFinder-Android/releases/download/android-v$versionCode/$assetName" &&
+            url.path == "/armsone/NasFinder-Android/releases/download/android-v$productVersion/$assetName" &&
             url.query == null && url.ref == null
     }
 

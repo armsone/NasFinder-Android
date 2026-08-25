@@ -3,10 +3,11 @@
 NasFinder Android는 공식 GitHub Release에 더 높은 `versionCode`가 있을 때만 사용자에게 선택적으로 안내한다. 확인만 자동이며 APK 다운로드와 Android 설치 화면은 사용자가 각각 눌러야 진행된다.
 
 - API: `https://api.github.com/repos/armsone/NasFinder-Android/releases/latest`
-- tag: `android-v{versionCode}`
-- APK: `NasFinder-Android-v{versionCode}.apk`
+- tag: `android-v{versionName}`
+- APK: `NasFinder-Android-{versionName}.apk`
+- 릴리스 본문: `Android-Version-Code: {versionCode}`와 `Build-Number: {YYYYMMDDHHMM}`
 
-정식 배포는 다른 armsone Android 앱과 동일하게 이 Mac의 장기 보관 signing key로 `releaseQa`를 만들고 검증한 뒤 `android-v{versionCode}` 안정 Release에 게시한다. Draft와 prerelease는 앱의 자동 업데이트 대상으로 사용하지 않는다.
+정식 배포는 다른 armsone Android 앱과 동일하게 이 Mac의 장기 보관 signing key로 `releaseQa`를 만들고 검증한 뒤 제품 버전 태그의 안정 Release에 게시한다. Draft와 prerelease는 앱의 자동 업데이트 대상으로 사용하지 않는다.
 - draft·prerelease·다른 host·다른 파일명·250 MiB 초과 자산은 거절한다.
 - Release JSON은 1,000,000자에서 읽기를 중단한다. 응답 전체를 메모리에 읽은 뒤 크기만 검사하지 않는다.
 - APK redirect는 최대 5회이며 HTTPS 표준 포트의 GitHub release CDN host만 허용한다. HTTP downgrade, user-info URL, 임의 포트와 유사 도메인은 거절한다.

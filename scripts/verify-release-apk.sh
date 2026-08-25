@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-  echo "usage: $0 /absolute/path/NasFinder-Android-vVERSION_CODE.apk" >&2
+  echo "usage: $0 /absolute/path/NasFinder-Android-VERSION_NAME.apk" >&2
   exit 64
 fi
 
@@ -10,7 +10,7 @@ apk_path=$1
 apk_name=${apk_path##*/}
 
 case "$apk_name" in
-  NasFinder-Android-v*.apk) ;;
+  NasFinder-Android-*.apk) ;;
   *) echo "unexpected release filename: $apk_name" >&2; exit 65 ;;
 esac
 
@@ -34,8 +34,13 @@ version_code=$(printf '%s\n' "$package_line" | sed -n "s/.*versionCode='\([^']*\
 case "$version_code" in
   ''|*[!0-9]*) echo "invalid versionCode" >&2; exit 65 ;;
 esac
-if [ "$apk_name" != "NasFinder-Android-v${version_code}.apk" ]; then
-  echo "filename/versionCode mismatch" >&2
+version_name=$(printf '%s\n' "$package_line" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+case "$version_name" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "invalid versionName" >&2; exit 65 ;;
+esac
+if [ "$apk_name" != "NasFinder-Android-${version_name}.apk" ]; then
+  echo "filename/versionName mismatch" >&2
   exit 65
 fi
 
