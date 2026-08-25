@@ -19,7 +19,8 @@ object FolderSuperThumbnailPolicy {
     const val SAMPLE_GRID_SIZE = 12
     const val TOTAL_SAMPLES = SAMPLE_GRID_SIZE * SAMPLE_GRID_SIZE // 144
     const val SKIN_TONE_THRESHOLD_PERCENT = 42
-    const val GAUSSIAN_BLUR_RADIUS_PX = 4 // 2dp at 384px/192dp reference
+    const val BLUR_RADIUS_POINTS = 1.5f
+    const val GAUSSIAN_BLUR_RADIUS_PX = 3 // 1.5 logical points at 384px/192dp reference (3px)
 
     const val MISSING_FOLDER_NEGATIVE_MILLIS = 60_000L // 60s
     const val EMPTY_MARKER_NEGATIVE_MILLIS = 600_000L // 10m (600s)

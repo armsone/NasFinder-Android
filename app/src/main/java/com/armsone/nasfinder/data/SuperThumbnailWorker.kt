@@ -275,7 +275,7 @@ class SuperThumbnailWorker(
                         continue
                     }
                     estimatedBytes += estimate
-                    var wasCached = thumbnails.hasCached(connection, safeItem)
+                    var wasCached = thumbnails.hasVaultCached(connection, safeItem)
                     if (!wasCached && vaultOptions.enabled) {
                         val restored = vault.restoredData(safeItem, rootPath, service)
                         if (restored != null && thumbnails.storeJpegData(connection, safeItem, restored)) {
@@ -308,7 +308,11 @@ class SuperThumbnailWorker(
                         }
                     }
                     val cached = try {
-                        thumbnails.load(connection, safeItem, service)
+                        if (wasCached) {
+                            thumbnails.load(connection, safeItem, service)
+                        } else {
+                            thumbnails.generateSuperThumbnail(connection, safeItem, service)
+                        }
                     } catch (error: Throwable) {
                         cooperativeLease?.let { cooperation?.release(it) }
                         throw error
@@ -374,65 +378,81 @@ class SuperThumbnailWorker(
                 }
         }
         // Bottom-up folder Super Thumbnail production
-        for (dirPath in visitedDirectoryNodes.asReversed()) {
-            val childFolders = dirChildrenMap[dirPath].orEmpty().filter { it.isDirectory }
-            for (folderItem in childFolders) {
-                currentCoroutineContext().ensureActive()
-                if (resumeItemIds != null && folderItem.id !in resumeItemIds) continue
-                if (!allowsThermalWork()) return Result.retry()
-                val folderChildren = dirChildrenMap[folderItem.path] ?: continue
-                sessionStore.prepare(
-                    sessionKey = sessionKey,
-                    rootPath = rootPath,
-                    items = listOf(folderItem),
-                    vaultEnabled = vaultOptions.enabled,
-                )
-                if (folderChildren.isEmpty()) {
-                    if (vaultOptions.enabled) {
-                        vault.storeFolderEmptyMarkerWithRetry(folderItem, rootPath, service)
-                    }
-                    sessionStore.recordSuccess(sessionKey, folderItem)
-                } else {
-                    var wasCached = thumbnails.hasCached(connection, folderItem)
-                    if (!wasCached && vaultOptions.enabled) {
-                        val restored = vault.restoredData(folderItem, rootPath, service)
-                        if (restored != null && thumbnails.storeJpegData(connection, folderItem, restored)) {
-                            wasCached = true
+        val unblurredFolderSheets = mutableMapOf<String, Bitmap>()
+        try {
+            for (dirPath in visitedDirectoryNodes.asReversed()) {
+                val childFolders = dirChildrenMap[dirPath].orEmpty().filter { it.isDirectory }
+                for (folderItem in childFolders) {
+                    currentCoroutineContext().ensureActive()
+                    if (resumeItemIds != null && folderItem.id !in resumeItemIds) continue
+                    if (!allowsThermalWork()) return Result.retry()
+                    val folderChildren = dirChildrenMap[folderItem.path] ?: continue
+                    sessionStore.prepare(
+                        sessionKey = sessionKey,
+                        rootPath = rootPath,
+                        items = listOf(folderItem),
+                        vaultEnabled = vaultOptions.enabled,
+                    )
+                    if (folderChildren.isEmpty()) {
+                        if (vaultOptions.enabled) {
+                            vault.storeFolderEmptyMarkerWithRetry(folderItem, rootPath, service)
                         }
-                    }
-                    if (wasCached) {
-                        sessionStore.markCached(sessionKey, folderItem)
+                        sessionStore.recordSuccess(sessionKey, folderItem)
                     } else {
+                        var wasCached = thumbnails.hasVaultCached(connection, folderItem)
+                        if (!wasCached && vaultOptions.enabled) {
+                            val restored = vault.restoredData(folderItem, rootPath, service)
+                            if (restored != null && thumbnails.storeJpegData(connection, folderItem, restored)) {
+                                wasCached = true
+                            }
+                        }
+                        // Always rebuild an unblurred run-scoped source, even when the
+                        // folder's final JPEG was restored from cache or another Mac.
+                        // Parents therefore never consume a persisted blurred child.
                         val selected = FolderSuperThumbnailPolicy.selectChildren(folderChildren)
                         val tileBitmaps = selected.associateWith { child ->
-                            if (thumbnails.hasCached(connection, child)) {
+                            if (child.isDirectory) {
+                                unblurredFolderSheets[child.path]
+                            } else if (thumbnails.hasCached(connection, child)) {
                                 thumbnails.load(connection, child, service)
                             } else null
                         }
-                        val sheet = FolderSuperThumbnailComposer.composeSheet(selected, tileBitmaps::get)
-                        val out = ByteArrayOutputStream()
-                        if (sheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
-                            val jpegBytes = out.toByteArray()
-                            sheet.recycle()
-                            if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
-                                thumbnails.storeJpegData(connection, folderItem, jpegBytes)
-                                if (vaultOptions.enabled) {
-                                    vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
-                                }
-                                generated++
-                                sessionStore.recordSuccess(sessionKey, folderItem)
-                            } else {
-                                failed++
-                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
-                            }
+                        val rawSheet = FolderSuperThumbnailComposer.composeRawSheet(selected, tileBitmaps::get)
+                        unblurredFolderSheets.put(folderItem.path, rawSheet)?.let { previous ->
+                            if (!previous.isRecycled) previous.recycle()
+                        }
+                        if (wasCached) {
+                            sessionStore.markCached(sessionKey, folderItem)
                         } else {
-                            sheet.recycle()
-                            failed++
-                            sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
+                            val finalSheet = rawSheet.copy(rawSheet.config ?: Bitmap.Config.ARGB_8888, true)
+                            FolderSuperThumbnailComposer.applySkinToneBlurIfNeeded(finalSheet)
+                            val out = ByteArrayOutputStream()
+                            if (finalSheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
+                                val jpegBytes = out.toByteArray()
+                                finalSheet.recycle()
+                                if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
+                                    thumbnails.storeJpegData(connection, folderItem, jpegBytes)
+                                    if (vaultOptions.enabled) {
+                                        vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
+                                    }
+                                    generated++
+                                    sessionStore.recordSuccess(sessionKey, folderItem)
+                                } else {
+                                    failed++
+                                    sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
+                                }
+                            } else {
+                                finalSheet.recycle()
+                                failed++
+                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
+                            }
                         }
                     }
                 }
             }
+        } finally {
+            unblurredFolderSheets.values.forEach { if (!it.isRecycled) it.recycle() }
+            unblurredFolderSheets.clear()
         }
         if (vaultOptions.enabled && observedMedia.isNotEmpty()) {
             runCatching { vault.verifyStoredItemIds(observedMedia, rootPath, service) }

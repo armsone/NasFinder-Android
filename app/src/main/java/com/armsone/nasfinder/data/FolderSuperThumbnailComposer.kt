@@ -13,7 +13,7 @@ import kotlin.math.exp
 /** Pure Android SDK composer for 384x384 3x3 Folder Super Thumbnail sheets. */
 object FolderSuperThumbnailComposer {
 
-    fun composeSheet(
+    fun composeRawSheet(
         children: List<RemoteFileItem>,
         resolveTileBitmap: (RemoteFileItem) -> Bitmap?,
     ): Bitmap {
@@ -61,21 +61,33 @@ object FolderSuperThumbnailComposer {
             }
         }
 
+        return result
+    }
+
+    fun applySkinToneBlurIfNeeded(bitmap: Bitmap): Bitmap {
         // Deterministic 12x12 sample for skin tone detection
         var skinCount = 0
         val samples = FolderSuperThumbnailPolicy.sampleCoordinates()
         for ((x, y) in samples) {
-            val pixel = result.getPixel(x, y)
+            val pixel = bitmap.getPixel(x, y)
             if (FolderSuperThumbnailPolicy.isSkinTone(pixel)) {
                 skinCount++
             }
         }
 
         if (FolderSuperThumbnailPolicy.shouldBlur(skinCount)) {
-            applyGaussianBlur(result, FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX)
+            applyGaussianBlur(bitmap, FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX)
         }
 
-        return result
+        return bitmap
+    }
+
+    fun composeSheet(
+        children: List<RemoteFileItem>,
+        resolveTileBitmap: (RemoteFileItem) -> Bitmap?,
+    ): Bitmap {
+        val rawSheet = composeRawSheet(children, resolveTileBitmap)
+        return applySkinToneBlurIfNeeded(rawSheet)
     }
 
     fun applyGaussianBlur(bitmap: Bitmap, radius: Int = FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX): Bitmap {

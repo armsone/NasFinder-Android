@@ -2447,7 +2447,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 Text(if (searchText.isBlank()) "${browser.items.size}개 항목" else "${displayedItems.size}/${browser.items.size}개 검색", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             when {
-                browser.items.isEmpty() && !state.isBusy -> EmptyState(
+                browser.items.isEmpty() && state.isBusy -> Spacer(Modifier.weight(1f))
+                browser.items.isEmpty() -> EmptyState(
                     icon = Icons.Default.Folder,
                     title = "빈 폴더",
                     description = "이 폴더에는 표시할 파일이 없습니다.",

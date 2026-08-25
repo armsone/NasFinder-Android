@@ -68,9 +68,9 @@
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
-      "status": "implemented_source_only",
+      "status": "needs_verification",
       "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "connected signature discovery to foreground load", "result": "policy tests pass; positive/negative NAS fixtures pending"}, {"attempt": 2, "date": "2026-08-25", "action": "searched canonical iOS -1 names first and legacy Android 0 names second", "result": "non-destructive compatibility path added; positive/negative NAS fixtures pending"}, {"attempt": 3, "date": "2026-08-25", "action": "prioritized NAS .NasFinder-Vault discovery ahead of warm standard memory and disk caches across all consumer routes", "result": "priority resolution policy tests pass; positive/negative NAS fixtures pending"}],
-      "reopen_history": []
+      "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Android folder showed intro-logo thumbnails instead of the available prioritized Super Thumbnail; cold-cache regeneration evidence is required after the producer fix."}]
     },
     {
       "id": "browser_thumbnail.super_thumbnail_vault.consumer_routes",
@@ -662,6 +662,54 @@
       "status": "implemented_source_only",
       "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "implemented source and policy tests", "result": "build, runtime and captures pending by shared-resource pause"}],
       "reopen_history": []
+    },
+    {
+      "id": "super_thumbnail.video_frame_selection",
+      "route_state": "super_thumbnail_generation",
+      "element": "video_frame",
+      "dimension": "3/13 primary, conditional 6/13 retry, inclusive 50% black-frame threshold",
+      "classification": "technical_contract",
+      "source_ref": {"kind": "spec", "value": "Product owner requires full duration * 3/13, retry at * 6/13 only when black pixels cover at least 50%, and primary retention when retry is also black"},
+      "target_observation": "Android source now uses exact 3/13 and 6/13 MediaMetadataRetriever positions with OPTION_CLOSEST and the shared inclusive black-frame selection contract; regenerated NAS evidence is pending.",
+      "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/SuperThumbnailPolicy.kt",
+      "fixture": "super_thumbnail_intro_logo_video_v1",
+      "fallback_capable": false,
+      "evidence": [],
+      "status": "implemented_source_only",
+      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "replaced time-zero/server video generation with exact rational frame policy and black-frame retry selection", "result": "focused policy tests and debug build pass; two-Mac regeneration and Android display trace pending"}],
+      "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Generated thumbnails repeatedly showed the video intro logo and did not follow the previously specified 13-part positions."}]
+    },
+    {
+      "id": "folder_thumbnail.blur.single_1_5pt",
+      "route_state": "folder_thumbnail_generation",
+      "element": "skin_tone_blur",
+      "dimension": "42% skin trigger, exactly 1.5pt final blur, no parent compounding",
+      "classification": "technical_contract",
+      "source_ref": {"kind": "spec", "value": "Product owner requires one final 1.5pt blur and forbids blur accumulation through parent folders"},
+      "target_observation": "Android composes parents from run-scoped unblurred child sheets and applies a 3px radius only to each final 384px sheet; regenerated folder evidence is pending.",
+      "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/FolderSuperThumbnailComposer.kt",
+      "fixture": "nested_skin_tone_folder_sheet_v1",
+      "fallback_capable": false,
+      "evidence": [],
+      "status": "implemented_source_only",
+      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "split raw/final composition and prevented persisted blurred child sheets from becoming parent inputs", "result": "focused policy tests and debug build pass; regenerated nested-folder capture pending"}],
+      "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Folder blur accumulated toward upper folders and became much stronger than the requested blur."}]
+    },
+    {
+      "id": "app_shell.navigation.immediate_response",
+      "route_state": "dashboard_browser_navigation",
+      "element": "buttons_and_back",
+      "dimension": "screen transition is immediate while credential, socket and listing work stays off the main thread",
+      "classification": "functional",
+      "source_ref": {"kind": "runtime", "value": "Product owner reports long no-response periods for Android buttons and Back in the same network where iPhone navigation is immediate"},
+      "target_observation": "Android publishes the target Browser state before launching work and moves credential reads, service close/create and directory listing to Dispatchers.IO. On the installed SM-F968N release candidate, connection tap, toolbar Back and system Back all changed the visible screen within the first 200 ms sampling window while remote work remained active.",
+      "implementation_ref": "app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt",
+      "fixture": "slow_nas_navigation_phone_v1",
+      "fallback_capable": false,
+      "evidence": [{"id": "navigation-immediate-sm-f968n-20260825", "type": "behavior_trace", "post_change": true, "path": ".parity/evidence/navigation_immediate_sm-f968n_20260825.txt", "sha256": "6adcf310c81a2ffe81de7e0a75e2a7064ebed073d1a0fb8c59474586292cf40c"}],
+      "status": "verified",
+      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "reproduced delayed connection transition on SM-F968N and separated immediate navigation from blocking remote initialization", "result": "navigation contract tests and debug build pass; updated APK was not installed, so device timing remains pending"}, {"attempt": 2, "date": "2026-08-25", "action": "installed signed 2.2.0 release candidate with data preservation and sampled connection, toolbar Back and system Back during active remote work", "result": "all three transitions changed the visible screen by the first 200 ms sample; Browser loading and dashboard return states were confirmed by hierarchy dump"}],
+      "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Buttons and the Back action remained unresponsive for a long time before eventually moving."}]
     }
   ]
 }

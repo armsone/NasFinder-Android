@@ -1,0 +1,22 @@
+NasFinder Android 2.2.0 (versionCode 341065, build 202608252025)
+Device: SM-F968N over wireless ADB
+Date: 2026-08-25 KST
+
+The signed release candidate was installed with `adb install -r`; package version
+verification succeeded and existing app data remained available.
+
+Connection tap:
+- The dashboard screenshot changed after the tap within the first 200 ms sampling window.
+- The next hierarchy dump showed Browser title `hastree`, path `/`, and a top progress bar while remote listing was still active.
+
+System Back during remote work:
+- The screenshot changed within the first 200 ms sampling window.
+- The next hierarchy dump showed the dashboard (`내 파일`, `네트워크`).
+
+Toolbar Back during remote work:
+- The screenshot changed within the first 200 ms sampling window.
+- The next hierarchy dump showed the dashboard (`내 파일`, `네트워크`).
+
+The ADB command plus screenshot transfer completed in 761-787 ms; this is not
+reported as the UI latency. The 200 ms sampling point and resulting hierarchy
+prove that the visible transition occurred before remote work completed.

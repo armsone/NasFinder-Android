@@ -225,6 +225,94 @@ class RemoteThumbnailRepository(
         }
     }
 
+    /** Generates a Super Thumbnail directly without time 0 or server intro-thumbnail fallback for video. */
+    suspend fun generateSuperThumbnail(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+    ): Bitmap? {
+        require(maxPixelSize in 1..MAX_ALLOWED_PIXEL_SIZE) { "올바르지 않은 썸네일 크기입니다." }
+        val vaultKey = RemoteThumbnailCacheKey.createVault(connection.id, item, maxPixelSize)
+        memory[vaultKey]?.let { return it }
+        disk.get(vaultKey)?.let { cached ->
+            decodeBounded(cached)?.let { bitmap ->
+                memory.put(vaultKey, bitmap)
+                return bitmap
+            }
+            disk.remove(vaultKey)
+        }
+
+        if (item.isDirectory) return null
+
+        val encoded = disk.temporaryFile("encoded-super")
+        val source = disk.temporaryFile("super-source")
+        try {
+            currentCoroutineContext().ensureActive()
+            val bitmap = thumbnailFetchPermits.withPermit {
+                when {
+                    item.isVideo -> {
+                        sparseVideoSuperThumbnailFrame(item, activeService)
+                    }
+                    item.isImage -> {
+                        val sourcePolicy = if (item.thumbnailUrl != null) {
+                            RemoteThumbnailSource.SERVER_THUMBNAIL
+                        } else {
+                            RemoteThumbnailSource.ORIGINAL_IMAGE
+                        }
+                        var imageResult: Bitmap? = null
+                        var imageError: Throwable? = null
+                        try {
+                            fetchSource(connection, item, activeService, source, sourcePolicy)
+                            currentCoroutineContext().ensureActive()
+                            imageResult = decodeBounded(source)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            imageError = error
+                        } finally {
+                            source.delete()
+                        }
+                        if (imageResult != null) {
+                            imageResult
+                        } else {
+                            if (imageError is RemoteThumbnailTrafficLimitReached) {
+                                throw imageError
+                            }
+                            if (sourcePolicy == RemoteThumbnailSource.SERVER_THUMBNAIL) {
+                                fetchSource(connection, item, activeService, source, RemoteThumbnailSource.ORIGINAL_IMAGE)
+                                currentCoroutineContext().ensureActive()
+                                decodeBounded(source) ?: throw IOException("원격 이미지에서 Super Thumbnail을 만들지 못했습니다.")
+                            } else {
+                                throw IOException("원격 이미지에서 Super Thumbnail을 만들지 못했습니다.")
+                            }
+                        }
+                    }
+                    else -> throw IOException("지원하지 않는 파일 형식입니다.")
+                }
+            }
+            encodeThumbnail(bitmap, encoded)
+            currentCoroutineContext().ensureActive()
+            disk.commit(vaultKey, encoded)
+            if (disk.contains(vaultKey)) runCatching { onCacheCommitted?.invoke(vaultKey) }
+            memory.put(vaultKey, bitmap)
+            val standardKey = RemoteThumbnailCacheKey.create(connection.id, item, maxPixelSize)
+            negativeUntil.remove(vaultKey)
+            negativeUntil.remove(standardKey)
+            return bitmap
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: RemoteThumbnailTrafficLimitReached) {
+            return null
+        } catch (_: Throwable) {
+            negativeUntil[vaultKey] = System.currentTimeMillis() + NEGATIVE_CACHE_MILLIS
+            return null
+        } finally {
+            source.delete()
+            HttpRangeContract.partialFile(source).delete()
+            encoded.delete()
+        }
+    }
+
     /** Starts a new refresh/session only when no request is still using the current accounting window. */
     suspend fun resetTrafficBudget(): Boolean = inFlightMutex.withLock {
         if (inFlight.isNotEmpty()) false else {
@@ -603,6 +691,71 @@ class RemoteThumbnailRepository(
         currentCoroutineContext().ensureActive()
         if (!destination.isFile || destination.length() > MAX_SOURCE_BYTES) {
             throw IOException("원격 이미지 다운로드 크기가 올바르지 않습니다.")
+        }
+    }
+
+    private suspend fun sparseVideoSuperThumbnailFrame(
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+    ): Bitmap {
+        if (!item.isVideo || item.isDirectory || item.size <= 0 || !activeService.supportsRangeStreaming) {
+            throw IOException("영상 Super Thumbnail 생성을 위한 범위 스트리밍을 지원하지 않습니다.")
+        }
+        val session = SparseVideoRangeSession(
+            itemSize = item.size,
+            trafficBudget = trafficBudget,
+            ownerJob = currentCoroutineContext()[Job],
+        ) { offset, length -> activeService.readRange(item, offset, length) }
+        val source = SparseRemoteMediaDataSource(session)
+        val retriever = MediaMetadataRetriever()
+        try {
+            currentCoroutineContext().ensureActive()
+            retriever.setDataSource(source)
+            currentCoroutineContext().ensureActive()
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: throw IOException("영상 재생 시간을 확인할 수 없습니다.")
+            if (durationMs <= 0) throw IOException("영상 재생 시간이 유효하지 않습니다.")
+
+            val durationUs = durationMs * 1000L
+            val primaryTimeUs = SuperThumbnailVideoPolicy.primaryTimeUs(durationUs)
+            val primaryFrame = retriever.getFrameAtTime(primaryTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?: throw IOException("영상에서 썸네일 프레임을 찾지 못했습니다.")
+            currentCoroutineContext().ensureActive()
+            if (primaryFrame.width <= 0 || primaryFrame.height <= 0 ||
+                primaryFrame.width > MAX_SOURCE_DIMENSION || primaryFrame.height > MAX_SOURCE_DIMENSION
+            ) {
+                primaryFrame.recycle()
+                throw IOException("영상 썸네일 크기가 올바르지 않습니다.")
+            }
+
+            val primaryIsBlack = SuperThumbnailVideoPolicy.isBlackFrame(primaryFrame)
+            var winningFrame = primaryFrame
+
+            if (primaryIsBlack) {
+                val retryTimeUs = SuperThumbnailVideoPolicy.retryTimeUs(durationUs)
+                val retryFrame = runCatching {
+                    currentCoroutineContext().ensureActive()
+                    retriever.getFrameAtTime(retryTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)?.takeIf {
+                        it.width > 0 && it.height > 0 &&
+                            it.width <= MAX_SOURCE_DIMENSION && it.height <= MAX_SOURCE_DIMENSION
+                    }
+                }.getOrNull()
+
+                if (retryFrame != null) {
+                    val retryIsBlack = SuperThumbnailVideoPolicy.isBlackFrame(retryFrame)
+                    if (!retryIsBlack) {
+                        primaryFrame.recycle()
+                        winningFrame = retryFrame
+                    } else {
+                        retryFrame.recycle()
+                    }
+                }
+            }
+
+            return scaleBounded(winningFrame)
+        } finally {
+            source.close()
+            runCatching { retriever.release() }
         }
     }
 

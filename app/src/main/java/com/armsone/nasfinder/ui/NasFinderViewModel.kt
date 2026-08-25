@@ -916,15 +916,18 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 )
             }
             var candidate: RemoteFileService? = null
-            runCatching {
-                RemoteFileServiceFactory.create(
-                    connection,
-                    repository.credentials.read(connection.id).orEmpty(),
-                ).also {
-                    candidate = it
-                    if (generation == superThumbnailPickerGeneration) superThumbnailPickerService = it
-                }.list(connection.normalizedRootPath)
-            }.onSuccess { items ->
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    RemoteFileServiceFactory.create(
+                        connection,
+                        repository.credentials.read(connection.id).orEmpty(),
+                    ).also {
+                        candidate = it
+                        if (generation == superThumbnailPickerGeneration) superThumbnailPickerService = it
+                    }.list(connection.normalizedRootPath)
+                }
+            }
+            result.onSuccess { items ->
                 if (generation != superThumbnailPickerGeneration) {
                     candidate?.close()
                     return@onSuccess
@@ -1067,33 +1070,34 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val generation = ++superThumbnailPickerGeneration
         superThumbnailPickerJob = viewModelScope.launch {
             _state.update { it.copy(superThumbnailPicker = picker.copy(path = path, items = emptyList(), isLoading = true, error = null)) }
-            runCatching { activeService.list(path) }
-                .onSuccess { items ->
-                    if (generation != superThumbnailPickerGeneration) return@onSuccess
-                    _state.update {
-                        it.copy(
-                            superThumbnailPicker = it.superThumbnailPicker.copy(
-                                path = path,
-                                items = visibleSuperThumbnailFolders(items),
-                                isLoading = false,
-                                error = null,
-                            )
+            val result = withContext(Dispatchers.IO) {
+                runCatching { activeService.list(path) }
+            }
+            result.onSuccess { items ->
+                if (generation != superThumbnailPickerGeneration) return@onSuccess
+                _state.update {
+                    it.copy(
+                        superThumbnailPicker = it.superThumbnailPicker.copy(
+                            path = path,
+                            items = visibleSuperThumbnailFolders(items),
+                            isLoading = false,
+                            error = null,
                         )
-                    }
+                    )
                 }
-                .onFailure { error ->
-                    if (generation != superThumbnailPickerGeneration || error is CancellationException) return@onFailure
-                    _state.update {
-                        it.copy(
-                            superThumbnailPicker = it.superThumbnailPicker.copy(
-                                path = path,
-                                items = emptyList(),
-                                isLoading = false,
-                                error = error.message ?: "폴더를 열 수 없습니다.",
-                            )
+            }.onFailure { error ->
+                if (generation != superThumbnailPickerGeneration || error is CancellationException) return@onFailure
+                _state.update {
+                    it.copy(
+                        superThumbnailPicker = it.superThumbnailPicker.copy(
+                            path = path,
+                            items = emptyList(),
+                            isLoading = false,
+                            error = error.message ?: "폴더를 열 수 없습니다.",
                         )
-                    }
+                    )
                 }
+            }
         }
     }
 
@@ -1145,22 +1149,25 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, message = null) }
-            runCatching {
-                val credential = password.ifBlank { repository.credentials.read(connection.id).orEmpty() }
-                val requestCredential = if (connection.kind == com.armsone.nasfinder.model.ConnectionKind.SYNOLOGY && synologyOtp.isNotBlank()) {
-                    require(synologyOtp.length in 6..8 && synologyOtp.all(Char::isDigit)) {
-                        "OTP는 6~8자리 숫자로 입력해 주세요."
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val credential = password.ifBlank { repository.credentials.read(connection.id).orEmpty() }
+                    val requestCredential = if (connection.kind == com.armsone.nasfinder.model.ConnectionKind.SYNOLOGY && synologyOtp.isNotBlank()) {
+                        require(synologyOtp.length in 6..8 && synologyOtp.all(Char::isDigit)) {
+                            "OTP는 6~8자리 숫자로 입력해 주세요."
+                        }
+                        JSONObject()
+                            .put("_nasfinder", "synology-v1")
+                            .put("password", credential)
+                            .put("otp", synologyOtp)
+                            .toString()
+                    } else {
+                        credential
                     }
-                    JSONObject()
-                        .put("_nasfinder", "synology-v1")
-                        .put("password", credential)
-                        .put("otp", synologyOtp)
-                        .toString()
-                } else {
-                    credential
+                    RemoteFileServiceFactory.create(connection, requestCredential).use { it.testConnection() }
                 }
-                RemoteFileServiceFactory.create(connection, requestCredential).use { it.testConnection() }
-            }.onSuccess {
+            }
+            result.onSuccess {
                 _state.update { it.copy(isBusy = false, message = "연결에 성공했습니다.") }; onSuccess()
             }.onFailure { error ->
                 if (error is SftpHostKeyTrustRequired) {
@@ -1255,18 +1262,37 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         connectionOpenJob?.cancel()
         val generation = ++thumbnailGeneration
         thumbnailRequests.clear()
-        _state.update { it.copy(remoteThumbnails = emptyMap(), thumbnailGeneration = generation) }
+        val preferences = repository.browserPreferences()
+        _state.update {
+            it.copy(
+                screen = Screen.Browser(connection, path, emptyList(), preferences),
+                isBusy = true,
+                message = null,
+                remoteThumbnails = emptyMap(),
+                thumbnailGeneration = generation,
+            )
+        }
         connectionOpenJob = viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = null) }
-            runCatching {
-                service?.close()
-                service = RemoteFileServiceFactory.create(connection, repository.credentials.read(connection.id).orEmpty())
-                service!!.list(path)
-            }.onSuccess { items ->
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    service?.close()
+                    val credential = repository.credentials.read(connection.id).orEmpty()
+                    val newService = RemoteFileServiceFactory.create(connection, credential)
+                    service = newService
+                    newService.list(path)
+                }
+            }
+            result.onSuccess { items ->
                 if (generation != thumbnailGeneration) return@onSuccess
                 repository.setLastPath(connection.id, path)
-                val preferences = repository.browserPreferences()
-                _state.update { it.copy(isBusy = false, screen = Screen.Browser(connection, path, items.sortedWith(preferences), preferences)) }
+                val currentPreferences = repository.browserPreferences()
+                _state.update {
+                    if (it.thumbnailGeneration != generation) it
+                    else it.copy(
+                        isBusy = false,
+                        screen = Screen.Browser(connection, path, items.sortedWith(currentPreferences), currentPreferences),
+                    )
+                }
             }.onFailure { error ->
                 if (generation != thumbnailGeneration) return@onFailure
                 if (fallbackToRoot && path != connection.normalizedRootPath) {
@@ -1274,7 +1300,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     openConnection(connection, connection.normalizedRootPath)
                     return@onFailure
                 }
-                _state.update { it.copy(isBusy = false, message = error.message ?: "폴더를 열 수 없습니다.") }
+                _state.update {
+                    if (it.thumbnailGeneration != generation) it
+                    else it.copy(isBusy = false, message = error.message ?: "폴더를 열 수 없습니다.")
+                }
             }
         }
     }
@@ -1454,13 +1483,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, message = null) }
-            runCatching {
-                service?.close()
-                RemoteFileServiceFactory.create(
-                    connection,
-                    repository.credentials.read(connection.id).orEmpty(),
-                ).also { service = it }
-            }.onSuccess {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    service?.close()
+                    val credential = repository.credentials.read(connection.id).orEmpty()
+                    RemoteFileServiceFactory.create(
+                        connection,
+                        credential,
+                    ).also { service = it }
+                }
+            }
+            result.onSuccess {
                 _state.update { it.copy(isBusy = false) }
                 prepareRemoteFile(
                     item = RemoteFileItem(

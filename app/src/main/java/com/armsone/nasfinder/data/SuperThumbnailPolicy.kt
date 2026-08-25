@@ -1,5 +1,6 @@
 package com.armsone.nasfinder.data
 
+import android.graphics.Bitmap
 import com.armsone.nasfinder.model.RemoteFileItem
 import java.util.ArrayDeque
 
@@ -37,6 +38,102 @@ internal data class SuperThumbnailRuntimeConstraints(
     }
 }
 
+internal enum class SuperThumbnailVideoFrameChoice { PRIMARY, RETRY }
+
+internal object SuperThumbnailVideoPolicy {
+    const val PRIMARY_TIME_NUMERATOR = 3L
+    const val RETRY_TIME_NUMERATOR = 6L
+    const val TIME_DENOMINATOR = 13L
+
+    const val BLACK_PIXEL_THRESHOLD = 13 // round(0.05 * 255), shared with Apple grayscale policy
+    const val BLACK_FRAME_THRESHOLD_PERCENT = 50
+    const val DEFAULT_SAMPLE_GRID_SIZE = 32
+
+    fun primaryTimeUs(durationUs: Long): Long {
+        require(durationUs >= 0) { "영상 재생 시간은 0 이상이어야 합니다." }
+        return durationUs * PRIMARY_TIME_NUMERATOR / TIME_DENOMINATOR
+    }
+
+    fun primaryTimeMs(durationMs: Long): Long {
+        require(durationMs >= 0) { "영상 재생 시간은 0 이상이어야 합니다." }
+        return durationMs * PRIMARY_TIME_NUMERATOR / TIME_DENOMINATOR
+    }
+
+    fun retryTimeUs(durationUs: Long): Long {
+        require(durationUs >= 0) { "영상 재생 시간은 0 이상이어야 합니다." }
+        return durationUs * RETRY_TIME_NUMERATOR / TIME_DENOMINATOR
+    }
+
+    fun retryTimeMs(durationMs: Long): Long {
+        require(durationMs >= 0) { "영상 재생 시간은 0 이상이어야 합니다." }
+        return durationMs * RETRY_TIME_NUMERATOR / TIME_DENOMINATOR
+    }
+
+    fun isBlackPixel(r: Int, g: Int, b: Int, threshold: Int = BLACK_PIXEL_THRESHOLD): Boolean {
+        if (r !in 0..255 || g !in 0..255 || b !in 0..255) return false
+        val grayscaleLuminance = (299L * r + 587L * g + 114L * b + 500L) / 1000L
+        return grayscaleLuminance <= threshold
+    }
+
+    fun isBlackPixel(color: Int, threshold: Int = BLACK_PIXEL_THRESHOLD): Boolean {
+        val r = (color shr 16) and 0xff
+        val g = (color shr 8) and 0xff
+        val b = color and 0xff
+        return isBlackPixel(r, g, b, threshold)
+    }
+
+    fun isBlackFrame(blackPixelCount: Int, totalSamples: Int): Boolean {
+        if (totalSamples <= 0) return false
+        return (blackPixelCount.toLong() * 100L) >= (BLACK_FRAME_THRESHOLD_PERCENT.toLong() * totalSamples.toLong())
+    }
+
+    fun sampleCoordinates(
+        width: Int,
+        height: Int,
+        gridCols: Int = DEFAULT_SAMPLE_GRID_SIZE,
+        gridRows: Int = DEFAULT_SAMPLE_GRID_SIZE,
+    ): List<Pair<Int, Int>> {
+        require(width > 0 && height > 0 && gridCols > 0 && gridRows > 0)
+        val cellWidth = width / gridCols
+        val cellHeight = height / gridRows
+        val halfW = (cellWidth / 2).coerceAtLeast(0)
+        val halfH = (cellHeight / 2).coerceAtLeast(0)
+        return buildList(gridCols * gridRows) {
+            for (row in 0 until gridRows) {
+                val y = (row * cellHeight + halfH).coerceIn(0, height - 1)
+                for (col in 0 until gridCols) {
+                    val x = (col * cellWidth + halfW).coerceIn(0, width - 1)
+                    add(x to y)
+                }
+            }
+        }
+    }
+
+    fun chooseFrame(
+        primaryIsBlack: Boolean,
+        retryExtracted: Boolean,
+        retryIsBlack: Boolean,
+    ): SuperThumbnailVideoFrameChoice = when {
+        !primaryIsBlack -> SuperThumbnailVideoFrameChoice.PRIMARY
+        !retryExtracted -> SuperThumbnailVideoFrameChoice.PRIMARY
+        retryIsBlack -> SuperThumbnailVideoFrameChoice.PRIMARY
+        else -> SuperThumbnailVideoFrameChoice.RETRY
+    }
+
+    fun isBlackFrame(bitmap: Bitmap, threshold: Int = BLACK_PIXEL_THRESHOLD): Boolean {
+        val side = DEFAULT_SAMPLE_GRID_SIZE.coerceAtLeast(1)
+        val sample = Bitmap.createScaledBitmap(bitmap, side, side, true)
+        return try {
+            val pixels = IntArray(side * side)
+            sample.getPixels(pixels, 0, side, 0, 0, side, side)
+            val blackCount = pixels.count { isBlackPixel(it, threshold) }
+            isBlackFrame(blackCount, pixels.size)
+        } finally {
+            if (sample !== bitmap) sample.recycle()
+        }
+    }
+}
+
 internal object SuperThumbnailEligibility {
     private const val SERVER_THUMBNAIL_ESTIMATE = 512L * 1024L
     private const val UNKNOWN_IMAGE_ESTIMATE = 4L * 1024L * 1024L
@@ -45,12 +142,14 @@ internal object SuperThumbnailEligibility {
 
     /** Returns a bounded traffic estimate, or null when the repository cannot load the item. */
     fun estimatedBytes(item: RemoteFileItem, supportsRangeStreaming: Boolean): Long? =
-        when (RemoteThumbnailFetchPolicy.source(item, supportsRangeStreaming)) {
-            RemoteThumbnailSource.NONE -> null
-            RemoteThumbnailSource.FOLDER_VAULT -> FOLDER_ESTIMATE
-            RemoteThumbnailSource.SERVER_THUMBNAIL -> SERVER_THUMBNAIL_ESTIMATE
-            RemoteThumbnailSource.ORIGINAL_IMAGE -> item.size.takeIf { it > 0 } ?: UNKNOWN_IMAGE_ESTIMATE
-            RemoteThumbnailSource.SPARSE_VIDEO -> minOf(item.size, SPARSE_VIDEO_ESTIMATE).coerceAtLeast(1L)
+        when {
+            item.isDirectory -> FOLDER_ESTIMATE
+            item.isVideo -> if (supportsRangeStreaming && item.size > 0) {
+                minOf(item.size, SPARSE_VIDEO_ESTIMATE).coerceAtLeast(1L)
+            } else null
+            item.isImage && item.thumbnailUrl != null -> SERVER_THUMBNAIL_ESTIMATE
+            item.isImage -> item.size.takeIf { it > 0 } ?: UNKNOWN_IMAGE_ESTIMATE
+            else -> null
         }
 }
 
