@@ -160,7 +160,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun NasFinderApp(model: NasFinderViewModel) {
+fun NasFinderApp(
+    model: NasFinderViewModel,
+    automaticUpdateDownloadEnabled: Boolean,
+    onAutomaticUpdateDownloadChanged: (Boolean) -> Unit,
+    onCheckForUpdates: () -> Unit,
+) {
     val state by model.state.collectAsStateWithLifecycle()
     var showBusyOverlay by remember { mutableStateOf(false) }
     LaunchedEffect(state.isBusy) {
@@ -202,7 +207,7 @@ fun NasFinderApp(model: NasFinderViewModel) {
                     onBack = { model.show(Screen.Dashboard) },
                 )
                 Screen.GooglePhotos -> GooglePhotosScreen(state, model)
-                Screen.Settings -> SettingsScreen(state, model)
+                Screen.Settings -> SettingsScreen(state, model, automaticUpdateDownloadEnabled, onAutomaticUpdateDownloadChanged, onCheckForUpdates)
                 Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
                 Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
                 Screen.SuperThumbnailFolderPicker -> SuperThumbnailFolderPickerScreen(state, model)
@@ -5000,7 +5005,7 @@ private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
 }
 
 @Composable
-private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
+private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automaticUpdateDownloadEnabled: Boolean, onAutomaticUpdateDownloadChanged: (Boolean) -> Unit, onCheckForUpdates: () -> Unit) {
     val uriHandler = LocalUriHandler.current
     var confirmCacheClear by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { model.refreshDownloadCacheSize() }
@@ -5234,6 +5239,16 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel) {
                         Text("저장된 연결", Modifier.weight(1f))
                         Text("${state.connections.size}개", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("업데이트 자동 다운로드")
+                            Text("데이터 요금이 없는 네트워크에서 받습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(checked = automaticUpdateDownloadEnabled, onCheckedChange = onAutomaticUpdateDownloadChanged)
+                    }
+                    HorizontalDivider()
+                    TextButton(onClick = onCheckForUpdates, modifier = Modifier.fillMaxWidth()) { Text("업데이트 확인") }
                 }
             }
             item { SectionTitle("파일 앱 연동", Icons.Default.FolderOpen) }

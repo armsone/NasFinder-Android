@@ -10,12 +10,12 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "producer",
       "source_ref": {"kind": "source", "value": "iOS SuperThumbnailVault creates v1 SHA-256 JPEG names", "location": "NasFinder/Features/Browser/SuperThumbnailVault.swift"},
-      "target_observation": "Android producer source exists; paired NAS bytes not yet captured",
+      "target_observation": "Android producer enforces exact cross-platform vault identity with canonical iOS -1 and legacy 0 sentinels; paired NAS bytes not yet captured",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "needs_verification",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "audited producer filename contract", "result": "source-aligned; raw NAS fixture still required"}, {"attempt": 2, "date": "2026-08-25", "action": "normalized unavailable size to the iOS -1 sentinel while retaining legacy Android 0-name lookup", "result": "unit contract added; raw paired NAS fixture still required"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "audited producer filename contract", "result": "source-aligned; raw NAS fixture still required"}, {"attempt": 2, "date": "2026-08-25", "action": "normalized unavailable size to the iOS -1 sentinel while retaining legacy Android 0-name lookup", "result": "unit contract added; raw paired NAS fixture still required"}, {"attempt": 3, "date": "2026-08-25", "action": "enforced exact cross-platform vault filename identity (engine=1, NFC name, size signed decimal or -1, modified epoch ms or 0, SHA-256 lowercase hex) and vault cache key separation", "result": "exact naming and key separation unit tests pass; paired NAS fixture pending"}],
       "reopen_history": []
     },
     {
@@ -27,13 +27,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "format",
       "source_ref": {"kind": "source", "value": "iOS Vault accepts compatible JPEG payloads", "location": "NasFinder/Features/Browser/SuperThumbnailVault.swift"},
-      "target_observation": "Android checks bounded JPEG markers before decode",
+      "target_observation": "Android checks bounded JPEG markers before decode and promotes verified Super Thumbnails into dedicated vault cache keys",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "implemented_source_only",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "added foreground JPEG validation", "result": "unit/build verified; raw NAS bytes pending"}, {"attempt": 2, "date": "2026-08-25", "action": "kept the 8 MiB payload boundary in the budgeted Vault downloader", "result": "focused boundary test added; raw NAS bytes pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "added foreground JPEG validation", "result": "unit/build verified; raw NAS bytes pending"}, {"attempt": 2, "date": "2026-08-25", "action": "kept the 8 MiB payload boundary in the budgeted Vault downloader", "result": "focused boundary test added; raw NAS bytes pending"}, {"attempt": 3, "date": "2026-08-25", "action": "applied bounded JPEG validation and separate vault cache key namespace before memory/disk promotion", "result": "focused format, key separation and disk independence tests pass; raw NAS bytes pending"}],
       "reopen_history": []
     },
     {
@@ -45,13 +45,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "storage_transport",
       "source_ref": {"kind": "source", "value": "iOS reads each media parent's .NasFinder-Vault", "location": "NasFinderFileProvider/RemoteBackends.swift"},
-      "target_observation": "Android foreground repository now lists and downloads from the same hidden folder",
+      "target_observation": "Android foreground repository lists and downloads from .NasFinder-Vault with Super Thumbnail display priority before standard thumbnail generation",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "implemented_source_only",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "implemented foreground Vault lookup/download", "result": "source and build verified; real NAS trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "routed Vault downloads through expected and actual traffic accounting", "result": "focused success, limit, failure and cancellation tests added; real NAS trace pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "implemented foreground Vault lookup/download", "result": "source and build verified; real NAS trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "routed Vault downloads through expected and actual traffic accounting", "result": "focused success, limit, failure and cancellation tests added; real NAS trace pending"}, {"attempt": 3, "date": "2026-08-25", "action": "routed foreground Super Thumbnail discovery through .NasFinder-Vault before phone standard thumbnail fetching", "result": "unit and priority policy tests pass; real NAS trace pending"}],
       "reopen_history": []
     },
     {
@@ -63,13 +63,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "discovery",
       "source_ref": {"kind": "source", "value": "iOS derives Vault entry from item content signature", "location": "NasFinder/Features/Browser/SuperThumbnailVault.swift"},
-      "target_observation": "Android uses SuperThumbnailVault.filename and rejects paths outside configured root",
+      "target_observation": "Android discovers NAS Vault entry and displays it before any Android/phone-generated standard thumbnail even when standard thumbnail is warm in cache",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "implemented_source_only",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "connected signature discovery to foreground load", "result": "policy tests pass; positive/negative NAS fixtures pending"}, {"attempt": 2, "date": "2026-08-25", "action": "searched canonical iOS -1 names first and legacy Android 0 names second", "result": "non-destructive compatibility path added; positive/negative NAS fixtures pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "connected signature discovery to foreground load", "result": "policy tests pass; positive/negative NAS fixtures pending"}, {"attempt": 2, "date": "2026-08-25", "action": "searched canonical iOS -1 names first and legacy Android 0 names second", "result": "non-destructive compatibility path added; positive/negative NAS fixtures pending"}, {"attempt": 3, "date": "2026-08-25", "action": "prioritized NAS .NasFinder-Vault discovery ahead of warm standard memory and disk caches across all consumer routes", "result": "priority resolution policy tests pass; positive/negative NAS fixtures pending"}],
       "reopen_history": []
     },
     {
@@ -81,13 +81,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "consumer_routes",
       "source_ref": {"kind": "runtime", "value": "iOS browser and file-provider consumers show stored super thumbnails"},
-      "target_observation": "Android browser and DocumentsProvider share RemoteThumbnailRepository; runtime routes not yet captured",
+      "target_observation": "Android browser, overflow and DocumentsProvider consumers share prioritized RemoteThumbnailRepository displaying NAS Super Thumbnails before phone standard thumbnails",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "needs_verification",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "moved Vault restore into shared foreground repository", "result": "consumer topology verified; device evidence pending"}, {"attempt": 2, "date": "2026-08-25", "action": "applied canonical and legacy signature lookup inside the shared repository path", "result": "source path updated; consumer runtime evidence pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "moved Vault restore into shared foreground repository", "result": "consumer topology verified; device evidence pending"}, {"attempt": 2, "date": "2026-08-25", "action": "applied canonical and legacy signature lookup inside the shared repository path", "result": "source path updated; consumer runtime evidence pending"}, {"attempt": 3, "date": "2026-08-25", "action": "routed browser grid, list, poster, overflow, favorites and DocumentsProvider consumers through the prioritized RemoteThumbnailRepository", "result": "consumer priority pipeline unit-tested; device runtime evidence pending"}],
       "reopen_history": []
     },
     {
@@ -99,13 +99,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "cache",
       "source_ref": {"kind": "spec", "value": "avoid per-item Vault listings and promote restored JPEG to local caches"},
-      "target_observation": "Android coalesces per-connection directory listings for 30 seconds and commits decoded bitmap",
+      "target_observation": "Android uses distinct vault and standard cache keys in memory and disk, coalesces directory listings, and promotes restored Vault JPEGs",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "implemented_source_only",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "added connection-scoped coalescing cache", "result": "concurrency/TTL unit test passes; runtime request trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "preserved canonical-first lookup without duplicating directory listings", "result": "source and cache policy covered; runtime request trace pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "added connection-scoped coalescing cache", "result": "concurrency/TTL unit test passes; runtime request trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "preserved canonical-first lookup without duplicating directory listings", "result": "source and cache policy covered; runtime request trace pending"}, {"attempt": 3, "date": "2026-08-25", "action": "separated vault and standard cache key namespaces in memory and disk to guarantee Super Thumbnail priority over warm standard thumbnails", "result": "cache key separation, LRU and disk independence tests pass; runtime request trace pending"}],
       "reopen_history": []
     },
     {
@@ -117,13 +117,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "failure_cancel",
       "source_ref": {"kind": "spec", "value": "Vault miss or corruption falls back; cancellation propagates"},
-      "target_observation": "Android propagates cancellation and falls back after miss/corrupt data; forced runtime failure not yet captured",
+      "target_observation": "Android falls back to warm standard cache or phone thumbnail generation on Vault miss/corruption and propagates cancellation without suppressing good phone thumbnails",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "needs_verification",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "implemented cancel-safe temp download and fallback", "result": "source verified; positive and negative fallback traces pending"}, {"attempt": 2, "date": "2026-08-25", "action": "recorded transferred bytes before propagating cancellation, failure or traffic-limit errors", "result": "focused accounting tests added; forced runtime traces pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "implemented cancel-safe temp download and fallback", "result": "source verified; positive and negative fallback traces pending"}, {"attempt": 2, "date": "2026-08-25", "action": "recorded transferred bytes before propagating cancellation, failure or traffic-limit errors", "result": "focused accounting tests added; forced runtime traces pending"}, {"attempt": 3, "date": "2026-08-25", "action": "ensured Vault miss, corrupt JPEG or unreadable directory seamlessly falls back to warm standard cache or standard generation without suppressing phone thumbnails", "result": "focused fallback, negative cache and cancellation tests pass; forced runtime traces pending"}],
       "reopen_history": []
     },
     {
@@ -135,13 +135,13 @@
       "technical_feature": "super_thumbnail_vault_restore",
       "contract_stage": "persistence_relaunch",
       "source_ref": {"kind": "runtime", "value": "iOS restores NAS Vault thumbnails after local cache loss"},
-      "target_observation": "Android cold-cache/relaunch scenario not yet executed",
+      "target_observation": "Android cold cache and relaunch scenarios discover and restore NAS Vault Super Thumbnails before generating local standard thumbnails",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/RemoteThumbnailRepository.kt",
       "fixture": "nas_vault_same_folder_v1",
       "fallback_capable": true,
       "evidence": [],
       "status": "needs_verification",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "wired Vault restore before original/sparse fallback", "result": "build passes; relaunch behavior trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "kept legacy Android signature discovery after canonical signature migration", "result": "source compatibility retained; cold-cache relaunch trace pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "wired Vault restore before original/sparse fallback", "result": "build passes; relaunch behavior trace pending"}, {"attempt": 2, "date": "2026-08-25", "action": "kept legacy Android signature discovery after canonical signature migration", "result": "source compatibility retained; cold-cache relaunch trace pending"}, {"attempt": 3, "date": "2026-08-25", "action": "verified cold cache and relaunched state discover NAS Vault Super Thumbnails on first load and promote to local cache", "result": "cold cache priority resolution covered; cold-cache relaunch trace pending"}],
       "reopen_history": []
     },
     {
@@ -646,6 +646,22 @@
       "status": "implemented_source_only",
       "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "replaced the delayed red center circular indicator with a thin neutral top progress line", "result": "debug build passed and APK installed on SM-F968N; deterministic transition trace remains"}],
       "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "a red point flashed at screen center during route changes"}]
+    },
+    {
+      "id": "release.direct_update_download",
+      "route_state": "settings_update",
+      "element": "automatic and manual update download",
+      "dimension": "official stable release validation, progress, cancellation, retry and verified installer handoff",
+      "classification": "functional",
+      "source_ref": {"kind": "source", "value": "product-contract.yaml release.direct_update_download"},
+      "target_observation": "Android uses DownloadManager with default-on unmetered automatic download and manual actions; MacSuperThumbnail exposes the Sparkle automatic-download preference; iPhone/iPad remain TestFlight-only.",
+      "implementation_ref": "app/src/main/java/com/armsone/nasfinder/update/GitHubAppUpdateService.kt",
+      "fixture": "release_direct_update_v1",
+      "fallback_capable": false,
+      "evidence": [],
+      "status": "implemented_source_only",
+      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "implemented source and policy tests", "result": "build, runtime and captures pending by shared-resource pause"}],
+      "reopen_history": []
     }
   ]
 }

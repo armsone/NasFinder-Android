@@ -10,6 +10,11 @@ import java.io.IOException
 import java.net.URL
 
 class GitHubUpdatePolicyTest {
+    @Test fun releaseDigestRequiresLowercaseSha256Prefix() {
+        assertEquals("ab".repeat(32), GitHubUpdatePolicy.sha256("sha256:${"ab".repeat(32)}"))
+        assertNull(GitHubUpdatePolicy.sha256("${"ab".repeat(32)}"))
+        assertNull(GitHubUpdatePolicy.sha256("sha256:${"AB".repeat(32)}"))
+    }
     @Test fun strictTagAndAssetContract() {
         assertEquals("2.1.0", GitHubUpdatePolicy.productVersion("android-v2.1.0"))
         assertNull(GitHubUpdatePolicy.productVersion("android-v340486"))
@@ -45,7 +50,7 @@ class GitHubUpdatePolicyTest {
         assertNull(GitHubReleaseDecoder.decode("""{"draft":true,"prerelease":false,"tag_name":"android-v2.1.0","assets":[]}"""))
         assertNull(GitHubReleaseDecoder.decode("""{"draft":false,"prerelease":true,"tag_name":"android-v2.1.0","assets":[]}"""))
         assertNull(GitHubReleaseDecoder.decode("""{"draft":false,"prerelease":false,"tag_name":"android-v2.1.0","body":"Android-Version-Code: 340486","assets":[{"name":"other.apk","browser_download_url":"https://github.com/armsone/NasFinder-Android/releases/download/android-v2.1.0/other.apk","size":100}]}"""))
-        val accepted = GitHubReleaseDecoder.decode("""{"draft":false,"prerelease":false,"tag_name":"android-v2.1.0","body":"Android-Version-Code: 340486\nBuild-Number: 202608251045","assets":[{"name":"NasFinder-Android-2.1.0.apk","browser_download_url":"https://github.com/armsone/NasFinder-Android/releases/download/android-v2.1.0/NasFinder-Android-2.1.0.apk","size":100}]}""")
+        val accepted = GitHubReleaseDecoder.decode("""{"draft":false,"prerelease":false,"tag_name":"android-v2.1.0","body":"Android-Version-Code: 340486\nBuild-Number: 202608251045","assets":[{"name":"NasFinder-Android-2.1.0.apk","browser_download_url":"https://github.com/armsone/NasFinder-Android/releases/download/android-v2.1.0/NasFinder-Android-2.1.0.apk","size":100,"digest":"sha256:${"ab".repeat(32)}"}]}""")
         assertEquals(340486, accepted?.versionCode)
         assertEquals(100L, accepted?.assetSizeBytes)
     }

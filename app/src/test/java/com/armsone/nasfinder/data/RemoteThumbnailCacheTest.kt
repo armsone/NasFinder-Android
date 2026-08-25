@@ -388,6 +388,132 @@ class RemoteThumbnailCacheTest {
         assertEquals(1, afterClear?.size)
     }
 
+    @Test
+    fun `vault cache key is distinct from standard cache key and both are valid hex strings`() {
+        val item = RemoteFileItem(
+            id = "photo-1",
+            name = "photo.jpg",
+            path = "/photos/photo.jpg",
+            isDirectory = false,
+            size = 2048,
+            modifiedAt = Instant.parse("2026-08-25T10:00:00Z"),
+        )
+        val standardKey = RemoteThumbnailCacheKey.create("conn-1", item, 1024)
+        val vaultKey = RemoteThumbnailCacheKey.createVault("conn-1", item, 1024)
+
+        assertNotEquals(standardKey, vaultKey)
+        assertTrue(standardKey.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(vaultKey.matches(Regex("[0-9a-f]{64}")))
+        assertEquals(standardKey, RemoteThumbnailCacheKey.create("conn-1", item, 1024, isVault = false))
+        assertEquals(vaultKey, RemoteThumbnailCacheKey.create("conn-1", item, 1024, isVault = true))
+    }
+
+    @Test
+    fun `vault cache key changes at every content identity boundary`() {
+        val item = RemoteFileItem(
+            id = "photo-1",
+            name = "photo.jpg",
+            path = "/photos/photo.jpg",
+            isDirectory = false,
+            size = 2048,
+            modifiedAt = Instant.parse("2026-08-25T10:00:00Z"),
+        )
+        val original = RemoteThumbnailCacheKey.createVault("conn-1", item, 1024)
+
+        assertEquals(original, RemoteThumbnailCacheKey.createVault("conn-1", item.copy(id = "different-id"), 1024))
+        assertNotEquals(original, RemoteThumbnailCacheKey.createVault("conn-2", item, 1024))
+        assertNotEquals(original, RemoteThumbnailCacheKey.createVault("conn-1", item.copy(path = "/other.jpg"), 1024))
+        assertNotEquals(original, RemoteThumbnailCacheKey.createVault("conn-1", item.copy(size = 2049), 1024))
+        assertNotEquals(
+            original,
+            RemoteThumbnailCacheKey.createVault("conn-1", item.copy(modifiedAt = item.modifiedAt?.plusSeconds(1)), 1024),
+        )
+        assertNotEquals(original, RemoteThumbnailCacheKey.createVault("conn-1", item, 512))
+    }
+
+    @Test
+    fun `priority policy selects warm vault then nas vault restore before warm standard`() {
+        // 1. Warm Vault in memory/disk -> WARM_VAULT
+        assertEquals(
+            RemoteThumbnailResolutionStage.WARM_VAULT,
+            RemoteThumbnailPriorityPolicy.evaluateStage(
+                hasWarmVault = true,
+                hasVaultOnNas = true,
+                hasWarmStandard = true,
+            ),
+        )
+        assertEquals(
+            RemoteThumbnailResolutionStage.WARM_VAULT,
+            RemoteThumbnailPriorityPolicy.evaluateStage(
+                hasWarmVault = true,
+                hasVaultOnNas = false,
+                hasWarmStandard = false,
+            ),
+        )
+
+        // 2. NAS Vault Super Thumbnail exists even when standard thumbnail is warm -> NAS_VAULT_RESTORE
+        assertEquals(
+            RemoteThumbnailResolutionStage.NAS_VAULT_RESTORE,
+            RemoteThumbnailPriorityPolicy.evaluateStage(
+                hasWarmVault = false,
+                hasVaultOnNas = true,
+                hasWarmStandard = true,
+            ),
+        )
+
+        // 3. Vault miss when standard thumbnail is warm -> WARM_STANDARD fallback
+        assertEquals(
+            RemoteThumbnailResolutionStage.WARM_STANDARD,
+            RemoteThumbnailPriorityPolicy.evaluateStage(
+                hasWarmVault = false,
+                hasVaultOnNas = false,
+                hasWarmStandard = true,
+            ),
+        )
+
+        // 4. Cold cache and Vault miss -> STANDARD_FETCH
+        assertEquals(
+            RemoteThumbnailResolutionStage.STANDARD_FETCH,
+            RemoteThumbnailPriorityPolicy.evaluateStage(
+                hasWarmVault = false,
+                hasVaultOnNas = false,
+                hasWarmStandard = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `disk cache commits vault and standard keys independently without collision`() {
+        val cache = ThumbnailDiskCache(temporary.newFolder("vault-standard-disk"), 100, 10_000)
+        val item = RemoteFileItem(
+            id = "photo-1",
+            name = "photo.jpg",
+            path = "/photos/photo.jpg",
+            isDirectory = false,
+            size = 100,
+            modifiedAt = Instant.parse("2026-08-25T10:00:00Z"),
+        )
+        val standardKey = RemoteThumbnailCacheKey.create("conn-1", item, 1024)
+        val vaultKey = RemoteThumbnailCacheKey.createVault("conn-1", item, 1024)
+
+        cache.commit(standardKey, cache.temporaryFile("std").apply { writeBytes(byteArrayOf(1, 2)) })
+        assertTrue(cache.contains(standardKey))
+        assertFalse(cache.contains(vaultKey))
+
+        cache.commit(vaultKey, cache.temporaryFile("vlt").apply { writeBytes(byteArrayOf(3, 4, 5)) })
+        assertTrue(cache.contains(standardKey))
+        assertTrue(cache.contains(vaultKey))
+        assertEquals(2L, cache.get(standardKey)?.length())
+        assertEquals(3L, cache.get(vaultKey)?.length())
+
+        // Tracked removal removes both when requested
+        val removal = cache.removeTracked(setOf(standardKey, vaultKey))
+        assertEquals(2, removal.removedFileCount)
+        assertEquals(5L, removal.removedBytes)
+        assertFalse(cache.contains(standardKey))
+        assertFalse(cache.contains(vaultKey))
+    }
+
     private fun vaultDownloadService(payload: ByteArray, failure: Throwable? = null): RemoteFileService =
         object : RemoteFileService {
             override suspend fun testConnection() = Unit

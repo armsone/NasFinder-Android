@@ -46,15 +46,32 @@ class MainActivity : ComponentActivity() {
             }
             val updateState by appUpdateService.state.collectAsStateWithLifecycle()
             var ignoredUpdateVersion by rememberSaveable { mutableStateOf<Int?>(null) }
+            var automaticDownloadEnabled by rememberSaveable { mutableStateOf(appUpdateService.automaticDownloadEnabled) }
             NasFinderTheme(nasApplication.settings.theme()) {
-                NasFinderApp(model)
+                NasFinderApp(
+                    model,
+                    automaticDownloadEnabled,
+                    {
+                        automaticDownloadEnabled = it
+                        appUpdateService.automaticDownloadEnabled = it
+                    },
+                    {
+                        ignoredUpdateVersion = null
+                        appUpdateService.checkForUpdate(isManual = true)
+                    },
+                )
                 val updateVersion = when (val value = updateState) {
                     is AppUpdateState.Available -> value.release.versionCode
                     is AppUpdateState.Downloading -> value.release.versionCode
                     is AppUpdateState.Ready -> value.release.versionCode
-                    AppUpdateState.Checking, AppUpdateState.Idle -> null
+                    is AppUpdateState.Checking, is AppUpdateState.Latest, is AppUpdateState.Failed, AppUpdateState.Idle -> null
                 }
-                if (updateVersion != null && ignoredUpdateVersion != updateVersion) {
+                val showUpdateDialog = when (val value = updateState) {
+                    is AppUpdateState.Checking -> value.isManual
+                    is AppUpdateState.Latest, is AppUpdateState.Failed -> true
+                    else -> updateVersion != null && ignoredUpdateVersion != updateVersion
+                }
+                if (showUpdateDialog) {
                     AppUpdateDialog(
                         state = updateState,
                         onDownload = {
@@ -63,7 +80,9 @@ class MainActivity : ComponentActivity() {
                         onInstall = {
                             (updateState as? AppUpdateState.Ready)?.let { requestUpdateInstall(it.apkFile) }
                         },
-                        onLater = { ignoredUpdateVersion = updateVersion },
+                        onCancel = appUpdateService::cancelDownload,
+                        onRetry = { appUpdateService.checkForUpdate(isManual = true) },
+                        onLater = { ignoredUpdateVersion = updateVersion; appUpdateService.dismiss() },
                     )
                 }
                 LaunchedEffect(incomingIntent.value) {
