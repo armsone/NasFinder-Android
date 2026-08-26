@@ -168,18 +168,21 @@ object MediaViewerGesturePolicy {
         maxVolume: Int,
         accumulatedDragY: Float,
         fullRangeDragPx: Float,
-    ): Float = computeVolumeFraction(
-        startFraction = if (maxVolume > 0) startVolume.toFloat() / maxVolume else 0f,
-        accumulatedDragY = accumulatedDragY,
-        fullRangeDragPx = fullRangeDragPx,
-    )
+    ): Float {
+        if (maxVolume <= 0) return 0f
+        return computeVolumeFraction(
+            startFraction = if (startVolume in 0..maxVolume) startVolume.toFloat() / maxVolume else 0.5f,
+            accumulatedDragY = accumulatedDragY,
+            fullRangeDragPx = fullRangeDragPx,
+        )
+    }
 
     /**
      * Android's system media stream often has only about 15 steps. Pairing the next system step
      * with ExoPlayer's continuous gain makes the audible result follow [fraction] without a 6-7%
      * jump. The product of streamFraction and playerGain is exactly the requested fraction.
      */
-    fun fineVolumeSetting(fraction: Float, maxVolume: Int): FineVolumeSetting {
+    internal fun fineVolumeSetting(fraction: Float, maxVolume: Int): FineVolumeSetting {
         if (maxVolume <= 0) return FineVolumeSetting(0, 0f)
         val clamped = fraction.coerceIn(0f, 1f)
         if (clamped == 0f) return FineVolumeSetting(0, 0f)
