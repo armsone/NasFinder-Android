@@ -291,6 +291,12 @@ internal object MediaBufferingProgressPolicy {
     }
 }
 
+internal object MediaPlaybackProgressPolicy {
+    fun fraction(positionMs: Long, durationMs: Long): Float? =
+        if (durationMs <= 0) null
+        else (positionMs.toDouble() / durationMs).coerceIn(0.0, 1.0).toFloat()
+}
+
 /**
  * Detects animated GIF files so every viewer route can play them instead of showing the first
  * frame. Only the GIF block structure is scanned; scanning stops as soon as a second frame is

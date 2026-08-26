@@ -1054,7 +1054,7 @@ private fun MediaPreviewContent(
     LaunchedEffect(player, playing) {
         while (playing) {
             position = player?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
-            delay(250)
+            delay(100)
         }
     }
 
@@ -1528,17 +1528,21 @@ private fun MediaPreviewContent(
                     }
                 }
             }
-        } else if (duration > 0) {
-            LinearProgressIndicator(
-                progress = { (position.toFloat() / duration).coerceIn(0f, 1f) },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .height(2.dp),
-                color = Color.White.copy(alpha = .82f),
-                trackColor = Color.White.copy(alpha = .18f),
-            )
+        } else if (playing) {
+            MediaPlaybackProgressPolicy.fraction(position.toLong(), duration.toLong())?.let { playbackFraction ->
+                LinearProgressIndicator(
+                    progress = { playbackFraction },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .semantics {
+                            contentDescription = "재생 위치 ${formatDuration(position)} / ${formatDuration(duration)}"
+                        },
+                    color = Color.White,
+                    trackColor = Color.Black.copy(alpha = .88f),
+                )
+            }
         }
     }
 }
