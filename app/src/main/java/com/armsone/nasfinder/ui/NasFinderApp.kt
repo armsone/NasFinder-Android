@@ -1028,6 +1028,7 @@ private fun MediaPreviewContent(
     val mediaSourceKey = preview.remoteStream?.sourceKey ?: preview.cachedFile.absolutePath
     var retryTrigger by remember(mediaSourceKey) { mutableIntStateOf(0) }
     var isBuffering by remember(mediaSourceKey, retryTrigger) { mutableStateOf(true) }
+    var bufferedFraction by remember(mediaSourceKey, retryTrigger) { mutableStateOf<Float?>(null) }
     var playbackError by remember(mediaSourceKey, retryTrigger) { mutableStateOf<String?>(null) }
     var player by remember(mediaSourceKey, retryTrigger) { mutableStateOf<ExoPlayer?>(null) }
     var duration by remember(mediaSourceKey, retryTrigger) { mutableIntStateOf(0) }
@@ -1054,6 +1055,24 @@ private fun MediaPreviewContent(
         while (playing) {
             position = player?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
             delay(250)
+        }
+    }
+
+    LaunchedEffect(player, isBuffering) {
+        if (!isBuffering) {
+            bufferedFraction = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            val activePlayer = player
+            bufferedFraction = if (activePlayer == null) null else {
+                MediaBufferingProgressPolicy.fraction(
+                    bufferedPercentage = activePlayer.bufferedPercentage,
+                    bufferedPositionMs = activePlayer.bufferedPosition,
+                    durationMs = activePlayer.duration,
+                )
+            }
+            delay(200)
         }
     }
 
@@ -1265,6 +1284,7 @@ private fun MediaPreviewContent(
                         override fun onPlaybackStateChanged(playbackState: Int) {
                             isBuffering = playbackState == Player.STATE_BUFFERING
                             if (playbackState == Player.STATE_READY) {
+                                bufferedFraction = null
                                 duration = this@apply.duration.coerceIn(0, Int.MAX_VALUE.toLong()).toInt()
                                 if (!initialPositionRestored) {
                                     initialPositionRestored = true
@@ -1290,12 +1310,14 @@ private fun MediaPreviewContent(
                             playing = isPlaying
                             if (isPlaying) {
                                 isBuffering = false
+                                bufferedFraction = null
                                 playbackError = null
                             }
                         }
 
                         override fun onPlayerError(error: PlaybackException) {
                             isBuffering = false
+                            bufferedFraction = null
                             playing = false
                             playbackError = error.localizedMessage ?: "동영상을 재생할 수 없습니다."
                         }
@@ -1338,19 +1360,31 @@ private fun MediaPreviewContent(
                     .padding(horizontal = 20.dp, vertical = 14.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                Column(
+                    modifier = Modifier.widthIn(min = 210.dp, max = 280.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    CircularProgressIndicator(
-                        color = Color.White,
-                        modifier = Modifier.size(24.dp),
-                        strokeWidth = 2.5.dp,
-                    )
                     Text(
                         "동영상 준비 중…",
                         color = Color.White,
                         style = MaterialTheme.typography.bodyMedium,
+                    )
+                    val progressModifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .semantics { contentDescription = "동영상 준비 진행률" }
+                    bufferedFraction?.let { fraction ->
+                        LinearProgressIndicator(
+                            progress = { fraction },
+                            modifier = progressModifier,
+                            color = Color.White,
+                            trackColor = Color.White.copy(alpha = .22f),
+                        )
+                    } ?: LinearProgressIndicator(
+                        modifier = progressModifier,
+                        color = Color.White,
+                        trackColor = Color.White.copy(alpha = .22f),
                     )
                 }
             }

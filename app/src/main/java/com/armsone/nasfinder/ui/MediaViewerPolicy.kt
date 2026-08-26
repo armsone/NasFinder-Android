@@ -274,6 +274,23 @@ internal data class FineVolumeSetting(val streamIndex: Int, val playerGain: Floa
         if (maxVolume > 0) streamIndex.toFloat() / maxVolume * playerGain else 0f
 }
 
+/** Maps Media3's decoder/buffer state to a truthful preparation fraction when one is meaningful. */
+internal object MediaBufferingProgressPolicy {
+    fun fraction(
+        bufferedPercentage: Int,
+        bufferedPositionMs: Long,
+        durationMs: Long,
+    ): Float? {
+        val percentageFraction = bufferedPercentage
+            .takeIf { it in 1..100 }
+            ?.div(100f)
+        val positionFraction = if (durationMs > 0 && bufferedPositionMs > 0) {
+            (bufferedPositionMs.toDouble() / durationMs).coerceIn(0.0, 1.0).toFloat()
+        } else null
+        return listOfNotNull(percentageFraction, positionFraction).maxOrNull()
+    }
+}
+
 /**
  * Detects animated GIF files so every viewer route can play them instead of showing the first
  * frame. Only the GIF block structure is scanned; scanning stops as soon as a second frame is
