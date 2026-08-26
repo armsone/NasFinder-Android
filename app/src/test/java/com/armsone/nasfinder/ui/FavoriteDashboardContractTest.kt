@@ -13,8 +13,11 @@ class FavoriteDashboardContractTest {
         val shelf = app.substring(app.indexOf("private fun FavoriteShelf("), app.indexOf("private fun connectionKindBadge("))
         assertTrue(shelf.contains("onLoadThumbnail(favorite)"))
         assertTrue(shelf.contains("val thumbnail = thumbnails[favorite.id]"))
-        assertTrue(shelf.contains("bitmap = thumbnail.asImageBitmap()"))
+        assertTrue(shelf.contains("SkinAwareThumbnailImage("))
+        assertTrue(shelf.contains("bitmap = thumbnail"))
         assertTrue(shelf.contains("Icon(favoriteIcon(favorite)"))
+        assertTrue(shelf.contains("onLongClick = { onRemoveRequest(favorite) }"))
+        assertTrue(shelf.contains("onMove(favorite.id"))
 
         val loader = viewModel.substring(viewModel.indexOf("fun loadFavoriteThumbnail("), viewModel.indexOf("private fun updateFavoriteMetadata("))
         assertTrue(loader.contains("FavoriteItemResolver.resolve(favorite, connection, activeService)"))

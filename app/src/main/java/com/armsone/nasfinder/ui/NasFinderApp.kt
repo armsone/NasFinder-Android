@@ -26,6 +26,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.view.accessibility.AccessibilityManager
 import android.view.View
+import androidx.annotation.RequiresApi
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
@@ -907,21 +908,14 @@ private fun AnimatedGifPreview(file: File, fallback: android.graphics.Bitmap, de
             modifier = Modifier.fillMaxSize(),
         )
     }
-    is AnimatedGifContent.Framework -> {
-        AndroidView(
+    is AnimatedGifContent.Framework -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        FrameworkAnimatedGifPreview(content.drawable, description)
+    } else {
+        Image(
+            bitmap = fallback.asImageBitmap(),
+            contentDescription = description,
+            contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx -> ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER } },
-            update = { view ->
-                view.contentDescription = description
-                if (view.drawable !== content.drawable) {
-                    view.setImageDrawable(content.drawable)
-                    startAnimatedDrawable(content.drawable)
-                }
-            },
-            onRelease = { view ->
-                view.drawable?.let(::stopAnimatedDrawable)
-                view.setImageDrawable(null)
-            },
         )
     }
     is AnimatedGifContent.Legacy -> {
@@ -936,6 +930,26 @@ private fun AnimatedGifPreview(file: File, fallback: android.graphics.Bitmap, de
         )
     }
     }
+}
+
+@RequiresApi(Build.VERSION_CODES.P)
+@Composable
+private fun FrameworkAnimatedGifPreview(drawable: AnimatedImageDrawable, description: String) {
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { ctx -> ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER } },
+        update = { view ->
+            view.contentDescription = description
+            if (view.drawable !== drawable) {
+                view.setImageDrawable(drawable)
+                startAnimatedDrawable(drawable)
+            }
+        },
+        onRelease = { view ->
+            view.drawable?.let(::stopAnimatedDrawable)
+            view.setImageDrawable(null)
+        },
+    )
 }
 
 private sealed interface AnimatedGifContent {
