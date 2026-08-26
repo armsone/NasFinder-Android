@@ -200,6 +200,8 @@ data class ImagePreviewState(
     val remoteStream: RemoteMediaStreamSpec? = null,
     val pdfPageIndex: Int = 0,
     val pdfPageCount: Int = 0,
+    /** True when [cachedFile] is a multi-frame GIF that the viewer should animate; [bitmap] stays the static fallback. */
+    val animatedImage: Boolean = false,
 )
 
 enum class BuiltInPreviewKind { IMAGE, VIDEO, AUDIO, PDF }
@@ -335,6 +337,19 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun show(screen: Screen) {
         invalidateImagePreviewRequests()
         _state.update { it.copy(screen = screen, message = null) }
+    }
+
+    /**
+     * Called when the app has left the foreground (not for configuration changes). Only transient
+     * navigation, viewer and browser state is dropped; connections, credentials, settings,
+     * downloads, caches and files are untouched so the next foreground return starts on the dashboard.
+     */
+    fun returnToDashboardAfterBackground() {
+        connectionOpenJob?.cancel()
+        connectionOpenJob = null
+        thumbnailGeneration++
+        invalidateImagePreviewRequests()
+        _state.update { it.copy(screen = Screen.Dashboard, isBusy = false) }
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
@@ -2050,6 +2065,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                     bitmap = decoded.bitmap,
                                     cachedFile = file,
                                     pdfPageCount = decoded.pageCount,
+                                    animatedImage = decoded.animatedImage,
                                 ),
                             )
                         }
@@ -2080,7 +2096,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (usesInternalDownloadedPreview) previewJob = job
     }
 
-    private data class PreviewDecode(val bitmap: Bitmap? = null, val pageCount: Int = 0)
+    private data class PreviewDecode(val bitmap: Bitmap? = null, val pageCount: Int = 0, val animatedImage: Boolean = false)
 
     private fun RemoteFileItem.builtInPreviewKind(): BuiltInPreviewKind? =
         BuiltInPreviewPolicy.kind(name, mimeType)
@@ -2122,6 +2138,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         cachedFile = file,
                         localFiles = files,
                         pdfPageCount = decoded.pageCount,
+                        animatedImage = decoded.animatedImage,
                     ),
                 )
             }
@@ -2129,7 +2146,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     private fun decodeBuiltInPreview(file: File, kind: BuiltInPreviewKind): PreviewDecode? = when (kind) {
-        BuiltInPreviewKind.IMAGE -> decodePreviewBitmap(file)?.let { PreviewDecode(it) }
+        BuiltInPreviewKind.IMAGE -> decodePreviewBitmap(file)?.let {
+            PreviewDecode(it, animatedImage = AnimatedImagePolicy.isAnimatedGif(file))
+        }
         BuiltInPreviewKind.PDF -> renderPdfPage(file, 0)?.let { PreviewDecode(it.first, it.second) }
         BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> if (validateMedia(file)) PreviewDecode() else null
     }

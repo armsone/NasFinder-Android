@@ -12,8 +12,13 @@ import android.content.ContextWrapper
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
+import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.os.BatteryManager
+import android.os.Build
+import android.widget.ImageView
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.view.accessibility.AccessibilityManager
@@ -189,6 +194,19 @@ fun NasFinderApp(
     }
     val webBrowserSession = remember { WebBrowserSessionController() }
     DisposableEffect(webBrowserSession) { onDispose(webBrowserSession::close) }
+    val appLifecycleOwner = LocalLifecycleOwner.current
+    val appContext = LocalContext.current
+    DisposableEffect(appLifecycleOwner, model) {
+        // Leaving the foreground (home, recents, another app, screen off) returns the next visit to
+        // the dashboard. Configuration changes such as rotation or folding keep the current screen.
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && appContext.findHostActivity()?.isChangingConfigurations != true) {
+                model.returnToDashboardAfterBackground()
+            }
+        }
+        appLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { appLifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     BackHandler(enabled = state.imagePreview != null) {
         model.closeImagePreview()
     }
@@ -609,6 +627,7 @@ private fun BuiltInPreviewScreen(
                 BuiltInPreviewKind.IMAGE, BuiltInPreviewKind.PDF -> preview.bitmap?.let { bitmap ->
                     ZoomablePreviewBitmap(
                         bitmap = bitmap,
+                        animatedFile = preview.cachedFile.takeIf { preview.kind == BuiltInPreviewKind.IMAGE && preview.animatedImage },
                         description = preview.images[preview.index].name,
                         stateKey = "${preview.cachedFile.absolutePath}:${preview.pdfPageIndex}",
                         onPrevious = onPrevious,
@@ -690,6 +709,7 @@ private fun BuiltInPreviewScreen(
 @Composable
 private fun ZoomablePreviewBitmap(
     bitmap: android.graphics.Bitmap,
+    animatedFile: File?,
     description: String,
     stateKey: String,
     onPrevious: () -> Unit,
@@ -850,13 +870,74 @@ private fun ZoomablePreviewBitmap(
             },
         contentAlignment = Alignment.Center,
     ) {
+        if (animatedFile != null) {
+            AnimatedGifPreview(file = animatedFile, fallback = bitmap, description = description)
+        } else {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = description,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
+/**
+ * Plays a multi-frame GIF with the platform decoder. The already decoded first frame is shown
+ * while the animation loads and stays as the static fallback when the animated decode fails or
+ * the OS predates AnimatedImageDrawable (API 28).
+ */
+@Composable
+private fun AnimatedGifPreview(file: File, fallback: android.graphics.Bitmap, description: String) {
+    val animated by produceState<Drawable?>(initialValue = null, key1 = file.absolutePath) {
+        value = withContext(Dispatchers.IO) { decodeAnimatedGifDrawable(file) }
+    }
+    val drawable = animated
+    if (drawable == null) {
         Image(
-            bitmap = bitmap.asImageBitmap(),
+            bitmap = fallback.asImageBitmap(),
             contentDescription = description,
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
         )
+    } else {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx -> ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER } },
+            update = { view ->
+                view.contentDescription = description
+                if (view.drawable !== drawable) {
+                    view.setImageDrawable(drawable)
+                    startAnimatedDrawable(drawable)
+                }
+            },
+            onRelease = { view ->
+                view.drawable?.let(::stopAnimatedDrawable)
+                view.setImageDrawable(null)
+            },
+        )
     }
+}
+
+private fun decodeAnimatedGifDrawable(file: File): Drawable? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+    return runCatching {
+        ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
+            decoder.setTargetSampleSize(AnimatedImagePolicy.sampleSize(info.size.width, info.size.height))
+        }
+    }.getOrNull()?.takeIf { it is AnimatedImageDrawable }
+}
+
+private fun startAnimatedDrawable(drawable: Drawable) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && drawable is AnimatedImageDrawable) {
+        drawable.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
+        drawable.start()
+    }
+}
+
+private fun stopAnimatedDrawable(drawable: Drawable) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && drawable is AnimatedImageDrawable) drawable.stop()
 }
 
 @Composable
@@ -889,6 +970,7 @@ private fun MediaPreviewContent(
     var dismissOpacity by remember(mediaSourceKey) { mutableFloatStateOf(1f) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var gestureMessage by remember { mutableStateOf<String?>(null) }
+    var fineVolumeFraction by remember(mediaSourceKey) { mutableStateOf<Float?>(null) }
 
     val focusChangeListener = remember {
         AudioManager.OnAudioFocusChangeListener { focusChange ->
@@ -982,6 +1064,13 @@ private fun MediaPreviewContent(
                                         val startPosition = position
                                         val startVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
                                         val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                        val startVolumeFraction =
+                                            (startVolume.toFloat() / maxVolume * (player?.volume ?: 1f)).coerceIn(0f, 1f)
+                                        val volumeFullRangePx = MediaViewerGesturePolicy.logicalDistancePx(
+                                            MediaViewerGesturePolicy.VOLUME_FULL_RANGE_DRAG_DP,
+                                            density,
+                                        )
+                                        var appliedVolume = startVolume
 
                                         do {
                                             val event = awaitPointerEvent()
@@ -1039,20 +1128,21 @@ private fun MediaPreviewContent(
                                                                 }
                                                             }
                                                             MediaViewerGestureMode.VOLUME -> {
-                                                                val newVol = MediaViewerGesturePolicy.computeVolume(
-                                                                    startVolume,
-                                                                    maxVolume,
+                                                                // Accumulated drag drives a continuous readout; the stream only
+                                                                // moves when the nearest native step actually changes.
+                                                                val fraction = MediaViewerGesturePolicy.computeVolumeFraction(
+                                                                    startVolumeFraction,
                                                                     totalDrag.y,
-                                                                    containerSize.height.toFloat(),
+                                                                    volumeFullRangePx,
                                                                 )
-                                                                val percent = MediaViewerGesturePolicy.computeVolumePercent(
-                                                                    startVolume,
-                                                                    maxVolume,
-                                                                    totalDrag.y,
-                                                                    containerSize.height.toFloat(),
-                                                                )
-                                                                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVol, 0)
-                                                                gestureMessage = "볼륨 ${percent}%"
+                                                                val setting = MediaViewerGesturePolicy.fineVolumeSetting(fraction, maxVolume)
+                                                                if (setting.streamIndex != appliedVolume) {
+                                                                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, setting.streamIndex, 0)
+                                                                    appliedVolume = setting.streamIndex
+                                                                }
+                                                                player?.volume = setting.playerGain
+                                                                fineVolumeFraction = fraction
+                                                                gestureMessage = "볼륨 ${MediaViewerGesturePolicy.volumePercent(fraction)}%"
                                                                 change.consume()
                                                             }
                                                             MediaViewerGestureMode.DISMISS -> {
@@ -1157,6 +1247,14 @@ private fun MediaPreviewContent(
             onRelease = { released ->
                 audioManager.abandonAudioFocus(focusChangeListener)
                 val releasedPlayer = released.player as? ExoPlayer
+                fineVolumeFraction?.let { fraction ->
+                    val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                    audioManager.setStreamVolume(
+                        AudioManager.STREAM_MUSIC,
+                        MediaViewerGesturePolicy.nativeVolumeIndex(fraction, maxVolume),
+                        0,
+                    )
+                }
                 position = releasedPlayer?.currentPosition?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: position
                 released.player = null
                 releasedPlayer?.release()
