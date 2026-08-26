@@ -30,6 +30,7 @@ import com.armsone.nasfinder.model.RemoteFavorite
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.model.sortedWith
 import com.armsone.nasfinder.data.DownloadCache
+import com.armsone.nasfinder.data.FavoriteItemResolver
 import com.armsone.nasfinder.data.RemoteThumbnailRepository
 import com.armsone.nasfinder.data.RemoteThumbnailCacheStatistics
 import com.armsone.nasfinder.data.RemoteThumbnailTrafficSnapshot
@@ -97,6 +98,8 @@ data class AppState(
     val appVersion: String = "",
     val remoteThumbnails: Map<String, Bitmap> = emptyMap(),
     val thumbnailGeneration: Long = 0L,
+    val favoriteThumbnails: Map<String, Bitmap> = emptyMap(),
+    val favoriteThumbnailGeneration: Long = 0L,
     val imagePreview: ImagePreviewState? = null,
     val superThumbnailConnectionId: String? = null,
     val superThumbnailPath: String? = null,
@@ -239,6 +242,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var service: RemoteFileService? = null
     private var thumbnailGeneration = 0L
     private val thumbnailRequests = mutableSetOf<String>()
+    private var favoriteThumbnailGeneration = 0L
+    private val favoriteThumbnailRequests = mutableSetOf<String>()
+    private val favoriteThumbnailJobs = mutableMapOf<String, Job>()
     private var previewRequestGeneration = 0L
     private var previewJob: Job? = null
     private var connectionOpenJob: Job? = null
@@ -336,6 +342,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun show(screen: Screen) {
         invalidateImagePreviewRequests()
+        if (screen == Screen.Dashboard && _state.value.screen != Screen.Dashboard) {
+            invalidateFavoriteThumbnails()
+        }
         _state.update { it.copy(screen = screen, message = null) }
     }
 
@@ -348,8 +357,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         connectionOpenJob?.cancel()
         connectionOpenJob = null
         thumbnailGeneration++
+        invalidateFavoriteThumbnails()
         invalidateImagePreviewRequests()
-        _state.update { it.copy(screen = Screen.Dashboard, isBusy = false) }
+        _state.update {
+            it.copy(
+                screen = Screen.Dashboard,
+                isBusy = false,
+            )
+        }
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
@@ -528,6 +543,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         repository.save(current)
         if (password.isNotBlank()) repository.credentials.save(connection.id, password)
         _state.update { it.copy(connections = current, screen = Screen.Dashboard) }
+        invalidateFavoriteThumbnails()
         if (_state.value.superThumbnailConnectionId == null) selectSuperThumbnailConnection(connection.id)
         NasFinderAppWidgetProvider.updateAll(application)
     }
@@ -540,6 +556,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         repository.save(remaining); repository.credentials.delete(connection.id)
         favoriteRepository.saveRemote(remainingFavorites)
         if (_state.value.preferredId == connection.id) repository.setPreferred(null)
+        invalidateFavoriteThumbnails()
         _state.update {
             it.copy(
                 connections = remaining,
@@ -651,6 +668,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         .remove(KEY_SUPER_THUMBNAIL_WORK_TITLE)
                         .remove(KEY_SUPER_THUMBNAIL_WORK_LOCATIONS)
                         .apply()
+                    invalidateFavoriteThumbnails()
                     _state.update {
                         it.copy(
                             isBusy = false,
@@ -1476,9 +1494,63 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 path = item.path,
                 name = item.name,
                 isDirectory = item.isDirectory,
+                remoteItemId = item.id,
+                size = item.size,
+                modifiedAt = item.modifiedAt,
+                mimeType = item.mimeType,
+                thumbnailUrl = item.thumbnailUrl,
             )
         )
         _state.update { it.copy(remoteFavorites = favorites) }
+        invalidateFavoriteThumbnails()
+    }
+
+    private fun invalidateFavoriteThumbnails() {
+        favoriteThumbnailGeneration++
+        favoriteThumbnailJobs.values.forEach { it.cancel() }
+        favoriteThumbnailJobs.clear()
+        favoriteThumbnailRequests.clear()
+        _state.update {
+            it.copy(
+                favoriteThumbnails = emptyMap(),
+                favoriteThumbnailGeneration = favoriteThumbnailGeneration,
+            )
+        }
+    }
+
+    fun loadFavoriteThumbnail(favorite: RemoteFavorite) {
+        val connection = _state.value.connections.firstOrNull { it.id == favorite.connectionId } ?: return
+        val generation = favoriteThumbnailGeneration
+        val requestKey = "$generation\u0000${favorite.connectionId}\u0000${favorite.id}\u0000${favorite.path}"
+        if (!favoriteThumbnailRequests.add(requestKey)) return
+
+        favoriteThumbnailJobs[favorite.id] = viewModelScope.launch {
+            val resolved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val credential = repository.credentials.read(connection.id).orEmpty()
+                    RemoteFileServiceFactory.create(connection, credential).use { activeService ->
+                        val resolvedItem = FavoriteItemResolver.resolve(favorite, connection, activeService)
+                        resolvedItem to thumbnailRepository.load(connection, resolvedItem, activeService)
+                    }
+                }.getOrNull()
+            }
+            if (resolved != null && generation == favoriteThumbnailGeneration) {
+                val (resolvedItem, bitmap) = resolved
+                if (FavoriteItemResolver.hasMetadataChanged(favorite, resolvedItem)) {
+                    updateFavoriteMetadata(favorite, resolvedItem)
+                }
+                if (bitmap == null) return@launch
+                _state.update { state ->
+                    if (generation != state.favoriteThumbnailGeneration) state
+                    else state.copy(favoriteThumbnails = state.favoriteThumbnails + (favorite.id to bitmap))
+                }
+            }
+        }
+    }
+
+    private fun updateFavoriteMetadata(favorite: RemoteFavorite, item: RemoteFileItem) {
+        val updatedList = favoriteRepository.updateRemoteMetadata(favorite.id, item)
+        _state.update { it.copy(remoteFavorites = updatedList) }
     }
 
     fun openFavorite(favorite: RemoteFavorite) {
@@ -1502,23 +1574,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 runCatching {
                     service?.close()
                     val credential = repository.credentials.read(connection.id).orEmpty()
-                    RemoteFileServiceFactory.create(
+                    val activeService = RemoteFileServiceFactory.create(
                         connection,
                         credential,
                     ).also { service = it }
+                    val item = FavoriteItemResolver.resolve(favorite, connection, activeService)
+                    val sequence = FavoriteItemResolver.resolveFavoritePreviewSequence(
+                        activeFavorite = favorite,
+                        resolvedActiveItem = item,
+                        allFavorites = _state.value.remoteFavorites,
+                        connection = connection,
+                        activeService = activeService,
+                    )
+                    if (FavoriteItemResolver.hasMetadataChanged(favorite, item)) {
+                        updateFavoriteMetadata(favorite, item)
+                    }
+                    item to sequence
                 }
             }
-            result.onSuccess {
+            result.onSuccess { (item, sequence) ->
                 _state.update { it.copy(isBusy = false) }
                 prepareRemoteFile(
-                    item = RemoteFileItem(
-                        id = favorite.path,
-                        name = favorite.name,
-                        path = favorite.path,
-                        isDirectory = false,
-                    ),
+                    item = item,
                     action = RemoteFileAction.PREVIEW,
                     connection = connection,
+                    imageSequence = sequence,
                 )
             }.onFailure { error ->
                 _state.update {
@@ -2346,7 +2426,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(isBusy = true, message = null) }
             runCatching { withContext(Dispatchers.IO) { thumbnailRepository.clearDiskCache() } }
                 .onSuccess { statistics ->
-                    _state.update { it.copy(isBusy = false, thumbnailCacheStatistics = statistics, message = "썸네일 캐시를 비웠습니다.") }
+                    invalidateFavoriteThumbnails()
+                    _state.update {
+                        it.copy(
+                            isBusy = false,
+                            thumbnailCacheStatistics = statistics,
+                            message = "썸네일 캐시를 비웠습니다.",
+                        )
+                    }
                 }
                 .onFailure { error ->
                     val statistics = withContext(Dispatchers.IO) { thumbnailRepository.cacheStatistics() }

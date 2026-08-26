@@ -3,18 +3,16 @@ package com.armsone.nasfinder.data
 import android.content.Context
 import com.armsone.nasfinder.model.BrowserFavorite
 import com.armsone.nasfinder.model.RemoteFavorite
+import com.armsone.nasfinder.model.RemoteFileItem
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
 
 class FavoriteRepository(context: Context) {
     private val preferences = context.getSharedPreferences("favorites.v1", Context.MODE_PRIVATE)
 
     fun remoteFavorites(): List<RemoteFavorite> = decode(KEY_REMOTE) { value ->
-        RemoteFavorite(
-            id = value.getString("id"), connectionId = value.getString("connectionId"),
-            path = value.getString("path"), name = value.getString("name"),
-            isDirectory = value.getBoolean("isDirectory"), createdAt = value.getLong("createdAt"),
-        )
+        RemoteFavoriteJsonCodec.decode(value)
     }
 
     fun browserFavorites(): List<BrowserFavorite> = decode(KEY_BROWSER) { value ->
@@ -32,12 +30,28 @@ class FavoriteRepository(context: Context) {
         return values
     }
 
-    fun saveRemote(values: List<RemoteFavorite>) = save(KEY_REMOTE, values.map { value ->
-        JSONObject().apply {
-            put("id", value.id); put("connectionId", value.connectionId); put("path", value.path)
-            put("name", value.name); put("isDirectory", value.isDirectory); put("createdAt", value.createdAt)
-        }
-    })
+    fun updateRemoteMetadata(favoriteId: String, item: RemoteFileItem): List<RemoteFavorite> {
+        val current = remoteFavorites().toMutableList()
+        val index = current.indexOfFirst { it.id == favoriteId }
+        if (index < 0) return current
+        val existing = current[index]
+        val updated = existing.copy(
+            path = item.path,
+            name = item.name,
+            isDirectory = item.isDirectory,
+            remoteItemId = item.id,
+            size = item.size,
+            modifiedAt = item.modifiedAt,
+            mimeType = item.mimeType,
+            thumbnailUrl = item.thumbnailUrl,
+        )
+        if (existing == updated) return current
+        current[index] = updated
+        saveRemote(current)
+        return current
+    }
+
+    fun saveRemote(values: List<RemoteFavorite>) = save(KEY_REMOTE, values.map(RemoteFavoriteJsonCodec::encode))
 
     fun saveBrowser(values: List<BrowserFavorite>) {
         val homepage = values.firstOrNull { it.isHomepage }?.id
@@ -61,5 +75,37 @@ class FavoriteRepository(context: Context) {
     private companion object {
         const val KEY_REMOTE = "remote"
         const val KEY_BROWSER = "browser"
+    }
+}
+
+internal object RemoteFavoriteJsonCodec {
+    fun decode(value: JSONObject) = RemoteFavorite(
+        id = value.getString("id"),
+        connectionId = value.getString("connectionId"),
+        path = value.getString("path"),
+        name = value.getString("name"),
+        isDirectory = value.getBoolean("isDirectory"),
+        createdAt = value.getLong("createdAt"),
+        remoteItemId = value.optString("remoteItemId").takeIf(String::isNotBlank),
+        size = value.optLong("size").takeIf { value.has("size") },
+        modifiedAt = value.optString("modifiedAt").takeIf(String::isNotBlank)?.let {
+            runCatching { Instant.parse(it) }.getOrNull()
+        },
+        mimeType = value.optString("mimeType").takeIf(String::isNotBlank),
+        thumbnailUrl = value.optString("thumbnailUrl").takeIf(String::isNotBlank),
+    )
+
+    fun encode(value: RemoteFavorite) = JSONObject().apply {
+        put("id", value.id)
+        put("connectionId", value.connectionId)
+        put("path", value.path)
+        put("name", value.name)
+        put("isDirectory", value.isDirectory)
+        put("createdAt", value.createdAt)
+        value.remoteItemId?.let { put("remoteItemId", it) }
+        value.size?.let { put("size", it) }
+        value.modifiedAt?.let { put("modifiedAt", it.toString()) }
+        value.mimeType?.let { put("mimeType", it) }
+        value.thumbnailUrl?.let { put("thumbnailUrl", it) }
     }
 }

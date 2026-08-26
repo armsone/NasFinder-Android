@@ -87,7 +87,7 @@
       "fallback_capable": true,
       "evidence": [],
       "status": "needs_verification",
-      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "moved Vault restore into shared foreground repository", "result": "consumer topology verified; device evidence pending"}, {"attempt": 2, "date": "2026-08-25", "action": "applied canonical and legacy signature lookup inside the shared repository path", "result": "source path updated; consumer runtime evidence pending"}, {"attempt": 3, "date": "2026-08-25", "action": "routed browser grid, list, poster, overflow, favorites and DocumentsProvider consumers through the prioritized RemoteThumbnailRepository", "result": "consumer priority pipeline unit-tested; device runtime evidence pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-24", "action": "moved Vault restore into shared foreground repository", "result": "consumer topology verified; device evidence pending"}, {"attempt": 2, "date": "2026-08-25", "action": "applied canonical and legacy signature lookup inside the shared repository path", "result": "source path updated; consumer runtime evidence pending"}, {"attempt": 3, "date": "2026-08-25", "action": "routed browser grid, list, poster, overflow and DocumentsProvider consumers through the prioritized RemoteThumbnailRepository", "result": "consumer priority pipeline unit-tested; device runtime evidence pending"}, {"attempt": 4, "date": "2026-08-26", "action": "connected dashboard favorites to prioritized RemoteThumbnailRepository with dedicated loader and folder Super Thumbnail reuse", "result": "dashboard favorites thumbnail loader and resolution unit-tested; device runtime evidence pending"}],
       "reopen_history": []
     },
     {

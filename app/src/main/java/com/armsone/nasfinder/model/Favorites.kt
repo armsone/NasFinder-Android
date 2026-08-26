@@ -1,6 +1,7 @@
 package com.armsone.nasfinder.model
 
 import java.net.URI
+import java.time.Instant
 import java.util.UUID
 
 data class RemoteFavorite(
@@ -10,7 +11,23 @@ data class RemoteFavorite(
     val name: String,
     val isDirectory: Boolean,
     val createdAt: Long = System.currentTimeMillis(),
-)
+    val remoteItemId: String? = null,
+    val size: Long? = null,
+    val modifiedAt: Instant? = null,
+    val mimeType: String? = null,
+    val thumbnailUrl: String? = null,
+) {
+    fun toRemoteFileItem(): RemoteFileItem = RemoteFileItem(
+        id = remoteItemId?.takeIf { it.isNotBlank() } ?: path,
+        name = name,
+        path = path,
+        isDirectory = isDirectory,
+        size = size ?: 0L,
+        modifiedAt = modifiedAt,
+        mimeType = mimeType,
+        thumbnailUrl = thumbnailUrl,
+    )
+}
 
 data class BrowserFavorite(
     val id: String = UUID.randomUUID().toString(),

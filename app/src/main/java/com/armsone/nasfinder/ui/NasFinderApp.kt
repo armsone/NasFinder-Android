@@ -1639,8 +1639,11 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                             FavoriteShelf(
                                 favorites = state.remoteFavorites,
                                 connections = state.connections,
+                                thumbnails = state.favoriteThumbnails,
+                                thumbnailGeneration = state.favoriteThumbnailGeneration,
                                 theme = state.theme,
                                 onOpen = model::openFavorite,
+                                onLoadThumbnail = model::loadFavoriteThumbnail,
                             )
                         }
                     }
@@ -1764,23 +1767,54 @@ private fun launcherIconDrawable(icon: LauncherIconVariant) = when (icon) {
 private fun FavoriteShelf(
     favorites: List<RemoteFavorite>,
     connections: List<RemoteConnection>,
+    thumbnails: Map<String, android.graphics.Bitmap>,
+    thumbnailGeneration: Long,
     theme: AppTheme,
     onOpen: (RemoteFavorite) -> Unit,
+    onLoadThumbnail: (RemoteFavorite) -> Unit,
 ) {
     if (favorites.isEmpty()) return
 
     LazyRow(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
         items(favorites, key = { it.id }) { favorite ->
+            LaunchedEffect(
+                favorite.id,
+                favorite.connectionId,
+                favorite.path,
+                favorite.size,
+                favorite.modifiedAt,
+                thumbnailGeneration,
+            ) {
+                onLoadThumbnail(favorite)
+            }
             val connection = connections.firstOrNull { it.id == favorite.connectionId }
             val tint = connection?.let { serviceColor(it.kind.name, theme) }
                 ?: MaterialTheme.colorScheme.onSurfaceVariant
+            val thumbnail = thumbnails[favorite.id]
             Column(
                 modifier = Modifier.width(56.dp).clickable { onOpen(favorite) },
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box {
                     if (theme == AppTheme.SKEUOMORPHIC) {
-                        EnamelIconWell(favoriteIcon(favorite), MaterialTheme.colorScheme.onSurface, 52.dp, 28.dp)
+                        if (thumbnail != null && !thumbnail.isRecycled) {
+                            Surface(
+                                modifier = Modifier.size(52.dp),
+                                shape = RoundedCornerShape(11.dp),
+                                color = MaterialTheme.colorScheme.surface.copy(alpha = .96f),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .72f)),
+                                shadowElevation = 2.dp,
+                            ) {
+                                Image(
+                                    bitmap = thumbnail.asImageBitmap(),
+                                    contentDescription = favorite.name,
+                                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
+                                    contentScale = ContentScale.Crop,
+                                )
+                            }
+                        } else {
+                            EnamelIconWell(favoriteIcon(favorite), MaterialTheme.colorScheme.onSurface, 52.dp, 28.dp)
+                        }
                     } else {
                         Surface(
                             modifier = Modifier.size(52.dp),
@@ -1788,8 +1822,17 @@ private fun FavoriteShelf(
                             color = MaterialTheme.colorScheme.surface.copy(alpha = .90f),
                             border = BorderStroke(1.dp, tint.copy(alpha = .28f)),
                         ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(favoriteIcon(favorite), null, tint = tint, modifier = Modifier.size(30.dp))
+                            if (thumbnail != null && !thumbnail.isRecycled) {
+                                Image(
+                                    bitmap = thumbnail.asImageBitmap(),
+                                    contentDescription = favorite.name,
+                                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
+                                    contentScale = ContentScale.Crop,
+                                )
+                            } else {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(favoriteIcon(favorite), null, tint = tint, modifier = Modifier.size(30.dp))
+                                }
                             }
                         }
                     }
@@ -1829,11 +1872,17 @@ private fun FavoriteShelf(
     }
 }
 
-private fun favoriteIcon(favorite: RemoteFavorite) = when {
-    favorite.isDirectory -> Icons.Default.Folder
-    favorite.name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "heic", "webp") -> Icons.Default.Image
-    favorite.name.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "avi", "webm") -> Icons.Default.Movie
-    else -> Icons.Default.InsertDriveFile
+private fun favoriteIcon(favorite: RemoteFavorite): androidx.compose.ui.graphics.vector.ImageVector {
+    if (favorite.isDirectory) return Icons.Default.Folder
+    val ext = favorite.name.substringAfterLast('.', "").lowercase()
+    val mime = favorite.mimeType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+    return when {
+        mime.startsWith("image/") || ext in setOf("jpg", "jpeg", "jpe", "png", "gif", "heic", "heif", "webp", "bmp", "dib", "tif", "tiff", "avif", "svg") -> Icons.Default.Image
+        mime.startsWith("video/") || ext in setOf("3g2", "3gp", "flv", "fmp4", "m2ts", "m4v", "mkv", "mov", "mpe", "mpeg", "mpg", "mp4", "mts", "ogv", "qt", "ts", "vob", "webm") -> Icons.Default.Movie
+        mime == "application/pdf" || ext == "pdf" -> Icons.Default.PictureAsPdf
+        mime.startsWith("audio/") || ext in setOf("mp3", "m4a", "aac", "adts", "wav", "ogg", "oga", "flac", "opus", "amr") -> Icons.Default.Audiotrack
+        else -> Icons.Default.InsertDriveFile
+    }
 }
 
 private fun connectionKindBadge(kind: ConnectionKind) = when (kind) {
