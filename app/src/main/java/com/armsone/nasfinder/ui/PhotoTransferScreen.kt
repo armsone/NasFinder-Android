@@ -980,8 +980,9 @@ private fun SavedPhotoTransferCard(result: SavedPhotoTransferResult, modifier: M
     ) {
         val loadedThumbnail = thumbnail
         if (loadedThumbnail != null) {
-            Image(
-                bitmap = loadedThumbnail.asImageBitmap(),
+            SkinAwareThumbnailImage(
+                bitmap = loadedThumbnail,
+                cacheIdentity = "photo-transfer-saved:${result.uri}:${result.displayName}:${result.mimeType}",
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
@@ -1040,8 +1041,9 @@ private fun SelectedMediaReviewCard(
         contentAlignment = Alignment.Center,
     ) {
         item.thumbnail?.let { thumbnail ->
-            Image(
-                bitmap = thumbnail.asImageBitmap(),
+            SkinAwareThumbnailImage(
+                bitmap = thumbnail,
+                cacheIdentity = "photo-transfer-selected:${item.uri}:${item.byteLength}:${item.mimeType}",
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),

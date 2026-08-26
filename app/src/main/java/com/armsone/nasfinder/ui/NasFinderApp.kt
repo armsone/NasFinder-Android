@@ -1805,8 +1805,9 @@ private fun FavoriteShelf(
                                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .72f)),
                                 shadowElevation = 2.dp,
                             ) {
-                                Image(
-                                    bitmap = thumbnail.asImageBitmap(),
+                                SkinAwareThumbnailImage(
+                                    bitmap = thumbnail,
+                                    cacheIdentity = "favorite:${favorite.connectionId}:${favorite.remoteItemId ?: favorite.path}:${favorite.path}:${favorite.size}:${favorite.modifiedAt}:${favorite.thumbnailUrl}",
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
@@ -1823,8 +1824,9 @@ private fun FavoriteShelf(
                             border = BorderStroke(1.dp, tint.copy(alpha = .28f)),
                         ) {
                             if (thumbnail != null && !thumbnail.isRecycled) {
-                                Image(
-                                    bitmap = thumbnail.asImageBitmap(),
+                                SkinAwareThumbnailImage(
+                                    bitmap = thumbnail,
+                                    cacheIdentity = "favorite:${favorite.connectionId}:${favorite.remoteItemId ?: favorite.path}:${favorite.path}:${favorite.size}:${favorite.modifiedAt}:${favorite.thumbnailUrl}",
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
@@ -3202,8 +3204,9 @@ private fun longPress500Configuration(): ViewConfiguration {
 @Composable
 private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, modifier: Modifier, iconSize: androidx.compose.ui.unit.Dp, cornerRadius: androidx.compose.ui.unit.Dp) {
     if (thumbnail != null && !thumbnail.isRecycled) {
-        Image(
-            bitmap = thumbnail.asImageBitmap(),
+        SkinAwareThumbnailImage(
+            bitmap = thumbnail,
+            cacheIdentity = "remote:${item.id}:${item.path}:${item.size}:${item.modifiedAt}:${item.thumbnailUrl}",
             contentDescription = "${item.name} 썸네일",
             modifier = modifier.clip(RoundedCornerShape(cornerRadius)),
             contentScale = ContentScale.Crop,
@@ -4133,7 +4136,13 @@ private fun InboxArtwork(
         contentAlignment = Alignment.Center,
     ) {
         if (thumbnail != null) {
-            Image(thumbnail.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            SkinAwareThumbnailImage(
+                bitmap = thumbnail,
+                cacheIdentity = "inbox:${file.id}:${file.file.path}:${file.file.lastModified()}:${file.file.length()}:$requestedPixels",
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
         } else {
             Icon(icon, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }

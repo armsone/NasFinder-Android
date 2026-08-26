@@ -29,7 +29,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -835,7 +834,15 @@ private fun WebHardArtwork(
         if (!item.isDirectory && key !in thumbnails) withContext(Dispatchers.IO) { loadWebHardThumbnail(store.file(item.path), item) }?.let { thumbnails[key] = it }
     }
     Box(modifier.clip(RoundedCornerShape(11.dp)).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-        thumbnails[key]?.let { Image(it.asImageBitmap(), contentDescription, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+        thumbnails[key]?.let {
+            SkinAwareThumbnailImage(
+                bitmap = it,
+                cacheIdentity = "webhard:$key",
+                contentDescription = contentDescription,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        }
             ?: Icon(if (item.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null, modifier = Modifier.fillMaxSize(.48f), tint = if (item.isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
