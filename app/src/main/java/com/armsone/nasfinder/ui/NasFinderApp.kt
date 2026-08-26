@@ -1535,12 +1535,12 @@ private fun MediaPreviewContent(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .height(2.dp)
+                        .height(1.dp)
                         .semantics {
                             contentDescription = "재생 위치 ${formatDuration(position)} / ${formatDuration(duration)}"
                         },
-                    color = Color.White,
-                    trackColor = Color.Black.copy(alpha = .88f),
+                    color = Color.White.copy(alpha = .70f),
+                    trackColor = Color.Black.copy(alpha = .70f),
                 )
             }
         }
