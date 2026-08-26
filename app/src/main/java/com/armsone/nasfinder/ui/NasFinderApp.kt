@@ -13,15 +13,19 @@ import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.ImageDecoder
+import android.graphics.Canvas
+import android.graphics.Movie
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.SystemClock
 import android.widget.ImageView
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.view.accessibility.AccessibilityManager
+import android.view.View
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
@@ -890,26 +894,27 @@ private fun ZoomablePreviewBitmap(
  */
 @Composable
 private fun AnimatedGifPreview(file: File, fallback: android.graphics.Bitmap, description: String) {
-    val animated by produceState<Drawable?>(initialValue = null, key1 = file.absolutePath) {
-        value = withContext(Dispatchers.IO) { decodeAnimatedGifDrawable(file) }
+    val animated by produceState<AnimatedGifContent?>(initialValue = null, key1 = file.absolutePath) {
+        value = withContext(Dispatchers.IO) { decodeAnimatedGif(file) }
     }
-    val drawable = animated
-    if (drawable == null) {
+    when (val content = animated) {
+    null -> {
         Image(
             bitmap = fallback.asImageBitmap(),
             contentDescription = description,
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
         )
-    } else {
+    }
+    is AnimatedGifContent.Framework -> {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx -> ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER } },
             update = { view ->
                 view.contentDescription = description
-                if (view.drawable !== drawable) {
-                    view.setImageDrawable(drawable)
-                    startAnimatedDrawable(drawable)
+                if (view.drawable !== content.drawable) {
+                    view.setImageDrawable(content.drawable)
+                    startAnimatedDrawable(content.drawable)
                 }
             },
             onRelease = { view ->
@@ -918,15 +923,79 @@ private fun AnimatedGifPreview(file: File, fallback: android.graphics.Bitmap, de
             },
         )
     }
+    is AnimatedGifContent.Legacy -> {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx -> LegacyGifImageView(ctx) },
+            update = { view ->
+                view.contentDescription = description
+                view.show(content.movie)
+            },
+            onRelease = LegacyGifImageView::stop,
+        )
+    }
+    }
 }
 
-private fun decodeAnimatedGifDrawable(file: File): Drawable? {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+private sealed interface AnimatedGifContent {
+    data class Framework(val drawable: AnimatedImageDrawable) : AnimatedGifContent
+    data class Legacy(val movie: Movie) : AnimatedGifContent
+}
+
+@Suppress("DEPRECATION")
+private fun decodeAnimatedGif(file: File): AnimatedGifContent? {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        val drawable = runCatching {
+            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                decoder.setTargetSampleSize(AnimatedImagePolicy.sampleSize(info.size.width, info.size.height))
+            }
+        }.getOrNull() as? AnimatedImageDrawable
+        if (drawable != null) return AnimatedGifContent.Framework(drawable)
+    }
     return runCatching {
-        ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
-            decoder.setTargetSampleSize(AnimatedImagePolicy.sampleSize(info.size.width, info.size.height))
+        file.inputStream().buffered().use(Movie::decodeStream)
+    }.getOrNull()?.let { AnimatedGifContent.Legacy(it) }
+}
+
+@Suppress("DEPRECATION")
+private class LegacyGifImageView(context: Context) : View(context) {
+    private var movie: Movie? = null
+    private var startedAt = 0L
+    private var running = false
+
+    init { setLayerType(LAYER_TYPE_SOFTWARE, null) }
+
+    fun show(next: Movie) {
+        if (movie !== next) {
+            movie = next
+            startedAt = SystemClock.uptimeMillis()
         }
-    }.getOrNull()?.takeIf { it is AnimatedImageDrawable }
+        running = true
+        postInvalidateOnAnimation()
+    }
+
+    fun stop() {
+        running = false
+        movie = null
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val animation = movie ?: return
+        val movieWidth = animation.width().coerceAtLeast(1)
+        val movieHeight = animation.height().coerceAtLeast(1)
+        val scale = minOf(width.toFloat() / movieWidth, height.toFloat() / movieHeight)
+        val left = (width - movieWidth * scale) / 2f
+        val top = (height - movieHeight * scale) / 2f
+        val duration = animation.duration().takeIf { it > 0 } ?: 1_000
+        animation.setTime(((SystemClock.uptimeMillis() - startedAt) % duration).toInt())
+        canvas.save()
+        canvas.translate(left, top)
+        canvas.scale(scale, scale)
+        animation.draw(canvas, 0f, 0f)
+        canvas.restore()
+        if (running) postInvalidateOnAnimation()
+    }
 }
 
 private fun startAnimatedDrawable(drawable: Drawable) {

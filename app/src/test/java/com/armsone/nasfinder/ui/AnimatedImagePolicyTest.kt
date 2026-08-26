@@ -55,7 +55,8 @@ class AnimatedImagePolicyTest {
         assertTrue(app.contains("AnimatedGifPreview(file = animatedFile, fallback = bitmap, description = description)"))
         assertTrue(app.contains("ImageDecoder.decodeDrawable(ImageDecoder.createSource(file))"))
         assertTrue(app.contains("decoder.setTargetSampleSize(AnimatedImagePolicy.sampleSize(info.size.width, info.size.height))"))
-        assertTrue(app.contains("takeIf { it is AnimatedImageDrawable }"))
+        assertTrue(app.contains("file.inputStream().buffered().use(Movie::decodeStream)"))
+        assertTrue(app.contains("LegacyGifImageView"))
         assertTrue(app.contains("drawable.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE"))
         assertTrue(app.contains("view.drawable?.let(::stopAnimatedDrawable)"))
         // Zoom, pan and orientation handling stay on the shared container above the image content.
