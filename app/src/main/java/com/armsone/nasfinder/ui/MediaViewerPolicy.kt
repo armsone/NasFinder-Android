@@ -280,6 +280,8 @@ internal data class FineVolumeSetting(val streamIndex: Int, val playerGain: Floa
 
 /** Maps Media3's decoder/buffer state to a truthful preparation fraction when one is meaningful. */
 internal object MediaBufferingProgressPolicy {
+    const val STALL_TO_INDETERMINATE_MS = 1_500L
+
     fun fraction(
         bufferedPercentage: Int,
         bufferedPositionMs: Long,
@@ -293,6 +295,9 @@ internal object MediaBufferingProgressPolicy {
         } else null
         return listOfNotNull(percentageFraction, positionFraction).maxOrNull()
     }
+
+    fun hasAdvanced(previous: Float?, current: Float): Boolean =
+        previous == null || current > previous + 0.0001f || current < previous - 0.01f
 }
 
 internal object MediaPlaybackProgressPolicy {

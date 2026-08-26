@@ -36,6 +36,13 @@ class MediaBufferingProgressPolicyTest {
     }
 
     @Test
+    fun `only advancing positive progress remains determinate`() {
+        assertTrue(MediaBufferingProgressPolicy.hasAdvanced(null, 0.1f))
+        assertTrue(MediaBufferingProgressPolicy.hasAdvanced(0.1f, 0.2f))
+        assertFalse(MediaBufferingProgressPolicy.hasAdvanced(0.2f, 0.2f))
+    }
+
+    @Test
     fun `buffering overlay uses accessible horizontal progress and no dot spinner`() {
         val app = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt").readText()
         val start = app.indexOf("if (isBuffering && playbackError == null)")

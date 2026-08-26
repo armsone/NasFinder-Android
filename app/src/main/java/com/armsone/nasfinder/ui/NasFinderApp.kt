@@ -1063,14 +1063,28 @@ private fun MediaPreviewContent(
             bufferedFraction = null
             return@LaunchedEffect
         }
+        var lastMeaningfulFraction: Float? = null
+        var lastAdvanceAt = SystemClock.elapsedRealtime()
         while (true) {
             val activePlayer = player
-            bufferedFraction = if (activePlayer == null) null else {
+            val candidate = if (activePlayer == null) null else {
                 MediaBufferingProgressPolicy.fraction(
                     bufferedPercentage = activePlayer.bufferedPercentage,
                     bufferedPositionMs = activePlayer.bufferedPosition,
                     durationMs = activePlayer.duration,
                 )
+            }
+            val now = SystemClock.elapsedRealtime()
+            bufferedFraction = when {
+                candidate == null || candidate <= 0f -> null
+                MediaBufferingProgressPolicy.hasAdvanced(lastMeaningfulFraction, candidate) -> {
+                    lastMeaningfulFraction = candidate
+                    lastAdvanceAt = now
+                    candidate
+                }
+                now - lastAdvanceAt <= MediaBufferingProgressPolicy.STALL_TO_INDETERMINATE_MS ->
+                    lastMeaningfulFraction
+                else -> null
             }
             delay(200)
         }
