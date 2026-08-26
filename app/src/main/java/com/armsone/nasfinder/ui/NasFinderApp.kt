@@ -46,6 +46,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.ui.focus.FocusRequester
@@ -1604,6 +1605,7 @@ private fun skyBrush(theme: AppTheme): Brush = Brush.linearGradient(
 @Composable
 private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     var connectionPendingDeletion by remember { mutableStateOf<RemoteConnection?>(null) }
+    var favoritePendingDeletion by remember { mutableStateOf<RemoteFavorite?>(null) }
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         model.importPickedFiles(uris)
     }
@@ -1698,6 +1700,8 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                                 theme = state.theme,
                                 onOpen = model::openFavorite,
                                 onLoadThumbnail = model::loadFavoriteThumbnail,
+                                onRemoveRequest = { favoritePendingDeletion = it },
+                                onMove = model::moveFavorite,
                             )
                         }
                     }
@@ -1806,6 +1810,25 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
             },
         )
     }
+    favoritePendingDeletion?.let { favorite ->
+        AlertDialog(
+            onDismissRequest = { favoritePendingDeletion = null },
+            title = { Text("즐겨찾기에서 제거할까요?") },
+            text = { Text("‘${favorite.name}’ 항목만 즐겨찾기에서 제거합니다. 서버의 파일이나 폴더는 삭제되지 않습니다.") },
+            dismissButton = {
+                TextButton(onClick = { favoritePendingDeletion = null }) { Text("취소") }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        favoritePendingDeletion = null
+                        model.removeFavorite(favorite)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("즐겨찾기에서 제거") }
+            },
+        )
+    }
 }
 
 private fun launcherIconDrawable(icon: LauncherIconVariant) = when (icon) {
@@ -1826,10 +1849,19 @@ private fun FavoriteShelf(
     theme: AppTheme,
     onOpen: (RemoteFavorite) -> Unit,
     onLoadThumbnail: (RemoteFavorite) -> Unit,
+    onRemoveRequest: (RemoteFavorite) -> Unit,
+    onMove: (String, Int) -> Unit,
 ) {
     if (favorites.isEmpty()) return
 
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    val reorderThresholdPx = with(density) { 32.dp.toPx() }
+    val edgeZonePx = with(density) { 40.dp.toPx() }
+    val edgeScrollPx = with(density) { 12.dp.toPx() }
+
+    LazyRow(state = listState, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
         items(favorites, key = { it.id }) { favorite ->
             LaunchedEffect(
                 favorite.id,
@@ -1845,8 +1877,79 @@ private fun FavoriteShelf(
             val tint = connection?.let { serviceColor(it.kind.name, theme) }
                 ?: MaterialTheme.colorScheme.onSurfaceVariant
             val thumbnail = thumbnails[favorite.id]
+            var dragOffsetX by remember(favorite.id) { mutableFloatStateOf(0f) }
+            var isDragging by remember(favorite.id) { mutableStateOf(false) }
             Column(
-                modifier = Modifier.width(56.dp).clickable { onOpen(favorite) },
+                modifier = Modifier
+                    .width(56.dp)
+                    .animateItem()
+                    .zIndex(if (isDragging) 1f else 0f)
+                    .graphicsLayer { translationX = dragOffsetX }
+                    .semantics {
+                        contentDescription = "${favorite.name}, 즐겨찾기"
+                        customActions = buildList {
+                            add(CustomAccessibilityAction("즐겨찾기에서 제거") {
+                                onRemoveRequest(favorite)
+                                true
+                            })
+                            if (favorites.firstOrNull()?.id != favorite.id) {
+                                add(CustomAccessibilityAction("앞으로 이동") {
+                                    onMove(favorite.id, -1)
+                                    true
+                                })
+                            }
+                            if (favorites.lastOrNull()?.id != favorite.id) {
+                                add(CustomAccessibilityAction("뒤로 이동") {
+                                    onMove(favorite.id, 1)
+                                    true
+                                })
+                            }
+                        }
+                    }
+                    .combinedClickable(
+                        onClick = { onOpen(favorite) },
+                        onLongClick = { onRemoveRequest(favorite) },
+                        onLongClickLabel = "즐겨찾기에서 제거",
+                    )
+                    .pointerInput(favorite.id) {
+                        detectDragGestures(
+                            onDragStart = {
+                                isDragging = true
+                                dragOffsetX = 0f
+                            },
+                            onDragCancel = {
+                                isDragging = false
+                                dragOffsetX = 0f
+                            },
+                            onDragEnd = {
+                                isDragging = false
+                                dragOffsetX = 0f
+                            },
+                        ) { change, dragAmount ->
+                            change.consume()
+                            dragOffsetX += dragAmount.x
+                            while (dragOffsetX >= reorderThresholdPx) {
+                                onMove(favorite.id, 1)
+                                dragOffsetX -= reorderThresholdPx
+                            }
+                            while (dragOffsetX <= -reorderThresholdPx) {
+                                onMove(favorite.id, -1)
+                                dragOffsetX += reorderThresholdPx
+                            }
+
+                            val item = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == favorite.id }
+                            val draggedCenter = item?.let { it.offset + it.size / 2f + dragOffsetX }
+                            val viewportStart = listState.layoutInfo.viewportStartOffset.toFloat()
+                            val viewportEnd = listState.layoutInfo.viewportEndOffset.toFloat()
+                            val edgeDelta = when {
+                                draggedCenter == null -> 0f
+                                draggedCenter < viewportStart + edgeZonePx -> -edgeScrollPx
+                                draggedCenter > viewportEnd - edgeZonePx -> edgeScrollPx
+                                else -> 0f
+                            }
+                            if (edgeDelta != 0f) scope.launch { listState.scrollBy(edgeDelta) }
+                        }
+                    },
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box {

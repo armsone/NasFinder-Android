@@ -1505,6 +1505,30 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         invalidateFavoriteThumbnails()
     }
 
+    fun removeFavorite(favorite: RemoteFavorite) {
+        val remaining = _state.value.remoteFavorites.filterNot { it.id == favorite.id }
+        if (remaining.size == _state.value.remoteFavorites.size) return
+        favoriteRepository.saveRemote(remaining)
+        favoriteThumbnailJobs.remove(favorite.id)?.cancel()
+        _state.update {
+            it.copy(
+                remoteFavorites = remaining,
+                favoriteThumbnails = it.favoriteThumbnails - favorite.id,
+            )
+        }
+    }
+
+    fun moveFavorite(favoriteId: String, offset: Int) {
+        val values = _state.value.remoteFavorites.toMutableList()
+        val from = values.indexOfFirst { it.id == favoriteId }
+        if (from < 0) return
+        val to = (from + offset).coerceIn(0, values.lastIndex)
+        if (from == to) return
+        values.add(to, values.removeAt(from))
+        favoriteRepository.saveRemote(values)
+        _state.update { it.copy(remoteFavorites = values) }
+    }
+
     private fun invalidateFavoriteThumbnails() {
         favoriteThumbnailGeneration++
         favoriteThumbnailJobs.values.forEach { it.cancel() }
