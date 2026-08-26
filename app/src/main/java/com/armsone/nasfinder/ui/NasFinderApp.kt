@@ -1218,10 +1218,12 @@ private fun MediaPreviewContent(
                                                             MediaViewerGestureMode.VOLUME -> {
                                                                 // Accumulated drag drives a continuous readout; the stream only
                                                                 // moves when the nearest native step actually changes.
-                                                                val fraction = MediaViewerGesturePolicy.computeVolumeFraction(
-                                                                    startVolumeFraction,
-                                                                    totalDrag.y,
-                                                                    volumeFullRangePx,
+                                                                val fraction = MediaViewerGesturePolicy.quantizeVolumeFraction(
+                                                                    MediaViewerGesturePolicy.computeVolumeFraction(
+                                                                        startVolumeFraction,
+                                                                        totalDrag.y,
+                                                                        volumeFullRangePx,
+                                                                    ),
                                                                 )
                                                                 val setting = MediaViewerGesturePolicy.fineVolumeSetting(fraction, maxVolume)
                                                                 if (setting.streamIndex != appliedVolume) {
@@ -1539,8 +1541,8 @@ private fun MediaPreviewContent(
                         .semantics {
                             contentDescription = "재생 위치 ${formatDuration(position)} / ${formatDuration(duration)}"
                         },
-                    color = Color.White.copy(alpha = .70f),
-                    trackColor = Color.Black.copy(alpha = .70f),
+                    color = Color.White.copy(alpha = .35f),
+                    trackColor = Color.Black.copy(alpha = .35f),
                 )
             }
         }

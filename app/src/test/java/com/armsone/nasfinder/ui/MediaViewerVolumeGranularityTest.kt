@@ -10,6 +10,14 @@ class MediaViewerVolumeGranularityTest {
     private val maxVolume = 15 // typical STREAM_MUSIC index range on phones and tablets
     private val fullRangePx = MediaViewerGesturePolicy.logicalDistancePx(MediaViewerGesturePolicy.VOLUME_FULL_RANGE_DRAG_DP, 1f)
 
+    @Test fun `volume fraction is quantized to exact one percent units`() {
+        assertEquals(0f, MediaViewerGesturePolicy.quantizeVolumeFraction(-1f), 0f)
+        assertEquals(0.01f, MediaViewerGesturePolicy.quantizeVolumeFraction(0.006f), 0f)
+        assertEquals(0.57f, MediaViewerGesturePolicy.quantizeVolumeFraction(0.574f), 0f)
+        assertEquals(0.58f, MediaViewerGesturePolicy.quantizeVolumeFraction(0.575f), 0f)
+        assertEquals(1f, MediaViewerGesturePolicy.quantizeVolumeFraction(2f), 0f)
+    }
+
     @Test fun `full-range drag sweeps the whole volume range in both directions`() {
         assertEquals(1f, MediaViewerGesturePolicy.computeVolumeFraction(0, maxVolume, -fullRangePx, fullRangePx), 0.0001f)
         assertEquals(0f, MediaViewerGesturePolicy.computeVolumeFraction(maxVolume, maxVolume, fullRangePx, fullRangePx), 0.0001f)

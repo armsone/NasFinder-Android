@@ -22,7 +22,7 @@ class MediaPlaybackProgressPolicyTest {
     }
 
     @Test
-    fun `hidden controls render a one dp seventy percent black and white bottom progress line`() {
+    fun `hidden controls render a one dp thirty five percent black and white bottom progress line`() {
         val app = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt").readText()
         val start = app.indexOf("} else if (playing) {")
         val end = app.indexOf("\n        }\n    }\n}\n\nprivate fun formatDuration", start)
@@ -32,8 +32,8 @@ class MediaPlaybackProgressPolicyTest {
         assertTrue(progress.contains(".align(Alignment.BottomCenter)"))
         assertTrue(progress.contains(".fillMaxWidth()"))
         assertTrue(progress.contains(".height(1.dp)"))
-        assertTrue(progress.contains("color = Color.White.copy(alpha = .70f)"))
-        assertTrue(progress.contains("trackColor = Color.Black.copy(alpha = .70f)"))
+        assertTrue(progress.contains("color = Color.White.copy(alpha = .35f)"))
+        assertTrue(progress.contains("trackColor = Color.Black.copy(alpha = .35f)"))
         assertTrue(progress.contains("재생 위치"))
         assertFalse(progress.contains("navigationBarsPadding()"))
     }

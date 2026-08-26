@@ -177,6 +177,10 @@ object MediaViewerGesturePolicy {
         )
     }
 
+    /** The product contract exposes and applies volume in exact one-percentage-point units. */
+    fun quantizeVolumeFraction(fraction: Float): Float =
+        (fraction.coerceIn(0f, 1f) * 100f).roundToInt() / 100f
+
     /**
      * Android's system media stream often has only about 15 steps. Pairing the next system step
      * with ExoPlayer's continuous gain makes the audible result follow [fraction] without a 6-7%
@@ -184,7 +188,7 @@ object MediaViewerGesturePolicy {
      */
     internal fun fineVolumeSetting(fraction: Float, maxVolume: Int): FineVolumeSetting {
         if (maxVolume <= 0) return FineVolumeSetting(0, 0f)
-        val clamped = fraction.coerceIn(0f, 1f)
+        val clamped = quantizeVolumeFraction(fraction)
         if (clamped == 0f) return FineVolumeSetting(0, 0f)
         val streamIndex = ceil(clamped * maxVolume).toInt().coerceIn(1, maxVolume)
         val playerGain = (clamped * maxVolume / streamIndex).coerceIn(0f, 1f)
@@ -197,7 +201,7 @@ object MediaViewerGesturePolicy {
         return (fraction.coerceIn(0f, 1f) * maxVolume).roundToInt().coerceIn(0, maxVolume)
     }
 
-    fun volumePercent(fraction: Float): Int = (fraction.coerceIn(0f, 1f) * 100f).roundToInt()
+    fun volumePercent(fraction: Float): Int = (quantizeVolumeFraction(fraction) * 100f).roundToInt()
 
     fun computeVolume(
         startVolume: Int,
