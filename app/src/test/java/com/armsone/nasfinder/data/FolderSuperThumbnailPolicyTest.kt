@@ -43,31 +43,40 @@ class FolderSuperThumbnailPolicyTest {
         assertEquals(selected, FolderSuperThumbnailPolicy.selectChildren(items.reversed()))
     }
 
-    @Test fun skinThresholdMatchesPortableTwelveByTwelveContract() {
-        assertTrue(FolderSuperThumbnailPolicy.shouldBlur(61, 144))
-        assertFalse(FolderSuperThumbnailPolicy.shouldBlur(60, 144))
-        assertTrue(FolderSuperThumbnailPolicy.isSkinTone(200, 120, 90))
-        assertFalse(FolderSuperThumbnailPolicy.isSkinTone(40, 140, 240))
-        assertEquals(3, FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX)
-        assertEquals(1.5f, FolderSuperThumbnailPolicy.BLUR_RADIUS_POINTS, 0.001f)
+    @Test fun skinShareAtOrBelowTwentyPercentAppliesNoBlur() {
+        assertEquals(0f, FolderSuperThumbnailPolicy.blurRadiusDp(0, 144), 0.0001f)
+        assertEquals(0f, FolderSuperThumbnailPolicy.blurRadiusDp(0.20f), 0.0001f)
+        assertEquals(0f, FolderSuperThumbnailPolicy.blurRadiusDp(Float.NaN), 0.0001f)
+        // 28/144 ~= 19.4% -> still no blur; 29/144 ~= 20.1% -> already above the 20% cutoff
+        assertEquals(0f, FolderSuperThumbnailPolicy.blurRadiusDp(28, 144), 0.0001f)
     }
 
-    @Test fun nonCumulativeFolderBlurPolicyAppliesExactlyOnePointFivePointsToFinalSheet() {
-        // Blur radius is exactly 1.5 logical points = 3px at 384px/192dp reference
-        val referencePixels = FolderSuperThumbnailPolicy.SHEET_PIXEL_SIZE.toFloat() // 384px
-        val referenceDp = 192f // 192dp
-        val pxPerPoint = referencePixels / referenceDp // 2.0 px/dp
-        val expectedRadiusPx = (FolderSuperThumbnailPolicy.BLUR_RADIUS_POINTS * pxPerPoint).toInt()
+    @Test fun skinShareAboveTwentyPercentRampsLinearlyAndCapsAtTwoPointFiveDp() {
+        // clamp((share - 0.20) / 0.80, 0..1) * 2.5dp
+        assertEquals(0f, FolderSuperThumbnailPolicy.blurRadiusDp(0.20f), 0.0001f)
+        assertEquals(0.625f, FolderSuperThumbnailPolicy.blurRadiusDp(0.40f), 0.0001f)
+        assertEquals(1.25f, FolderSuperThumbnailPolicy.blurRadiusDp(0.60f), 0.0001f)
+        assertEquals(2.5f, FolderSuperThumbnailPolicy.blurRadiusDp(1.00f), 0.0001f)
+        // Never exceeds the 2.5dp cap even for out-of-range shares.
+        assertEquals(2.5f, FolderSuperThumbnailPolicy.blurRadiusDp(1.5f), 0.0001f)
+        assertTrue(FolderSuperThumbnailPolicy.isSkinTone(200, 120, 90))
+        assertFalse(FolderSuperThumbnailPolicy.isSkinTone(40, 140, 240))
+    }
 
-        assertEquals(3, expectedRadiusPx)
-        assertEquals(expectedRadiusPx, FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX)
+    @Test fun nonCumulativeFolderBlurPolicyNeverExceedsTwoPointFiveDpOnFinalSheet() {
+        val pxPerDp = FolderSuperThumbnailPolicy.SHEET_PIXEL_SIZE / FolderSuperThumbnailPolicy.REFERENCE_DP_SIZE
+        assertEquals(2f, pxPerDp, 0.0001f)
+
+        val maxRadiusPx = FolderSuperThumbnailPolicy.MAX_BLUR_RADIUS_DP * pxPerDp
+        assertEquals(maxRadiusPx, FolderSuperThumbnailPolicy.MAX_BLUR_RADIUS_PX)
+        assertEquals(maxRadiusPx, FolderSuperThumbnailPolicy.blurRadiusPx(144, 144), 0.0001f)
 
         // Sourcing parent folder tiles from unblurred child sheets guarantees blur is applied
         // at most once to the final composite sheet rather than compounding recursively.
-        val childSheetRequiresBlur = FolderSuperThumbnailPolicy.shouldBlur(65, 144)
-        val parentSheetRequiresBlur = FolderSuperThumbnailPolicy.shouldBlur(65, 144)
-        assertTrue(childSheetRequiresBlur)
-        assertTrue(parentSheetRequiresBlur)
+        val childSheetRadiusDp = FolderSuperThumbnailPolicy.blurRadiusDp(65, 144)
+        val parentSheetRadiusDp = FolderSuperThumbnailPolicy.blurRadiusDp(65, 144)
+        assertTrue(childSheetRadiusDp <= FolderSuperThumbnailPolicy.MAX_BLUR_RADIUS_DP)
+        assertTrue(parentSheetRadiusDp <= FolderSuperThumbnailPolicy.MAX_BLUR_RADIUS_DP)
     }
 
     private fun item(name: String, directory: Boolean) = RemoteFileItem(

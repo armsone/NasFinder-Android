@@ -189,6 +189,15 @@ class InboxParityContractTest {
         assertTrue(app.contains("WindowInsetsCompat.Type.statusBars()"))
         assertTrue(app.contains("insetsController?.hide(hiddenInsets)"))
         assertTrue(app.contains("insetsController?.show(hiddenInsets)"))
+
+        // 5. Cover flow's centered card shows its actual file/folder name and tracks selection
+        val coverFlow = app.substring(
+            app.indexOf("internal fun RemoteBrowserCoverFlow("),
+            app.indexOf("private data class BrowserCapabilities("),
+        )
+        assertTrue(coverFlow.contains("items.getOrNull(selectedIndex)?.name?.let { centeredItemName ->"))
+        assertTrue(coverFlow.indexOf("val selectedIndex = scrollPosition.roundToInt()") <
+            coverFlow.indexOf("items.getOrNull(selectedIndex)?.name?.let { centeredItemName ->"))
     }
 
     private fun sourceFile(relativePath: String): File {

@@ -271,6 +271,23 @@ class SuperThumbnailVaultAndSessionTest {
         assertNotNull(restored)
         org.junit.Assert.assertArrayEquals(validJpeg, restored)
 
+        // A failed replacement restores the prior sheet and cleans its backup.
+        service.failNextRenameTo = expectedJpegName
+        val failedReplacement = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 4, 0xff.toByte(), 0xd9.toByte())
+        assertFalse(vault.storeFolderThumbnail(folder, "/photos", service, failedReplacement))
+        org.junit.Assert.assertArrayEquals(validJpeg, vault.restoredData(folder, "/photos", service))
+        assertFalse(service.files.keys.any { it.contains(".backup-") })
+
+        // A normal producer pass replaces a legacy folder sheet at the same
+        // compatible filename instead of treating old baked blur as current.
+        val regeneratedJpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 9, 8, 7, 0xff.toByte(), 0xd9.toByte())
+        assertTrue(vault.storeFolderThumbnail(folder, "/photos", service, regeneratedJpeg))
+        org.junit.Assert.assertArrayEquals(
+            regeneratedJpeg,
+            vault.restoredData(folder, "/photos", service),
+        )
+        assertFalse(service.files.keys.any { it.contains(".backup-") })
+
         // Store folder empty marker
         val emptyStored = vault.storeFolderEmptyMarker(emptyFolder, "/photos", service)
         assertTrue(emptyStored)
@@ -294,6 +311,7 @@ class SuperThumbnailVaultAndSessionTest {
     private class FakeVaultService : RemoteFileService {
         val directories = linkedSetOf<String>()
         val files = linkedMapOf<String, ByteArray>()
+        var failNextRenameTo: String? = null
 
         override suspend fun testConnection() = Unit
         override suspend fun list(path: String): List<RemoteFileItem> {
@@ -318,6 +336,10 @@ class SuperThumbnailVaultAndSessionTest {
             files[join(parent, source.name)] = source.readBytes()
         }
         override suspend fun rename(item: RemoteFileItem, newName: String) {
+            if (failNextRenameTo == newName) {
+                failNextRenameTo = null
+                error("forced rename failure")
+            }
             val destination = join(item.path.substringBeforeLast('/').ifBlank { "/" }, newName)
             files.remove(item.path)?.let { files[destination] = it }
                 ?: error("missing staging")

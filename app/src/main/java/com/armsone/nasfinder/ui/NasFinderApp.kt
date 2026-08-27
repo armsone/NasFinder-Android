@@ -1982,6 +1982,7 @@ private fun FavoriteShelf(
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
+                                    appliesDisplayBlur = !favorite.isDirectory,
                                 )
                             }
                         } else {
@@ -2001,6 +2002,7 @@ private fun FavoriteShelf(
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
+                                    appliesDisplayBlur = !favorite.isDirectory,
                                 )
                             } else {
                                 Box(contentAlignment = Alignment.Center) {
@@ -3180,8 +3182,25 @@ internal fun RemoteBrowserCoverFlow(
         }
         Box(
             Modifier.fillMaxWidth().height(if (usesDarkBackground) 72.dp else 82.dp).align(Alignment.BottomCenter)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.Black.copy(alpha = .06f))))
-        )
+                .background(Brush.verticalGradient(listOf(Color.Transparent, if (usesDarkBackground) Color.White.copy(alpha = .10f) else Color.Black.copy(alpha = .06f)))),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            items.getOrNull(selectedIndex)?.name?.let { centeredItemName ->
+                Text(
+                    centeredItemName,
+                    color = chromeForeground,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 32.dp, vertical = 10.dp),
+                )
+            }
+        }
         Row(
             Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -3381,6 +3400,7 @@ private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.
             contentDescription = "${item.name} 썸네일",
             modifier = modifier.clip(RoundedCornerShape(cornerRadius)),
             contentScale = ContentScale.Crop,
+            appliesDisplayBlur = !item.isDirectory,
         )
     } else {
         Box(modifier, contentAlignment = Alignment.Center) {

@@ -399,16 +399,10 @@ class SuperThumbnailWorker(
                         }
                         sessionStore.recordSuccess(sessionKey, folderItem)
                     } else {
-                        var wasCached = thumbnails.hasVaultCached(connection, folderItem)
-                        if (!wasCached && vaultOptions.enabled) {
-                            val restored = vault.restoredData(folderItem, rootPath, service)
-                            if (restored != null && thumbnails.storeJpegData(connection, folderItem, restored)) {
-                                wasCached = true
-                            }
-                        }
-                        // Always rebuild an unblurred run-scoped source, even when the
-                        // folder's final JPEG was restored from cache or another Mac.
-                        // Parents therefore never consume a persisted blurred child.
+                        // Always rebuild from unblurred run-scoped sources. A normal
+                        // generation pass therefore upgrades legacy fixed-blur sheets at
+                        // the same compatible filename, while parents never consume a
+                        // persisted blurred child.
                         val selected = FolderSuperThumbnailPolicy.selectChildren(folderChildren)
                         val tileBitmaps = selected.associateWith { child ->
                             if (child.isDirectory) {
@@ -421,31 +415,27 @@ class SuperThumbnailWorker(
                         unblurredFolderSheets.put(folderItem.path, rawSheet)?.let { previous ->
                             if (!previous.isRecycled) previous.recycle()
                         }
-                        if (wasCached) {
-                            sessionStore.markCached(sessionKey, folderItem)
-                        } else {
-                            val finalSheet = rawSheet.copy(rawSheet.config ?: Bitmap.Config.ARGB_8888, true)
-                            FolderSuperThumbnailComposer.applySkinToneBlurIfNeeded(finalSheet)
-                            val out = ByteArrayOutputStream()
-                            if (finalSheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
-                                val jpegBytes = out.toByteArray()
-                                finalSheet.recycle()
-                                if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
-                                    thumbnails.storeJpegData(connection, folderItem, jpegBytes)
-                                    if (vaultOptions.enabled) {
-                                        vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
-                                    }
-                                    generated++
-                                    sessionStore.recordSuccess(sessionKey, folderItem)
-                                } else {
-                                    failed++
-                                    sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
+                        val finalSheet = rawSheet.copy(rawSheet.config ?: Bitmap.Config.ARGB_8888, true)
+                        FolderSuperThumbnailComposer.applySkinToneBlurIfNeeded(finalSheet)
+                        val out = ByteArrayOutputStream()
+                        if (finalSheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
+                            val jpegBytes = out.toByteArray()
+                            finalSheet.recycle()
+                            if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
+                                thumbnails.storeJpegData(connection, folderItem, jpegBytes)
+                                if (vaultOptions.enabled) {
+                                    vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
                                 }
+                                generated++
+                                sessionStore.recordSuccess(sessionKey, folderItem)
                             } else {
-                                finalSheet.recycle()
                                 failed++
-                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
+                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
                             }
+                        } else {
+                            finalSheet.recycle()
+                            failed++
+                            sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
                         }
                     }
                 }

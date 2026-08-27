@@ -8,6 +8,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import com.armsone.nasfinder.model.RemoteFileItem
+import kotlin.math.ceil
 import kotlin.math.exp
 
 /** Pure Android SDK composer for 384x384 3x3 Folder Super Thumbnail sheets. */
@@ -75,8 +76,9 @@ object FolderSuperThumbnailComposer {
             }
         }
 
-        if (FolderSuperThumbnailPolicy.shouldBlur(skinCount)) {
-            applyGaussianBlur(bitmap, FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX)
+        val radiusPx = FolderSuperThumbnailPolicy.blurRadiusPx(skinCount, samples.size)
+        if (radiusPx > 0f) {
+            applyGaussianBlur(bitmap, radiusPx)
         }
 
         return bitmap
@@ -90,20 +92,21 @@ object FolderSuperThumbnailComposer {
         return applySkinToneBlurIfNeeded(rawSheet)
     }
 
-    fun applyGaussianBlur(bitmap: Bitmap, radius: Int = FolderSuperThumbnailPolicy.GAUSSIAN_BLUR_RADIUS_PX): Bitmap {
-        if (radius <= 0) return bitmap
+    fun applyGaussianBlur(bitmap: Bitmap, radius: Float = FolderSuperThumbnailPolicy.MAX_BLUR_RADIUS_PX): Bitmap {
+        if (radius <= 0f || !radius.isFinite()) return bitmap
         val width = bitmap.width
         val height = bitmap.height
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
         val sigma = radius / 2.0
-        val kernelSize = radius * 2 + 1
+        val kernelRadius = ceil(radius.toDouble()).toInt().coerceAtLeast(1)
+        val kernelSize = kernelRadius * 2 + 1
         val kernel = DoubleArray(kernelSize)
         var kernelSum = 0.0
-        for (i in -radius..radius) {
+        for (i in -kernelRadius..kernelRadius) {
             val weight = exp(-(i * i) / (2.0 * sigma * sigma))
-            kernel[i + radius] = weight
+            kernel[i + kernelRadius] = weight
             kernelSum += weight
         }
         for (i in 0 until kernelSize) {
@@ -120,10 +123,10 @@ object FolderSuperThumbnailComposer {
                 var g = 0.0
                 var b = 0.0
                 var a = 0.0
-                for (k in -radius..radius) {
+                for (k in -kernelRadius..kernelRadius) {
                     val px = (x + k).coerceIn(0, width - 1)
                     val pixel = pixels[rowOffset + px]
-                    val weight = kernel[k + radius]
+                    val weight = kernel[k + kernelRadius]
                     a += ((pixel ushr 24) and 0xff) * weight
                     r += ((pixel ushr 16) and 0xff) * weight
                     g += ((pixel ushr 8) and 0xff) * weight
@@ -144,10 +147,10 @@ object FolderSuperThumbnailComposer {
                 var g = 0.0
                 var b = 0.0
                 var a = 0.0
-                for (k in -radius..radius) {
+                for (k in -kernelRadius..kernelRadius) {
                     val py = (y + k).coerceIn(0, height - 1)
                     val pixel = tempPixels[py * width + x]
-                    val weight = kernel[k + radius]
+                    val weight = kernel[k + kernelRadius]
                     a += ((pixel ushr 24) and 0xff) * weight
                     r += ((pixel ushr 16) and 0xff) * weight
                     g += ((pixel ushr 8) and 0xff) * weight

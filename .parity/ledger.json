@@ -680,19 +680,19 @@
       "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Generated thumbnails repeatedly showed the video intro logo and did not follow the previously specified 13-part positions."}]
     },
     {
-      "id": "folder_thumbnail.blur.single_1_5pt",
+      "id": "folder_thumbnail.blur.graded_0_20_to_2_5pt",
       "route_state": "folder_thumbnail_generation",
       "element": "skin_tone_blur",
-      "dimension": "42% skin trigger, exactly 1.5pt final blur, no parent compounding",
+      "dimension": "0-20% sharp, linear graded radius to a 2.5pt cap, no parent or consumer compounding",
       "classification": "technical_contract",
-      "source_ref": {"kind": "spec", "value": "Product owner requires one final 1.5pt blur and forbids blur accumulation through parent folders"},
-      "target_observation": "Android composes parents from run-scoped unblurred child sheets and applies a 3px radius only to each final 384px sheet; regenerated folder evidence is pending.",
+      "source_ref": {"kind": "spec", "value": "Product owner requires clamp((share - 0.20) / 0.80, 0...1) * 2.5pt on folder sheets, with no blur through 20% and no duplicate blur"},
+      "target_observation": "Mac and Android producers sample the unblurred final 12x12 sheet, bake the same graded 0...2.5pt radius once, and compose parents from unblurred child tiles. Apple and Android folder consumers skip the separate binary file-thumbnail display blur. Runtime regeneration and screenshots are pending.",
       "implementation_ref": "app/src/main/java/com/armsone/nasfinder/data/FolderSuperThumbnailComposer.kt",
       "fixture": "nested_skin_tone_folder_sheet_v1",
       "fallback_capable": false,
       "evidence": [],
       "status": "implemented_source_only",
-      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "split raw/final composition and prevented persisted blurred child sheets from becoming parent inputs", "result": "focused policy tests and debug build pass; regenerated nested-folder capture pending"}],
+      "attempts": [{"attempt": 1, "date": "2026-08-25", "action": "split raw/final composition and prevented persisted blurred child sheets from becoming parent inputs", "result": "focused policy tests and debug build pass; regenerated nested-folder capture pending"}, {"attempt": 2, "date": "2026-08-27", "action": "replaced the fixed threshold/radius with the shared 20%-floor linear formula in Mac and Android producers, disabled Android folder consumer re-blur, and made generation safely replace legacy same-name folder sheets through a recoverable remote backup", "result": "Mac 92-test suite and signed universal app build pass; Android focused policy/vault/rendering tests and debug source compilation pass; device/NAS regeneration evidence pending"}],
       "reopen_history": [{"date": "2026-08-25", "observed_by": "product_owner", "description": "Folder blur accumulated toward upper folders and became much stronger than the requested blur."}]
     },
     {
@@ -789,6 +789,22 @@
       "evidence": [],
       "status": "implemented_source_only",
       "attempts": [{"attempt": 1, "date": "2026-08-26", "action": "guarded the reset with isChangingConfigurations != true", "result": "ForegroundReturnContractTest asserts the guard; rotation/fold device trace pending"}],
+      "reopen_history": []
+    },
+    {
+      "id": "browser_overflow.centered_item.actual_name",
+      "route_state": "browser_overflow",
+      "element": "centered_item_name",
+      "dimension": "actual selected file or folder name follows the center card across touch, accessibility and D-pad selection",
+      "classification": "functional",
+      "source_ref": {"kind": "spec", "value": "Product owner requires Android Overflow main view to show the actual file or folder name"},
+      "target_observation": "RemoteBrowserCoverFlow derives the bottom-center single-line label from items[selectedIndex].name, so Browser and Inbox Overflow share the same selection-tracking label while existing activation, accessibility, responsive sizing and TV navigation remain on the common path. Runtime captures are pending.",
+      "implementation_ref": "app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt:RemoteBrowserCoverFlow",
+      "fixture": "overflow_selected_name_phone_tablet_tv_v1",
+      "fallback_capable": false,
+      "evidence": [],
+      "status": "implemented_source_only",
+      "attempts": [{"attempt": 1, "date": "2026-08-27", "action": "added a selectedIndex-bound actual-name label to the shared Overflow surface", "result": "InboxParityContractTest and debug Kotlin compilation pass; phone/tablet/TV screenshots and interaction traces pending"}],
       "reopen_history": []
     }
   ]

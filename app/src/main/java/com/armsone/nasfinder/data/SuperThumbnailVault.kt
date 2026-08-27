@@ -5,11 +5,13 @@ import com.armsone.nasfinder.network.RemoteFileService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -311,9 +313,14 @@ class SuperThumbnailVault(private val workDirectory: File) {
             boundary.requireInsideRoot(parent)
             val vaultPath = ensureVaultDirectory(parent, boundary, service)
             val targetName = folderFilename(folderItem.name)
-            val current = service.list(vaultPath)
-            if (current.any { !it.isDirectory && it.name == targetName }) return true
-            atomicallyUpload(jpegData, targetName, vaultPath, boundary, service)
+            atomicallyUpload(
+                jpegData,
+                targetName,
+                vaultPath,
+                boundary,
+                service,
+                replaceExisting = true,
+            )
             true
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -528,10 +535,13 @@ class SuperThumbnailVault(private val workDirectory: File) {
         vaultPath: String,
         boundary: SuperThumbnailTraversal,
         service: RemoteFileService,
+        replaceExisting: Boolean = false,
     ) {
         boundary.requireInsideRoot(vaultPath)
         val local = ownedTemporary(".upload-${UUID.randomUUID()}", ".tmp")
         var remoteTemporary: RemoteFileItem? = null
+        var remoteBackup: RemoteFileItem? = null
+        var finalCommitted = false
         try {
             FileOutputStream(local).use { output ->
                 output.write(jpeg)
@@ -541,23 +551,53 @@ class SuperThumbnailVault(private val workDirectory: File) {
             val staging = service.list(vaultPath).firstOrNull { !it.isDirectory && it.name == local.name }
                 ?: throw IllegalStateException("NAS Vault staging 업로드를 확인하지 못했습니다.")
             remoteTemporary = staging
-            val current = service.list(vaultPath)
-            if (current.any { !it.isDirectory && it.name == finalName }) {
-                service.delete(listOf(staging))
-                remoteTemporary = null
-                return
+            val existing = service.list(vaultPath)
+                .firstOrNull { !it.isDirectory && it.name == finalName }
+            if (existing != null) {
+                if (!replaceExisting) {
+                    service.delete(listOf(staging))
+                    remoteTemporary = null
+                    return
+                }
+                val backupName = ".backup-${UUID.randomUUID()}.tmp"
+                service.rename(existing, backupName)
+                // Keep a recoverable handle immediately: even if the next
+                // directory listing fails, cancellation/error cleanup can
+                // rename the stable remote item ID/path back to finalName.
+                remoteBackup = existing.copy(
+                    name = backupName,
+                    path = append(backupName, vaultPath),
+                )
+                remoteBackup = service.list(vaultPath)
+                    .firstOrNull { !it.isDirectory && it.name == backupName }
+                    ?: remoteBackup
             }
             service.rename(staging, finalName)
+            remoteTemporary = null
             repeat(VERIFY_ATTEMPTS) { attempt ->
                 if (service.list(vaultPath).any { !it.isDirectory && it.name == finalName }) {
-                    remoteTemporary = null
+                    finalCommitted = true
+                    remoteBackup?.let { service.delete(listOf(it)) }
+                    remoteBackup = null
                     return
                 }
                 if (attempt + 1 < VERIFY_ATTEMPTS) delay(RETRY_DELAY_MILLIS)
             }
             throw IllegalStateException("NAS Vault rename 결과를 확인하지 못했습니다.")
         } finally {
-            remoteTemporary?.let { runCatching { service.delete(listOf(it)) } }
+            withContext(NonCancellable) {
+                remoteTemporary?.let { runCatching { service.delete(listOf(it)) } }
+                remoteBackup?.let { backup ->
+                    runCatching {
+                        val current = service.list(vaultPath)
+                        if (!finalCommitted && current.none { !it.isDirectory && it.name == finalName }) {
+                            service.rename(backup, finalName)
+                        } else {
+                            service.delete(listOf(backup))
+                        }
+                    }
+                }
+            }
             local.delete()
         }
     }
