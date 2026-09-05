@@ -11,9 +11,9 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 343386
-        versionName = "2.2.2"
-        buildConfigField("String", "BUILD_NUMBER", "\"202608271106\"")
+        versionCode = 356395
+        versionName = "2.2.3"
+        buildConfigField("String", "BUILD_NUMBER", "\"202609051155\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }

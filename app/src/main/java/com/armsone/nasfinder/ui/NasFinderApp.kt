@@ -462,7 +462,7 @@ private fun BuiltInPreviewScreen(
     }
     var controlsVisible by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
     var controlInteraction by remember(previewSourceKey) { mutableIntStateOf(0) }
-    var slideshowPlaying by rememberSaveable(previewSourceKey) { mutableStateOf(false) }
+    var slideshowPlaying by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
     val focusRequester = remember { FocusRequester() }
 
     fun revealControls() { controlsVisible = true; controlInteraction++ }
@@ -660,7 +660,10 @@ private fun BuiltInPreviewScreen(
                         onDismiss = onClose,
                         onPlaybackFailure = onPlaybackFailure,
                         onNextMedia = if (preview.images.size > 1) {
-                            { onSelectIndex(MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)) }
+                            {
+                                slideshowPlaying = true
+                                onSelectIndex(MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode))
+                            }
                         } else null,
                     )
                 }
