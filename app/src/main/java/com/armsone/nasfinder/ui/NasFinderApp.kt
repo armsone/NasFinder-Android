@@ -190,7 +190,7 @@ fun NasFinderApp(
     val hostView = LocalView.current
     val hasActiveWork = state.isBusy || state.download != null || state.pendingInboxUpload?.isUploading == true ||
         state.pendingLocalUpload?.isUploading == true ||
-        state.imagePreview?.kind == BuiltInPreviewKind.VIDEO ||
+        state.imagePreview?.kind == BuiltInPreviewKind.VIDEO || state.trailer != null ||
         (state.screen == Screen.SuperThumbnailProgress && state.superThumbnailWork?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING))
     val keepScreenOn = state.screenAwakeMode == ScreenAwakeMode.ALWAYS ||
         (state.screenAwakeMode == ScreenAwakeMode.AUTOMATIC && hasActiveWork)
@@ -256,6 +256,7 @@ fun NasFinderApp(
                     onDiscardDownloadedFile = model::discardWebDownload,
                 )
             }
+            state.trailer?.let { VideoTrailerScreen(it, model) }
             state.imagePreview?.let { preview ->
                 BuiltInPreviewScreen(
                     preview = preview,
@@ -436,7 +437,7 @@ private tailrec fun Context.findHostActivity(): Activity? = when (this) {
 }
 
 @Composable
-private fun BuiltInPreviewScreen(
+internal fun BuiltInPreviewScreen(
     preview: ImagePreviewState,
     onClose: () -> Unit,
     onShare: () -> Unit,
@@ -445,7 +446,10 @@ private fun BuiltInPreviewScreen(
     onSelectIndex: (Int) -> Unit,
     onPreviousPdfPage: () -> Unit,
     onNextPdfPage: () -> Unit,
-    onPlaybackFailure: () -> Unit,
+    onPlaybackFailure: (() -> Unit)?,
+    showShare: Boolean = true,
+    playbackSuspended: Boolean = false,
+    accessoryControls: @Composable RowScope.() -> Unit = {},
 ) {
     BackHandler(onBack = onClose)
     val context = LocalContext.current
@@ -578,7 +582,8 @@ private fun BuiltInPreviewScreen(
                                 )
                             }
                         }
-                        IconButton(onClick = onShare) {
+                        accessoryControls()
+                        if (showShare) IconButton(onClick = onShare) {
                             Icon(Icons.Default.Share, "공유", tint = Color.White)
                         }
                         if (preview.kind == BuiltInPreviewKind.PDF && preview.images.size > 1) {
@@ -659,6 +664,7 @@ private fun BuiltInPreviewScreen(
                         onInteraction = ::revealControls,
                         onDismiss = onClose,
                         onPlaybackFailure = onPlaybackFailure,
+                        playbackSuspended = playbackSuspended,
                         onNextMedia = if (preview.images.size > 1) {
                             {
                                 slideshowPlaying = true
@@ -1035,8 +1041,9 @@ private fun MediaPreviewContent(
     onPlaybackModeChange: (MediaPlaybackMode) -> Unit,
     onInteraction: () -> Unit,
     onDismiss: () -> Unit,
-    onPlaybackFailure: () -> Unit,
+    onPlaybackFailure: (() -> Unit)?,
     onNextMedia: (() -> Unit)? = null,
+    playbackSuspended: Boolean = false,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
@@ -1059,6 +1066,18 @@ private fun MediaPreviewContent(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var gestureMessage by remember { mutableStateOf<String?>(null) }
     var fineVolumeFraction by remember(mediaSourceKey) { mutableStateOf<Float?>(null) }
+
+    var resumeAfterSuspension by remember(mediaSourceKey) { mutableStateOf(false) }
+    LaunchedEffect(player, playbackSuspended) {
+        val active = player ?: return@LaunchedEffect
+        if (playbackSuspended) {
+            resumeAfterSuspension = active.playWhenReady
+            active.pause()
+        } else if (resumeAfterSuspension) {
+            resumeAfterSuspension = false
+            active.play()
+        }
+    }
 
     val focusChangeListener = remember {
         AudioManager.OnAudioFocusChangeListener { focusChange ->
@@ -1466,7 +1485,7 @@ private fun MediaPreviewContent(
                         ) {
                             Text("닫기")
                         }
-                        OutlinedButton(
+                        if (onPlaybackFailure != null) OutlinedButton(
                             onClick = onPlaybackFailure,
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = .90f)),
                         ) {
@@ -2751,6 +2770,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         }
     }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }, bottomBar = {
         if (selectionMode) BottomAppBar {
+            IconButton(onClick = { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && it.isVideo }) { Icon(Icons.Default.Movie, "선택 영상 예고편 보기") }
             IconButton(onClick = { model.shareItems(selectedItems) }, enabled = selectedItems.isNotEmpty() && selectedItems.none(RemoteFileItem::isDirectory)) { Icon(Icons.Default.Share, "선택 파일 공유") }
             IconButton(onClick = { batchTransfer = RemoteTransferAction.COPY }, enabled = selectedItems.isNotEmpty() && capabilities.copy) { Icon(Icons.Default.ContentCopy, "선택 항목 복사") }
             IconButton(onClick = { batchTransfer = RemoteTransferAction.MOVE }, enabled = selectedItems.isNotEmpty() && capabilities.move) { Icon(Icons.Default.DriveFileMove, "선택 항목 이동") }
@@ -2931,6 +2951,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 leadingContent = { Icon(if (item.path in favoritePaths) Icons.Default.Star else Icons.Default.StarBorder, null) },
                 modifier = Modifier.clickable { actionItem = null; model.toggleFavorite(item) },
             )
+            if (!item.isDirectory && item.isVideo) ListItem(headlineContent = { Text("예고편 보기") }, leadingContent = { Icon(Icons.Default.Movie, null) }, modifier = Modifier.clickable { actionItem = null; model.startRemoteTrailer(listOf(item)) })
             if (!item.isDirectory) ListItem(headlineContent = { Text("공유") }, leadingContent = { Icon(Icons.Default.Share, null) }, modifier = Modifier.clickable { actionItem = null; model.shareItem(item) })
             if (capabilities.copy) ListItem(headlineContent = { Text("복사") }, leadingContent = { Icon(Icons.Default.ContentCopy, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.COPY) })
             if (capabilities.move) ListItem(headlineContent = { Text("이동") }, leadingContent = { Icon(Icons.Default.DriveFileMove, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.MOVE) })
@@ -3803,6 +3824,10 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                     },
                                 ) { Text(if (allSelected) "전체 해제" else "전체 선택") }
                             }
+                            val selectedVideos = files.filter { it.id in selectedIds }
+                            Button(onClick = { model.startInboxTrailer(selectedIds.toList()); selectedIds.clear(); selectionMode = false }, enabled = selectedVideos.isNotEmpty() && selectedVideos.all { it.isTrailerVideo }, modifier = Modifier.fillMaxWidth()) {
+                                Icon(Icons.Default.Movie, null); Spacer(Modifier.width(8.dp)); Text("예고편 보기")
+                            }
                             Button(
                                 onClick = { pendingSendIds = selectedIds.toList() },
                                 enabled = selectedIds.isNotEmpty(),
@@ -3855,6 +3880,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         onSend = { pendingSendIds = listOf(it.id) },
                         onShare = model::shareInboxFile,
                         onDelete = model::deleteInboxFile,
+                        onTrailer = { model.startInboxTrailer(listOf(it.id)) },
                         modifier = Modifier.padding(padding).fillMaxSize(),
                     )
                 InboxLayout.OVERFLOW ->
@@ -3948,6 +3974,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                     }
                                 }
                                 DropdownMenu(expanded = showContextMenu, onDismissRequest = { showContextMenu = false }) {
+                                    if (file.isTrailerVideo) DropdownMenuItem(text = { Text("예고편 보기") }, leadingIcon = { Icon(Icons.Default.Movie, null) }, onClick = { showContextMenu = false; model.startInboxTrailer(listOf(file.id)) })
                                     DropdownMenuItem(
                                         text = { Text("NAS로 보내기") },
                                         leadingIcon = { Icon(Icons.Default.CloudUpload, null) },
@@ -4090,6 +4117,7 @@ private fun InboxGrid(
     onSend: (InboxDisplayItem) -> Unit,
     onShare: (InboxDisplayItem) -> Unit,
     onDelete: (InboxDisplayItem) -> Unit,
+    onTrailer: (InboxDisplayItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     LazyVerticalGrid(
@@ -4112,6 +4140,7 @@ private fun InboxGrid(
                 onSend = { onSend(file) },
                 onShare = { onShare(file) },
                 onDelete = { onDelete(file) },
+                onTrailer = { onTrailer(file) },
             )
         }
     }
@@ -4127,6 +4156,7 @@ private fun InboxGridTile(
     onSend: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit,
+    onTrailer: () -> Unit,
 ) {
     var showContextMenu by remember(file.id) { mutableStateOf(false) }
     Column(
@@ -4160,6 +4190,7 @@ private fun InboxGridTile(
                 )
             }
             DropdownMenu(expanded = showContextMenu, onDismissRequest = { showContextMenu = false }) {
+                if (file.isTrailerVideo) DropdownMenuItem(text = { Text("예고편 보기") }, leadingIcon = { Icon(Icons.Default.Movie, null) }, onClick = { showContextMenu = false; onTrailer() })
                 DropdownMenuItem(text = { Text("NAS로 보내기") }, leadingIcon = { Icon(Icons.Default.CloudUpload, null) }, onClick = { showContextMenu = false; onSend() })
                 DropdownMenuItem(text = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null) }, onClick = { showContextMenu = false; onShare() })
                 DropdownMenuItem(

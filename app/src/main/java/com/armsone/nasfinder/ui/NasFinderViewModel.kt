@@ -67,6 +67,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -101,6 +102,7 @@ data class AppState(
     val favoriteThumbnails: Map<String, Bitmap> = emptyMap(),
     val favoriteThumbnailGeneration: Long = 0L,
     val imagePreview: ImagePreviewState? = null,
+    val trailer: TrailerSession? = null,
     val superThumbnailConnectionId: String? = null,
     val superThumbnailPath: String? = null,
     val superThumbnailTitle: String? = null,
@@ -2708,6 +2710,172 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    private var trailerJob: Job? = null
+    private var trailerRetry: (() -> Unit)? = null
+
+    fun startRemoteTrailer(items: List<RemoteFileItem>) {
+        val activeService = service ?: return
+        val videos = items.filter { !it.isDirectory && it.isVideo }
+        if (videos.size != items.size || videos.isEmpty()) return
+        trailerRetry = { startRemoteTrailer(videos) }
+        prepareTrailer(videos.map { it.name }) { index, destination ->
+            val item = videos[index]
+            activeService.download(item, destination) { received, total ->
+                _state.update { current ->
+                    if (current.trailer?.directory != destination.parentFile) return@update current
+                    current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                }
+            }
+            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "영상을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+        }
+    }
+
+    fun startInboxTrailer(ids: List<UUID>) {
+        val selected = runCatching { selectedInboxItems(ids) }.getOrElse { return }
+        if (selected.isEmpty() || selected.any { !it.asPreviewItem().isVideo }) return
+        trailerRetry = { startInboxTrailer(ids) }
+        prepareTrailer(selected.map { it.originalFilename }) { index, destination ->
+            kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                selected[index].file.inputStream().buffered().use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted) throw CancellationException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun prepareTrailer(names: List<String>, stage: suspend (Int, File) -> Unit) {
+        if (_state.value.trailer?.busy == true) return
+        closeTrailer(clearRetry = false)
+        val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
+        directory.mkdirs()
+        _state.update { it.copy(trailer = TrailerSession(directory), imagePreview = null) }
+        trailerJob = viewModelScope.launch {
+            try {
+                val sources = mutableListOf<TrailerSource>()
+                names.forEachIndexed { index, name ->
+                    updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · $name · 영상을 준비하는 중…", progress = null) }
+                    val file = File(directory, "source-$index.${name.substringAfterLast('.', "mp4")}")
+                    stage(index, file)
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · 좋은 장면을 고르는 중…", progress = null) }
+                    val metadata = withContext(Dispatchers.IO) {
+                        val reader = android.media.MediaMetadataRetriever()
+                        try {
+                            reader.setDataSource(file.absolutePath)
+                            val duration = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
+                            check(duration.isFinite() && duration > 0 && reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes") { "분석할 수 있는 영상이 아닙니다: $name" }
+                            var width = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1920
+                            var height = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1080
+                            val rotation = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                            if (rotation % 180 != 0) { val old = width; width = height; height = old }
+                            val thumbnail = if (android.os.Build.VERSION.SDK_INT >= 27) reader.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 180, 180)
+                            else reader.getFrameAtTime(0)?.let { original ->
+                                android.graphics.Bitmap.createScaledBitmap(original, 180, 180, true).also { if (it !== original) original.recycle() }
+                            }
+                            Pair(Triple(duration, width, height), thumbnail)
+                        } finally { reader.release() }
+                    }
+                    val analysis = AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first.first, (metadata.first.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    sources += TrailerSource(index, name, file, metadata.first.first, metadata.first.second, metadata.first.third, analysis, metadata.second)
+                    updateTrailer(directory) { it.copy(sources = sources.toList()) }
+                }
+                val lengths = sources.map { it.recommendedLength }.sorted()
+                val length = minOf(sources.minOf { it.duration }, lengths[lengths.size / 2])
+                updateTrailer(directory) { it.copy(sources = sources, total = sources.sumOf { source -> source.recommendedTotal }, clipLength = length, format = TrailerFormat.closest(sources.first().width, sources.first().height), busy = false) }
+                trailerJob = null
+                regenerateTrailer(sources.map { it.id }, sources.sumOf { it.recommendedTotal }, length, TrailerFormat.closest(sources.first().width, sources.first().height))
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "예고편을 만들지 못했습니다.", progress = null) } }
+        }
+    }
+
+    fun regenerateTrailer(order: List<Int>, total: Double, length: Double, format: TrailerFormat) {
+        val session = _state.value.trailer ?: return
+        if (session.busy || order.size != session.sources.size || order.toSet() != session.sources.map { it.id }.toSet()) return
+        val directory = session.directory
+        val sources = order.map { id -> session.sources.first { it.id == id } }
+        val scenes = trailerScenes(sources, total, length)
+        if (scenes.isEmpty()) {
+            updateTrailer(directory) { it.copy(error = "이 장면 길이로 만들 수 없습니다. 장면 길이를 줄여 주세요.") }; return
+        }
+        _state.update { it.copy(trailer = session.copy(sources = sources, total = total, clipLength = length, format = format, busy = true, status = "선택한 장면을 이어 붙이는 중…", error = null, progress = null)) }
+        trailerJob = viewModelScope.launch {
+            val output = File(session.directory, "trailer-${UUID.randomUUID()}.mp4")
+            try {
+                TrailerExporter.export(application, scenes, format, output) { progress ->
+                    updateTrailer(directory) { it.copy(progress = progress) }
+                }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                updateTrailer(directory) { it.copy(output = output, busy = false, progress = null, saved = false) }
+                // Old outputs remain in this private session until close, so the player's decoder can release safely.
+            } catch (cancelled: CancellationException) { output.delete(); throw cancelled }
+            catch (failure: Exception) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                output.delete()
+                updateTrailer(directory) { it.copy(busy = false, progress = null, error = failure.message ?: "다시 만들어 주세요.") }
+            }
+        }
+    }
+
+    fun retryTrailer() {
+        val session = _state.value.trailer ?: return
+        if (session.output != null) regenerateTrailer(session.sources.map { it.id }, session.total, session.clipLength, session.format)
+        else trailerRetry?.invoke()
+    }
+
+    fun saveTrailer() {
+        val session = _state.value.trailer ?: return
+        val output = session.output ?: return
+        val directory = session.directory
+        if (session.busy || session.saved) return
+        _state.update { it.copy(trailer = session.copy(busy = true, status = "폰하드에 저장하는 중…", error = null)) }
+        trailerJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    output.inputStream().buffered().use { inboxStore.import("예고편-${System.currentTimeMillis()}.mp4", "video/mp4", it) }
+                }
+                val files = inboxFiles()
+                _state.update { current ->
+                    current.copy(inboxFiles = files, trailer = current.trailer?.let { if (it.directory == directory) it.copy(busy = false, saved = true) else it })
+                }
+                NasFinderAppWidgetProvider.updateAll(application)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "저장하지 못했습니다. 다시 시도해 주세요.") } }
+        }
+    }
+
+    fun dismissTrailer() = closeTrailer(clearRetry = true)
+
+    private fun closeTrailer(clearRetry: Boolean) {
+        val session = _state.value.trailer
+        val running = trailerJob
+        _state.update { it.copy(trailer = null) }
+        trailerJob = null
+        if (clearRetry) trailerRetry = null
+        if (session != null) {
+            if (running?.isActive == true) {
+                running.invokeOnCompletion { session.directory.deleteRecursively() }
+                running.cancel()
+            } else session.directory.deleteRecursively()
+        }
+    }
+
+    private fun updateTrailer(directory: File, transform: (TrailerSession) -> TrailerSession) {
+        _state.update { current ->
+            val session = current.trailer?.takeIf { it.directory == directory } ?: return@update current
+            current.copy(trailer = transform(session))
+        }
+    }
+
     fun previewInboxFile(item: InboxDisplayItem) {
         val supported = _state.value.inboxFiles.mapNotNull { candidate ->
             val remote = candidate.asPreviewItem()
@@ -2851,6 +3019,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     override fun onCleared() {
+        dismissTrailer()
         _state.value.pendingLocalUpload?.let { pending -> runCatching { cleanupOwnedWebDownload(pending.file) } }
         previewJob?.cancel()
         connectionOpenJob?.cancel()
