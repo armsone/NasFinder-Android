@@ -1,6 +1,7 @@
 @file:OptIn(
     androidx.compose.material3.ExperimentalMaterial3Api::class,
     androidx.compose.foundation.ExperimentalFoundationApi::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
 )
 @file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 
@@ -162,13 +163,35 @@ import com.armsone.nasfinder.ui.theme.serviceForegroundColor
 import com.armsone.nasfinder.ui.theme.WorkbenchAccent
 import com.armsone.nasfinder.ui.theme.BrowserOrange
 import androidx.core.content.FileProvider
+import android.net.Uri
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
+import java.util.UUID
+import com.armsone.nasfinder.data.PhoneHardItem
+import com.armsone.nasfinder.data.PhoneHardTarget
+import com.armsone.nasfinder.data.PhoneHardEntryKind
+import com.armsone.nasfinder.ui.CreateFolderDialog
+import com.armsone.nasfinder.ui.SelectPhoneHardDestinationDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+// Keep controls inside the system area even while a player hides the system bars.
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun Modifier.appSafeArea(): Modifier = windowInsetsPadding(
+    WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility),
+).appBottomSafety()
+
+@Composable
+internal fun Modifier.appBottomSafety(): Modifier {
+    val metrics = LocalContext.current.resources.displayMetrics
+    val density = LocalDensity.current
+    val bottom = with(density) { (metrics.ydpi * 5f / 25.4f).toDp() }.coerceAtLeast(32.dp)
+    return padding(bottom = bottom)
+}
 
 @Composable
 fun NasFinderApp(
@@ -219,8 +242,9 @@ fun NasFinderApp(
     BackHandler(enabled = state.imagePreview == null && state.screen != Screen.Dashboard) {
         model.show(Screen.Dashboard)
     }
+
     NasFinderTheme(state.theme) {
-        Box(Modifier.fillMaxSize().background(skyBrush(state.theme))) {
+        Box(Modifier.fillMaxSize().background(skyBrush(state.theme)).then(if (state.imagePreview?.kind == BuiltInPreviewKind.VIDEO) Modifier else Modifier.appSafeArea())) {
             SkyThemeDecoration(state.theme)
             when (val screen = state.screen) {
                 Screen.Dashboard -> DashboardScreen(state, model)
@@ -231,6 +255,13 @@ fun NasFinderApp(
                     onBack = { model.show(Screen.Dashboard) },
                 )
                 Screen.GooglePhotos -> GooglePhotosScreen(state, model)
+                Screen.LocalPhotoLibrary -> LocalPhotoLibraryScreen(
+                    onBack = { model.show(Screen.Dashboard) },
+                    onPreview = model::previewLocalMediaUri,
+                    onCreateTrailer = model::startLocalMediaTrailer,
+                    onMusicOverlay = { model.startLocalMusicOverlay(it, null) },
+                    onCopyToPhoneHard = model::copyLocalMediaToInbox,
+                )
                 Screen.Settings -> SettingsScreen(state, model, automaticUpdateDownloadEnabled, onAutomaticUpdateDownloadChanged, onCheckForUpdates)
                 Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
                 Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
@@ -246,6 +277,7 @@ fun NasFinderApp(
                     connections = state.connections,
                     preferredConnectionId = state.preferredId,
                     resumedDownload = state.pendingLocalUpload,
+                    trailerActive = state.trailer != null,
                     onClose = { model.show(Screen.Dashboard) },
                     onToggleFavorite = model::toggleBrowserFavorite,
                     onSetHomepage = model::setBrowserHomepage,
@@ -256,7 +288,7 @@ fun NasFinderApp(
                     onDiscardDownloadedFile = model::discardWebDownload,
                 )
             }
-            state.trailer?.let { VideoTrailerScreen(it, model) }
+            state.trailer?.let { VideoTrailerScreen(it, model, browsingForMusic = state.screen == Screen.WebBrowser) }
             state.imagePreview?.let { preview ->
                 BuiltInPreviewScreen(
                     preview = preview,
@@ -525,6 +557,7 @@ internal fun BuiltInPreviewScreen(
         topBar = {
             if (controlsVisible) {
                 TopAppBar(
+                    modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
                     title = {
                         Column {
                             Text(preview.images[preview.index].name, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1521,7 +1554,8 @@ private fun MediaPreviewContent(
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .background(Color.Black.copy(alpha = .72f))
-                    .navigationBarsPadding()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal))
+                    .appBottomSafety()
                     .padding(16.dp),
             ) {
                 Slider(
@@ -1760,6 +1794,14 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
             }
             item {
                 DashboardCard {
+                    DashboardRow(
+                        Icons.Default.PhotoLibrary,
+                        "내 사진·영상",
+                        "기기 미디어 탐색 · 예고편 만들기",
+                        iconTint = MaterialTheme.colorScheme.primary,
+                        titleColor = MaterialTheme.colorScheme.onSurface,
+                    ) { model.show(Screen.LocalPhotoLibrary) }
+                    DashboardRowDivider()
                     state.connections.forEach { connection ->
                         ConnectionRow(connection, state.preferredId == connection.id, state.theme,
                             onOpen = { model.resumeConnection(connection) },
@@ -2004,7 +2046,7 @@ private fun FavoriteShelf(
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
-                                    appliesDisplayBlur = !favorite.isDirectory,
+                                    isFolderCover = favorite.isDirectory,
                                 )
                             }
                         } else {
@@ -2024,7 +2066,7 @@ private fun FavoriteShelf(
                                     contentDescription = favorite.name,
                                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(11.dp)),
                                     contentScale = ContentScale.Crop,
-                                    appliesDisplayBlur = !favorite.isDirectory,
+                                    isFolderCover = favorite.isDirectory,
                                 )
                             } else {
                                 Box(contentAlignment = Alignment.Center) {
@@ -2712,6 +2754,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         else if (parentPath == null) model.show(Screen.Dashboard)
         else model.openConnection(browser.connection, parentPath)
     }
+
+
     Scaffold(modifier = Modifier.onSizeChanged { viewportSize = it }, containerColor = Color.Transparent, topBar = { TopAppBar(title = { Column { Text(if (selectionMode) "${selectedIds.size}개 선택" else browser.connection.name, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(browser.path, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis) } }, navigationIcon = {
         CompositionLocalProvider(LocalViewConfiguration provides longPress500Configuration()) {
         Box(
@@ -2770,7 +2814,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         }
     }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }, bottomBar = {
         if (selectionMode) BottomAppBar {
-            IconButton(onClick = { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && it.isVideo }) { Icon(Icons.Default.Movie, "선택 영상 예고편 보기") }
+            IconButton(onClick = { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }) { Icon(Icons.Default.Movie, "선택 예고편 보기") }
+            IconButton(onClick = { model.startRemoteMusicOverlay(selectedItems.toList(), null); selectedIds.clear(); selectionMode = false }, enabled = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }) { Icon(Icons.Default.MusicNote, "음악 입히기") }
             IconButton(onClick = { model.shareItems(selectedItems) }, enabled = selectedItems.isNotEmpty() && selectedItems.none(RemoteFileItem::isDirectory)) { Icon(Icons.Default.Share, "선택 파일 공유") }
             IconButton(onClick = { batchTransfer = RemoteTransferAction.COPY }, enabled = selectedItems.isNotEmpty() && capabilities.copy) { Icon(Icons.Default.ContentCopy, "선택 항목 복사") }
             IconButton(onClick = { batchTransfer = RemoteTransferAction.MOVE }, enabled = selectedItems.isNotEmpty() && capabilities.move) { Icon(Icons.Default.DriveFileMove, "선택 항목 이동") }
@@ -2877,7 +2922,18 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 browser.preferences.layout == BrowserLayout.LIST -> LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(displayedItems, key = { it.id }) { item ->
                         if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
-                        FileRow(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, selected = item.id in selectedIds, selectionMode = selectionMode, accessibilityLayout = accessibilityLayout, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
+                        if (item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, item.id, item.path, state.folderCountGeneration, browser.preferences.showHiddenFiles) { model.loadFolderChildCount(item) }
+                        FileRow(
+                            item,
+                            thumbnail = state.remoteThumbnails[item.id],
+                            theme = state.theme,
+                            selected = item.id in selectedIds,
+                            selectionMode = selectionMode,
+                            accessibilityLayout = accessibilityLayout,
+                            folderChildCount = if (item.isDirectory) state.folderCountCache[item.id] else null,
+                            onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
+                            onLongClick = { actionItem = item },
+                        )
                     }
                 }
                 else -> {
@@ -2897,7 +2953,18 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     ) {
                     items(displayedItems, key = { it.id }) { item ->
                         if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
-                        FileTile(item, thumbnail = state.remoteThumbnails[item.id], theme = state.theme, poster = poster, selected = item.id in selectedIds, selectionMode = selectionMode, onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) }, onLongClick = { actionItem = item })
+                        if (item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, item.id, item.path, state.folderCountGeneration, browser.preferences.showHiddenFiles) { model.loadFolderChildCount(item) }
+                        FileTile(
+                            item,
+                            thumbnail = state.remoteThumbnails[item.id],
+                            theme = state.theme,
+                            poster = poster,
+                            selected = item.id in selectedIds,
+                            selectionMode = selectionMode,
+                            folderChildCount = if (item.isDirectory) state.folderCountCache[item.id] else null,
+                            onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
+                            onLongClick = { actionItem = item },
+                        )
                     }
                     }
                 }
@@ -2938,8 +3005,28 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             },
         )
     }
+    var folderTrailerTarget by remember { mutableStateOf<RemoteFileItem?>(null) }
+    folderTrailerTarget?.let { folder ->
+        AlertDialog(
+            onDismissRequest = { folderTrailerTarget = null },
+            title = { Text("예고편 만들기") },
+            text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    folderTrailerTarget = null
+                    model.startRemoteFolderTrailer(folder, includeSubfolders = true)
+                }) { Text("하위 폴더 포함") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    folderTrailerTarget = null
+                    model.startRemoteFolderTrailer(folder, includeSubfolders = false)
+                }) { Text("현재 폴더만") }
+            },
+        )
+    }
     actionItem?.let { item ->
-        ModalBottomSheet(onDismissRequest = { actionItem = null }) {
+        ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = { actionItem = null }) {
             ListItem(
                 headlineContent = { Text(item.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
                 supportingContent = { Text(if (item.isDirectory) "폴더" else formatBytes(item.size)) },
@@ -2951,7 +3038,22 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 leadingContent = { Icon(if (item.path in favoritePaths) Icons.Default.Star else Icons.Default.StarBorder, null) },
                 modifier = Modifier.clickable { actionItem = null; model.toggleFavorite(item) },
             )
-            if (!item.isDirectory && item.isVideo) ListItem(headlineContent = { Text("예고편 보기") }, leadingContent = { Icon(Icons.Default.Movie, null) }, modifier = Modifier.clickable { actionItem = null; model.startRemoteTrailer(listOf(item)) })
+            if (item.isDirectory) ListItem(
+                headlineContent = { Text("예고편 만들기") },
+                leadingContent = { Icon(Icons.Default.Movie, null) },
+                modifier = Modifier.clickable {
+                    actionItem = null
+                    model.prepareRemoteFolderTrailer(item) { hasSubfolders ->
+                        if (hasSubfolders) {
+                            folderTrailerTarget = item
+                        }
+                    }
+                }
+            )
+            if (!item.isDirectory && (item.isVideo || item.isImage)) {
+                ListItem(headlineContent = { Text("예고편 보기") }, leadingContent = { Icon(Icons.Default.Movie, null) }, modifier = Modifier.clickable { actionItem = null; model.startRemoteTrailer(listOf(item)) })
+                ListItem(headlineContent = { Text("음악 입히기") }, leadingContent = { Icon(Icons.Default.MusicNote, null) }, modifier = Modifier.clickable { actionItem = null; model.startRemoteMusicOverlay(listOf(item), null) })
+            }
             if (!item.isDirectory) ListItem(headlineContent = { Text("공유") }, leadingContent = { Icon(Icons.Default.Share, null) }, modifier = Modifier.clickable { actionItem = null; model.shareItem(item) })
             if (capabilities.copy) ListItem(headlineContent = { Text("복사") }, leadingContent = { Icon(Icons.Default.ContentCopy, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.COPY) })
             if (capabilities.move) ListItem(headlineContent = { Text("이동") }, leadingContent = { Icon(Icons.Default.DriveFileMove, null) }, modifier = Modifier.clickable { actionItem = null; model.beginTransfer(item, RemoteTransferAction.MOVE) })
@@ -3094,13 +3196,11 @@ internal fun RemoteBrowserCoverFlow(
     ) {
         val widthValue = maxWidth.value
         val heightValue = maxHeight.value
-        val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding().value
-        val bottomInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding().value
         val centralCardSide = CoverFlowLayoutPolicy.centralCardSide(
             containerWidth = widthValue,
             containerHeight = heightValue,
-            topContentInset = topInset,
-            bottomContentInset = bottomInset,
+            topContentInset = 0f,
+            bottomContentInset = 0f,
         )
         val baseCardSide = CoverFlowLayoutPolicy.baseCardSide(widthValue, centralCardSide)
         val step = CoverFlowLayoutPolicy.cardStep(widthValue).dp
@@ -3334,7 +3434,17 @@ private fun remoteParentPath(path: String, rootPath: String): String? {
 }
 
 @Composable
-private fun FileRow(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, selected: Boolean, selectionMode: Boolean, accessibilityLayout: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun FileRow(
+    item: RemoteFileItem,
+    thumbnail: android.graphics.Bitmap?,
+    theme: AppTheme,
+    selected: Boolean,
+    selectionMode: Boolean,
+    accessibilityLayout: Boolean,
+    folderChildCount: FolderChildCountState? = null,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) { Surface(Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "작업 보기"), color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
             val artworkSide = if (accessibilityLayout) 50.dp else 58.dp
@@ -3342,13 +3452,32 @@ private fun FileRow(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, t
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(item.name, style = MaterialTheme.typography.bodyLarge, maxLines = if (accessibilityLayout) 3 else 2, overflow = TextOverflow.Ellipsis)
-                if (!item.isDirectory) Text(
-                    listOfNotNull(item.extension.uppercase().takeIf(String::isNotBlank), formatBytes(item.size)).joinToString(" · "),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                if (!item.isDirectory) {
+                    Text(
+                        listOfNotNull(item.extension.uppercase().takeIf(String::isNotBlank), formatBytes(item.size)).joinToString(" · "),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                } else {
+                    val countLabel = when (folderChildCount) {
+                        is FolderChildCountState.Ready -> "폴더 ${folderChildCount.folderCount}, 파일 ${folderChildCount.fileCount}"
+                        FolderChildCountState.Loading -> "개수 확인 중…"
+                        FolderChildCountState.Error -> "개수 확인 불가"
+                        null -> null
+                    }
+                    if (countLabel != null) {
+                        val baseStyle = MaterialTheme.typography.labelMedium
+                        Text(
+                            countLabel,
+                            style = baseStyle.copy(fontSize = baseStyle.fontSize * 0.8f),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 item.modifiedAt?.let { modified ->
                     Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(modified)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
@@ -3359,7 +3488,17 @@ private fun FileRow(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, t
 }
 
 @Composable
-private fun FileTile(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, theme: AppTheme, poster: Boolean, selected: Boolean, selectionMode: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun FileTile(
+    item: RemoteFileItem,
+    thumbnail: android.graphics.Bitmap?,
+    theme: AppTheme,
+    poster: Boolean,
+    selected: Boolean,
+    selectionMode: Boolean,
+    folderChildCount: FolderChildCountState? = null,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     val corner = if (poster) 15.dp else 11.dp
     CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) {
         Column(Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "작업 보기"), verticalArrangement = Arrangement.spacedBy(if (poster) 9.dp else 6.dp)) {
@@ -3385,6 +3524,23 @@ private fun FileTile(item: RemoteFileItem, thumbnail: android.graphics.Bitmap?, 
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            } else {
+                val countLabel = when (folderChildCount) {
+                    is FolderChildCountState.Ready -> "폴더 ${folderChildCount.folderCount}, 파일 ${folderChildCount.fileCount}"
+                    FolderChildCountState.Loading -> "개수 확인 중…"
+                    FolderChildCountState.Error -> "개수 확인 불가"
+                    null -> null
+                }
+                if (countLabel != null) {
+                    val baseStyle = MaterialTheme.typography.labelSmall
+                    Text(
+                        countLabel,
+                        style = baseStyle.copy(fontSize = baseStyle.fontSize * 0.8f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             if (poster) {
                 item.modifiedAt?.let { modified ->
@@ -3424,7 +3580,7 @@ private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.
             contentDescription = "${item.name} 썸네일",
             modifier = modifier.clip(RoundedCornerShape(cornerRadius)),
             contentScale = ContentScale.Crop,
-            appliesDisplayBlur = !item.isDirectory,
+            isFolderCover = item.isDirectory,
         )
     } else {
         Box(modifier, contentAlignment = Alignment.Center) {
@@ -3532,7 +3688,7 @@ private fun BrowserMenu(
     var expanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     IconButton({ expanded = true }) { Icon(Icons.Default.MoreVert, "파일과 보기 작업") }
-    if (expanded) ModalBottomSheet(
+    if (expanded) ModalBottomSheet(modifier = Modifier.appBottomSafety(),
         onDismissRequest = { expanded = false },
         sheetState = sheetState,
         dragHandle = null,
@@ -3619,6 +3775,12 @@ private fun BrowserChoice(label: String, selected: Boolean, modifier: Modifier, 
     }
 }
 
+private fun isImmediateChildOf(relativePath: String, parentSubdirectory: String?): Boolean {
+    val normalizedParent = parentSubdirectory?.trim()?.removePrefix("/")?.removeSuffix("/").orEmpty()
+    val parentOfItem = relativePath.substringBeforeLast('/', "")
+    return parentOfItem == normalizedParent
+}
+
 private fun sortTitle(sort: SortField) = when (sort) {
     SortField.NAME -> "이름"
     SortField.KIND -> "종류"
@@ -3642,7 +3804,11 @@ private fun inboxLayoutIcon(layout: InboxLayout) = when (layout) {
 
 @Composable
 private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
-    val files = state.inboxFiles
+    val allFiles = state.inboxFiles
+    var currentSubdirectory by rememberSaveable { mutableStateOf<String?>(null) }
+    val files = remember(allFiles, currentSubdirectory) {
+        allFiles.filter { isImmediateChildOf(it.relativePath, currentSubdirectory) }
+    }
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val webHardStore = remember(context) { WebHardFileStore(context.applicationContext) }
@@ -3712,17 +3878,35 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             model.refreshInbox()
         }
     }
+    var folderItems by remember { mutableStateOf<List<PhoneHardItem>>(emptyList()) }
+    LaunchedEffect(currentSubdirectory, allFiles) {
+        folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+    }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
+    var moveTargetsDialog by remember { mutableStateOf<List<PhoneHardTarget>?>(null) }
+    var copyTargetsDialog by remember { mutableStateOf<List<PhoneHardTarget>?>(null) }
+    var deleteFolderTarget by remember { mutableStateOf<PhoneHardTarget?>(null) }
+    var phoneHardOpBusy by remember { mutableStateOf(false) }
+    var phoneHardOpStatus by remember { mutableStateOf<String?>(null) }
+
     LaunchedEffect(files) {
         val available = files.mapTo(hashSetOf()) { it.id }
         selectedIds.removeAll { it !in available }
         if (selectedIds.isEmpty() && files.isEmpty()) selectionMode = false
     }
-    BackHandler(selectionMode) {
+    BackHandler(selectionMode && !phoneHardOpBusy) {
         selectedIds.clear()
         selectionMode = false
     }
+    BackHandler(enabled = !selectionMode && !currentSubdirectory.isNullOrBlank() && !phoneHardOpBusy) {
+        val parent = currentSubdirectory?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }
+        currentSubdirectory = parent
+    }
+    BackHandler(enabled = phoneHardOpBusy) {}
     val selectableIds = files.take(InboxBatchContracts.MAX_SELECTED_ITEMS).map { it.id }
     val allSelected = selectableIds.isNotEmpty() && selectedIds.size == selectableIds.size && selectedIds.containsAll(selectableIds)
+
+    Box(Modifier.fillMaxSize()) {
     Scaffold(
         modifier = Modifier.onSizeChanged { viewportSize = it },
         containerColor = Color.Transparent,
@@ -3733,8 +3917,13 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        if (!selectionMode && state.theme == AppTheme.SKEUOMORPHIC) PhoneHardMark(28.dp)
-                        Text(if (selectionMode) "${selectedIds.size}개 선택" else "폰하드")
+                        if (!selectionMode && state.theme == AppTheme.SKEUOMORPHIC && currentSubdirectory.isNullOrBlank()) PhoneHardMark(28.dp)
+                        val titleText = when {
+                            selectionMode -> "${selectedIds.size}개 선택"
+                            currentSubdirectory.isNullOrBlank() -> "폰하드"
+                            else -> currentSubdirectory!!.substringAfterLast('/')
+                        }
+                        Text(titleText, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 },
                 navigationIcon = {
@@ -3744,13 +3933,26 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             if (!allSelected) selectedIds.addAll(selectableIds)
                         }) { Text(if (allSelected) "전체 해제" else "전체 선택") }
                     } else {
-                        IconButton(onClick = { model.show(Screen.Dashboard) }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
+                        IconButton(
+                            enabled = !phoneHardOpBusy,
+                            onClick = {
+                                if (!currentSubdirectory.isNullOrBlank()) {
+                                    val parent = currentSubdirectory?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }
+                                    currentSubdirectory = parent
+                                } else {
+                                    model.show(Screen.Dashboard)
+                                }
+                            },
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, if (currentSubdirectory.isNullOrBlank()) "뒤로" else "상위 폴더")
                         }
                     }
                 },
                 actions = {
                     if (!selectionMode) {
+                        IconButton(enabled = !phoneHardOpBusy, onClick = { showCreateFolderDialog = true }) {
+                            Icon(Icons.Default.CreateNewFolder, "새 폴더 만들기")
+                        }
                         if (files.isNotEmpty()) Box {
                             IconButton(onClick = { layoutMenuExpanded = true }) {
                                 Icon(inboxLayoutIcon(configuredLayout), "보기: ${configuredLayout.title}")
@@ -3829,6 +4031,45 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 Icon(Icons.Default.Movie, null); Spacer(Modifier.width(8.dp)); Text("예고편 보기")
                             }
                             Button(
+                                onClick = { model.startInboxMusicOverlay(selectedIds.toList(), null); selectedIds.clear(); selectionMode = false },
+                                enabled = selectedVideos.isNotEmpty() && selectedVideos.all { it.isTrailerVideo },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Default.MusicNote, null); Spacer(Modifier.width(8.dp)); Text("음악 입히기")
+                            }
+                            val selectedTargets = remember(selectedIds.toList(), files) {
+                                files.filter { it.id in selectedIds }.map {
+                                    PhoneHardTarget(
+                                        id = it.id,
+                                        relativePath = it.relativePath,
+                                        isDirectory = false,
+                                    )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                OutlinedButton(
+                                    onClick = { moveTargetsDialog = selectedTargets },
+                                    enabled = selectedTargets.isNotEmpty() && !phoneHardOpBusy,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Default.DriveFileMove, null)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("이동")
+                                }
+                                OutlinedButton(
+                                    onClick = { copyTargetsDialog = selectedTargets },
+                                    enabled = selectedTargets.isNotEmpty() && !phoneHardOpBusy,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, null)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("복사")
+                                }
+                            }
+                            Button(
                                 onClick = { pendingSendIds = selectedIds.toList() },
                                 enabled = selectedIds.isNotEmpty(),
                                 modifier = Modifier.fillMaxWidth(),
@@ -3843,7 +4084,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             }
         },
     ) { padding ->
-        if (files.isEmpty() && !showsAutomaticOverflow) {
+        if (files.isEmpty() && folderItems.isEmpty() && !showsAutomaticOverflow) {
             LazyColumn(Modifier.padding(padding).fillMaxSize()) {
                 item { PhoneHardConnectionHeader(webHardConnection) }
                 item {
@@ -3867,10 +4108,15 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                 InboxLayout.THUMBNAILS, InboxLayout.POSTERS ->
                     InboxGrid(
                         connection = webHardConnection,
+                        directories = folderItems.filter { it.kind == PhoneHardEntryKind.DIRECTORY },
                         files = files,
                         poster = displayedLayout == InboxLayout.POSTERS,
                         selectionMode = selectionMode,
                         selectedIds = selectedIds,
+                        onOpenFolder = { path -> if (!phoneHardOpBusy) currentSubdirectory = path },
+                        onMoveFolder = { target -> if (!phoneHardOpBusy) moveTargetsDialog = listOf(target) },
+                        onCopyFolder = { target -> if (!phoneHardOpBusy) copyTargetsDialog = listOf(target) },
+                        onDeleteFolder = { target -> if (!phoneHardOpBusy) deleteFolderTarget = target },
                         onActivate = { file ->
                             if (selectionMode) {
                                 if (file.id in selectedIds) selectedIds.remove(file.id)
@@ -3885,6 +4131,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     )
                 InboxLayout.OVERFLOW ->
                     InboxOverflow(
+                        directories = folderItems.filter { it.kind == PhoneHardEntryKind.DIRECTORY },
                         files = files,
                         theme = state.theme,
                         usesDarkBackground = overflowUsesDarkBackground,
@@ -3892,6 +4139,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         onDashboard = { model.show(Screen.Dashboard) },
                         configuredLayout = configuredLayout,
                         onSelectLayout = ::setLayout,
+                        onOpenFolder = { path -> if (!phoneHardOpBusy) currentSubdirectory = path },
                         onToggleBackground = { dark ->
                             overflowUsesDarkBackground = dark
                             inboxPreferences.edit().putBoolean("overflow_dark", dark).apply()
@@ -3906,6 +4154,94 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     contentPadding = PaddingValues(horizontal = 16.dp),
                 ) {
                     item { PhoneHardConnectionHeader(webHardConnection, horizontalPadding = 0.dp) }
+
+                    // Breadcrumb navigation bar
+                    if (!currentSubdirectory.isNullOrBlank()) {
+                        item {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(Icons.Default.FolderOpen, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "폰하드 > ${currentSubdirectory!!.replace('/', ' ')}",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(onClick = {
+                                        val parent = currentSubdirectory?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }
+                                        currentSubdirectory = parent
+                                    }) {
+                                        Text("상위로")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Directory items
+                    val subdirs = folderItems.filter { it.kind == PhoneHardEntryKind.DIRECTORY }
+                    items(subdirs, key = { "dir_${it.relativePath}" }) { dirItem ->
+                        var showFolderContextMenu by remember(dirItem.relativePath) { mutableStateOf(false) }
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Box(
+                                Modifier.weight(1f).combinedClickable(
+                                    onClick = { if (!phoneHardOpBusy) currentSubdirectory = dirItem.relativePath },
+                                    onLongClick = { if (!selectionMode && !phoneHardOpBusy) showFolderContextMenu = true },
+                                ),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Surface(
+                                        modifier = Modifier.size(48.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(Icons.Default.Folder, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(28.dp))
+                                        }
+                                    }
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Text(dirItem.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                                        Text("폴더", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                                DropdownMenu(expanded = showFolderContextMenu, onDismissRequest = { showFolderContextMenu = false }) {
+                                    val target = PhoneHardTarget(id = null, relativePath = dirItem.relativePath, isDirectory = true)
+                                    DropdownMenuItem(
+                                        text = { Text("이동") },
+                                        leadingIcon = { Icon(Icons.Default.DriveFileMove, null) },
+                                        onClick = { showFolderContextMenu = false; moveTargetsDialog = listOf(target) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("복사") },
+                                        leadingIcon = { Icon(Icons.Default.ContentCopy, null) },
+                                        onClick = { showFolderContextMenu = false; copyTargetsDialog = listOf(target) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("삭제") },
+                                        leadingIcon = { Icon(Icons.Default.Delete, null) },
+                                        colors = MenuDefaults.itemColors(textColor = MaterialTheme.colorScheme.error, leadingIconColor = MaterialTheme.colorScheme.error),
+                                        onClick = { showFolderContextMenu = false; deleteFolderTarget = target },
+                                    )
+                                }
+                            }
+                        }
+                        HorizontalDivider()
+                    }
+
+                    // File items
                     items(files, key = { it.id }) { file ->
                     val selected = file.id in selectedIds
                     var showContextMenu by remember(file.id) { mutableStateOf(false) }
@@ -3948,7 +4284,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                             model.previewInboxFile(file)
                                         }
                                     },
-                                    onLongClick = { if (!selectionMode) showContextMenu = true },
+                                    onLongClick = { if (!selectionMode && !phoneHardOpBusy) showContextMenu = true },
                                 ),
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -3974,7 +4310,21 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                     }
                                 }
                                 DropdownMenu(expanded = showContextMenu, onDismissRequest = { showContextMenu = false }) {
-                                    if (file.isTrailerVideo) DropdownMenuItem(text = { Text("예고편 보기") }, leadingIcon = { Icon(Icons.Default.Movie, null) }, onClick = { showContextMenu = false; model.startInboxTrailer(listOf(file.id)) })
+                                    val fileTarget = PhoneHardTarget(id = file.id, relativePath = file.relativePath, isDirectory = false)
+                                    if (file.isTrailerVideo) {
+                                        DropdownMenuItem(text = { Text("예고편 보기") }, leadingIcon = { Icon(Icons.Default.Movie, null) }, onClick = { showContextMenu = false; model.startInboxTrailer(listOf(file.id)) })
+                                        DropdownMenuItem(text = { Text("음악 입히기") }, leadingIcon = { Icon(Icons.Default.MusicNote, null) }, onClick = { showContextMenu = false; model.startInboxMusicOverlay(listOf(file.id), null) })
+                                    }
+                                    DropdownMenuItem(
+                                        text = { Text("이동") },
+                                        leadingIcon = { Icon(Icons.Default.DriveFileMove, null) },
+                                        onClick = { showContextMenu = false; moveTargetsDialog = listOf(fileTarget) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("복사") },
+                                        leadingIcon = { Icon(Icons.Default.ContentCopy, null) },
+                                        onClick = { showContextMenu = false; copyTargetsDialog = listOf(fileTarget) },
+                                    )
                                     DropdownMenuItem(
                                         text = { Text("NAS로 보내기") },
                                         leadingIcon = { Icon(Icons.Default.CloudUpload, null) },
@@ -4090,6 +4440,156 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             confirmButton = { TextButton(onClick = model::dismissInboxError) { Text("확인") } },
         )
     }
+
+    if (showCreateFolderDialog) {
+        CreateFolderDialog(
+            parentPath = currentSubdirectory,
+            onDismiss = { showCreateFolderDialog = false },
+            onConfirm = { folderName ->
+                showCreateFolderDialog = false
+                phoneHardOpBusy = true
+                phoneHardOpStatus = "폴더를 만드는 중입니다…"
+                model.createPhoneHardFolder(folderName, currentSubdirectory) { success, errorMsg ->
+                    if (success) {
+                        folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+                    } else if (!errorMsg.isNullOrBlank()) {
+                        model.showInboxErrorMessage(errorMsg)
+                    }
+                    phoneHardOpBusy = false
+                    phoneHardOpStatus = null
+                }
+            },
+        )
+    }
+
+    moveTargetsDialog?.let { targets ->
+        SelectPhoneHardDestinationDialog(
+            title = "폴더/파일 이동 대상 선택",
+            model = model,
+            targets = targets,
+            onDismiss = { moveTargetsDialog = null },
+            onSelectDestination = { dest ->
+                moveTargetsDialog = null
+                phoneHardOpBusy = true
+                phoneHardOpStatus = "이동하는 중입니다…"
+                model.movePhoneHardTargets(targets, dest) { result ->
+                    folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+                    if (result.failed.isNotEmpty()) {
+                        val failedIds = result.failed.mapNotNull { it.first.id }.toSet()
+                        if (selectionMode) {
+                            selectedIds.retainAll(failedIds)
+                            if (selectedIds.isEmpty()) selectionMode = false
+                        }
+                        val errorDetail = result.failed.first().second
+                        val message = when {
+                            result.succeeded.isEmpty() && result.failed.size == 1 -> errorDetail
+                            result.succeeded.isEmpty() -> "${result.failed.size}개 항목을 이동하지 못했습니다: $errorDetail"
+                            else -> "${result.succeeded.size}개 항목을 이동했지만 ${result.failed.size}개는 이동하지 못했습니다: $errorDetail"
+                        }
+                        model.showInboxErrorMessage(message)
+                    } else {
+                        if (selectionMode) {
+                            selectedIds.clear()
+                            selectionMode = false
+                        }
+                    }
+                    phoneHardOpBusy = false
+                    phoneHardOpStatus = null
+                }
+            },
+        )
+    }
+
+    copyTargetsDialog?.let { targets ->
+        SelectPhoneHardDestinationDialog(
+            title = "폴더/파일 복사 대상 선택",
+            model = model,
+            targets = targets,
+            onDismiss = { copyTargetsDialog = null },
+            onSelectDestination = { dest ->
+                copyTargetsDialog = null
+                phoneHardOpBusy = true
+                phoneHardOpStatus = "복사하는 중입니다…"
+                model.copyPhoneHardTargets(targets, dest) { result ->
+                    folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+                    if (result.failed.isNotEmpty()) {
+                        val failedIds = result.failed.mapNotNull { it.first.id }.toSet()
+                        if (selectionMode) {
+                            selectedIds.retainAll(failedIds)
+                            if (selectedIds.isEmpty()) selectionMode = false
+                        }
+                        val errorDetail = result.failed.first().second
+                        val message = when {
+                            result.succeeded.isEmpty() && result.failed.size == 1 -> errorDetail
+                            result.succeeded.isEmpty() -> "${result.failed.size}개 항목을 복사하지 못했습니다: $errorDetail"
+                            else -> "${result.succeeded.size}개 항목을 복사했지만 ${result.failed.size}개는 복사하지 못했습니다: $errorDetail"
+                        }
+                        model.showInboxErrorMessage(message)
+                    } else {
+                        if (selectionMode) {
+                            selectedIds.clear()
+                            selectionMode = false
+                        }
+                    }
+                    phoneHardOpBusy = false
+                    phoneHardOpStatus = null
+                }
+            },
+        )
+    }
+
+    deleteFolderTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteFolderTarget = null },
+            title = { Text("폴더 삭제") },
+            text = { Text("'${target.relativePath.substringAfterLast('/')}' 폴더와 그 안의 모든 내용이 영구히 삭제됩니다.") },
+            dismissButton = { TextButton(onClick = { deleteFolderTarget = null }) { Text("취소") } },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val toDelete = target
+                        deleteFolderTarget = null
+                        phoneHardOpBusy = true
+                        phoneHardOpStatus = "삭제하는 중입니다…"
+                        model.deletePhoneHardTargets(listOf(toDelete)) { result ->
+                            folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+                            if (result.failed.isNotEmpty()) {
+                                val errorDetail = result.failed.first().second
+                                model.showInboxErrorMessage(errorDetail)
+                            }
+                            phoneHardOpBusy = false
+                            phoneHardOpStatus = null
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("삭제") }
+            },
+        )
+    }
+    } // Scaffold Box
+    if (phoneHardOpBusy) {
+        Surface(
+            modifier = Modifier.fillMaxSize().clickable(enabled = true, onClick = {}),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.padding(24.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.5.dp)
+                        Text(phoneHardOpStatus ?: "처리하는 중입니다…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -4109,10 +4609,15 @@ private fun PhoneHardConnectionHeader(
 @Composable
 private fun InboxGrid(
     connection: WebHardConnectionState,
+    directories: List<PhoneHardItem> = emptyList(),
     files: List<InboxDisplayItem>,
     poster: Boolean,
     selectionMode: Boolean,
     selectedIds: List<java.util.UUID>,
+    onOpenFolder: (String) -> Unit = {},
+    onMoveFolder: (PhoneHardTarget) -> Unit = {},
+    onCopyFolder: (PhoneHardTarget) -> Unit = {},
+    onDeleteFolder: (PhoneHardTarget) -> Unit = {},
     onActivate: (InboxDisplayItem) -> Unit,
     onSend: (InboxDisplayItem) -> Unit,
     onShare: (InboxDisplayItem) -> Unit,
@@ -4130,6 +4635,17 @@ private fun InboxGrid(
         item(span = { GridItemSpan(maxLineSpan) }) {
             PhoneHardConnectionHeader(connection, horizontalPadding = 0.dp)
         }
+        items(directories, key = { "dir_${it.relativePath}" }) { dirItem ->
+            InboxFolderGridTile(
+                folder = dirItem,
+                poster = poster,
+                selectionMode = selectionMode,
+                onActivate = { onOpenFolder(dirItem.relativePath) },
+                onMove = { onMoveFolder(PhoneHardTarget(id = null, relativePath = dirItem.relativePath, isDirectory = true)) },
+                onCopy = { onCopyFolder(PhoneHardTarget(id = null, relativePath = dirItem.relativePath, isDirectory = true)) },
+                onDelete = { onDeleteFolder(PhoneHardTarget(id = null, relativePath = dirItem.relativePath, isDirectory = true)) },
+            )
+        }
         items(files, key = { it.id }) { file ->
             InboxGridTile(
                 file = file,
@@ -4143,6 +4659,57 @@ private fun InboxGrid(
                 onTrailer = { onTrailer(file) },
             )
         }
+    }
+}
+
+@Composable
+private fun InboxFolderGridTile(
+    folder: PhoneHardItem,
+    poster: Boolean,
+    selectionMode: Boolean,
+    onActivate: () -> Unit,
+    onMove: () -> Unit,
+    onCopy: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var showContextMenu by remember(folder.relativePath) { mutableStateOf(false) }
+    Column(
+        Modifier.fillMaxWidth().combinedClickable(
+            onClick = onActivate,
+            onLongClick = { if (!selectionMode) showContextMenu = true },
+            onLongClickLabel = "작업 보기",
+        ),
+        verticalArrangement = Arrangement.spacedBy(if (poster) 9.dp else 6.dp),
+    ) {
+        Box {
+            Surface(
+                Modifier.fillMaxWidth().aspectRatio(1f),
+                shape = RoundedCornerShape(if (poster) 15.dp else 11.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Folder, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(if (poster) 56.dp else 36.dp))
+                }
+            }
+            DropdownMenu(expanded = showContextMenu, onDismissRequest = { showContextMenu = false }) {
+                DropdownMenuItem(text = { Text("이동") }, leadingIcon = { Icon(Icons.Default.DriveFileMove, null) }, onClick = { showContextMenu = false; onMove() })
+                DropdownMenuItem(text = { Text("복사") }, leadingIcon = { Icon(Icons.Default.ContentCopy, null) }, onClick = { showContextMenu = false; onCopy() })
+                DropdownMenuItem(
+                    text = { Text("삭제") },
+                    leadingIcon = { Icon(Icons.Default.Delete, null) },
+                    colors = MenuDefaults.itemColors(textColor = MaterialTheme.colorScheme.error, leadingIconColor = MaterialTheme.colorScheme.error),
+                    onClick = { showContextMenu = false; onDelete() },
+                )
+            }
+        }
+        Text(
+            folder.name,
+            style = if (poster) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text("폴더", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -4223,6 +4790,7 @@ private fun InboxGridTile(
 
 @Composable
 private fun InboxOverflow(
+    directories: List<PhoneHardItem> = emptyList(),
     files: List<InboxDisplayItem>,
     theme: AppTheme,
     usesDarkBackground: Boolean,
@@ -4232,6 +4800,7 @@ private fun InboxOverflow(
     onSelectLayout: (InboxLayout) -> Unit = {},
     onToggleBackground: (Boolean) -> Unit,
     onActivate: (InboxDisplayItem) -> Unit,
+    onOpenFolder: (String) -> Unit = {},
     initialSelectedIndex: Int,
     onSelectedIndexChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
@@ -4240,8 +4809,18 @@ private fun InboxOverflow(
     val scope = rememberCoroutineScope()
     val thumbnails = remember(files) { mutableStateMapOf<String, android.graphics.Bitmap>() }
     val requested = remember(files) { mutableSetOf<String>() }
-    val items = remember(files) {
-        files.map { file ->
+    val items = remember(directories, files) {
+        directories.map { dir ->
+            RemoteFileItem(
+                id = "dir:${dir.relativePath}",
+                name = dir.name,
+                path = dir.relativePath,
+                isDirectory = true,
+                size = 0L,
+                modifiedAt = dir.modifiedAt,
+                mimeType = null,
+            )
+        } + files.map { file ->
             RemoteFileItem(
                 id = file.id.toString(),
                 name = file.originalFilename,
@@ -4288,7 +4867,7 @@ private fun InboxOverflow(
             onDashboard = onDashboard,
             viewModes = inboxViewModes,
             onToggleBackground = onToggleBackground,
-            onActivate = { item -> filesByID[item.id]?.let(onActivate) },
+            onActivate = { item -> if (item.isDirectory) onOpenFolder(item.path) else filesByID[item.id]?.let(onActivate) },
             initialSelectedIndex = initialSelectedIndex,
             onSelectedIndexChange = onSelectedIndexChange,
             onLoadThumbnail = { item ->

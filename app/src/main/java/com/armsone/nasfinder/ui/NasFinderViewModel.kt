@@ -71,6 +71,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.withPermit
+import com.armsone.nasfinder.data.SharedInboxStore
 import java.io.File
 import java.net.URI
 import java.net.URLDecoder
@@ -127,7 +129,15 @@ data class AppState(
     val googlePhotosDisclosureRequired: Boolean = false,
     val googlePhotosPhase: GooglePhotosPhase = GooglePhotosPhase.IDLE,
     val googlePhotosImportedCount: Int = 0,
+    val folderCountCache: Map<String, FolderChildCountState> = emptyMap(),
+    val folderCountGeneration: Long = 0L,
 )
+
+sealed interface FolderChildCountState {
+    data object Loading : FolderChildCountState
+    data class Ready(val folderCount: Int, val fileCount: Int) : FolderChildCountState
+    data object Error : FolderChildCountState
+}
 
 enum class GooglePhotosPhase { IDLE, AUTHORIZING, PREPARING, WAITING_FOR_SELECTION, IMPORTING, FINISHED, CANCELLED, ERROR }
 
@@ -154,6 +164,7 @@ data class InboxDisplayItem(
     val byteCount: Long,
     val importedAt: java.time.Instant,
     val file: File,
+    val relativePath: String,
 )
 
 enum class RemoteTransferAction { COPY, MOVE }
@@ -229,6 +240,7 @@ sealed interface Screen {
     data object SuperThumbnailFolderPicker : Screen
     data object SuperThumbnailProgress : Screen
     data object SuperThumbnailReport : Screen
+    data object LocalPhotoLibrary : Screen
     data object WebBrowser : Screen
     data object WebHard : Screen
 }
@@ -249,6 +261,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val favoriteThumbnailJobs = mutableMapOf<String, Job>()
     private var previewRequestGeneration = 0L
     private var previewJob: Job? = null
+    private val trackedOwnedPreviewFiles = mutableSetOf<File>()
+    private val folderCountSemaphore = kotlinx.coroutines.sync.Semaphore(2)
+    private var folderCountGeneration = 0L
+    private val folderCountRequests = mutableSetOf<String>()
     private var connectionOpenJob: Job? = null
     private var googlePhotosJob: Job? = null
     private val googlePhotosAccount = GooglePhotosAccountController(application)
@@ -370,6 +386,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
+    fun showInboxErrorMessage(message: String) { _state.update { it.copy(inboxErrorMessage = message) } }
 
     fun requestGooglePhotosImport() {
         _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosDisclosureRequired = true, message = null) }
@@ -1296,7 +1313,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         invalidateImagePreviewRequests()
         connectionOpenJob?.cancel()
         val generation = ++thumbnailGeneration
+        val countGen = ++folderCountGeneration
         thumbnailRequests.clear()
+        folderCountRequests.clear()
         val preferences = repository.browserPreferences()
         _state.update {
             it.copy(
@@ -1305,6 +1324,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 message = null,
                 remoteThumbnails = emptyMap(),
                 thumbnailGeneration = generation,
+                folderCountCache = emptyMap(),
+                folderCountGeneration = countGen,
             )
         }
         connectionOpenJob = viewModelScope.launch {
@@ -1381,6 +1402,73 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    fun loadFolderChildCount(item: RemoteFileItem) {
+        if (!item.isDirectory) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        if (browser.items.none { it.id == item.id && it.path == item.path }) return
+        val activeConnection = browser.connection
+        val preferencesSnapshot = browser.preferences
+        val generation = folderCountGeneration
+        val cacheKey = "${activeConnection.id}\u0000${item.path}\u0000${preferencesSnapshot.showHiddenFiles}\u0000$generation"
+
+        if (!folderCountRequests.add(cacheKey)) return
+
+        _state.update { current ->
+            if (current.folderCountGeneration != generation) current
+            else current.copy(
+                folderCountCache = current.folderCountCache + (item.id to FolderChildCountState.Loading)
+            )
+        }
+
+        viewModelScope.launch {
+            folderCountSemaphore.withPermit {
+                val currentBrowser = _state.value.screen as? Screen.Browser
+                if (generation != folderCountGeneration || currentBrowser == null ||
+                    currentBrowser.connection.id != activeConnection.id ||
+                    currentBrowser.items.none { it.id == item.id && it.path == item.path }
+                ) return@withPermit
+
+                val countState = withContext(Dispatchers.IO) {
+                    try {
+                        val activeService = service ?: run {
+                            val credential = repository.credentials.read(activeConnection.id).orEmpty()
+                            RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+                        }
+                        val rawEntries = activeService.list(item.path)
+                        val visibleEntries = rawEntries.filter { entry ->
+                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") return@filter false
+                            val normEntryPath = entry.path.trimEnd('/')
+                            val normItemPath = item.path.trimEnd('/')
+                            if (normEntryPath == normItemPath) return@filter false
+                            if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) return@filter false
+                            true
+                        }
+                        val folderCount = visibleEntries.count { it.isDirectory }
+                        val fileCount = visibleEntries.count { !it.isDirectory }
+                        FolderChildCountState.Ready(folderCount, fileCount)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        FolderChildCountState.Error
+                    }
+                }
+
+                val nowBrowser = _state.value.screen as? Screen.Browser
+                if (generation != folderCountGeneration || nowBrowser == null ||
+                    nowBrowser.connection.id != activeConnection.id ||
+                    nowBrowser.items.none { it.id == item.id && it.path == item.path }
+                ) return@withPermit
+
+                _state.update { current ->
+                    if (current.folderCountGeneration != generation) current
+                    else current.copy(
+                        folderCountCache = current.folderCountCache + (item.id to countState)
+                    )
+                }
+            }
+        }
+    }
+
     fun refreshBrowser() {
         val browser = _state.value.screen as? Screen.Browser ?: return
         viewModelScope.launch {
@@ -1407,6 +1495,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         previewRequestGeneration++
         previewJob?.cancel()
         previewJob = null
+        val filesToClean = synchronized(trackedOwnedPreviewFiles) {
+            val list = trackedOwnedPreviewFiles.toList()
+            trackedOwnedPreviewFiles.clear()
+            list
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            filesToClean.forEach { runCatching { it.delete() } }
+        }
         _state.update {
             it.copy(
                 imagePreview = null,
@@ -1776,11 +1872,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(message = "선택한 저장 연결을 찾을 수 없습니다.") }
             return false
         }
-        _state.update { it.copy(isBusy = true, message = null) }
         val imported = withContext(Dispatchers.IO) {
             runCatching {
                 val source = validateWebDownload(file)
-                source.inputStream().buffered().use { input -> inboxStore.import(filename, mimeType, input) }
+                val testItem = RemoteFileItem(filename, filename, filename, false, mimeType = mimeType)
+                val destinationSubdir = if (testItem.isAudio) SharedInboxStore.MUSIC_DIRECTORY_NAME else null
+                source.inputStream().buffered().use { input ->
+                    inboxStore.import(filename, mimeType, input, destinationSubdirectory = destinationSubdir)
+                }
             }
         }
         return imported.fold(
@@ -1792,7 +1891,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         isBusy = false,
                         inboxFiles = files,
                         pendingLocalUpload = null,
-                        screen = if (connection == null) Screen.Inbox else it.screen,
+                        screen = if (connection == null && it.trailer == null) Screen.Inbox else it.screen,
                         message = if (connection == null) "폰하드에 저장했습니다." else null,
                     )
                 }
@@ -2044,11 +2143,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         val refreshed = runCatching { service?.list(browser.path) ?: error("원격 연결이 종료되었습니다.") }
         refreshed.onSuccess { items ->
+            val countGen = ++folderCountGeneration
+            folderCountRequests.clear()
             _state.update {
                 it.copy(
                     isBusy = false,
                     screen = browser.copy(items = items.sortedWith(browser.preferences)),
                     pendingTransfer = if (clearTransfer) null else it.pendingTransfer,
+                    folderCountCache = emptyMap(),
+                    folderCountGeneration = countGen,
                     message = successMessage,
                 )
             }
@@ -2372,8 +2475,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun updateBrowserPreferences(preferences: BrowserPreferences) {
         val browser = _state.value.screen as? Screen.Browser ?: return
+        val showHiddenChanged = browser.preferences.showHiddenFiles != preferences.showHiddenFiles
+        val countGen = if (showHiddenChanged) ++folderCountGeneration else folderCountGeneration
+        if (showHiddenChanged) folderCountRequests.clear()
         repository.setBrowserPreferences(preferences)
-        _state.update { it.copy(screen = browser.copy(items = browser.items.sortedWith(preferences), preferences = preferences)) }
+        _state.update {
+            it.copy(
+                screen = browser.copy(items = browser.items.sortedWith(preferences), preferences = preferences),
+                folderCountCache = if (showHiddenChanged) emptyMap() else it.folderCountCache,
+                folderCountGeneration = countGen,
+            )
+        }
     }
 
     fun setTheme(theme: AppTheme) {
@@ -2655,6 +2767,50 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         importInboxUris(selected, successMessage = "가져왔습니다", partialMessage = "가져왔지만")
     }
 
+    private var localMediaCopyJob: Job? = null
+
+    fun copyLocalMediaToInbox(
+        uris: List<Uri>,
+        onProgress: (current: Int, total: Int) -> Unit = { _, _ -> },
+        onComplete: (successCount: Int, failedCount: Int) -> Unit = { _, _ -> },
+    ) {
+        val selected = uris.distinct()
+        if (selected.isEmpty() || localMediaCopyJob?.isActive == true) return
+        localMediaCopyJob = viewModelScope.launch {
+            val total = selected.size
+            var importedCount = 0
+            var failedCount = 0
+            withContext(Dispatchers.IO) {
+                selected.forEachIndexed { index, uri ->
+                    runCatching {
+                        val name = queryName(uri) ?: "폰하드 파일 ${index + 1}"
+                        application.contentResolver.openInputStream(uri)?.use { input ->
+                            inboxStore.import(name, application.contentResolver.getType(uri), input)
+                        } ?: error("파일을 열 수 없습니다.")
+                        importedCount++
+                    }.onFailure { failedCount++ }
+                    withContext(Dispatchers.Main) {
+                        onProgress(index + 1, total)
+                    }
+                }
+            }
+            val files = withContext(Dispatchers.IO) { inboxFiles() }
+            _state.update {
+                it.copy(
+                    inboxFiles = files,
+                    message = if (failedCount == 0) "${importedCount}개 파일을 폰하드에 복사했습니다." else null,
+                    inboxErrorMessage = when {
+                        failedCount == 0 -> null
+                        importedCount == 0 -> "${failedCount}개 파일을 복사하지 못했습니다."
+                        else -> "${importedCount}개 파일을 복사했지만 ${failedCount}개는 복사하지 못했습니다."
+                    },
+                )
+            }
+            NasFinderAppWidgetProvider.updateAll(application)
+            onComplete(importedCount, failedCount)
+        }
+    }
+
     private fun importInboxUris(uris: List<Uri>, successMessage: String, partialMessage: String) {
         viewModelScope.launch {
             val (count, failed, files) = withContext(Dispatchers.IO) {
@@ -2713,28 +2869,263 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var trailerJob: Job? = null
     private var trailerRetry: (() -> Unit)? = null
 
+    fun prepareRemoteFolderTrailer(
+        folder: RemoteFileItem,
+        onPrompt: (hasSubfolders: Boolean) -> Unit,
+    ) {
+        if (!folder.isDirectory) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        val activeConnection = browser.connection
+        val requestedPath = folder.path
+        val preferencesSnapshot = browser.preferences
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            val checkResult = withContext(Dispatchers.IO) {
+                try {
+                    val activeService = service ?: run {
+                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
+                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+                    }
+                    val rawEntries = activeService.list(requestedPath)
+                    val visibleChildFolders = rawEntries.filter { entry ->
+                        if (!entry.isDirectory) return@filter false
+                        if (entry.name.isBlank() || entry.name == "." || entry.name == "..") return@filter false
+                        val normEntryPath = entry.path.trimEnd('/')
+                        val normReqPath = requestedPath.trimEnd('/')
+                        if (normEntryPath == normReqPath) return@filter false
+                        if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) return@filter false
+                        true
+                    }
+                    val visibleChildCount = visibleChildFolders.size
+                    Result.success(visibleChildCount > 0)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
+            }
+            _state.update { it.copy(isBusy = false) }
+            // Stale screen check: ensure user is still in the same browser connection/path
+            val currentBrowser = _state.value.screen as? Screen.Browser
+            if (currentBrowser == null || currentBrowser.connection.id != activeConnection.id) {
+                return@launch
+            }
+            checkResult.onSuccess { hasSubfolders ->
+                if (hasSubfolders) {
+                    onPrompt(true)
+                } else {
+                    startRemoteFolderTrailer(folder, includeSubfolders = false)
+                }
+            }.onFailure { error ->
+                _state.update { it.copy(message = error.message ?: "폴더 내용을 불러오지 못했습니다.") }
+            }
+        }
+    }
+
+    fun startRemoteFolderTrailer(folder: RemoteFileItem, includeSubfolders: Boolean = false) {
+        if (!folder.isDirectory) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        val activeConnection = browser.connection
+        val preferencesSnapshot = browser.preferences
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            val (mediaCandidates, skippedCount) = withContext(Dispatchers.IO) {
+                try {
+                    val activeService = service ?: run {
+                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
+                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+                    }
+                    val media = mutableListOf<RemoteFileItem>()
+                    var nonMediaCount = 0
+                    if (includeSubfolders) {
+                        val queue = java.util.ArrayDeque<String>()
+                        val visitedPaths = mutableSetOf<String>()
+                        queue.add(folder.path)
+                        visitedPaths.add(folder.path.trimEnd('/'))
+                        while (queue.isNotEmpty()) {
+                            val currentPath = queue.removeFirst()
+                            val entries = activeService.list(currentPath)
+                            for (entry in entries) {
+                                if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                                if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+                                val normPath = entry.path.trimEnd('/')
+                                if (entry.isDirectory) {
+                                    if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
+                                        queue.add(entry.path)
+                                    }
+                                } else if (entry.isVideo || entry.isImage) {
+                                    media.add(entry)
+                                } else {
+                                    nonMediaCount++
+                                }
+                            }
+                        }
+                    } else {
+                        val children = activeService.list(folder.path)
+                        val validChildren = children.filter { entry ->
+                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") false
+                            else if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) false
+                            else entry.path.trimEnd('/') != folder.path.trimEnd('/')
+                        }
+                        media.addAll(validChildren.filter { !it.isDirectory && (it.isVideo || it.isImage) })
+                        nonMediaCount = validChildren.count { !it.isDirectory && !it.isVideo && !it.isImage }
+                    }
+                    media to nonMediaCount
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    null to 0
+                }
+            }
+            _state.update { it.copy(isBusy = false) }
+            if (mediaCandidates == null) {
+                _state.update { it.copy(message = "폴더 내용을 불러오지 못했습니다.") }
+                return@launch
+            }
+            if (mediaCandidates.isEmpty()) {
+                _state.update { it.copy(message = "예고편을 만들 수 있는 사진이나 영상이 없습니다.") }
+                return@launch
+            }
+            trailerRetry = { startRemoteFolderTrailer(folder, includeSubfolders) }
+            val activeService = service ?: return@launch
+            val candidatesWithTime = mediaCandidates.map { it to (it.modifiedAt?.toEpochMilli() ?: 0L) }
+            prepareTrailer(
+                names = candidatesWithTime.map { it.first.name },
+                captureTimes = candidatesWithTime.map { it.second },
+                initialExcludedCount = skippedCount,
+                stage = { index, destination ->
+                    val item = candidatesWithTime[index].first
+                    activeService.download(item, destination) { received, total ->
+                        _state.update { current ->
+                            if (current.trailer?.directory != destination.parentFile) return@update current
+                            current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                        }
+                    }
+                    check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+                }
+            )
+        }
+    }
+
     fun startRemoteTrailer(items: List<RemoteFileItem>) {
         val activeService = service ?: return
-        val videos = items.filter { !it.isDirectory && it.isVideo }
-        if (videos.size != items.size || videos.isEmpty()) return
-        trailerRetry = { startRemoteTrailer(videos) }
-        prepareTrailer(videos.map { it.name }) { index, destination ->
-            val item = videos[index]
+        val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }
+        if (media.size != items.size || media.isEmpty()) return
+        trailerRetry = { startRemoteTrailer(media) }
+        val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
+        prepareTrailer(media.map { it.name }, captureTimes = captureTimes) { index, destination ->
+            val item = media[index]
             activeService.download(item, destination) { received, total ->
                 _state.update { current ->
                     if (current.trailer?.directory != destination.parentFile) return@update current
                     current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
                 }
             }
-            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "영상을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+        }
+    }
+
+    fun previewLocalMediaUri(uri: Uri) {
+        val requestGeneration = ++previewRequestGeneration
+        previewJob?.cancel()
+        previewJob = viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            var createdTempFile: File? = null
+            val itemAndFile = withContext(Dispatchers.IO) {
+                runCatching {
+                    val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어 파일"
+                    val mimeType = application.contentResolver.getType(uri)
+                    val isVideo = mimeType?.startsWith("video/") == true ||
+                        name.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp", "ts")
+                    val isImage = mimeType?.startsWith("image/") == true ||
+                        name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif", "bmp")
+                    val ext = if (isImage) "jpg" else if (isVideo) "mp4" else name.substringAfterLast('.', "dat")
+                    val tempDir = File(application.cacheDir, "local_preview").also { it.mkdirs() }
+                    val tempFile = File(tempDir, "preview-${UUID.randomUUID()}.$ext")
+                    createdTempFile = tempFile
+                    application.contentResolver.openInputStream(uri)?.use { input ->
+                        tempFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    } ?: error("파일을 읽을 수 없습니다.")
+                    val item = RemoteFileItem(
+                        id = uri.toString(),
+                        name = name,
+                        path = tempFile.absolutePath,
+                        isDirectory = false,
+                        size = tempFile.length(),
+                        mimeType = mimeType,
+                    )
+                    item to tempFile
+                }
+            }
+            if (requestGeneration != previewRequestGeneration) {
+                withContext(Dispatchers.IO) { createdTempFile?.delete() }
+                return@launch
+            }
+            _state.update { it.copy(isBusy = false) }
+            itemAndFile.onSuccess { (item, file) ->
+                synchronized(trackedOwnedPreviewFiles) { trackedOwnedPreviewFiles.add(file) }
+                prepareLocalPreview(listOf(item), listOf(file), 0)
+            }.onFailure { error ->
+                withContext(Dispatchers.IO) { createdTempFile?.delete() }
+                _state.update { it.copy(message = error.message ?: "미리보기를 열 수 없습니다.") }
+            }
+        }
+    }
+
+    fun startLocalMediaTrailer(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val activeUris = uris.distinct()
+        trailerRetry = { startLocalMediaTrailer(activeUris) }
+        val names = activeUris.map { uri ->
+            queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어"
+        }
+        val captureTimes = activeUris.map { uri ->
+            runCatching {
+                val projection = arrayOf(
+                    android.provider.MediaStore.MediaColumns.DATE_TAKEN,
+                    android.provider.MediaStore.MediaColumns.DATE_ADDED,
+                    android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
+                )
+                application.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val taken = cursor.getLong(0)
+                        if (taken > 0L) taken
+                        else {
+                            val added = cursor.getLong(1)
+                            if (added > 0L) added * 1000L
+                            else cursor.getLong(2) * 1000L
+                        }
+                    } else 0L
+                } ?: 0L
+            }.getOrDefault(0L)
+        }
+        prepareTrailer(names, captureTimes = captureTimes) { index, destination ->
+            val uri = activeUris[index]
+            kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                application.contentResolver.openInputStream(uri)?.use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted) throw CancellationException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: error("파일을 열 수 없습니다: ${names[index]}")
+            }
+            check(destination.length() > 0) { "파일을 끝까지 읽지 못했습니다: ${names[index]}" }
         }
     }
 
     fun startInboxTrailer(ids: List<UUID>) {
         val selected = runCatching { selectedInboxItems(ids) }.getOrElse { return }
-        if (selected.isEmpty() || selected.any { !it.asPreviewItem().isVideo }) return
+        if (selected.isEmpty() || selected.any { val item = it.asPreviewItem(); !item.isVideo && !item.isImage }) return
         trailerRetry = { startInboxTrailer(ids) }
-        prepareTrailer(selected.map { it.originalFilename }) { index, destination ->
+        val captureTimes = selected.map { it.importedAt.toEpochMilli() }
+        prepareTrailer(selected.map { it.originalFilename }, captureTimes = captureTimes) { index, destination ->
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 selected[index].file.inputStream().buffered().use { input ->
                     destination.outputStream().buffered().use { output ->
@@ -2751,68 +3142,496 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    private fun prepareTrailer(names: List<String>, stage: suspend (Int, File) -> Unit) {
+    fun phoneHardAudioFiles(): List<TrailerMusicTrack> {
+        val files = inboxFiles()
+        val musicCanonicalDir = inboxStore.musicDirectory.canonicalFile
+        val musicCanonicalPath = musicCanonicalDir.path
+        return files.filter { item ->
+            if (!item.file.exists() || !item.asPreviewItem().isAudio) return@filter false
+            val itemCanonicalPath = runCatching { item.file.canonicalFile.path }.getOrNull() ?: return@filter false
+            itemCanonicalPath == musicCanonicalPath ||
+                itemCanonicalPath.startsWith(musicCanonicalPath + File.separator)
+        }.mapNotNull { item ->
+            runCatching {
+                val retriever = android.media.MediaMetadataRetriever()
+                val duration = try {
+                    retriever.setDataSource(item.file.absolutePath)
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+                } finally {
+                    retriever.release()
+                }
+                TrailerMusicTrack(
+                    file = item.file,
+                    name = item.originalFilename,
+                    durationSeconds = duration,
+                )
+            }.getOrNull()
+        }
+    }
+
+    suspend fun listRemoteAudioFiles(
+        connection: RemoteConnection,
+        path: String,
+    ): Result<List<RemoteFileItem>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val credential = repository.credentials.read(connection.id).orEmpty()
+            RemoteFileServiceFactory.create(connection, credential).use { svc ->
+                val allItems = svc.list(path)
+                allItems.filter { it.isDirectory || it.isAudio }
+            }
+        }
+    }
+
+    suspend fun downloadRemoteAudioToCache(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        destinationFile: File,
+        progress: (Long, Long) -> Unit,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            destinationFile.parentFile?.mkdirs()
+            val credential = repository.credentials.read(connection.id).orEmpty()
+            RemoteFileServiceFactory.create(connection, credential).use { svc ->
+                svc.download(item, destinationFile, progress)
+            }
+            check(destinationFile.exists() && destinationFile.length() > 0L) { "오디오 파일을 내려받지 못했습니다." }
+        }
+    }
+
+    suspend fun importAudioFileToMusic(
+        sourceFile: File,
+        originalFilename: String,
+        mimeType: String?,
+    ): Result<TrailerMusicTrack> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(sourceFile.exists() && sourceFile.length() > 0L) { "가져올 음악 파일이 비어있습니다." }
+            val retriever = android.media.MediaMetadataRetriever()
+            val duration = try {
+                retriever.setDataSource(sourceFile.absolutePath)
+                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+            } finally {
+                retriever.release()
+            }
+            check(duration > 0.0) { "오디오 재생 시간을 확인할 수 없거나 손상된 파일입니다." }
+            val record = sourceFile.inputStream().buffered().use { input ->
+                inboxStore.import(
+                    originalFilename = originalFilename,
+                    mimeType = mimeType,
+                    input = input,
+                    destinationSubdirectory = SharedInboxStore.MUSIC_DIRECTORY_NAME,
+                )
+            }
+            val destination = inboxStore.file(record)
+            _state.update { it.copy(inboxFiles = inboxFiles()) }
+            TrailerMusicTrack(
+                file = destination,
+                name = record.originalFilename,
+                durationSeconds = duration,
+            )
+        }
+    }
+
+
+    fun startRemoteMusicOverlay(
+        items: List<RemoteFileItem>,
+        musicTrack: TrailerMusicTrack?,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+    ) {
+        val activeService = service ?: return
+        val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }
+        if (media.size != items.size || media.isEmpty()) return
+        trailerRetry = { startRemoteMusicOverlay(media, musicTrack, musicPolicy) }
+        val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
+        prepareTrailer(
+            names = media.map { it.name },
+            captureTimes = captureTimes,
+            isMusicOverlayMode = true,
+            initialMusicTrack = musicTrack,
+            initialMusicPolicy = musicPolicy,
+        ) { index, destination ->
+            val item = media[index]
+            activeService.download(item, destination) { received, total ->
+                _state.update { current ->
+                    if (current.trailer?.directory != destination.parentFile) return@update current
+                    current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                }
+            }
+            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+        }
+    }
+
+    fun startInboxMusicOverlay(
+        ids: List<UUID>,
+        musicTrack: TrailerMusicTrack?,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+    ) {
+        val selected = runCatching { selectedInboxItems(ids) }.getOrElse { return }
+        if (selected.isEmpty() || selected.any { val item = it.asPreviewItem(); !item.isVideo && !item.isImage }) return
+        trailerRetry = { startInboxMusicOverlay(ids, musicTrack, musicPolicy) }
+        val captureTimes = selected.map { it.importedAt.toEpochMilli() }
+        prepareTrailer(
+            names = selected.map { it.originalFilename },
+            captureTimes = captureTimes,
+            isMusicOverlayMode = true,
+            initialMusicTrack = musicTrack,
+            initialMusicPolicy = musicPolicy,
+        ) { index, destination ->
+            kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                selected[index].file.inputStream().buffered().use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted) throw CancellationException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun startLocalMusicOverlay(
+        uris: List<Uri>,
+        musicTrack: TrailerMusicTrack?,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+    ) {
+        if (uris.isEmpty()) return
+        val activeUris = uris.distinct()
+        trailerRetry = { startLocalMusicOverlay(activeUris, musicTrack, musicPolicy) }
+        val names = activeUris.map { uri ->
+            queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어"
+        }
+        val captureTimes = activeUris.map { uri ->
+            runCatching {
+                val projection = arrayOf(
+                    android.provider.MediaStore.MediaColumns.DATE_TAKEN,
+                    android.provider.MediaStore.MediaColumns.DATE_ADDED,
+                    android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
+                )
+                application.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val taken = cursor.getLong(0)
+                        if (taken > 0L) taken
+                        else {
+                            val added = cursor.getLong(1)
+                            if (added > 0L) added * 1000L
+                            else cursor.getLong(2) * 1000L
+                        }
+                    } else 0L
+                } ?: 0L
+            }.getOrDefault(0L)
+        }
+        prepareTrailer(
+            names = names,
+            captureTimes = captureTimes,
+            isMusicOverlayMode = true,
+            initialMusicTrack = musicTrack,
+            initialMusicPolicy = musicPolicy,
+        ) { index, destination ->
+            val uri = activeUris[index]
+            kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                application.contentResolver.openInputStream(uri)?.use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted) throw CancellationException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: error("파일을 열 수 없습니다: ${names[index]}")
+            }
+            check(destination.length() > 0) { "파일을 끝까지 읽지 못했습니다: ${names[index]}" }
+        }
+    }
+
+    private fun prepareTrailer(
+        names: List<String>,
+        captureTimes: List<Long> = emptyList(),
+        initialExcludedCount: Int = 0,
+        isMusicOverlayMode: Boolean = false,
+        initialMusicTrack: TrailerMusicTrack? = null,
+        initialMusicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        stage: suspend (Int, File) -> Unit,
+    ) {
         if (_state.value.trailer?.busy == true) return
         closeTrailer(clearRetry = false)
         val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
         directory.mkdirs()
-        _state.update { it.copy(trailer = TrailerSession(directory), imagePreview = null) }
+        _state.update {
+            it.copy(
+                trailer = TrailerSession(
+                    directory = directory,
+                    isMusicOverlayMode = isMusicOverlayMode,
+                    musicTrack = initialMusicTrack,
+                    musicPolicy = initialMusicPolicy,
+                ),
+                imagePreview = null,
+            )
+        }
         trailerJob = viewModelScope.launch {
             try {
                 val sources = mutableListOf<TrailerSource>()
+                var undecodableCount = 0
                 names.forEachIndexed { index, name ->
-                    updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · $name · 영상을 준비하는 중…", progress = null) }
-                    val file = File(directory, "source-$index.${name.substringAfterLast('.', "mp4")}")
+                    val isImage = com.armsone.nasfinder.model.RemoteFileItem(name, name, name, false).isImage
+                    updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · $name · ${if (isImage) "이미지" else "영상"}를 준비하는 중…", progress = null) }
+                    val file = File(directory, "source-$index.${name.substringAfterLast('.', if (isImage) "jpg" else "mp4")}")
                     stage(index, file)
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                    updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · 좋은 장면을 고르는 중…", progress = null) }
-                    val metadata = withContext(Dispatchers.IO) {
-                        val reader = android.media.MediaMetadataRetriever()
-                        try {
-                            reader.setDataSource(file.absolutePath)
-                            val duration = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
-                            check(duration.isFinite() && duration > 0 && reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes") { "분석할 수 있는 영상이 아닙니다: $name" }
-                            var width = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1920
-                            var height = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1080
-                            val rotation = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                            if (rotation % 180 != 0) { val old = width; width = height; height = old }
-                            val thumbnail = if (android.os.Build.VERSION.SDK_INT >= 27) reader.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 180, 180)
-                            else reader.getFrameAtTime(0)?.let { original ->
-                                android.graphics.Bitmap.createScaledBitmap(original, 180, 180, true).also { if (it !== original) original.recycle() }
-                            }
-                            Pair(Triple(duration, width, height), thumbnail)
-                        } finally { reader.release() }
+                    if (!isMusicOverlayMode) {
+                        updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · 한양이 장면을 고르는 중…", progress = null) }
                     }
-                    val analysis = AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first.first, (metadata.first.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
-                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                    sources += TrailerSource(index, name, file, metadata.first.first, metadata.first.second, metadata.first.third, analysis, metadata.second)
-                    updateTrailer(directory) { it.copy(sources = sources.toList()) }
+                    val decodedResult = withContext(Dispatchers.IO) {
+                        try {
+                            if (isImage) {
+                                val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                android.graphics.BitmapFactory.decodeFile(file.absolutePath, options)
+                                var width = options.outWidth
+                                var height = options.outHeight
+                                if (width <= 0 || height <= 0) {
+                                    val decoded = android.graphics.BitmapFactory.decodeFile(file.absolutePath)
+                                    checkNotNull(decoded) { "분석할 수 있는 이미지가 아닙니다: $name" }
+                                    width = decoded.width
+                                    height = decoded.height
+                                    decoded.recycle()
+                                }
+                                var parsedCaptureTime = captureTimes.getOrNull(index) ?: 0L
+                                runCatching {
+                                    val exif = androidx.exifinterface.media.ExifInterface(file.absolutePath)
+                                    val orientation = exif.getAttributeInt(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL)
+                                    if (orientation == androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 || orientation == androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270) {
+                                        val tmp = width; width = height; height = tmp
+                                    }
+                                    if (parsedCaptureTime <= 0L) {
+                                        val dateStr = exif.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL)
+                                            ?: exif.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME)
+                                        if (dateStr != null) {
+                                            val format = java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", java.util.Locale.US)
+                                            format.parse(dateStr)?.time?.let { parsedCaptureTime = it }
+                                        }
+                                    }
+                                }
+                                val thumbOptions = android.graphics.BitmapFactory.Options().apply {
+                                    inSampleSize = maxOf(1, maxOf(width, height) / 180)
+                                }
+                                val rawThumb = android.graphics.BitmapFactory.decodeFile(file.absolutePath, thumbOptions)
+                                val thumb = rawThumb?.let { original ->
+                                    android.graphics.Bitmap.createScaledBitmap(original, 180, 180, true).also { if (it !== original) original.recycle() }
+                                }
+                                checkNotNull(thumb) { "이미지 썸네일을 생성할 수 없습니다: $name" }
+                                Triple(Triple(0.0, width, height), thumb, parsedCaptureTime)
+                            } else {
+                                val reader = android.media.MediaMetadataRetriever()
+                                try {
+                                    reader.setDataSource(file.absolutePath)
+                                    val duration = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
+                                    check(duration.isFinite() && duration > 0 && reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes") { "분석할 수 있는 영상이 아닙니다: $name" }
+                                    var width = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1920
+                                    var height = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1080
+                                    val rotation = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                                    if (rotation % 180 != 0) { val old = width; width = height; height = old }
+
+                                    var parsedCaptureTime = captureTimes.getOrNull(index) ?: 0L
+                                    if (parsedCaptureTime <= 0L) {
+                                        reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE)?.let { dateStr ->
+                                            val formats = listOf(
+                                                java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss.SSS'Z'", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") },
+                                                java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") },
+                                                java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US),
+                                            )
+                                            for (fmt in formats) {
+                                                val parsed = runCatching { fmt.parse(dateStr) }.getOrNull()
+                                                if (parsed != null) {
+                                                    parsedCaptureTime = parsed.time
+                                                    break
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Verify video track and decoder support using MediaExtractor / MediaCodecList
+                                    val extractor = android.media.MediaExtractor()
+                                    try {
+                                        extractor.setDataSource(file.absolutePath)
+                                        var hasSupportedVideoTrack = false
+                                        for (trackIndex in 0 until extractor.trackCount) {
+                                            val format = extractor.getTrackFormat(trackIndex)
+                                            val mime = format.getString(android.media.MediaFormat.KEY_MIME).orEmpty()
+                                            if (mime.startsWith("video/")) {
+                                                val codecList = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+                                                if (codecList.findDecoderForFormat(format) != null) {
+                                                    hasSupportedVideoTrack = true
+                                                    break
+                                                }
+                                            }
+                                        }
+                                        check(hasSupportedVideoTrack) { "디코더를 지원하지 않는 비디오 형식입니다: $name" }
+                                    } finally {
+                                        extractor.release()
+                                    }
+
+                                    val thumb = if (android.os.Build.VERSION.SDK_INT >= 27) reader.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 180, 180)
+                                    else reader.getFrameAtTime(0)?.let { original ->
+                                        android.graphics.Bitmap.createScaledBitmap(original, 180, 180, true).also { if (it !== original) original.recycle() }
+                                    }
+                                    checkNotNull(thumb) { "영상 프레임을 추출할 수 없습니다: $name" }
+                                    Triple(Triple(duration, width, height), thumb, parsedCaptureTime)
+                                } finally { reader.release() }
+                            }
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                    if (decodedResult == null) {
+                        undecodableCount++
+                        file.delete()
+                    } else {
+                        val (metadata, thumbnail, capTime) = decodedResult
+                        val analysis = if (isImage || isMusicOverlayMode) {
+                            // "영상에 음악 입히기" keeps whole original clips (musicOverlayScenes ignores
+                            // highlight data), and ducking at export reads raw PCM independently
+                            // (TrailerExporter/AutoDuckingAudioProcessor), so skip the costly HanYang
+                            // highlight analysis here.
+                            AudioAnalysisResult(
+                                waveform = emptyList(),
+                                peakTimeSeconds = 0.0,
+                                peakTimesSeconds = listOf(0.0),
+                                audioAvailability = ClipAudioAvailability.NoTrack,
+                                highlightSource = ClipHighlightSource.Fallback
+                            )
+                        } else {
+                            AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first, (metadata.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
+                        }
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        val sourceIndex = sources.size
+                        sources += TrailerSource(sourceIndex, name, file, metadata.first, metadata.second, metadata.third, analysis, thumbnail, isImage = isImage, captureTimeMillis = capTime)
+                        updateTrailer(directory) { it.copy(sources = sources.toList()) }
+                    }
                 }
-                val lengths = sources.map { it.recommendedLength }.sorted()
-                val length = minOf(sources.minOf { it.duration }, lengths[lengths.size / 2])
-                updateTrailer(directory) { it.copy(sources = sources, total = sources.sumOf { source -> source.recommendedTotal }, clipLength = length, format = TrailerFormat.closest(sources.first().width, sources.first().height), busy = false) }
+                if (sources.isEmpty()) {
+                    val totalSkipped = initialExcludedCount + undecodableCount
+                    val err = if (totalSkipped > 0) "사용 가능한 사진이나 영상이 없습니다 (지원되지 않거나 손상된 ${totalSkipped}개 제외)."
+                    else "사용 가능한 사진이나 영상이 없습니다."
+                    updateTrailer(directory) { it.copy(busy = false, error = err, progress = null) }
+                    return@launch
+                }
+                // Sort sources by default chronological oldest first (captureTimeMillis > 0 first, then by name)
+                val sortedSources = sources.sortedWith(
+                    compareBy<TrailerSource> { if (it.captureTimeMillis > 0L) it.captureTimeMillis else Long.MAX_VALUE }
+                        .thenBy { it.name }
+                ).mapIndexed { newIndex, src -> src.copy(id = newIndex) }
+
+                val lengths = sortedSources.map { it.recommendedLength }.sorted()
+                val videoDurations = sortedSources.filter { !it.isImage }.map { it.duration }
+                val minVideoDuration = videoDurations.minOrNull() ?: 4.0
+                val length = if (isMusicOverlayMode) {
+                    minVideoDuration.coerceAtLeast(1.0)
+                } else {
+                    minOf(minVideoDuration, lengths[lengths.size / 2]).coerceAtLeast(1.0)
+                }
+                val hasVideos = sortedSources.any { !it.isImage }
+                val photoLength = defaultPhotoClipLength(length, hasVideos)
+                val totalExcluded = initialExcludedCount + undecodableCount
+                val initialTotal = sortedSources.sumOf { if (it.isImage) photoLength else it.recommendedLength }
+                val statusMessage = if (isMusicOverlayMode) {
+                    "음악을 선택해 주세요."
+                } else if (totalExcluded > 0) {
+                    "장면을 분석했습니다 (${totalExcluded}개 제외됨). 설정을 확인해 주세요."
+                } else {
+                    "장면을 분석했습니다. 설정을 확인해 주세요."
+                }
+                updateTrailer(directory) {
+                    it.copy(
+                        status = statusMessage,
+                        sources = sortedSources,
+                        total = initialTotal,
+                        clipLength = length,
+                        photoClipLength = photoLength,
+                        format = TrailerFormat.closest(sortedSources.first().width, sortedSources.first().height),
+                        busy = false,
+                        isMusicOverlayMode = isMusicOverlayMode,
+                        musicTrack = initialMusicTrack,
+                        musicPolicy = initialMusicPolicy,
+                        awaitingInitialSettings = true,
+                    )
+                }
                 trailerJob = null
-                regenerateTrailer(sources.map { it.id }, sources.sumOf { it.recommendedTotal }, length, TrailerFormat.closest(sources.first().width, sources.first().height))
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "예고편을 만들지 못했습니다.", progress = null) } }
         }
     }
 
-    fun regenerateTrailer(order: List<Int>, total: Double, length: Double, format: TrailerFormat) {
+    fun regenerateTrailer(
+        order: List<Int>,
+        total: Double,
+        length: Double,
+        photoLength: Double = defaultPhotoClipLength(length),
+        format: TrailerFormat,
+        musicTrack: TrailerMusicTrack? = _state.value.trailer?.musicTrack,
+        musicPolicy: TrailerMusicPolicy = _state.value.trailer?.musicPolicy ?: TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        autoDucking: Boolean = _state.value.trailer?.autoDucking ?: true,
+    ) {
         val session = _state.value.trailer ?: return
-        if (session.busy || order.size != session.sources.size || order.toSet() != session.sources.map { it.id }.toSet()) return
+        if (session.busy) return
         val directory = session.directory
-        val sources = order.map { id -> session.sources.first { it.id == id } }
-        val scenes = trailerScenes(sources, total, length)
+        val existingMap = session.sources.associateBy { it.id }
+        if (order.isEmpty()) {
+            updateTrailer(directory) { it.copy(error = "예고편에 포함할 미디어를 선택해 주세요.") }
+            return
+        }
+        if (order.size != order.toSet().size || !order.all { existingMap.containsKey(it) }) {
+            updateTrailer(directory) { it.copy(error = "선택한 미디어 목록이 올바르지 않습니다.") }
+            return
+        }
+        val sources = order.mapNotNull { existingMap[it] }
+        val scenes = if (session.isMusicOverlayMode) {
+            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy)
+        } else {
+            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy)
+        }
         if (scenes.isEmpty()) {
             updateTrailer(directory) { it.copy(error = "이 장면 길이로 만들 수 없습니다. 장면 길이를 줄여 주세요.") }; return
         }
-        _state.update { it.copy(trailer = session.copy(sources = sources, total = total, clipLength = length, format = format, busy = true, status = "선택한 장면을 이어 붙이는 중…", error = null, progress = null)) }
+        _state.update {
+            it.copy(
+                trailer = session.copy(
+                    sources = sources,
+                    total = total,
+                    clipLength = length,
+                    photoClipLength = photoLength,
+                    format = format,
+                    musicTrack = musicTrack,
+                    musicPolicy = musicPolicy,
+                    autoDucking = autoDucking,
+                    awaitingInitialSettings = false,
+                    busy = true,
+                    status = "선택한 장면을 이어 붙이는 중…",
+                    error = null,
+                    progress = null,
+                )
+            )
+        }
         trailerJob = viewModelScope.launch {
             val output = File(session.directory, "trailer-${UUID.randomUUID()}.mp4")
             try {
-                TrailerExporter.export(application, scenes, format, output) { progress ->
-                    updateTrailer(directory) { it.copy(progress = progress) }
+                TrailerExporter.export(
+                    context = application,
+                    scenes = scenes,
+                    format = format,
+                    destination = output,
+                    musicTrack = musicTrack,
+                    musicPolicy = musicPolicy,
+                    autoDucking = autoDucking,
+                ) { status, progress ->
+                    updateTrailer(directory) { it.copy(status = status, progress = progress) }
                 }
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 updateTrailer(directory) { it.copy(output = output, busy = false, progress = null, saved = false) }
@@ -2828,7 +3647,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun retryTrailer() {
         val session = _state.value.trailer ?: return
-        if (session.output != null) regenerateTrailer(session.sources.map { it.id }, session.total, session.clipLength, session.format)
+        if (session.output != null) regenerateTrailer(
+            session.sources.map { it.id },
+            session.total,
+            session.clipLength,
+            session.photoClipLength,
+            session.format,
+            session.musicTrack,
+            session.musicPolicy,
+            session.autoDucking,
+        )
         else trailerRetry?.invoke()
     }
 
@@ -2998,6 +3826,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     byteCount = record.byteCount,
                     importedAt = record.importedAt,
                     file = inboxStore.file(record),
+                    relativePath = record.storedFilename,
                 )
             }.getOrNull()
         }
@@ -3016,6 +3845,69 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         check(candidate.parentFile == root) { "안전하지 않은 임시 파일 경로입니다." }
         return candidate
+    }
+
+    fun loadPhoneHardFolder(subpath: String? = null): List<com.armsone.nasfinder.data.PhoneHardItem> {
+        return runCatching {
+            inboxStore.listPhoneHardFolder(subpath)
+        }.getOrElse { emptyList() }
+    }
+
+    fun createPhoneHardFolder(name: String, parentSubdirectory: String?, onResult: (Boolean, String?) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                inboxStore.createFolder(name, parentSubdirectory)
+            }
+            withContext(Dispatchers.Main) {
+                if (result.isSuccess) {
+                    refreshInbox()
+                    onResult(true, null)
+                } else {
+                    onResult(false, result.exceptionOrNull()?.message ?: "폴더 생성에 실패했습니다.")
+                }
+            }
+        }
+    }
+
+    fun movePhoneHardTargets(
+        targets: List<com.armsone.nasfinder.data.PhoneHardTarget>,
+        destinationSubdirectory: String?,
+        onResult: (com.armsone.nasfinder.data.PhoneHardOperationResult) -> Unit,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = inboxStore.moveTargets(targets, destinationSubdirectory)
+            withContext(Dispatchers.Main) {
+                refreshInbox()
+                onResult(res)
+            }
+        }
+    }
+
+    fun copyPhoneHardTargets(
+        targets: List<com.armsone.nasfinder.data.PhoneHardTarget>,
+        destinationSubdirectory: String?,
+        onResult: (com.armsone.nasfinder.data.PhoneHardOperationResult) -> Unit,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = inboxStore.copyTargets(targets, destinationSubdirectory)
+            withContext(Dispatchers.Main) {
+                refreshInbox()
+                onResult(res)
+            }
+        }
+    }
+
+    fun deletePhoneHardTargets(
+        targets: List<com.armsone.nasfinder.data.PhoneHardTarget>,
+        onResult: (com.armsone.nasfinder.data.PhoneHardOperationResult) -> Unit,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = inboxStore.deleteTargets(targets)
+            withContext(Dispatchers.Main) {
+                refreshInbox()
+                onResult(res)
+            }
+        }
     }
 
     override fun onCleared() {

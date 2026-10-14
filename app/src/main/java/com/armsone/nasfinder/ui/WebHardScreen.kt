@@ -160,6 +160,8 @@ internal fun PhoneHardConnectionPanel(
         OutlinedTextFieldDefaults.colors()
     }
 
+    var serverExpanded by rememberSaveable { mutableStateOf(false) }
+
     val content: @Composable () -> Unit = {
         Column(
             Modifier.fillMaxWidth().padding(if (enamel) 14.dp else 12.dp),
@@ -168,6 +170,7 @@ internal fun PhoneHardConnectionPanel(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(if (enamel) 9.dp else 10.dp),
+                modifier = Modifier.fillMaxWidth().clickable { serverExpanded = !serverExpanded },
             ) {
                 if (enamel) {
                     PhoneHardMark(28.dp)
@@ -182,69 +185,90 @@ internal fun PhoneHardConnectionPanel(
                     fontWeight = if (enamel) FontWeight.Bold else FontWeight.SemiBold,
                     color = if (enamel) BkPanelCharcoal else Color.Unspecified,
                 )
+                if (connection.server != null) {
+                    Surface(
+                        color = (if (enamel) Color(0xFF2E7D32) else MaterialTheme.colorScheme.primary).copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(6.dp),
+                    ) {
+                        Text(
+                            "실행 중",
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (enamel) Color(0xFF1B5E20) else MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                }
                 Spacer(Modifier.weight(1f))
-                if (enamel) {
+                if (serverExpanded && enamel) {
                     PhoneHardRefreshButton(
                         onClick = connection::refreshAddresses,
                         enabled = connection.server == null,
                     )
                 }
+                Icon(
+                    if (serverExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (serverExpanded) "접기" else "펼치기",
+                    tint = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
-            if (enamel) {
-                PhoneHardBkAddressRow(connection, largeFont)
-            } else {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().heightIn(min = addressHeight).padding(start = 12.dp, end = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+            if (serverExpanded) {
+                if (enamel) {
+                    PhoneHardBkAddressRow(connection, largeFont)
+                } else {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(10.dp),
                     ) {
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                            Text(
-                                "접속 주소",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                connection.selectedAddress?.hostAddress ?: "사용 가능한 접속 주소가 없습니다",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
-                            Icon(Icons.Default.Refresh, "접속 주소 새로고침")
+                        Row(
+                            Modifier.fillMaxWidth().heightIn(min = addressHeight).padding(start = 12.dp, end = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                Text(
+                                    "접속 주소",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    connection.selectedAddress?.hostAddress ?: "사용 가능한 접속 주소가 없습니다",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(onClick = connection::refreshAddresses, enabled = connection.server == null) {
+                                Icon(Icons.Default.Refresh, "접속 주소 새로고침")
+                            }
                         }
                     }
                 }
-            }
 
-            if (passwordExpanded) {
-                PhoneHardPasswordField(connection, Modifier.fillMaxWidth().height(fieldHeight), fieldColors, enamel)
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                PhoneHardPasswordButton(
-                    expanded = passwordExpanded,
-                    enamel = enamel,
-                    onClick = { passwordExpanded = !passwordExpanded },
-                    modifier = Modifier.weight(1f).height(fieldHeight),
-                )
-                PhoneHardConnectionButton(connection, enamel, Modifier.weight(1f).height(fieldHeight))
-            }
-
-            if (!enamel && connection.server != null && connection.selectedAddress != null) {
-                androidx.compose.foundation.text.selection.SelectionContainer {
-                    Text(
-                        "http://${connection.selectedAddress!!.hostAddress}:${connection.port}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.primary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                if (passwordExpanded) {
+                    PhoneHardPasswordField(connection, Modifier.fillMaxWidth().height(fieldHeight), fieldColors, enamel)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PhoneHardPasswordButton(
+                        expanded = passwordExpanded,
+                        enamel = enamel,
+                        onClick = { passwordExpanded = !passwordExpanded },
+                        modifier = Modifier.weight(1f).height(fieldHeight),
                     )
+                    PhoneHardConnectionButton(connection, enamel, Modifier.weight(1f).height(fieldHeight))
+                }
+
+                if (!enamel && connection.server != null && connection.selectedAddress != null) {
+                    androidx.compose.foundation.text.selection.SelectionContainer {
+                        Text(
+                            "http://${connection.selectedAddress!!.hostAddress}:${connection.port}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (enamel) BkPanelCharcoal else MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
         }
@@ -841,6 +865,7 @@ private fun WebHardArtwork(
                 contentDescription = contentDescription,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop,
+                isFolderCover = item.isDirectory,
             )
         }
             ?: Icon(if (item.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null, modifier = Modifier.fillMaxSize(.48f), tint = if (item.isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)

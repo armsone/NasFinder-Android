@@ -76,6 +76,51 @@ import java.util.UUID
 
 private const val MAX_WEB_DOWNLOAD_BYTES = 512L * 1024L * 1024L
 private const val MAX_WEB_DOWNLOAD_REDIRECTS = 8
+private val MUSIC_FILE_EXTENSIONS = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma")
+
+private fun hasMusicExtension(url: String): Boolean {
+    val withoutQuery = url.substringBefore('?').substringBefore('#')
+    val ext = withoutQuery.substringAfterLast('.', "").lowercase()
+    return ext in MUSIC_FILE_EXTENSIONS
+}
+
+private const val MUSIC_RESCAN_DEBOUNCE_MILLIS = 700L
+private const val MAX_MUSIC_RESCANS_PER_PAGE = 6
+
+private fun isAudioResponse(url: String, mimeType: String?, contentDisposition: String?): Boolean {
+    if (hasMusicExtension(url)) return true
+    val normalizedMime = mimeType?.substringBefore(';')?.trim()
+    if (normalizedMime != null && normalizedMime.startsWith("audio/", ignoreCase = true)) return true
+    val guessedName = runCatching { URLUtil.guessFileName(url, contentDisposition, mimeType) }.getOrNull()
+    return guessedName != null && hasMusicExtension(guessedName)
+}
+
+private const val MUSIC_SCAN_JS = """
+(function(){
+  try {
+    var audio = [];
+    document.querySelectorAll('audio').forEach(function(a){ var s = a.currentSrc || a.src; if (s) audio.push(s); });
+    document.querySelectorAll('audio source').forEach(function(s){ if (s.src) audio.push(s.src); });
+    var links = [];
+    document.querySelectorAll('a[href]').forEach(function(l){ if (l.href) links.push(l.href); });
+    return JSON.stringify({audio: audio, links: links});
+  } catch (e) { return '{"audio":[],"links":[]}'; }
+})()
+"""
+
+private fun parseMusicScanResult(rawEvaluateJavascriptResult: String?): List<String> {
+    if (rawEvaluateJavascriptResult.isNullOrBlank()) return emptyList()
+    return runCatching {
+        // evaluateJavascript() returns the JS string result JSON-encoded (quoted/escaped); unwrap it first.
+        val decoded = org.json.JSONArray("[$rawEvaluateJavascriptResult]").getString(0)
+        val obj = org.json.JSONObject(decoded)
+        val audio = obj.optJSONArray("audio")?.let { arr -> (0 until arr.length()).mapNotNull { arr.optString(it, null) } }.orEmpty()
+            .filter { it.startsWith("http://") || it.startsWith("https://") }
+        val links = obj.optJSONArray("links")?.let { arr -> (0 until arr.length()).mapNotNull { arr.optString(it, null) } }.orEmpty()
+            .filter { (it.startsWith("http://") || it.startsWith("https://")) && hasMusicExtension(it) }
+        (audio + links).distinct()
+    }.getOrDefault(emptyList())
+}
 
 private data class ActiveWebDownload(val filename: String, val received: Long, val total: Long?)
 private data class PendingWebDownload(val file: File, val filename: String, val mimeType: String?)
@@ -362,6 +407,7 @@ fun WebBrowserScreen(
     connections: List<RemoteConnection> = emptyList(),
     preferredConnectionId: String? = null,
     resumedDownload: PendingLocalUpload? = null,
+    trailerActive: Boolean = false,
     onClose: () -> Unit,
     onToggleFavorite: (title: String, url: String) -> Unit,
     onSetHomepage: (BrowserFavorite) -> Unit,
@@ -398,6 +444,14 @@ fun WebBrowserScreen(
     var chooseNetworkConnection by remember { mutableStateOf(false) }
     var shortcut by remember { mutableStateOf<WebShortcut?>(null) }
     var fullscreenContent by remember { mutableStateOf<BrowserFullscreenContent?>(null) }
+    var musicCandidates by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showMusicCandidates by remember { mutableStateOf(false) }
+    var musicDownloadIntent by remember { mutableStateOf(false) }
+    var musicSavedNotice by remember { mutableStateOf(false) }
+    var musicScanToken by remember { mutableIntStateOf(0) }
+    var musicScanCount by remember { mutableIntStateOf(0) }
+    val musicScanHandler = remember { Handler(Looper.getMainLooper()) }
+    val musicRescanRunnableRef = remember { arrayOfNulls<Runnable>(1) }
     val latestFullscreenContent by rememberUpdatedState(fullscreenContent)
     val lifecycleOwner = LocalLifecycleOwner.current
     val normalizedAddress = BrowserUrlPolicy.normalize(address)
@@ -443,6 +497,28 @@ fun WebBrowserScreen(
             activeDownload = null
             downloadJob = null
         }
+    }
+
+    fun cancelMusicRescan() {
+        musicRescanRunnableRef[0]?.let(musicScanHandler::removeCallbacks)
+        musicRescanRunnableRef[0] = null
+    }
+
+    fun scheduleMusicRescan(view: WebView, token: Int) {
+        if (token != musicScanToken || musicScanCount >= MAX_MUSIC_RESCANS_PER_PAGE) return
+        musicRescanRunnableRef[0]?.let(musicScanHandler::removeCallbacks)
+        val runnable = Runnable {
+            if (token != musicScanToken) return@Runnable
+            musicScanCount++
+            view.evaluateJavascript(MUSIC_SCAN_JS) { raw ->
+                if (token == musicScanToken) {
+                    val found = parseMusicScanResult(raw)
+                    if (found.isNotEmpty()) musicCandidates = (musicCandidates + found).distinct()
+                }
+            }
+        }
+        musicRescanRunnableRef[0] = runnable
+        musicScanHandler.postDelayed(runnable, MUSIC_RESCAN_DEBOUNCE_MILLIS)
     }
 
     fun navigate() {
@@ -510,6 +586,7 @@ fun WebBrowserScreen(
             latestDownloadJob?.cancel()
             latestPendingDownload?.file?.takeUnless { it == handedOffFile }
                 ?.let { cleanupLocalWebDownload(context.cacheDir, it) }
+            cancelMusicRescan()
         }
     }
 
@@ -615,17 +692,30 @@ fun WebBrowserScreen(
                         }
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             loading = true
+                            musicCandidates = emptyList()
+                            musicScanCount = 0
+                            musicScanToken++
+                            cancelMusicRescan()
                             url?.let { address = it }
                         }
                         override fun onPageFinished(view: WebView?, url: String?) {
                             loading = false
                             canGoBack = view?.canGoBack() == true
                             url?.let { address = it }
+                            val directCandidate = url?.takeIf { hasMusicExtension(it) }
+                            if (directCandidate != null) musicCandidates = (musicCandidates + directCandidate).distinct()
+                            view?.let { scheduleMusicRescan(it, musicScanToken) }
+                        }
+                        override fun onLoadResource(view: WebView?, url: String?) {
+                            if (view != null) scheduleMusicRescan(view, musicScanToken)
                         }
                     }
                     setDownloadListener { url, agent, disposition, mime, length ->
-                        if (url.isNullOrBlank()) error = "다운로드 주소가 없습니다."
-                        else startDownload(url, agent, disposition, mime, length)
+                        when {
+                            url.isNullOrBlank() -> error = "다운로드 주소가 없습니다."
+                            isAudioResponse(url, mime, disposition) -> musicCandidates = (musicCandidates + url).distinct()
+                            else -> startDownload(url, agent, disposition, mime, length)
+                        }
                     }
                     setOnLongClickListener { view ->
                         val hit = (view as WebView).hitTestResult
@@ -686,6 +776,21 @@ fun WebBrowserScreen(
                 }
             }
         }
+        if (musicCandidates.isNotEmpty() && activeDownload == null) {
+            Surface(
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary,
+                shadowElevation = 4.dp,
+                onClick = { showMusicCandidates = true },
+            ) {
+                Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.onPrimary)
+                    Spacer(Modifier.width(6.dp))
+                    Text("음악 다운로드", color = MaterialTheme.colorScheme.onPrimary)
+                }
+            }
+        }
         }
     }
 
@@ -696,6 +801,7 @@ fun WebBrowserScreen(
                     if (downloaded.file == handedOffFile) onDiscardDownloadedFile(downloaded.file)
                     else cleanupLocalWebDownload(context.cacheDir, downloaded.file)
                     pendingDownload = null
+                    musicDownloadIntent = false
                 }
             },
             title = { Text("어디에 저장할까요?") },
@@ -706,9 +812,15 @@ fun WebBrowserScreen(
                         enabled = !downloadActionInFlight,
                         onClick = {
                             downloadActionInFlight = true
+                            val wasMusicDownload = musicDownloadIntent
                             scope.launch {
                                 val saved = onSaveDownloadedFile(downloaded.file, downloaded.filename, downloaded.mimeType)
-                                if (saved) { handedOffFile = null; pendingDownload = null }
+                                if (saved) {
+                                    handedOffFile = null
+                                    pendingDownload = null
+                                    if (wasMusicDownload && trailerActive) musicSavedNotice = true
+                                }
+                                musicDownloadIntent = false
                                 downloadActionInFlight = false
                             }
                         },
@@ -724,6 +836,7 @@ fun WebBrowserScreen(
                             else cleanupLocalWebDownload(context.cacheDir, downloaded.file)
                             handedOffFile = null
                             pendingDownload = null
+                            musicDownloadIntent = false
                         },
                     ) { Text("취소") }
                 }
@@ -761,6 +874,7 @@ fun WebBrowserScreen(
                                         handedOffFile = downloaded.file
                                         pendingDownload = null
                                         chooseNetworkConnection = false
+                                        musicDownloadIntent = false
                                     }
                                     downloadActionInFlight = false
                                 }
@@ -778,8 +892,48 @@ fun WebBrowserScreen(
             },
         )
     }
+    if (showMusicCandidates) {
+        AlertDialog(
+            onDismissRequest = { showMusicCandidates = false },
+            title = { Text("음악 다운로드") },
+            text = {
+                LazyColumn(Modifier.heightIn(max = 320.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(musicCandidates) { url ->
+                        ListItem(
+                            headlineContent = {
+                                val displayName = android.net.Uri.parse(url).lastPathSegment?.ifBlank { null } ?: "음악 파일"
+                                Text(displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            },
+                            leadingContent = { Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.primary) },
+                            modifier = Modifier.clickable {
+                                showMusicCandidates = false
+                                musicDownloadIntent = true
+                                startDownload(url)
+                            },
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMusicCandidates = false }) { Text("닫기") }
+            },
+        )
+    }
+    if (musicSavedNotice) {
+        AlertDialog(
+            onDismissRequest = { musicSavedNotice = false },
+            title = { Text("음악을 받았습니다") },
+            text = { Text("폰하드(Music 폴더)에 저장했습니다. 예고편 편집으로 돌아가 배경 음악으로 선택할 수 있습니다.") },
+            confirmButton = {
+                TextButton(onClick = { musicSavedNotice = false; onClose() }) { Text("에디터로 돌아가기") }
+            },
+            dismissButton = {
+                TextButton(onClick = { musicSavedNotice = false }) { Text("계속 둘러보기") }
+            },
+        )
+    }
     shortcut?.let { selected ->
-        ModalBottomSheet(onDismissRequest = { shortcut = null }) {
+        ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = { shortcut = null }) {
             Text(
                 if (selected.isImage) "이미지 메뉴" else "링크 메뉴",
                 style = MaterialTheme.typography.titleLarge,
@@ -839,7 +993,7 @@ fun WebBrowserScreen(
         )
     }
     if (showFavorites) {
-        ModalBottomSheet(onDismissRequest = { showFavorites = false }) {
+        ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = { showFavorites = false }) {
             Text(
                 "즐겨찾기",
                 style = MaterialTheme.typography.titleLarge,

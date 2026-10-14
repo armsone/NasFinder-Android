@@ -69,6 +69,7 @@ data class RemoteFileItem(
     private val normalizedMimeType: String get() = mimeType.orEmpty().substringBefore(';').trim().lowercase(Locale.ROOT)
     val isImage: Boolean get() = normalizedMimeType.startsWith("image/") || extension in IMAGE_EXTENSIONS
     val isVideo: Boolean get() = normalizedMimeType.startsWith("video/") || extension in VIDEO_EXTENSIONS
+    val isAudio: Boolean get() = normalizedMimeType.startsWith("audio/") || extension in AUDIO_EXTENSIONS
     val isPdf: Boolean get() = normalizedMimeType == "application/pdf" || extension == "pdf"
 
     private companion object {
@@ -79,6 +80,9 @@ data class RemoteFileItem(
         val VIDEO_EXTENSIONS = setOf(
             "3g2", "3gp", "asf", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mpe",
             "mpeg", "mpg", "mp4", "mts", "ogv", "qt", "ts", "vob", "webm", "wmv",
+        )
+        val AUDIO_EXTENSIONS = setOf(
+            "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aiff", "aif"
         )
     }
 }

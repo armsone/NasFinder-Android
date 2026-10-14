@@ -119,8 +119,10 @@ internal fun SkinAwareThumbnailImage(
     contentDescription: String?,
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
-    appliesDisplayBlur: Boolean = true,
+    isFolderCover: Boolean = false,
+    appliesDisplayBlur: Boolean = isFolderCover,
 ) {
+    val effectiveAppliesBlur = isFolderCover || appliesDisplayBlur
     val effectiveIdentity = ThumbnailSkinToneCacheIdentity.effective(
         cacheIdentity,
         bitmap.width,
@@ -128,12 +130,12 @@ internal fun SkinAwareThumbnailImage(
         bitmap.generationId,
     )
     val shouldBlur by produceState<Boolean?>(
-        initialValue = if (appliesDisplayBlur) thumbnailSkinToneCache.cached(effectiveIdentity) else false,
+        initialValue = if (effectiveAppliesBlur) thumbnailSkinToneCache.cached(effectiveIdentity) else false,
         key1 = effectiveIdentity,
         key2 = bitmap,
-        key3 = appliesDisplayBlur,
+        key3 = effectiveAppliesBlur,
     ) {
-        value = if (appliesDisplayBlur) {
+        value = if (effectiveAppliesBlur) {
             withContext(Dispatchers.Default) {
                 thumbnailSkinToneCache.getOrClassify(effectiveIdentity) {
                     ThumbnailSkinTonePolicy.shouldBlur(bitmap)

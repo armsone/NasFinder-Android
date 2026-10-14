@@ -1,10 +1,18 @@
 package com.armsone.nasfinder.ui
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Matrix as AndroidMatrix
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import androidx.exifinterface.media.ExifInterface
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
@@ -12,30 +20,224 @@ import androidx.media3.effect.Presentation
 import androidx.media3.transformer.*
 import kotlinx.coroutines.*
 import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
+import kotlin.math.min
+
+import android.opengl.Matrix
+import androidx.media3.effect.GlMatrixTransformation
+import java.util.Random
+
+// Ken Burns transformation for image clips: random zoom 1.0->1.1 or 1.1->1.0 with a fixed focal point sampled once per clip.
+@androidx.annotation.OptIn(UnstableApi::class)
+private class ImageKenBurnsTransformation(
+    private val zoomIn: Boolean,
+    private val focalX: Float,
+    private val focalY: Float,
+    private val durationUs: Long,
+) : GlMatrixTransformation {
+    private var baseTimeUs: Long = -1L
+
+    override fun getGlMatrixArray(presentationTimeUs: Long): FloatArray {
+        if (baseTimeUs < 0L) {
+            baseTimeUs = presentationTimeUs
+        }
+        val elapsedUs = (presentationTimeUs - baseTimeUs).coerceAtLeast(0L)
+        val progress = if (durationUs > 0) (elapsedUs.toFloat() / durationUs).coerceIn(0f, 1f) else 0f
+        val currentZoom = if (zoomIn) 1.0f + 0.10f * progress else 1.10f - 0.10f * progress
+        val maxShiftX = (currentZoom - 1f) / currentZoom
+        val maxShiftY = (currentZoom - 1f) / currentZoom
+        val translateX = focalX * maxShiftX
+        val translateY = focalY * maxShiftY
+
+        val glMatrix = FloatArray(16)
+        Matrix.setIdentityM(glMatrix, 0)
+        Matrix.translateM(glMatrix, 0, translateX, translateY, 0f)
+        Matrix.scaleM(glMatrix, 0, currentZoom, currentZoom, 1f)
+        return glMatrix
+    }
+}
 
 // HanClip's composition, crop presentation and cancellation/export validation path.
 @androidx.annotation.OptIn(UnstableApi::class)
 internal object TrailerExporter {
-    suspend fun export(context: Context, scenes: List<TrailerScene>, format: TrailerFormat, destination: File, progress: (Float) -> Unit): File = withContext(Dispatchers.Main.immediate) {
+    suspend fun export(
+        context: Context,
+        scenes: List<TrailerScene>,
+        format: TrailerFormat,
+        destination: File,
+        musicTrack: TrailerMusicTrack? = null,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        autoDucking: Boolean = true,
+        progress: (status: String, progress: Float?) -> Unit,
+    ): File = withContext(Dispatchers.Main.immediate) {
         require(scenes.isNotEmpty()) { "이 장면 길이로 만들 수 있는 영상이 없습니다. 장면 길이를 줄여 주세요." }
-        val edited = scenes.map { scene ->
-            val input = MediaItem.Builder().setUri(Uri.fromFile(scene.source.file))
-                .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs((scene.start * 1000).toLong())
-                    .setEndPositionMs(((scene.start + scene.length) * 1000).toLong()).build()).build()
-            EditedMediaItem.Builder(input).setFrameRate(30)
-                .setEffects(Effects(emptyList(), listOf(Presentation.createForWidthAndHeight(format.width, format.height, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP))))
-                .build()
+        val totalClips = scenes.size
+        val random = Random()
+        val presentation = Presentation.createForWidthAndHeight(format.width, format.height, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)
+
+        // Preprocess images at 60% resolution of output dimensions (even dimensions >= 2)
+        val targetWidth = ((kotlin.math.round(format.width * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
+        val targetHeight = ((kotlin.math.round(format.height * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
+        val tempImages = mutableListOf<File>()
+
+        val edited = try {
+            withContext(Dispatchers.IO) {
+                val preprocessedBySource = mutableMapOf<Int, File>()
+                scenes.mapIndexed { index, scene ->
+                    val clipIndex = index + 1
+                    withContext(Dispatchers.Main) {
+                        progress("${clipIndex}/${totalClips}개 클립 연결 준비 중…", clipIndex.toFloat() / totalClips)
+                    }
+                    if (scene.source.isImage) {
+                        val preprocessedFile = preprocessedBySource.getOrPut(scene.source.id) {
+                            val tempFile = File(destination.parentFile ?: context.cacheDir, "preprocessed-${scene.source.id}-${UUID.randomUUID()}.jpg")
+                            tempImages.add(tempFile)
+                            preprocessImage(scene.source.file, targetWidth, targetHeight, tempFile)
+                            tempFile
+                        }
+                        val inputUri = Uri.fromFile(preprocessedFile)
+                        val durationUs = (scene.length * 1_000_000).toLong()
+                        val zoomIn = random.nextBoolean()
+                        val focalX = (random.nextFloat() * 2f - 1f)
+                        val focalY = (random.nextFloat() * 2f - 1f)
+                        val kenBurns = ImageKenBurnsTransformation(zoomIn, focalX, focalY, durationUs)
+                        val input = MediaItem.Builder()
+                            .setUri(inputUri)
+                            .setImageDurationMs((scene.length * 1000).toLong())
+                            .build()
+                        EditedMediaItem.Builder(input)
+                            .setDurationUs(durationUs)
+                            .setFrameRate(30)
+                            .setEffects(Effects(emptyList(), listOf(presentation, kenBurns)))
+                            .build()
+                    } else {
+                        val inputUri = Uri.fromFile(scene.source.file)
+                        val input = MediaItem.Builder().setUri(inputUri)
+                            .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs((scene.start * 1000).toLong())
+                                .setEndPositionMs(((scene.start + scene.length) * 1000).toLong()).build()).build()
+                        EditedMediaItem.Builder(input).setFrameRate(30)
+                            .setEffects(Effects(emptyList(), listOf(presentation)))
+                            .build()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            tempImages.forEach { it.delete() }
+            throw e
         }
-        val composition = Composition.Builder(EditedMediaItemSequence.withAudioAndVideoFrom(edited))
-            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL).build()
+        val videoSequence = EditedMediaItemSequence.withAudioAndVideoFrom(edited)
+
+        val totalVideoDurationSeconds = scenes.sumOf { it.length }
+        val sequences = mutableListOf<EditedMediaItemSequence>()
+        sequences.add(videoSequence)
+
+        // Copy the selected music into this export's own temp file so a later move/delete of the
+        // original (e.g. on PhoneHard) can't affect an export already in progress.
+        val copiedMusicFile: File? = if (musicTrack != null) {
+            try {
+                require(musicTrack.file.isFile) { "선택한 음악 파일을 찾을 수 없습니다. 음악을 다시 선택해 주세요." }
+                require(musicTrack.durationSeconds > 0.0) { "선택한 음악의 길이를 확인할 수 없습니다. 음악을 다시 선택해 주세요." }
+                withContext(Dispatchers.IO) {
+                    val sourceExt = musicTrack.file.extension.takeIf { it.isNotBlank() && it.all(Char::isLetterOrDigit) } ?: "tmp"
+                    val copy = File(destination.parentFile ?: context.cacheDir, "music-${UUID.randomUUID()}.$sourceExt")
+                    tempImages.add(copy)
+                    musicTrack.file.copyTo(copy, overwrite = true)
+                    copy
+                }
+            } catch (e: Exception) {
+                tempImages.forEach { it.delete() }
+                throw e
+            }
+        } else null
+
         val scope = CoroutineScope(currentCoroutineContext())
         var poll: Job? = null
         var transformer: Transformer? = null
         try {
+        if (copiedMusicFile != null) {
+            val musicDurationSeconds = musicTrack!!.durationSeconds
+            val duckingTimeline = if (autoDucking) {
+                val uniqueVideoSources = scenes.map { it.source }
+                    .filter { !it.isImage }
+                    .distinctBy { it.id }
+
+                val envelopes = mutableMapOf<Int, BooleanArray>()
+                for (src in uniqueVideoSources) {
+                    val env = AudioAnalysisService.extractActivityEnvelope(
+                        context = context,
+                        uri = Uri.fromFile(src.file),
+                        sourceDurationSeconds = src.duration,
+                        binSeconds = 0.1,
+                        silenceThresholdRms = 0.01,
+                    )
+                    envelopes[src.id] = env
+                }
+                AudioDuckingTimeline.buildWithEnvelopes(scenes, envelopes, binSeconds = 0.1)
+            } else null
+
+            fun makeMusicEffects(startOffsetSeconds: Double): Effects {
+                val audioProcessors = mutableListOf<androidx.media3.common.audio.AudioProcessor>()
+                if (duckingTimeline != null) {
+                    audioProcessors.add(AutoDuckingAudioProcessor(duckingTimeline, outputStartOffsetSeconds = startOffsetSeconds))
+                }
+                return Effects(audioProcessors, emptyList())
+            }
+
+            val musicUri = Uri.fromFile(copiedMusicFile)
+            val musicItems = mutableListOf<EditedMediaItem>()
+
+            if (musicPolicy == TrailerMusicPolicy.LOOP_MUSIC) {
+                // Loop music until matching total video duration
+                var accumulated = 0.0
+                while (accumulated < totalVideoDurationSeconds - 0.05) {
+                    val remaining = totalVideoDurationSeconds - accumulated
+                    val clipDuration = min(musicDurationSeconds, remaining)
+                    val input = MediaItem.Builder()
+                        .setUri(musicUri)
+                        .setClippingConfiguration(
+                            MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs(0L)
+                                .setEndPositionMs((clipDuration * 1000).toLong())
+                                .build()
+                        ).build()
+                    val musicEffects = makeMusicEffects(startOffsetSeconds = accumulated)
+                    musicItems.add(
+                        EditedMediaItem.Builder(input)
+                            .setEffects(musicEffects)
+                            .build()
+                    )
+                    accumulated += clipDuration
+                }
+            } else {
+                // FIT_MUSIC_LENGTH: single music item matching total video duration
+                val clipDuration = min(musicDurationSeconds, totalVideoDurationSeconds)
+                val input = MediaItem.Builder()
+                    .setUri(musicUri)
+                    .setClippingConfiguration(
+                        MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(0L)
+                            .setEndPositionMs((clipDuration * 1000).toLong())
+                            .build()
+                    ).build()
+                val musicEffects = makeMusicEffects(startOffsetSeconds = 0.0)
+                musicItems.add(
+                    EditedMediaItem.Builder(input)
+                        .setEffects(musicEffects)
+                        .build()
+                )
+            }
+            if (musicItems.isNotEmpty()) {
+                sequences.add(EditedMediaItemSequence.withAudioFrom(musicItems))
+            }
+        }
+
+        val composition = Composition.Builder(sequences)
+            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL).build()
             suspendCancellableCoroutine<Unit> { continuation ->
                 val instance = Transformer.Builder(context).setVideoMimeType(MimeTypes.VIDEO_H264).setAudioMimeType(MimeTypes.AUDIO_AAC)
                     .addListener(object : Transformer.Listener {
@@ -54,11 +256,15 @@ internal object TrailerExporter {
                     if (Looper.myLooper() == Looper.getMainLooper()) instance.cancel()
                     else Handler(Looper.getMainLooper()).post { instance.cancel() }
                 }
+                progress("영상으로 저장 중 (${totalClips}/${totalClips}개 연결 완료)", 0f)
                 instance.start(composition, destination.absolutePath)
                 poll = scope.launch {
                     val holder = ProgressHolder()
                     while (isActive) {
-                        if (instance.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) progress(holder.progress / 100f)
+                        if (instance.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            val p = holder.progress / 100f
+                            progress("영상으로 저장 중 (${totalClips}/${totalClips}개 연결 완료)", p)
+                        }
                         delay(250)
                     }
                 }
@@ -76,6 +282,83 @@ internal object TrailerExporter {
         } finally {
             poll?.cancel()
             transformer?.cancel()
+            tempImages.forEach { it.delete() }
+        }
+    }
+
+    private fun preprocessImage(source: File, targetW: Int, targetH: Int, output: File) {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(source.absolutePath, bounds)
+        check(bounds.outWidth > 0 && bounds.outHeight > 0) { "이미지를 읽을 수 없습니다: ${source.name}" }
+
+        val exif = ExifInterface(source.absolutePath)
+        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        val isRotated90 = orientation == ExifInterface.ORIENTATION_ROTATE_90 || orientation == ExifInterface.ORIENTATION_ROTATE_270
+
+        val (rawW, rawH) = if (isRotated90) bounds.outHeight to bounds.outWidth else bounds.outWidth to bounds.outHeight
+        val sample = maxOf(1, minOf(rawW / targetW, rawH / targetH))
+        val samplePowerOfTwo = Integer.highestOneBit(sample).coerceAtLeast(1)
+
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = samplePowerOfTwo
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val decoded = checkNotNull(BitmapFactory.decodeFile(source.absolutePath, decodeOptions)) {
+            "이미지 디코딩에 실패했습니다: ${source.name}"
+        }
+
+        val orientedBitmap = try {
+            val matrix = AndroidMatrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.postRotate(90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.postRotate(270f)
+                    matrix.postScale(-1f, 1f)
+                }
+            }
+            if (!matrix.isIdentity) {
+                val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                if (rotated !== decoded) decoded.recycle()
+                rotated
+            } else {
+                decoded
+            }
+        } catch (e: Exception) {
+            decoded.recycle()
+            throw e
+        }
+
+        val resultBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        try {
+            val canvas = Canvas(resultBitmap)
+            val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+
+            val srcW = orientedBitmap.width.toFloat()
+            val srcH = orientedBitmap.height.toFloat()
+            val scale = maxOf(targetW / srcW, targetH / srcH)
+            val cropW = targetW / scale
+            val cropH = targetH / scale
+            val cropX = (srcW - cropW) / 2f
+            val cropY = (srcH - cropH) / 2f
+
+            val srcRect = Rect(cropX.toInt(), cropY.toInt(), (cropX + cropW).toInt(), (cropY + cropH).toInt())
+            val dstRect = Rect(0, 0, targetW, targetH)
+            canvas.drawBitmap(orientedBitmap, srcRect, dstRect, paint)
+
+            FileOutputStream(output).use { fos ->
+                resultBitmap.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+            }
+        } finally {
+            orientedBitmap.recycle()
+            resultBitmap.recycle()
         }
     }
 }

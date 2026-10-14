@@ -67,6 +67,128 @@ internal object AudioAnalysisService {
         }
     }
 
+    suspend fun extractActivityEnvelope(
+        context: Context,
+        uri: Uri,
+        sourceDurationSeconds: Double,
+        binSeconds: Double = 0.1,
+        silenceThresholdRms: Double = 0.01,
+    ): BooleanArray = runInterruptible(Dispatchers.Default) {
+        if (sourceDurationSeconds <= 0.0) return@runInterruptible BooleanArray(0)
+        val bucketCount = max(1, kotlin.math.ceil(sourceDurationSeconds / binSeconds).toInt())
+        runCatching {
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(context, uri, null)
+                val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
+                    extractor.getTrackFormat(index)
+                        .getString(MediaFormat.KEY_MIME)
+                        ?.startsWith("audio/") == true
+                } ?: return@runCatching BooleanArray(bucketCount) { false }
+
+                extractor.selectTrack(trackIndex)
+                val format = extractor.getTrackFormat(trackIndex)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: return@runCatching BooleanArray(bucketCount) { false }
+                val decoder = MediaCodec.createDecoderByType(mime)
+                val info = MediaCodec.BufferInfo()
+                val energy = DoubleArray(bucketCount)
+                val counts = IntArray(bucketCount)
+
+                try {
+                    format.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                    decoder.configure(format, null, null, 0)
+                    decoder.start()
+
+                    var inputDone = false
+                    var outputDone = false
+                    var outputPcmEncoding = AudioFormat.ENCODING_PCM_16BIT
+                    while (!outputDone) {
+                        if (Thread.currentThread().isInterrupted) throw CancellationException()
+                        if (!inputDone) {
+                            val inputIndex = decoder.dequeueInputBuffer(10_000)
+                            if (inputIndex >= 0) {
+                                val inputBuffer = decoder.getInputBuffer(inputIndex)
+                                val sampleSize = if (inputBuffer != null) {
+                                    inputBuffer.clear()
+                                    extractor.readSampleData(inputBuffer, 0)
+                                } else {
+                                    -1
+                                }
+
+                                if (sampleSize < 0) {
+                                    decoder.queueInputBuffer(
+                                        inputIndex,
+                                        0,
+                                        0,
+                                        0,
+                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                    )
+                                    inputDone = true
+                                } else {
+                                    decoder.queueInputBuffer(
+                                        inputIndex,
+                                        0,
+                                        sampleSize,
+                                        max(0L, extractor.sampleTime),
+                                        0
+                                    )
+                                    extractor.advance()
+                                }
+                            }
+                        }
+
+                        when (val outputIndex = decoder.dequeueOutputBuffer(info, 10_000)) {
+                            MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                val outputFormat = decoder.outputFormat
+                                outputPcmEncoding = if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                                    outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                                } else {
+                                    AudioFormat.ENCODING_PCM_16BIT
+                                }
+                            }
+                            else -> if (outputIndex >= 0) {
+                                val buffer = decoder.getOutputBuffer(outputIndex)
+                                if (buffer != null && info.size > 0) {
+                                    buffer.position(info.offset)
+                                    buffer.limit(info.offset + info.size)
+                                    val pcmBuffer = buffer.slice().order(ByteOrder.LITTLE_ENDIAN)
+                                    val metrics = if (outputPcmEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                                        metricsFloatPcm(pcmBuffer)
+                                    } else {
+                                        metrics16BitPcm(pcmBuffer)
+                                    }
+                                    val timeSeconds = info.presentationTimeUs / 1_000_000.0
+                                    val bucket = (timeSeconds / binSeconds).toInt()
+                                    if (bucket in 0 until bucketCount) {
+                                        energy[bucket] += metrics.rms
+                                        counts[bucket] += 1
+                                    }
+                                }
+                                outputDone = outputDone ||
+                                    (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                                decoder.releaseOutputBuffer(outputIndex, false)
+                            }
+                        }
+                    }
+                } finally {
+                    runCatching { decoder.stop() }
+                    decoder.release()
+                }
+
+                BooleanArray(bucketCount) { idx ->
+                    val avgRms = if (counts[idx] > 0) energy[idx] / counts[idx] else 0.0
+                    avgRms >= silenceThresholdRms
+                }
+            } finally {
+                extractor.release()
+            }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            BooleanArray(0)
+        }
+    }
+
     private fun analyzePcm(
         context: Context,
         uri: Uri,
