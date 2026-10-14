@@ -2476,33 +2476,10 @@ private fun PhoneHardDashboardRow(
                     contentScale = ContentScale.Fit,
                 )
             }
-            if (draftCount > 0) {
-                Box(
-                    Modifier
-                        .size(10.dp)
-                        .background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape)
-                        .border(1.5.dp, MaterialTheme.colorScheme.surface, androidx.compose.foundation.shape.CircleShape)
-                )
-            }
         }
         Spacer(Modifier.width(12.dp))
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
             Text("폰하드", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-            if (draftCount > 0) {
-                Spacer(Modifier.width(8.dp))
-                Surface(
-                    shape = RoundedCornerShape(6.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                ) {
-                    Text(
-                        "편집 중 ${draftCount}",
-                        Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-            }
         }
         detail?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
