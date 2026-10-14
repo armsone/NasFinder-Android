@@ -41,7 +41,7 @@ private fun sceneLengthLabel(seconds: Double): String =
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewModel, browsingForMusic: Boolean = false) {
-    var settings by rememberSaveable(session.directory.absolutePath) { mutableStateOf(false) }
+    var settings by rememberSaveable(session.directory.absolutePath) { mutableStateOf(session.awaitingInitialSettings) }
     var confirmClose by remember { mutableStateOf(false) }
     // Hoisted above the Dialog so the draft (order/subset/total/length/format/music choice)
     // survives while the trailer dialog is suspended for a nested music browser visit.
@@ -51,12 +51,26 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
     val draftFormat = remember(session.directory.absolutePath) { mutableStateOf(session.format) }
     val draftMusicTrack = remember(session.directory.absolutePath) { mutableStateOf(session.musicTrack) }
     val draftMusicPolicy = remember(session.directory.absolutePath) { mutableStateOf(session.musicPolicy) }
+    val draftMusicFitCount = remember(session.directory.absolutePath) { mutableStateOf(session.musicFitCount) }
     val draftAutoDucking = remember(session.directory.absolutePath) { mutableStateOf(session.autoDucking) }
     var draftInitialized by rememberSaveable(session.directory.absolutePath) { mutableStateOf(false) }
     fun requestClose() {
         if (settings) settings = false
         else if (session.busy) confirmClose = true
-        else model.dismissTrailer()
+        else {
+            model.suspendTrailerDraft(
+                showingSettings = false,
+                sources = draftSources.value,
+                total = draftTotal.value,
+                length = draftLength.value,
+                photoLength = if (session.isMusicOverlayMode) 1.0 else defaultPhotoClipLength(draftLength.value, draftSources.value.any { !it.isImage }),
+                format = draftFormat.value,
+                musicTrack = draftMusicTrack.value,
+                musicPolicy = draftMusicPolicy.value,
+                musicFitCount = draftMusicFitCount.value,
+                autoDucking = draftAutoDucking.value,
+            )
+        }
     }
     LaunchedEffect(session.directory.absolutePath, session.busy, session.output, session.error, session.awaitingInitialSettings, session.isMusicOverlayMode) {
         if ((session.awaitingInitialSettings || session.isMusicOverlayMode) && session.output == null && !session.busy && session.error == null) {
@@ -67,6 +81,7 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
                 draftFormat.value = session.format
                 draftMusicTrack.value = session.musicTrack
                 draftMusicPolicy.value = session.musicPolicy
+                draftMusicFitCount.value = session.musicFitCount
                 draftAutoDucking.value = session.autoDucking
                 draftInitialized = true
             }
@@ -154,10 +169,31 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
         }
         if (confirmClose) AlertDialog(
             onDismissRequest = { confirmClose = false },
-            title = { Text("예고편 만들기를 중단할까요?") },
-            text = { Text("계속 만들기를 누르면 지금 작업을 이어갑니다.") },
-            confirmButton = { TextButton(onClick = { confirmClose = false; model.dismissTrailer() }) { Text("중단") } },
-            dismissButton = { TextButton(onClick = { confirmClose = false }) { Text("계속 만들기") } },
+            title = { Text(if (session.isMusicOverlayMode) "음악 입히기를 중단할까요?" else "예고편 만들기를 중단할까요?") },
+            text = { Text("지금까지의 진행 상태는 보관되며 나중에 이어서 편집할 수 있습니다.") },
+            dismissButton = {
+                TextButton(onClick = { confirmClose = false }) {
+                    Text("계속 만들기")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmClose = false
+                    model.suspendTrailerDraft(
+                        showingSettings = settings,
+                        sources = draftSources.value,
+                        total = draftTotal.value,
+                        length = draftLength.value,
+                        photoLength = if (session.isMusicOverlayMode) 1.0 else defaultPhotoClipLength(draftLength.value, draftSources.value.any { !it.isImage }),
+                        format = draftFormat.value,
+                        musicTrack = draftMusicTrack.value,
+                        musicPolicy = draftMusicPolicy.value,
+                        musicFitCount = draftMusicFitCount.value,
+                        autoDucking = draftAutoDucking.value,
+                        wasCancelled = true,
+                    )
+                }) { Text("중단") }
+            },
         )
         if (settings) TrailerSettings(
             session = session,
@@ -168,9 +204,10 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
             formatState = draftFormat,
             musicTrackState = draftMusicTrack,
             musicPolicyState = draftMusicPolicy,
+            musicFitCountState = draftMusicFitCount,
             autoDuckingState = draftAutoDucking,
             onClose = { settings = false },
-        ) { order, total, length, photoLength, format, musicTrack, musicPolicy, autoDucking ->
+        ) { order, total, length, photoLength, format, musicTrack, musicPolicy, musicFitCount, autoDucking ->
             settings = false
             model.regenerateTrailer(
                 order = order,
@@ -180,6 +217,7 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
                 format = format,
                 musicTrack = musicTrack,
                 musicPolicy = musicPolicy,
+                musicFitCount = musicFitCount,
                 autoDucking = autoDucking,
             )
         }
@@ -197,9 +235,10 @@ private fun TrailerSettings(
     formatState: MutableState<TrailerFormat>,
     musicTrackState: MutableState<TrailerMusicTrack?>,
     musicPolicyState: MutableState<TrailerMusicPolicy>,
+    musicFitCountState: MutableState<Int>,
     autoDuckingState: MutableState<Boolean>,
     onClose: () -> Unit,
-    regenerate: (List<Int>, Double, Double, Double, TrailerFormat, TrailerMusicTrack?, TrailerMusicPolicy, Boolean) -> Unit,
+    regenerate: (List<Int>, Double, Double, Double, TrailerFormat, TrailerMusicTrack?, TrailerMusicPolicy, Int, Boolean) -> Unit,
 ) {
     var sources by sourcesState
     var total by totalState
@@ -210,15 +249,17 @@ private fun TrailerSettings(
     var format by formatState
     var musicTrack by musicTrackState
     var musicPolicy by musicPolicyState
+    var musicFitCount by musicFitCountState
     var autoDucking by autoDuckingState
-    var showMusicPicker by remember { mutableStateOf(false) }
+    val initialShowMusicPicker = session.isMusicOverlayMode && session.musicTrack == null
+    var showMusicPicker by remember { mutableStateOf(initialShowMusicPicker) }
     var customTotal by remember { mutableStateOf(false) }
     var customLength by remember { mutableStateOf(false) }
-    val scenes = remember(sources, total, length, photoLength, musicTrack, musicPolicy) {
+    val scenes = remember(sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount) {
         if (session.isMusicOverlayMode) {
-            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy)
+            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
         } else {
-            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy)
+            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount)
         }
     }
     val actual = scenes.sumOf { it.length }
@@ -245,19 +286,143 @@ private fun TrailerSettings(
             }
             Text("원본 ${trailerLengthTitle(original)} 중 ${"%.1f".format(if (original > 0) actual / original * 100 else 0.0)}%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             HorizontalDivider()
+            Text("배경 음악", style = MaterialTheme.typography.titleSmall)
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                text = musicTrack?.name ?: "음악 없음",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (musicTrack != null) {
+                                Text(
+                                    text = trailerLengthTitle(musicTrack!!.durationSeconds),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        if (musicTrack != null) {
+                            TextButton(onClick = {
+                                musicTrack = null
+                                musicPolicy = TrailerMusicPolicy.LOOP_MUSIC
+                                musicFitCount = 1
+                            }) {
+                                Text("음악 제거")
+                            }
+                        }
+                        Button(onClick = { showMusicPicker = true }) {
+                            Text("음악 선택")
+                        }
+                    }
+
+                    if (musicTrack != null) {
+                        HorizontalDivider()
+                        Text("음악 적용 방식", style = MaterialTheme.typography.labelMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            val fitTitle = if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
+                                when (musicFitCount) {
+                                    1 -> "음악 길이에 맞추기"
+                                    2 -> "두 번 맞추기"
+                                    3 -> "세 번 맞추기"
+                                    4 -> "네 번 맞추기"
+                                    else -> "${musicFitCount}번 맞추기"
+                                }
+                            } else {
+                                "음악 길이에 맞추기"
+                            }
+                            TrailerChoice(
+                                title = fitTitle,
+                                selected = musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
+                                    musicFitCount += 1
+                                } else {
+                                    musicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH
+                                    musicFitCount = 1
+                                }
+                                val track = musicTrack
+                                if (track != null && track.durationSeconds > 0) {
+                                    total = track.durationSeconds * musicFitCount
+                                }
+                            }
+                            TrailerChoice(
+                                title = "음악 반복",
+                                selected = musicPolicy == TrailerMusicPolicy.LOOP_MUSIC,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                musicPolicy = TrailerMusicPolicy.LOOP_MUSIC
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("자동 오디오 더킹", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "영상 원본 오디오가 나올 때 음악 볼륨을 자동으로 줄입니다",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Switch(checked = autoDucking, onCheckedChange = { autoDucking = it })
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            // Keep the trailer session and this draft alive; VideoTrailerScreen
+                            // suspends its Dialog (without dismissing) while the browser is shown,
+                            // and reappears with this same sheet once the browser is closed.
+                            model.show(Screen.WebBrowser)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Default.Language, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("브라우저에서 음악 받기")
+                    }
+                }
+            }
+
             if (session.isMusicOverlayMode) {
                 Text("원본 영상을 자르지 않고 그대로 이어 붙입니다. 사진은 1초씩 들어갑니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
             Text("얼마나 길게 볼까요?", style = MaterialTheme.typography.titleSmall)
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
-                    TrailerChoice(trailerLengthTitle(value), abs(total - value) < .01, Modifier.weight(1f), value <= original) { total = value; customTotal = false }
+                    TrailerChoice(trailerLengthTitle(value), abs(total - value) < .01, Modifier.weight(1f), value <= original) {
+                        total = value
+                        customTotal = false
+                        if (musicTrack != null) {
+                            musicPolicy = TrailerMusicPolicy.SINGLE
+                        }
+                    }
                 }
             }
             TextButton(onClick = { customTotal = !customTotal }, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
                 Text("다른 길이", Modifier.weight(1f)); Text(trailerLengthTitle(total)); Icon(if (customTotal) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null)
             }
-            if (customTotal && original > 1) Slider(value = total.toFloat(), onValueChange = { total = it.roundToInt().toDouble() }, valueRange = 1f..original.toFloat(), modifier = Modifier.semantics { contentDescription = "예고편 총길이" })
+            if (customTotal && original > 1) Slider(value = total.toFloat(), onValueChange = {
+                total = it.roundToInt().toDouble()
+                if (musicTrack != null) {
+                    musicPolicy = TrailerMusicPolicy.SINGLE
+                }
+            }, valueRange = 1f..original.toFloat(), modifier = Modifier.semantics { contentDescription = "예고편 총길이" })
             if (hasVideos) {
                 Text("영상 한 장면은 얼마나 볼까요?", style = MaterialTheme.typography.titleSmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -311,94 +476,6 @@ private fun TrailerSettings(
                             Box(Modifier.size(if (ratio >= 1) 28.dp else (28 * ratio).dp, if (ratio >= 1) (28 / ratio).dp else 28.dp).border(2.dp, if (format == candidate) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, RoundedCornerShape(3.dp)))
                             Text(candidate.title, style = MaterialTheme.typography.labelSmall)
                         }
-                    }
-                }
-            }
-            Text("배경 음악", style = MaterialTheme.typography.titleSmall)
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(10.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                text = musicTrack?.name ?: "음악 없음",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            if (musicTrack != null) {
-                                Text(
-                                    text = trailerLengthTitle(musicTrack!!.durationSeconds),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        if (musicTrack != null) {
-                            TextButton(onClick = { musicTrack = null }) {
-                                Text("음악 제거")
-                            }
-                        }
-                        Button(onClick = { showMusicPicker = true }) {
-                            Text("음악 선택")
-                        }
-                    }
-
-                    if (musicTrack != null) {
-                        HorizontalDivider()
-                        Text("음악 적용 방식", style = MaterialTheme.typography.labelMedium)
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            TrailerChoice(
-                                title = "음악 길이에 맞추기",
-                                selected = musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH,
-                                modifier = Modifier.weight(1f),
-                            ) {
-                                musicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH
-                            }
-                            TrailerChoice(
-                                title = "음악 반복",
-                                selected = musicPolicy == TrailerMusicPolicy.LOOP_MUSIC,
-                                modifier = Modifier.weight(1f),
-                            ) {
-                                musicPolicy = TrailerMusicPolicy.LOOP_MUSIC
-                            }
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("자동 오디오 더킹", style = MaterialTheme.typography.bodyMedium)
-                                Text(
-                                    "영상 원본 오디오가 나올 때 음악 볼륨을 자동으로 줄입니다",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                            Switch(checked = autoDucking, onCheckedChange = { autoDucking = it })
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            // Keep the trailer session and this draft alive; VideoTrailerScreen
-                            // suspends its Dialog (without dismissing) while the browser is shown,
-                            // and reappears with this same sheet once the browser is closed.
-                            model.show(Screen.WebBrowser)
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Default.Language, null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("브라우저에서 음악 받기")
                     }
                 }
             }
@@ -667,7 +744,7 @@ private fun TrailerSettings(
             }
             if (excluded > 0) Text("장면 길이와 개수에 따라 ${excluded}개 미디어는 제외됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Button(
-                onClick = { regenerate(sources.map { it.id }, total, length, photoLength, format, musicTrack, musicPolicy, autoDucking) },
+                onClick = { regenerate(sources.map { it.id }, total, length, photoLength, format, musicTrack, musicPolicy, musicFitCount, autoDucking) },
                 enabled = sources.isNotEmpty() && scenes.isNotEmpty() && (!session.isMusicOverlayMode || musicTrack != null),
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -687,6 +764,8 @@ private fun TrailerSettings(
                 onDismiss = { showMusicPicker = false },
                 onSelectTrack = { selected ->
                     musicTrack = selected
+                    musicPolicy = TrailerMusicPolicy.LOOP_MUSIC
+                    musicFitCount = 1
                     showMusicPicker = false
                 },
             )

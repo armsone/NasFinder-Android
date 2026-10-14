@@ -11,6 +11,7 @@ import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
@@ -92,6 +93,11 @@ data class AppState(
     val inboxErrorMessage: String? = null,
     val inboxFiles: List<InboxDisplayItem> = emptyList(),
     val download: RemoteDownloadState? = null,
+    val networkDownloadProgress: NetworkDownloadProgress? = null,
+    val isDownloadingNetwork: Boolean = false,
+    val initialInboxSubpath: String? = null,
+    val isLocalThumbnailRunning: Boolean = false,
+    val localThumbnailProgress: Pair<Int, Int>? = null,
     val remoteFavorites: List<RemoteFavorite> = emptyList(),
     val browserFavorites: List<BrowserFavorite> = emptyList(),
     val pendingTransfer: PendingRemoteTransfer? = null,
@@ -131,6 +137,17 @@ data class AppState(
     val googlePhotosImportedCount: Int = 0,
     val folderCountCache: Map<String, FolderChildCountState> = emptyMap(),
     val folderCountGeneration: Long = 0L,
+    val trailerDraftCount: Int = 0,
+    val trailerDraftPicker: List<TrailerDraft>? = null,
+    val trailerDraftStaleNotice: String? = null,
+    val trailerConflict: TrailerConflictConfirmation? = null,
+)
+
+data class TrailerConflictConfirmation(
+    val title: String,
+    val message: String,
+    val onResumeExisting: () -> Unit,
+    val onStartNew: () -> Unit,
 )
 
 sealed interface FolderChildCountState {
@@ -165,6 +182,7 @@ data class InboxDisplayItem(
     val importedAt: java.time.Instant,
     val file: File,
     val relativePath: String,
+    val durationMillis: Long? = null,
 )
 
 enum class RemoteTransferAction { COPY, MOVE }
@@ -250,6 +268,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val favoriteRepository = application.favorites
     private val settingsRepository = application.settings
     private val inboxStore = application.inbox
+    private val networkDownloadCoordinator: NetworkDownloadCoordinator = NetworkDownloadCoordinator.create(application, inboxStore)
+    private var networkDownloadJob: Job? = null
     private val downloadCache = DownloadCache(application)
     private val thumbnailRepository = RemoteThumbnailRepository(application)
     private val superThumbnailDataController = SuperThumbnailDataController(application)
@@ -616,6 +636,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         )
     }
 
+    fun selectSuperThumbnailFolder(connectionId: String, path: String, title: String? = null) {
+        val connection = _state.value.connections.firstOrNull { it.id == connectionId } ?: return
+        val effectiveTitle = title ?: pathTitle(path, connection.name)
+        selectSuperThumbnailLocation(
+            SuperThumbnailLocation(connection.id, path, effectiveTitle)
+        )
+    }
+
     private fun selectSuperThumbnailLocation(
         location: SuperThumbnailLocation,
         recordHistory: Boolean = true,
@@ -774,7 +802,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val existing = manager
                     .getWorkInfosForUniqueWorkFlow(SuperThumbnailWorkController.uniqueName(connectionId))
                     .first()
-                    .firstOrNull { it.state.isActive }
+                    .firstOrNull { it.state.isWorkActive }
                 if (existing == null) {
                     superThumbnailDataController.enqueue(
                         connectionId = connectionId,
@@ -827,7 +855,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 .getWorkInfosForUniqueWorkFlow(SuperThumbnailWorkController.uniqueName(connectionId))
                 .collect { values ->
                     if (_state.value.superThumbnailConnectionId != connectionId) return@collect
-                    val info = values.firstOrNull { it.state.isActive }
+                    val info = values.firstOrNull { it.state.isWorkActive }
                         ?: values.lastOrNull()
                     if (info == null) return@collect
                     _state.update {
@@ -849,7 +877,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    private val WorkInfo.State.isActive: Boolean
+    private val WorkInfo.State.isWorkActive: Boolean
         get() = this == WorkInfo.State.ENQUEUED || this == WorkInfo.State.BLOCKED || this == WorkInfo.State.RUNNING
 
     private fun loadSuperThumbnailHistory(): List<SuperThumbnailLocation> {
@@ -1640,7 +1668,47 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    private fun resolvePhoneHardDiskFile(relativePath: String): File {
+        val rootCanonical = inboxStore.rootDirectory.canonicalFile
+        val norm = relativePath.trim().removePrefix("/").removeSuffix("/")
+        val file = if (norm.isEmpty()) rootCanonical else File(rootCanonical, norm).canonicalFile
+        val isContained = file.canonicalPath == rootCanonical.canonicalPath ||
+            file.canonicalPath.startsWith(rootCanonical.canonicalPath + File.separator)
+        return if (isContained) file else File(rootCanonical, "__invalid_phonehard_path__")
+    }
+
     fun loadFavoriteThumbnail(favorite: RemoteFavorite) {
+        if (favorite.connectionId == "phonehard") {
+            val generation = favoriteThumbnailGeneration
+            val requestKey = "$generation\u0000phonehard\u0000${favorite.id}\u0000${favorite.path}"
+            if (!favoriteThumbnailRequests.add(requestKey)) return
+            favoriteThumbnailJobs[favorite.id] = viewModelScope.launch {
+                val bitmap = withContext(Dispatchers.IO) {
+                    val diskFile = resolvePhoneHardDiskFile(favorite.path)
+                    if (diskFile.exists() && !favorite.isDirectory) {
+                        val uri = runCatching {
+                            androidx.core.content.FileProvider.getUriForFile(application, "${application.packageName}.sharefiles", diskFile)
+                        }.getOrNull()
+                        decodeInboxThumbnail(
+                            application,
+                            uri,
+                            diskFile,
+                            isImage = favorite.mimeType?.startsWith("image/") == true || isPhoneHardImage(diskFile.name),
+                            isVideo = favorite.mimeType?.startsWith("video/") == true || isPhoneHardVideo(diskFile.name),
+                            isPdf = favorite.mimeType == "application/pdf" || diskFile.name.endsWith(".pdf", ignoreCase = true),
+                            maxPixelSize = 160,
+                        )
+                    } else null
+                }
+                if (bitmap != null && generation == favoriteThumbnailGeneration) {
+                    _state.update { state ->
+                        if (generation != state.favoriteThumbnailGeneration) state
+                        else state.copy(favoriteThumbnails = state.favoriteThumbnails + (favorite.id to bitmap))
+                    }
+                }
+            }
+            return
+        }
         val connection = _state.value.connections.firstOrNull { it.id == favorite.connectionId } ?: return
         val generation = favoriteThumbnailGeneration
         val requestKey = "$generation\u0000${favorite.connectionId}\u0000${favorite.id}\u0000${favorite.path}"
@@ -1676,6 +1744,34 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun openFavorite(favorite: RemoteFavorite) {
+        if (favorite.connectionId == "phonehard") {
+            if (favorite.isDirectory) {
+                _state.update { it.copy(initialInboxSubpath = favorite.path) }
+                show(Screen.Inbox)
+            } else {
+                val file = _state.value.inboxFiles.firstOrNull { it.id.toString() == favorite.remoteItemId || it.relativePath == favorite.path }
+                if (file != null) {
+                    previewInboxFile(file)
+                } else {
+                    val diskFile = resolvePhoneHardDiskFile(favorite.path)
+                    if (diskFile.exists()) {
+                        val displayItem = InboxDisplayItem(
+                            id = runCatching { java.util.UUID.fromString(favorite.remoteItemId) }.getOrDefault(java.util.UUID.randomUUID()),
+                            originalFilename = favorite.name,
+                            file = diskFile,
+                            relativePath = favorite.path,
+                            byteCount = favorite.size ?: diskFile.length(),
+                            importedAt = favorite.modifiedAt ?: java.time.Instant.ofEpochMilli(diskFile.lastModified()),
+                            mimeType = favorite.mimeType,
+                        )
+                        previewInboxFile(displayItem)
+                    } else {
+                        _state.update { it.copy(message = "폰하드 파일을 찾을 수 없습니다: ${favorite.name}") }
+                    }
+                }
+            }
+            return
+        }
         val connection = _state.value.connections.firstOrNull {
             it.id == favorite.connectionId
         }
@@ -1734,7 +1830,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun shareItem(item: RemoteFileItem) {
-        if (!item.isDirectory) prepareRemoteFile(item, RemoteFileAction.SHARE)
+        if (!item.isDirectory) {
+            prepareRemoteFile(item, RemoteFileAction.SHARE)
+        } else {
+            shareItems(listOf(item))
+        }
     }
 
     fun createFolder(name: String) {
@@ -1774,34 +1874,155 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun shareItems(items: List<RemoteFileItem>) {
+        if (items.isEmpty()) return
         val browser = _state.value.screen as? Screen.Browser ?: return
-        val files = items.filterNot(RemoteFileItem::isDirectory).distinctBy(RemoteFileItem::id)
-        if (files.isEmpty() || files.size != items.size) {
-            _state.update { it.copy(message = "공유는 파일만 선택할 수 있습니다.") }
-            return
-        }
-        val activeService = service ?: run {
-            _state.update { it.copy(message = "원격 연결을 다시 연 뒤 시도해 주세요.") }
-            return
-        }
+        // Captured up front so a later connection switch cannot redirect this share.
+        val connection = browser.connection
+        val selected = items.distinctBy(RemoteFileItem::id)
+        val hasDirectory = selected.any(RemoteFileItem::isDirectory)
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = null) }
-            val prepared = mutableListOf<File>()
+            _state.update { it.copy(isBusy = true, message = if (hasDirectory) "공유 항목을 압축하는 중입니다…" else null) }
+            // Folder or mixed selection: package all into ONE isolated unique zip
+            val zipFile = if (hasDirectory) {
+                val sharesDir = File(application.cacheDir, "shares").apply { mkdirs() }
+                File(sharesDir, "remote_share_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.zip")
+            } else null
             val result = runCatching {
-                for (item in files) {
-                    prepared += downloadCache.resolve(
-                        connectionId = browser.connection.id,
-                        item = item,
-                        progress = { _, _ -> },
-                        download = { destination, progress -> activeService.download(item, destination, progress) },
-                    )
+                val prepared = withContext(Dispatchers.IO) {
+                    withDedicatedRemoteService(connection) { ownService ->
+                        if (zipFile == null) {
+                            selected.map { item ->
+                                downloadCache.resolve(
+                                    connectionId = connection.id,
+                                    item = item,
+                                    progress = { _, _ -> },
+                                    download = { destination, progress -> ownService.download(item, destination, progress) },
+                                )
+                            }
+                        } else {
+                            writeRemoteShareZip(connection, ownService, selected, zipFile)
+                            listOf(zipFile)
+                        }
+                    }
                 }
-                val shareIntent = NasFinderShareIntentFactory.createMultiple(application, prepared)
+                val shareIntent = if (prepared.size == 1) {
+                    NasFinderShareIntentFactory.create(application, prepared)
+                } else {
+                    NasFinderShareIntentFactory.createMultiple(application, prepared)
+                }
                 application.startActivity(
-                    Intent.createChooser(shareIntent, "원격 파일 공유").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    Intent.createChooser(shareIntent, if (zipFile != null) "압축 파일 공유" else "파일 공유")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             }
-            _state.update { it.copy(isBusy = false, message = result.exceptionOrNull()?.message) }
+            if (result.isFailure) zipFile?.delete()
+            _state.update {
+                it.copy(
+                    isBusy = false,
+                    message = result.exceptionOrNull()?.let { error -> error.message ?: "선택한 항목을 공유하지 못했습니다." },
+                )
+            }
+        }
+    }
+
+    /**
+     * Runs [block] with a service that belongs only to this operation. The browser's shared
+     * [service] is never read, reassigned or closed here; the owned service is always closed.
+     */
+    private suspend fun <T> withDedicatedRemoteService(
+        connection: RemoteConnection,
+        block: suspend (RemoteFileService) -> T,
+    ): T {
+        check(_state.value.connections.any { it.id == connection.id }) {
+            "연결 정보를 찾을 수 없습니다. 연결을 다시 연 뒤 시도해 주세요."
+        }
+        val credential = repository.credentials.read(connection.id)
+        val needsStoredToken = connection.kind == com.armsone.nasfinder.model.ConnectionKind.DROPBOX ||
+            connection.kind == com.armsone.nasfinder.model.ConnectionKind.ONEDRIVE ||
+            connection.kind == com.armsone.nasfinder.model.ConnectionKind.GOOGLE_DRIVE
+        check(!needsStoredToken || !credential.isNullOrBlank()) {
+            "${connection.name}의 저장된 로그인 정보를 읽을 수 없습니다. 다시 로그인한 뒤 시도해 주세요."
+        }
+        return RemoteFileServiceFactory.create(connection, credential.orEmpty()).use { ownService -> block(ownService) }
+    }
+
+    /** Reserves an entry name that is unique inside [parentPrefix]; folders and files share one namespace. */
+    private fun reserveZipEntryName(used: MutableSet<String>, parentPrefix: String, displayName: String): String {
+        val safe = displayName.replace('/', '_').replace('\\', '_').trim()
+            .takeUnless { it.isEmpty() || it == "." || it == ".." } ?: "이름 없음"
+        val dot = safe.lastIndexOf('.')
+        val stem = if (dot > 0) safe.substring(0, dot) else safe
+        val extension = if (dot > 0) safe.substring(dot) else ""
+        var candidate = safe
+        var suffix = 2
+        while (!used.add((parentPrefix + candidate).lowercase())) {
+            candidate = "$stem ($suffix)$extension"
+            suffix++
+        }
+        return parentPrefix + candidate
+    }
+
+    /**
+     * Writes every selected file and the full tree of every selected folder (hidden and empty
+     * folders included) into [zipFile]. Depth overflow, a revisited folder or an unreadable
+     * listing throws, so the caller never shares a silently truncated archive.
+     */
+    private suspend fun writeRemoteShareZip(
+        connection: RemoteConnection,
+        ownService: RemoteFileService,
+        selected: List<RemoteFileItem>,
+        zipFile: File,
+    ) {
+        val maxDepth = DefaultNetworkDownloadCoordinator.MAX_REMOTE_DIRECTORY_DEPTH
+        val selectedDirPaths = selected.filter(RemoteFileItem::isDirectory).map { it.path.trimEnd('/') }
+        val roots = selected.filter { candidate ->
+            val path = candidate.path.trimEnd('/')
+            selectedDirPaths.none { it != path && path.startsWith("$it/") }
+        }
+        java.util.zip.ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
+            val usedNames = mutableSetOf<String>()
+            val visitedPaths = mutableSetOf<String>()
+            val visitedIds = mutableSetOf<String>()
+            // remote folder, zip entry name ending in '/', depth below its selected root
+            val queue = java.util.ArrayDeque<Triple<RemoteFileItem, String, Int>>()
+            suspend fun addFile(item: RemoteFileItem, entryName: String) {
+                val diskFile = downloadCache.resolve(
+                    connectionId = connection.id,
+                    item = item,
+                    progress = { _, _ -> },
+                    download = { destination, progress -> ownService.download(item, destination, progress) },
+                )
+                zos.putNextEntry(java.util.zip.ZipEntry(entryName))
+                diskFile.inputStream().buffered().use { it.copyTo(zos) }
+                zos.closeEntry()
+            }
+            for (item in roots) {
+                if (item.isDirectory) queue.add(Triple(item, reserveZipEntryName(usedNames, "", item.name) + "/", 0))
+                else addFile(item, reserveZipEntryName(usedNames, "", item.name))
+            }
+            while (queue.isNotEmpty()) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val (folder, prefix, depth) = queue.removeFirst()
+                val folderPath = folder.path.trimEnd('/')
+                if (depth > maxDepth) {
+                    throw java.io.IOException("폴더가 ${maxDepth}단계보다 깊어 공유할 수 없습니다: ${folder.path}")
+                }
+                if (!visitedPaths.add(folderPath) || (folder.id.isNotBlank() && !visitedIds.add(folder.id))) {
+                    throw java.io.IOException("같은 폴더가 반복되는 구조여서 공유할 수 없습니다: ${folder.path}")
+                }
+                zos.putNextEntry(java.util.zip.ZipEntry(prefix))
+                zos.closeEntry()
+                for (child in ownService.list(folder.path)) {
+                    if (child.name.isBlank() || child.name == "." || child.name == "..") continue
+                    if (child.isDirectory) {
+                        // Some servers list the folder itself; that is not a child.
+                        if (child.path.trimEnd('/') == folderPath) continue
+                        queue.add(Triple(child, reserveZipEntryName(usedNames, prefix, child.name) + "/", depth + 1))
+                    } else {
+                        addFile(child, reserveZipEntryName(usedNames, prefix, child.name))
+                    }
+                }
+            }
         }
     }
 
@@ -2869,9 +3090,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var trailerJob: Job? = null
     private var trailerRetry: (() -> Unit)? = null
 
-    fun prepareRemoteFolderTrailer(
+    private fun checkRemoteFolderHasSubfolders(
         folder: RemoteFileItem,
-        onPrompt: (hasSubfolders: Boolean) -> Unit,
+        onResult: (hasSubfolders: Boolean) -> Unit,
     ) {
         if (!folder.isDirectory) return
         val browser = _state.value.screen as? Screen.Browser ?: return
@@ -2896,8 +3117,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) return@filter false
                         true
                     }
-                    val visibleChildCount = visibleChildFolders.size
-                    Result.success(visibleChildCount > 0)
+                    Result.success(visibleChildFolders.isNotEmpty())
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
@@ -2905,19 +3125,40 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 }
             }
             _state.update { it.copy(isBusy = false) }
-            // Stale screen check: ensure user is still in the same browser connection/path
             val currentBrowser = _state.value.screen as? Screen.Browser
             if (currentBrowser == null || currentBrowser.connection.id != activeConnection.id) {
                 return@launch
             }
             checkResult.onSuccess { hasSubfolders ->
-                if (hasSubfolders) {
-                    onPrompt(true)
-                } else {
-                    startRemoteFolderTrailer(folder, includeSubfolders = false)
-                }
+                onResult(hasSubfolders)
             }.onFailure { error ->
                 _state.update { it.copy(message = error.message ?: "폴더 내용을 불러오지 못했습니다.") }
+            }
+        }
+    }
+
+    fun prepareRemoteFolderTrailer(
+        folder: RemoteFileItem,
+        onPrompt: (hasSubfolders: Boolean) -> Unit,
+    ) {
+        checkRemoteFolderHasSubfolders(folder) { hasSubfolders ->
+            if (hasSubfolders) {
+                onPrompt(true)
+            } else {
+                startRemoteFolderTrailer(folder, includeSubfolders = false)
+            }
+        }
+    }
+
+    fun prepareRemoteFolderMusicOverlay(
+        folder: RemoteFileItem,
+        onPrompt: (hasSubfolders: Boolean) -> Unit,
+    ) {
+        checkRemoteFolderHasSubfolders(folder) { hasSubfolders ->
+            if (hasSubfolders) {
+                onPrompt(true)
+            } else {
+                startRemoteFolderMusicOverlay(folder, includeSubfolders = false)
             }
         }
     }
@@ -3237,12 +3478,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun startRemoteMusicOverlay(
         items: List<RemoteFileItem>,
         musicTrack: TrailerMusicTrack?,
-        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = 1,
     ) {
         val activeService = service ?: return
         val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }
         if (media.size != items.size || media.isEmpty()) return
-        trailerRetry = { startRemoteMusicOverlay(media, musicTrack, musicPolicy) }
+        trailerRetry = { startRemoteMusicOverlay(media, musicTrack, musicPolicy, musicFitCount) }
         val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
         prepareTrailer(
             names = media.map { it.name },
@@ -3250,6 +3492,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             isMusicOverlayMode = true,
             initialMusicTrack = musicTrack,
             initialMusicPolicy = musicPolicy,
+            initialMusicFitCount = musicFitCount,
         ) { index, destination ->
             val item = media[index]
             activeService.download(item, destination) { received, total ->
@@ -3265,11 +3508,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun startInboxMusicOverlay(
         ids: List<UUID>,
         musicTrack: TrailerMusicTrack?,
-        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = 1,
     ) {
         val selected = runCatching { selectedInboxItems(ids) }.getOrElse { return }
         if (selected.isEmpty() || selected.any { val item = it.asPreviewItem(); !item.isVideo && !item.isImage }) return
-        trailerRetry = { startInboxMusicOverlay(ids, musicTrack, musicPolicy) }
+        trailerRetry = { startInboxMusicOverlay(ids, musicTrack, musicPolicy, musicFitCount) }
         val captureTimes = selected.map { it.importedAt.toEpochMilli() }
         prepareTrailer(
             names = selected.map { it.originalFilename },
@@ -3277,6 +3521,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             isMusicOverlayMode = true,
             initialMusicTrack = musicTrack,
             initialMusicPolicy = musicPolicy,
+            initialMusicFitCount = musicFitCount,
         ) { index, destination ->
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 selected[index].file.inputStream().buffered().use { input ->
@@ -3297,11 +3542,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun startLocalMusicOverlay(
         uris: List<Uri>,
         musicTrack: TrailerMusicTrack?,
-        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = 1,
     ) {
         if (uris.isEmpty()) return
         val activeUris = uris.distinct()
-        trailerRetry = { startLocalMusicOverlay(activeUris, musicTrack, musicPolicy) }
+        trailerRetry = { startLocalMusicOverlay(activeUris, musicTrack, musicPolicy, musicFitCount) }
         val names = activeUris.map { uri ->
             queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어"
         }
@@ -3331,6 +3577,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             isMusicOverlayMode = true,
             initialMusicTrack = musicTrack,
             initialMusicPolicy = musicPolicy,
+            initialMusicFitCount = musicFitCount,
         ) { index, destination ->
             val uri = activeUris[index]
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
@@ -3356,10 +3603,43 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         initialExcludedCount: Int = 0,
         isMusicOverlayMode: Boolean = false,
         initialMusicTrack: TrailerMusicTrack? = null,
-        initialMusicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        initialMusicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        initialMusicFitCount: Int = 1,
+        forceNew: Boolean = false,
         stage: suspend (Int, File) -> Unit,
     ) {
         if (_state.value.trailer?.busy == true) return
+
+        val existingDraft = TrailerDraftStore.getDraft(isMusicOverlayMode)
+        if (!forceNew && existingDraft != null && existingDraft.isValid()) {
+            _state.update {
+                it.copy(
+                    trailerConflict = TrailerConflictConfirmation(
+                        title = if (isMusicOverlayMode) "음악 입히기 편집 재개" else "예고편 편집 재개",
+                        message = "이전에 작업 중이던 편집이 보관되어 있습니다. 이전 편집을 이어 진행할까요, 아니면 버리고 새로 시작할까요?",
+                        onResumeExisting = {
+                            resumeTrailerDraft(existingDraft)
+                        },
+                        onStartNew = {
+                            TrailerDraftStore.clearDraft(isMusicOverlayMode)
+                            prepareTrailer(
+                                names = names,
+                                captureTimes = captureTimes,
+                                initialExcludedCount = initialExcludedCount,
+                                isMusicOverlayMode = isMusicOverlayMode,
+                                initialMusicTrack = initialMusicTrack,
+                                initialMusicPolicy = initialMusicPolicy,
+                                initialMusicFitCount = initialMusicFitCount,
+                                forceNew = true,
+                                stage = stage,
+                            )
+                        }
+                    )
+                )
+            }
+            return
+        }
+
         closeTrailer(clearRetry = false)
         val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
         directory.mkdirs()
@@ -3370,8 +3650,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     isMusicOverlayMode = isMusicOverlayMode,
                     musicTrack = initialMusicTrack,
                     musicPolicy = initialMusicPolicy,
+                    musicFitCount = initialMusicFitCount,
                 ),
                 imagePreview = null,
+                trailerDraftCount = TrailerDraftStore.draftCount(),
             )
         }
         trailerJob = viewModelScope.launch {
@@ -3560,7 +3842,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         isMusicOverlayMode = isMusicOverlayMode,
                         musicTrack = initialMusicTrack,
                         musicPolicy = initialMusicPolicy,
+                        musicFitCount = initialMusicFitCount,
                         awaitingInitialSettings = true,
+                        prepared = true,
                     )
                 }
                 trailerJob = null
@@ -3576,7 +3860,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         photoLength: Double = defaultPhotoClipLength(length),
         format: TrailerFormat,
         musicTrack: TrailerMusicTrack? = _state.value.trailer?.musicTrack,
-        musicPolicy: TrailerMusicPolicy = _state.value.trailer?.musicPolicy ?: TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        musicPolicy: TrailerMusicPolicy = _state.value.trailer?.musicPolicy ?: TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = _state.value.trailer?.musicFitCount ?: 1,
         autoDucking: Boolean = _state.value.trailer?.autoDucking ?: true,
     ) {
         val session = _state.value.trailer ?: return
@@ -3593,9 +3878,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         val sources = order.mapNotNull { existingMap[it] }
         val scenes = if (session.isMusicOverlayMode) {
-            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy)
+            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
         } else {
-            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy)
+            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount)
         }
         if (scenes.isEmpty()) {
             updateTrailer(directory) { it.copy(error = "이 장면 길이로 만들 수 없습니다. 장면 길이를 줄여 주세요.") }; return
@@ -3610,6 +3895,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     format = format,
                     musicTrack = musicTrack,
                     musicPolicy = musicPolicy,
+                    musicFitCount = musicFitCount,
                     autoDucking = autoDucking,
                     awaitingInitialSettings = false,
                     busy = true,
@@ -3629,6 +3915,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     destination = output,
                     musicTrack = musicTrack,
                     musicPolicy = musicPolicy,
+                    musicFitCount = musicFitCount,
                     autoDucking = autoDucking,
                 ) { status, progress ->
                     updateTrailer(directory) { it.copy(status = status, progress = progress) }
@@ -3655,6 +3942,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             session.format,
             session.musicTrack,
             session.musicPolicy,
+            session.musicFitCount,
             session.autoDucking,
         )
         else trailerRetry?.invoke()
@@ -3681,7 +3969,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    fun dismissTrailer() = closeTrailer(clearRetry = true)
+    fun dismissTrailer() {
+        suspendTrailerDraft(showingSettings = false)
+    }
 
     private fun closeTrailer(clearRetry: Boolean) {
         val session = _state.value.trailer
@@ -3690,11 +3980,164 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         trailerJob = null
         if (clearRetry) trailerRetry = null
         if (session != null) {
-            if (running?.isActive == true) {
-                running.invokeOnCompletion { session.directory.deleteRecursively() }
+            val isManaged = TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)
+            if (!isManaged) {
+                if (running?.isActive == true) {
+                    running.invokeOnCompletion { session.directory.deleteRecursively() }
+                    running.cancel()
+                } else session.directory.deleteRecursively()
+            } else if (running?.isActive == true) {
                 running.cancel()
-            } else session.directory.deleteRecursively()
+            }
         }
+    }
+
+    fun suspendTrailerDraft(
+        showingSettings: Boolean = false,
+        sources: List<TrailerSource>? = null,
+        total: Double? = null,
+        length: Double? = null,
+        photoLength: Double? = null,
+        format: TrailerFormat? = null,
+        musicTrack: TrailerMusicTrack? = null,
+        musicPolicy: TrailerMusicPolicy? = null,
+        musicFitCount: Int? = null,
+        autoDucking: Boolean? = null,
+        wasCancelled: Boolean = false,
+    ) {
+        val session = _state.value.trailer ?: return
+        val running = trailerJob
+        trailerJob = null
+        val wasRunning = running?.isActive == true
+        if (wasRunning) running?.cancel()
+
+        val finalOutput = session.output?.takeIf { it.exists() && it.length() > 0 }
+
+        // Staging/analysis never finished: there is no valid plan to keep, so only this
+        // session's own partial directory is removed and no draft is stored.
+        if (!session.prepared) {
+            if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
+                if (wasRunning) running?.invokeOnCompletion { session.directory.deleteRecursively() }
+                else session.directory.deleteRecursively()
+            }
+            val cancelMsg = if (session.isMusicOverlayMode) "음악 입히기가 취소되었습니다." else "예고편 만들기가 취소되었습니다."
+            _state.update {
+                it.copy(
+                    trailer = null,
+                    trailerDraftCount = TrailerDraftStore.draftCount(),
+                    message = if (wasCancelled) cancelMsg else it.message,
+                )
+            }
+            return
+        }
+
+        val draftSources = (sources ?: session.sources).ifEmpty { session.sources }
+
+        if (draftSources.isNotEmpty()) {
+            val draft = TrailerDraft(
+                isMusicOverlayMode = session.isMusicOverlayMode,
+                directory = session.directory,
+                sources = draftSources,
+                total = total ?: session.total,
+                clipLength = length ?: session.clipLength,
+                photoClipLength = photoLength ?: session.photoClipLength,
+                format = format ?: session.format,
+                musicTrack = musicTrack ?: session.musicTrack,
+                musicPolicy = musicPolicy ?: session.musicPolicy,
+                musicFitCount = musicFitCount ?: session.musicFitCount,
+                autoDucking = autoDucking ?: session.autoDucking,
+                output = finalOutput,
+                showingSettings = showingSettings,
+            )
+            TrailerDraftStore.saveDraft(draft)
+        } else if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
+            session.directory.deleteRecursively()
+        }
+
+        _state.update {
+            it.copy(
+                trailer = null,
+                trailerDraftCount = TrailerDraftStore.draftCount(),
+            )
+        }
+    }
+
+    fun resumeTrailerDraft(draft: TrailerDraft) {
+        if (_state.value.trailer != null) return
+        if (!draft.isValid()) {
+            TrailerDraftStore.removeDraft(draft)
+            _state.update {
+                it.copy(
+                    trailerDraftStaleNotice = "이전 편집 파일이 삭제되었거나 사용할 수 없어 복원할 수 없습니다. 새 편집을 시작해 주세요.",
+                    trailerDraftCount = TrailerDraftStore.draftCount(),
+                    trailerDraftPicker = null,
+                )
+            }
+            return
+        }
+
+        val restoredSession = TrailerSession(
+            directory = draft.directory,
+            sources = draft.sources,
+            total = draft.total,
+            clipLength = draft.clipLength,
+            photoClipLength = draft.photoClipLength,
+            format = draft.format,
+            output = draft.output?.takeIf { it.exists() && it.length() > 0 },
+            busy = false,
+            status = if (draft.output != null) "예고편을 불러왔습니다." else "편집을 이어갑니다.",
+            progress = null,
+            error = null,
+            saved = false,
+            isMusicOverlayMode = draft.isMusicOverlayMode,
+            musicTrack = draft.musicTrack?.takeIf { it.file.exists() },
+            musicPolicy = draft.musicPolicy,
+            musicFitCount = draft.musicFitCount,
+            autoDucking = draft.autoDucking,
+            awaitingInitialSettings = draft.showingSettings || draft.output == null,
+            prepared = true,
+        )
+
+        _state.update {
+            it.copy(
+                trailer = restoredSession,
+                imagePreview = null,
+                trailerDraftPicker = null,
+            )
+        }
+    }
+
+    fun discardTrailerDraft(draft: TrailerDraft) {
+        TrailerDraftStore.removeDraft(draft)
+        val remaining = TrailerDraftStore.getAllDrafts()
+        _state.update {
+            it.copy(
+                trailerDraftCount = remaining.size,
+                trailerDraftPicker = remaining.takeIf { it.isNotEmpty() },
+            )
+        }
+    }
+
+    fun openPhoneHardLongTouch() {
+        if (_state.value.trailer != null) return
+        val drafts = TrailerDraftStore.getAllDrafts()
+        when {
+            drafts.isEmpty() -> return
+            drafts.size == 1 -> resumeTrailerDraft(drafts.first())
+            else -> _state.update { it.copy(trailerDraftPicker = drafts) }
+        }
+    }
+
+    fun dismissTrailerDraftPicker() {
+        _state.update { it.copy(trailerDraftPicker = null) }
+    }
+
+    fun dismissTrailerDraftStaleNotice() {
+        _state.update { it.copy(trailerDraftStaleNotice = null) }
+    }
+
+    fun dismissTrailerConflict() {
+        _state.update { it.copy(trailerConflict = null) }
     }
 
     private fun updateTrailer(directory: File, transform: (TrailerSession) -> TrailerSession) {
@@ -3815,21 +4258,83 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             null,
         )?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
     }.getOrNull()
-    private fun inboxFiles(): List<InboxDisplayItem> = inboxStore.records()
-        .sortedWith(compareByDescending<com.armsone.nasfinder.data.SharedInboxRecord> { it.importedAt }.thenBy { it.originalFilename })
-        .mapNotNull { record ->
-            runCatching {
-                InboxDisplayItem(
-                    id = record.id,
-                    originalFilename = record.originalFilename,
-                    mimeType = record.mimeType,
-                    byteCount = record.byteCount,
-                    importedAt = record.importedAt,
-                    file = inboxStore.file(record),
-                    relativePath = record.storedFilename,
-                )
-            }.getOrNull()
+    private val phoneHardDurationCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private var durationPrefetchJob: Job? = null
+
+    private fun durationCacheKey(idOrPath: String, modifiedAt: Long, byteCount: Long): String =
+        "$idOrPath:$modifiedAt:$byteCount"
+
+    private fun extractMediaDuration(file: File): Long? = runCatching {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(file.path)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.takeIf { it > 0L }
+        } finally {
+            retriever.release()
         }
+    }.getOrNull()
+
+    private fun prefetchInboxDurations(items: List<InboxDisplayItem>) {
+        val candidates = items.filter { item ->
+            val kind = BuiltInPreviewPolicy.kind(item.originalFilename, item.mimeType)
+            (kind == BuiltInPreviewKind.VIDEO || kind == BuiltInPreviewKind.AUDIO) &&
+                !phoneHardDurationCache.containsKey(durationCacheKey(item.id.toString(), item.file.lastModified(), item.byteCount))
+        }
+        if (candidates.isEmpty()) return
+
+        durationPrefetchJob?.cancel()
+        durationPrefetchJob = viewModelScope.launch(Dispatchers.IO) {
+            var anyChanged = false
+            for (item in candidates) {
+                if (coroutineContext[Job]?.isActive != true) break
+                val key = durationCacheKey(item.id.toString(), item.file.lastModified(), item.byteCount)
+                val dur = extractMediaDuration(item.file)
+                phoneHardDurationCache[key] = dur ?: -1L
+                if (dur != null) anyChanged = true
+            }
+            if (anyChanged && coroutineContext[Job]?.isActive != false) {
+                _state.update { current ->
+                    current.copy(
+                        inboxFiles = current.inboxFiles.map { file ->
+                            if (file.durationMillis == null) {
+                                val key = durationCacheKey(file.id.toString(), file.file.lastModified(), file.byteCount)
+                                val cached = phoneHardDurationCache[key]
+                                if (cached != null && cached > 0L) file.copy(durationMillis = cached) else file
+                            } else file
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun inboxFiles(): List<InboxDisplayItem> {
+        val loaded = inboxStore.records()
+            .sortedWith(compareByDescending<com.armsone.nasfinder.data.SharedInboxRecord> { it.importedAt }.thenBy { it.originalFilename })
+            .mapNotNull { record ->
+                runCatching {
+                    val file = inboxStore.file(record)
+                    val kind = BuiltInPreviewPolicy.kind(record.originalFilename, record.mimeType)
+                    val isMedia = kind == BuiltInPreviewKind.VIDEO || kind == BuiltInPreviewKind.AUDIO
+                    val key = durationCacheKey(record.id.toString(), file.lastModified(), record.byteCount)
+                    val cachedDuration = if (isMedia) phoneHardDurationCache[key]?.takeIf { it > 0L } else null
+                    InboxDisplayItem(
+                        id = record.id,
+                        originalFilename = record.originalFilename,
+                        mimeType = record.mimeType,
+                        byteCount = record.byteCount,
+                        importedAt = record.importedAt,
+                        file = file,
+                        relativePath = record.storedFilename,
+                        durationMillis = cachedDuration,
+                    )
+                }.getOrNull()
+            }
+        prefetchInboxDurations(loaded)
+        return loaded
+    }
 
     private fun uniqueFile(parent: File, requested: String): File {
         val root = parent.canonicalFile
@@ -3876,7 +4381,24 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val res = inboxStore.moveTargets(targets, destinationSubdirectory)
+            var updated = _state.value.remoteFavorites
+            for (mapping in res.pathMappings) {
+                val src = mapping.sourcePath.trim().removePrefix("/").removeSuffix("/")
+                val dst = mapping.destinationPath.trim().removePrefix("/").removeSuffix("/")
+                updated = updated.map { fav ->
+                    if (fav.connectionId == "phonehard") {
+                        if (fav.path == src) fav.copy(path = dst)
+                        else if (mapping.isDirectory && fav.path.startsWith("$src/")) {
+                            fav.copy(path = "$dst/${fav.path.removePrefix("$src/")}")
+                        } else fav
+                    } else fav
+                }
+            }
+            if (updated != _state.value.remoteFavorites) {
+                favoriteRepository.saveRemote(updated)
+            }
             withContext(Dispatchers.Main) {
+                _state.update { it.copy(remoteFavorites = updated) }
                 refreshInbox()
                 onResult(res)
             }
@@ -3903,15 +4425,553 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val res = inboxStore.deleteTargets(targets)
+            val removedSet = if (res.removedPaths.isNotEmpty()) {
+                res.removedPaths.map { it.trim().removePrefix("/").removeSuffix("/") }.toSet()
+            } else {
+                res.succeeded.map { it.relativePath.trim().removePrefix("/").removeSuffix("/") }.toSet()
+            }
+            val remaining = _state.value.remoteFavorites.filterNot { fav ->
+                fav.connectionId == "phonehard" && removedSet.any { dp -> fav.path == dp || fav.path.startsWith("$dp/") }
+            }
+            if (remaining.size != _state.value.remoteFavorites.size) {
+                favoriteRepository.saveRemote(remaining)
+            }
             withContext(Dispatchers.Main) {
+                _state.update { it.copy(remoteFavorites = remaining) }
                 refreshInbox()
                 onResult(res)
             }
         }
     }
 
+    fun downloadRemoteItems(
+        connection: RemoteConnection,
+        items: List<RemoteFileItem>,
+        destination: NetworkDownloadDestination,
+    ) {
+        if (items.isEmpty()) return
+        networkDownloadJob?.cancel()
+        _state.update {
+            it.copy(
+                isDownloadingNetwork = true,
+                networkDownloadProgress = NetworkDownloadProgress(
+                    currentFileName = "",
+                    completedFiles = 0,
+                    totalFiles = items.size,
+                    currentFileBytes = 0L,
+                    currentFileTotalBytes = 0L,
+                    totalBytesDownloaded = 0L,
+                    totalBytesExpected = 0L,
+                ),
+            )
+        }
+        // Started lazily so the job is registered before its own cleanup can compare against it.
+        val job = viewModelScope.launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            val ownJob = coroutineContext[Job]
+            var result: NetworkDownloadResult = NetworkDownloadResult.Cancelled(0, 0L)
+            try {
+                result = runCatching {
+                    withDedicatedRemoteService(connection) { ownService ->
+                        networkDownloadCoordinator.download(
+                            service = ownService,
+                            items = items,
+                            destination = destination,
+                        ) { progress ->
+                            if (ownJob?.isActive == true) _state.update { it.copy(networkDownloadProgress = progress) }
+                        }
+                    }
+                }.getOrElse { e ->
+                    if (e is CancellationException) {
+                        NetworkDownloadResult.Cancelled(0, 0L)
+                    } else {
+                        NetworkDownloadResult.Failure(e.message ?: "다운로드 중 오류가 발생했습니다.", e)
+                    }
+                }
+            } finally {
+                // A cancelled job must still surface the files it already committed.
+                withContext(NonCancellable + Dispatchers.Main) {
+                    if (destination is NetworkDownloadDestination.PhoneHard) {
+                        refreshInbox()
+                    }
+                    // A newer download owns the progress fields once it has replaced this job.
+                    if (networkDownloadJob === ownJob) {
+                        networkDownloadJob = null
+                        val msg = when (val finished = result) {
+                            is NetworkDownloadResult.Success -> finished.message
+                            is NetworkDownloadResult.Failure -> finished.message
+                            is NetworkDownloadResult.Cancelled -> finished.message
+                            is NetworkDownloadResult.Skipped -> finished.reason
+                        }
+                        _state.update {
+                            it.copy(
+                                isDownloadingNetwork = false,
+                                networkDownloadProgress = null,
+                                message = msg,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        networkDownloadJob = job
+        job.start()
+    }
+
+    fun cancelNetworkDownload() {
+        networkDownloadJob?.cancel()
+        _state.update {
+            it.copy(
+                isDownloadingNetwork = false,
+                networkDownloadProgress = null,
+                message = "사용자에 의해 다운로드가 취소되었습니다.",
+            )
+        }
+    }
+
+    fun startRemoteFolderMusicOverlay(folder: RemoteFileItem, includeSubfolders: Boolean = false) {
+        if (!folder.isDirectory) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        val activeConnection = browser.connection
+        val preferencesSnapshot = browser.preferences
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            val (mediaCandidates, _) = withContext(Dispatchers.IO) {
+                try {
+                    val activeService = service ?: run {
+                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
+                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+                    }
+                    val media = mutableListOf<RemoteFileItem>()
+                    var nonMediaCount = 0
+                    if (includeSubfolders) {
+                        val queue = java.util.ArrayDeque<String>()
+                        val visitedPaths = mutableSetOf<String>()
+                        queue.add(folder.path)
+                        visitedPaths.add(folder.path.trimEnd('/'))
+                        while (queue.isNotEmpty()) {
+                            val currentPath = queue.removeFirst()
+                            val entries = activeService.list(currentPath)
+                            for (entry in entries) {
+                                if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                                if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+                                val normPath = entry.path.trimEnd('/')
+                                if (entry.isDirectory) {
+                                    if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
+                                        queue.add(entry.path)
+                                    }
+                                } else if (entry.isVideo || entry.isImage) {
+                                    media.add(entry)
+                                } else {
+                                    nonMediaCount++
+                                }
+                            }
+                        }
+                    } else {
+                        val entries = activeService.list(folder.path)
+                        for (entry in entries) {
+                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                            if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+                            if (entry.isDirectory) continue
+                            if (entry.isVideo || entry.isImage) {
+                                media.add(entry)
+                            } else {
+                                nonMediaCount++
+                            }
+                        }
+                    }
+                    media to nonMediaCount
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    emptyList<RemoteFileItem>() to 0
+                }
+            }
+            _state.update { it.copy(isBusy = false) }
+            if (mediaCandidates.isEmpty()) {
+                _state.update { it.copy(message = "폴더에 음악을 입힐 사진이나 영상이 없습니다.") }
+                return@launch
+            }
+            startRemoteMusicOverlay(mediaCandidates, null)
+        }
+    }
+
+    fun startInboxFolderTrailer(folderRelativePath: String, includeSubfolders: Boolean = false) {
+        val norm = folderRelativePath.trim().removePrefix("/").removeSuffix("/")
+        val candidates = _state.value.inboxFiles.filter { item ->
+            val itemRel = item.relativePath.trim().removePrefix("/").removeSuffix("/")
+            val parent = itemRel.substringBeforeLast('/', "")
+            val inFolder = if (includeSubfolders) itemRel.startsWith("$norm/") else parent == norm
+            inFolder && (item.isTrailerVideo || BuiltInPreviewPolicy.kind(item.originalFilename, item.mimeType) in setOf(BuiltInPreviewKind.VIDEO, BuiltInPreviewKind.IMAGE))
+        }
+        if (candidates.isEmpty()) {
+            _state.update { it.copy(message = "폴더에 재생 가능한 사진이나 영상이 없습니다.") }
+            return
+        }
+        startInboxTrailer(candidates.map { it.id })
+    }
+
+    fun startInboxFolderMusicOverlay(folderRelativePath: String, includeSubfolders: Boolean = false) {
+        val norm = folderRelativePath.trim().removePrefix("/").removeSuffix("/")
+        val candidates = _state.value.inboxFiles.filter { item ->
+            val itemRel = item.relativePath.trim().removePrefix("/").removeSuffix("/")
+            val parent = itemRel.substringBeforeLast('/', "")
+            val inFolder = if (includeSubfolders) itemRel.startsWith("$norm/") else parent == norm
+            inFolder && (item.isTrailerVideo || BuiltInPreviewPolicy.kind(item.originalFilename, item.mimeType) in setOf(BuiltInPreviewKind.VIDEO, BuiltInPreviewKind.IMAGE))
+        }
+        if (candidates.isEmpty()) {
+            _state.update { it.copy(message = "폴더에 음악을 입힐 사진이나 영상이 없습니다.") }
+            return
+        }
+        startInboxMusicOverlay(candidates.map { it.id }, null)
+    }
+
+    fun hasInboxSubfolders(folderRelativePath: String): Boolean {
+        val norm = folderRelativePath.trim().removePrefix("/").removeSuffix("/")
+        val subItems = loadPhoneHardFolder(norm)
+        return subItems.any { it.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY }
+    }
+
+    fun renamePhoneHardItem(relativePath: String, newName: String, onResult: (Boolean, String?) -> Unit) {
+        val trimmedName = newName.trim()
+        if (trimmedName.isBlank() || trimmedName == "." || trimmedName == ".." || '/' in trimmedName || '\\' in trimmedName) {
+            onResult(false, "올바르지 않은 이름입니다.")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = inboxStore.renamePhoneHardTarget(relativePath, trimmedName)
+            if (res.isSuccess) {
+                var updated = _state.value.remoteFavorites
+                for (mapping in res.pathMappings) {
+                    val src = mapping.sourcePath.trim().removePrefix("/").removeSuffix("/")
+                    val dst = mapping.destinationPath.trim().removePrefix("/").removeSuffix("/")
+                    val newNameOnly = dst.substringAfterLast('/')
+                    updated = updated.map { fav ->
+                        if (fav.connectionId == "phonehard") {
+                            if (fav.path == src) fav.copy(path = dst, name = newNameOnly)
+                            else if (mapping.isDirectory && fav.path.startsWith("$src/")) {
+                                fav.copy(path = "$dst/${fav.path.removePrefix("$src/")}")
+                            } else fav
+                        } else fav
+                    }
+                }
+                if (updated != _state.value.remoteFavorites) {
+                    favoriteRepository.saveRemote(updated)
+                }
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(remoteFavorites = updated) }
+                    refreshInbox()
+                    onResult(true, null)
+                }
+            } else {
+                val err = res.failed.firstOrNull()?.second ?: "이름 변경에 실패했습니다."
+                withContext(Dispatchers.Main) {
+                    onResult(false, err)
+                }
+            }
+        }
+    }
+
+    fun exportPhoneHardTargetsToExternalTree(
+        targets: List<com.armsone.nasfinder.data.PhoneHardTarget>,
+        treeUri: Uri,
+        onResult: (NetworkDownloadResult) -> Unit,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                networkDownloadCoordinator.exportPhoneHardTargetsToExternalTree(targets, treeUri)
+            }.getOrElse { e ->
+                if (e is CancellationException) NetworkDownloadResult.Cancelled(0, 0L)
+                else NetworkDownloadResult.Failure(e.message ?: "외부 저장소 내보내기 실패", e)
+            }
+            withContext(Dispatchers.Main) {
+                onResult(result)
+            }
+        }
+    }
+
+    fun clearInitialInboxSubpath() {
+        _state.update { it.copy(initialInboxSubpath = null) }
+    }
+
+    fun isPhoneHardFavorite(relativePath: String): Boolean {
+        val norm = relativePath.trim().removePrefix("/").removeSuffix("/")
+        return _state.value.remoteFavorites.any { it.connectionId == "phonehard" && it.path == norm }
+    }
+
+    fun togglePhoneHardFavorite(
+        relativePath: String,
+        name: String,
+        isDirectory: Boolean,
+        id: String? = null,
+        size: Long? = null,
+        modifiedAt: java.time.Instant? = null,
+        mimeType: String? = null,
+    ) {
+        val norm = relativePath.trim().removePrefix("/").removeSuffix("/")
+        val favorites = favoriteRepository.toggleRemote(
+            RemoteFavorite(
+                connectionId = "phonehard",
+                path = norm,
+                name = name,
+                isDirectory = isDirectory,
+                remoteItemId = id ?: norm,
+                size = size,
+                modifiedAt = modifiedAt,
+                mimeType = mimeType,
+                thumbnailUrl = null,
+            )
+        )
+        _state.update { it.copy(remoteFavorites = favorites) }
+        invalidateFavoriteThumbnails()
+    }
+
+    fun sharePhoneHardTargets(folderPaths: List<String>, fileIds: List<UUID>) {
+        if (folderPaths.isEmpty() && fileIds.isEmpty()) return
+        if (folderPaths.isEmpty()) {
+            val toShare = _state.value.inboxFiles.filter { it.id in fileIds }
+            if (toShare.isEmpty()) return
+            if (toShare.size == 1) shareInboxFile(toShare.first())
+            else shareInboxFiles(fileIds)
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val sharesDir = File(application.cacheDir, "shares").apply { mkdirs() }
+            val uniqueZipName = "phonehard_share_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.zip"
+            val zipFile = File(sharesDir, uniqueZipName)
+            try {
+                val maxDepth = DefaultNetworkDownloadCoordinator.MAX_REMOTE_DIRECTORY_DEPTH
+                val rootCanonical = inboxStore.rootDirectory.canonicalFile
+                val rootPath = rootCanonical.path.trimEnd(File.separatorChar)
+                fun isInsidePhoneHard(file: File) = file.path.startsWith("$rootPath${File.separator}")
+                val inboxSnapshot = _state.value.inboxFiles
+                val displayNames = inboxSnapshot.associate { it.file.canonicalPath to it.originalFilename }
+
+                val folders = folderPaths.map { folderPath ->
+                    val norm = folderPath.trim().removePrefix("/").removeSuffix("/")
+                    val requested = if (norm.isEmpty()) rootCanonical else File(rootCanonical, norm)
+                    if (java.nio.file.Files.isSymbolicLink(requested.toPath())) {
+                        throw java.io.IOException("심볼릭 링크 폴더는 공유할 수 없습니다: $norm")
+                    }
+                    val folderFile = requested.canonicalFile
+                    if (folderFile.path != rootPath && !isInsidePhoneHard(folderFile)) {
+                        throw java.io.IOException("폰하드 밖의 폴더는 공유할 수 없습니다: $norm")
+                    }
+                    if (!folderFile.isDirectory) throw java.io.IOException("공유할 폴더를 찾을 수 없습니다: $norm")
+                    folderFile
+                }.distinctBy { it.path }
+                // A selection nested inside another selected folder is already covered by its ancestor.
+                val topFolders = folders.filter { candidate ->
+                    folders.none { it.path != candidate.path && candidate.path.startsWith("${it.path}${File.separator}") }
+                }
+                val topFiles = fileIds.distinct().map { fileId ->
+                    val fileItem = inboxSnapshot.firstOrNull { it.id == fileId }
+                        ?: throw java.io.IOException("선택한 파일을 폰하드에서 찾을 수 없습니다.")
+                    if (java.nio.file.Files.isSymbolicLink(fileItem.file.toPath())) {
+                        throw java.io.IOException("심볼릭 링크는 공유할 수 없습니다: ${fileItem.originalFilename}")
+                    }
+                    val canonical = fileItem.file.canonicalFile
+                    if (!isInsidePhoneHard(canonical) || !canonical.isFile) {
+                        throw java.io.IOException("공유할 파일을 찾을 수 없습니다: ${fileItem.originalFilename}")
+                    }
+                    canonical to fileItem.originalFilename
+                }.filter { (file, _) ->
+                    topFolders.none { it.path == rootPath || file.path.startsWith("${it.path}${File.separator}") }
+                }
+
+                var entryCount = 0
+                java.util.zip.ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
+                    val usedNames = mutableSetOf<String>()
+                    fun addFile(file: File, entryName: String) {
+                        zos.putNextEntry(java.util.zip.ZipEntry(entryName))
+                        file.inputStream().buffered().use { input -> input.copyTo(zos) }
+                        zos.closeEntry()
+                        entryCount++
+                    }
+                    fun addFolder(folder: File, prefix: String, depth: Int, ancestors: Set<String>) {
+                        ensureActive()
+                        if (depth > maxDepth) {
+                            throw java.io.IOException("폴더가 ${maxDepth}단계보다 깊어 공유할 수 없습니다: ${folder.name}")
+                        }
+                        if (folder.path in ancestors) {
+                            throw java.io.IOException("같은 폴더가 반복되는 구조여서 공유할 수 없습니다: ${folder.name}")
+                        }
+                        // Every folder gets its own entry so empty ones survive.
+                        zos.putNextEntry(java.util.zip.ZipEntry(prefix))
+                        zos.closeEntry()
+                        entryCount++
+                        val children = folder.listFiles()
+                            ?: throw java.io.IOException("폴더를 읽을 수 없습니다: ${folder.name}")
+                        val nextAncestors = ancestors + folder.path
+                        for (child in children.sortedBy { it.name }) {
+                            if (java.nio.file.Files.isSymbolicLink(child.toPath())) {
+                                throw java.io.IOException("심볼릭 링크가 들어 있는 폴더는 공유할 수 없습니다: ${child.name}")
+                            }
+                            val canonical = child.canonicalFile
+                            if (!isInsidePhoneHard(canonical)) {
+                                throw java.io.IOException("폰하드 밖을 가리키는 항목은 공유할 수 없습니다: ${child.name}")
+                            }
+                            when {
+                                canonical.isDirectory ->
+                                    addFolder(canonical, reserveZipEntryName(usedNames, prefix, child.name) + "/", depth + 1, nextAncestors)
+                                canonical.isFile ->
+                                    addFile(canonical, reserveZipEntryName(usedNames, prefix, displayNames[canonical.path] ?: child.name))
+                                else -> throw java.io.IOException("공유할 수 없는 항목이 있습니다: ${child.name}")
+                            }
+                        }
+                    }
+                    for (folderFile in topFolders) {
+                        addFolder(folderFile, reserveZipEntryName(usedNames, "", folderFile.name) + "/", 0, emptySet())
+                    }
+                    for ((file, displayName) in topFiles) {
+                        ensureActive()
+                        addFile(file, reserveZipEntryName(usedNames, "", displayName))
+                    }
+                }
+                if (entryCount == 0) {
+                    zipFile.delete()
+                    withContext(Dispatchers.Main) {
+                        _state.update { it.copy(inboxErrorMessage = "공유할 항목이 없습니다.") }
+                    }
+                    return@launch
+                }
+                val sendIntent = NasFinderShareIntentFactory.create(application, listOf(zipFile))
+                withContext(Dispatchers.Main) {
+                    application.startActivity(
+                        Intent.createChooser(sendIntent, "항목 압축 파일 공유")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                zipFile.delete()
+                throw cancelled
+            } catch (e: Exception) {
+                zipFile.delete()
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(inboxErrorMessage = e.message ?: "항목을 공유하지 못했습니다.") }
+                }
+            }
+        }
+    }
+
+    fun shareInboxFolder(relativePath: String) {
+        sharePhoneHardTargets(listOf(relativePath), emptyList())
+    }
+
+    private var localThumbnailJob: Job? = null
+
+    fun startLocalThumbnailGeneration(
+        target: com.armsone.nasfinder.data.PhoneHardTarget,
+        onProgress: ((Int, Int) -> Unit)? = null,
+        onComplete: ((Int) -> Unit)? = null,
+    ) {
+        if (localThumbnailJob?.isActive == true) {
+            cancelLocalThumbnailGeneration()
+            return
+        }
+        _state.update { it.copy(isLocalThumbnailRunning = true) }
+        // Started lazily so the job is registered before its own cleanup can compare against it.
+        val job = viewModelScope.launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            val ownJob = coroutineContext[Job]
+            try {
+                val rootCanonical = inboxStore.rootDirectory.canonicalFile
+                val norm = target.relativePath.trim().removePrefix("/").removeSuffix("/")
+                val targetFile = if (norm.isEmpty()) rootCanonical else File(rootCanonical, norm).canonicalFile
+
+                val mediaFiles = if (target.isDirectory) {
+                    targetFile.walkTopDown()
+                        .filter { it.isFile && (isPhoneHardImage(it.name) || isPhoneHardVideo(it.name) || it.name.endsWith(".pdf", ignoreCase = true)) }
+                        .toList()
+                } else {
+                    if (targetFile.isFile && (isPhoneHardImage(targetFile.name) || isPhoneHardVideo(targetFile.name) || targetFile.name.endsWith(".pdf", ignoreCase = true))) {
+                        listOf(targetFile)
+                    } else emptyList()
+                }
+
+                if (mediaFiles.isEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        _state.update { it.copy(isLocalThumbnailRunning = false, inboxErrorMessage = "사진 또는 영상 파일이 없습니다.") }
+                    }
+                    return@launch
+                }
+
+                val total = mediaFiles.size
+                var generatedCount = 0
+                val thumbDir = File(application.cacheDir, "inbox_thumbs").apply { mkdirs() }
+                for ((index, file) in mediaFiles.withIndex()) {
+                    ensureActive()
+                    withContext(Dispatchers.Main) {
+                        _state.update { it.copy(localThumbnailProgress = (index + 1) to total) }
+                        onProgress?.invoke(index + 1, total)
+                    }
+                    val isImage = isPhoneHardImage(file.name)
+                    val isVideo = isPhoneHardVideo(file.name)
+                    val isPdf = file.name.endsWith(".pdf", ignoreCase = true)
+                    val uri = runCatching {
+                        androidx.core.content.FileProvider.getUriForFile(application, "${application.packageName}.sharefiles", file)
+                    }.getOrNull()
+
+                    val baseBitmap = decodeInboxThumbnail(application, uri, file, isImage, isVideo, isPdf, 512)
+                    if (baseBitmap != null) {
+                        val maxDim = maxOf(baseBitmap.width, baseBitmap.height).coerceAtLeast(1)
+                        for (targetSize in listOf(112, 240, 420, 512)) {
+                            val scaled = if (targetSize >= maxDim || targetSize == 512) {
+                                baseBitmap
+                            } else {
+                                val scale = targetSize.toFloat() / maxDim
+                                val w = (baseBitmap.width * scale).toInt().coerceAtLeast(1)
+                                val h = (baseBitmap.height * scale).toInt().coerceAtLeast(1)
+                                android.graphics.Bitmap.createScaledBitmap(baseBitmap, w, h, true)
+                            }
+                            val key = "${file.canonicalPath}:${file.lastModified()}:${file.length()}:$targetSize"
+                            InboxThumbnailMemoryCache.put(key, scaled)
+                            val diskThumbFile = File(thumbDir, "${file.canonicalPath.hashCode()}_${file.lastModified()}_${file.length()}_$targetSize.png")
+                            val tmp = File(thumbDir, "${diskThumbFile.name}.tmp")
+                            runCatching {
+                                tmp.outputStream().buffered().use { out ->
+                                    scaled.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, out)
+                                }
+                                tmp.renameTo(diskThumbFile)
+                            }
+                        }
+                        generatedCount++
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    invalidateFavoriteThumbnails()
+                    refreshInbox()
+                    _state.update { it.copy(isLocalThumbnailRunning = false, localThumbnailProgress = null) }
+                    onComplete?.invoke(generatedCount)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(isLocalThumbnailRunning = false, localThumbnailProgress = null, inboxErrorMessage = "썸네일 생성 중 오류: ${e.message}") }
+                }
+            } finally {
+                // Only the job that still owns the slot may clear it; a restarted run keeps its own state.
+                withContext(NonCancellable + Dispatchers.Main) {
+                    if (localThumbnailJob === ownJob) {
+                        localThumbnailJob = null
+                        _state.update { it.copy(isLocalThumbnailRunning = false, localThumbnailProgress = null) }
+                    }
+                }
+            }
+        }
+        localThumbnailJob = job
+        job.start()
+    }
+
+    fun cancelLocalThumbnailGeneration() {
+        localThumbnailJob?.cancel()
+        localThumbnailJob = null
+        _state.update { it.copy(isLocalThumbnailRunning = false, localThumbnailProgress = null) }
+    }
+
     override fun onCleared() {
+        localThumbnailJob?.cancel()
         dismissTrailer()
+        networkDownloadJob?.cancel()
         _state.value.pendingLocalUpload?.let { pending -> runCatching { cleanupOwnedWebDownload(pending.file) } }
         previewJob?.cancel()
         connectionOpenJob?.cancel()
@@ -3994,4 +5054,15 @@ internal object AppEntryRouteParser {
     private fun decode(value: String): String? = runCatching {
         URLDecoder.decode(value, StandardCharsets.UTF_8.name())
     }.getOrNull()
+}
+
+
+internal fun isPhoneHardImage(filename: String): Boolean {
+    val ext = filename.substringAfterLast('.', "").lowercase()
+    return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
+}
+
+internal fun isPhoneHardVideo(filename: String): Boolean {
+    val ext = filename.substringAfterLast('.', "").lowercase()
+    return ext in setOf("mp4", "mkv", "mov", "webm", "avi", "3gp", "ts", "m4v")
 }

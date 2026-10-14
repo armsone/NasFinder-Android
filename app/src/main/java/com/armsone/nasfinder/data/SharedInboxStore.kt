@@ -1,12 +1,14 @@
 package com.armsone.nasfinder.data
 
 import android.content.Context
+import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
 import java.time.Instant
 import java.util.UUID
@@ -18,6 +20,12 @@ data class SharedInboxRecord(
     val mimeType: String?,
     val byteCount: Long,
     val importedAt: Instant,
+)
+
+data class PhoneHardImportResult(
+    val targetFile: File,
+    val relativePath: String,
+    val records: List<SharedInboxRecord>,
 )
 
 /**
@@ -83,7 +91,7 @@ class SharedInboxStore private constructor(
         val original = safeBasename(originalFilename)
         val subDir = destinationSubdirectory?.trim()?.removePrefix("/")?.removeSuffix("/")?.takeIf { it.isNotEmpty() }
         val relativeOriginal = if (subDir != null) "$subDir/$original" else original
-        val stored = uniqueStoredFilename(relativeOriginal)
+        val stored = uniqueStoredFilename(relativeOriginal, current)
         require(current.none { it.id == id }) { "중복된 폰하드 파일 UUID입니다." }
         require(current.none { it.storedFilename == stored }) { "중복된 폰하드 파일 저장 이름입니다." }
         val safeMime = validateMimeType(mimeType)
@@ -109,6 +117,121 @@ class SharedInboxStore private constructor(
             temporary.delete()
             if (payloadCommitted) destination.delete()
             snapshot = runCatching { readManifest() }.getOrElse { current }
+            throw error
+        }
+    }
+
+    /**
+     * Imports a staged file or directory tree into [destinationSubdirectory] without overwriting existing entries.
+     * Preserves top-level names, subdirectories, hidden files, and empty directories.
+     * Atomically registers all imported files into the manifest.
+     * Preserves the staged entry on disk.
+     */
+    fun importFromStaging(
+        stagedEntry: File,
+        desiredName: String,
+        destinationSubdirectory: String? = null,
+        mimeType: String? = null,
+    ): PhoneHardImportResult = synchronized(PROCESS_LOCK) {
+        require(stagedEntry.exists()) { "스테이징 소스가 존재하지 않습니다: ${stagedEntry.path}" }
+        val destDir = resolveDirectory(destinationSubdirectory)
+        if (!destDir.exists() && !destDir.mkdirs()) {
+            throw IllegalStateException("대상 저장 폴더를 생성할 수 없습니다: ${destDir.path}")
+        }
+        val safeName = safeBasename(desiredName)
+        require(safeName != MANIFEST_NAME && safeName != LEGACY_MANIFEST_NAME) {
+            "예약된 시스템 이름으로는 저장할 수 없습니다."
+        }
+
+        val currentManifest = readManifest()
+        val uniqueName = findUniqueNameInDirectory(destDir, safeName, currentManifest)
+        val targetEntry = File(destDir, uniqueName).canonicalFile
+        validateContainment(targetEntry)
+        require(!targetEntry.exists()) { "대상 항목이 이미 존재합니다: ${targetEntry.path}" }
+
+        val rootCanonical = rootDirectory.canonicalFile
+        val createdFiles = mutableListOf<File>()
+        val newRecords = mutableListOf<SharedInboxRecord>()
+
+        try {
+            if (stagedEntry.isDirectory) {
+                if (!targetEntry.mkdirs()) throw IllegalStateException("대상 폴더를 생성하지 못했습니다: ${targetEntry.path}")
+                createdFiles.add(targetEntry)
+
+                stagedEntry.walkTopDown().forEach { sourceChild ->
+                    if (sourceChild == stagedEntry) return@forEach
+                    if (Files.isSymbolicLink(sourceChild.toPath())) return@forEach
+                    val relSubPath = sourceChild.relativeTo(stagedEntry).invariantSeparatorsPath
+                    val destChild = File(targetEntry, relSubPath).canonicalFile
+                    validateContainment(destChild)
+
+                    if (sourceChild.isDirectory) {
+                        if (!destChild.exists() && !destChild.mkdirs()) {
+                            throw IllegalStateException("하위 폴더를 생성하지 못했습니다: ${destChild.path}")
+                        }
+                        createdFiles.add(destChild)
+                    } else if (sourceChild.isFile) {
+                        destChild.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                        sourceChild.copyTo(destChild, overwrite = false)
+                        createdFiles.add(destChild)
+
+                        val childRel = destChild.relativeTo(rootCanonical).invariantSeparatorsPath
+                        // [mimeType] describes the top-level entry only; children are detected per file.
+                        val childSafeMime = validateMimeType(getMimeTypeFromExtension(sourceChild.extension))
+                        val safeOriginal = safeBasename(sourceChild.name)
+                        val record = SharedInboxRecord(
+                            id = UUID.randomUUID(),
+                            originalFilename = safeOriginal,
+                            storedFilename = childRel,
+                            mimeType = childSafeMime,
+                            byteCount = destChild.length(),
+                            importedAt = Instant.now(),
+                        )
+                        validateRecord(record)
+                        newRecords.add(record)
+                    }
+                }
+            } else {
+                targetEntry.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                stagedEntry.copyTo(targetEntry, overwrite = false)
+                createdFiles.add(targetEntry)
+
+                val storedRel = targetEntry.relativeTo(rootCanonical).invariantSeparatorsPath
+                val safeMime = validateMimeType(
+                    mimeType ?: getMimeTypeFromExtension(stagedEntry.extension)
+                )
+                val record = SharedInboxRecord(
+                    id = UUID.randomUUID(),
+                    originalFilename = safeName,
+                    storedFilename = storedRel,
+                    mimeType = safeMime,
+                    byteCount = targetEntry.length(),
+                    importedAt = Instant.now(),
+                )
+                validateRecord(record)
+                newRecords.add(record)
+            }
+
+            // Ensure atomic and guaranteed unique IDs and stored filenames across all records
+            require(newRecords.map { it.id }.distinct().size == newRecords.size) { "신규 임포트 기록 간 UUID가 중복되었습니다." }
+            require(newRecords.map { it.storedFilename }.distinct().size == newRecords.size) { "신규 임포트 기록 간 저장 경로가 중복되었습니다." }
+            val existingIds = currentManifest.mapTo(hashSetOf()) { it.id }
+            val existingStored = currentManifest.mapTo(hashSetOf()) { it.storedFilename }
+            require(newRecords.none { it.id in existingIds }) { "매니페스트에 이미 존재하는 UUID입니다." }
+            require(newRecords.none { it.storedFilename in existingStored }) { "매니페스트에 이미 존재하는 저장 경로입니다." }
+
+            val updatedManifest = currentManifest + newRecords
+            hooks.commitManifest(manifestFile, encodeManifest(updatedManifest))
+            snapshot = updatedManifest
+            val targetRel = targetEntry.relativeTo(rootCanonical).invariantSeparatorsPath
+            PhoneHardImportResult(targetEntry, targetRel, newRecords)
+        } catch (error: Throwable) {
+            for (created in createdFiles.reversed()) {
+                runCatching {
+                    if (created.isDirectory) created.deleteRecursively() else created.delete()
+                }
+            }
+            snapshot = runCatching { readManifest() }.getOrElse { currentManifest }
             throw error
         }
     }
@@ -221,6 +344,7 @@ class SharedInboxStore private constructor(
         val deduped = deduplicateTargets(targets)
         val succeeded = mutableListOf<PhoneHardTarget>()
         val failed = mutableListOf<Pair<PhoneHardTarget, String>>()
+        val pathMappings = mutableListOf<PhoneHardPathMapping>()
 
         var currentManifest = readManifest()
 
@@ -247,19 +371,20 @@ class SharedInboxStore private constructor(
                 }
 
                 val targetName = targetFile.name
-                val finalName = findUniqueNameInDirectory(destDir, targetName)
+                val movingDirectory = targetFile.isDirectory
+                val finalName = findUniqueNameInDirectory(destDir, targetName, currentManifest)
                 val finalFile = File(destDir, finalName).canonicalFile
                 validateContainment(finalFile)
 
                 // Perform filesystem move
-                atomicMoveOrFallback(targetFile, finalFile)
+                moveWithoutReplacing(targetFile, finalFile)
                 fileMoved = true
                 movedFile = finalFile
 
                 val newRel = finalFile.relativeTo(rootCanonical).invariantSeparatorsPath
 
                 // Build candidate manifest without mutating currentManifest yet
-                val candidateManifest = if (target.isDirectory) {
+                val candidateManifest = if (movingDirectory) {
                     currentManifest.map { record ->
                         if (record.storedFilename == targetRel) {
                             record.copy(storedFilename = newRel)
@@ -284,10 +409,11 @@ class SharedInboxStore private constructor(
                 currentManifest = candidateManifest
                 snapshot = currentManifest
                 succeeded.add(target)
+                pathMappings.add(PhoneHardPathMapping(targetRel, newRel, movingDirectory))
             } catch (e: Exception) {
                 if (fileMoved && movedFile != null && originalFile != null) {
                     val rollbackResult = runCatching {
-                        atomicMoveOrFallback(movedFile, originalFile)
+                        moveWithoutReplacing(movedFile, originalFile)
                     }
                     if (rollbackResult.isFailure) {
                         failed.add(target to "이동 후 매니페스트 저장에 실패했으며 원래 위치 복구도 실패했습니다: ${e.message}")
@@ -299,7 +425,98 @@ class SharedInboxStore private constructor(
                 }
             }
         }
-        PhoneHardOperationResult(succeeded, failed)
+        PhoneHardOperationResult(succeeded, failed, pathMappings = pathMappings)
+    }
+
+    /**
+     * Renames one file or folder in place.
+     * Never overwrites, preserves IDs, mimeType and importedAt of the entry and every descendant record,
+     * restores the original name when the manifest cannot be committed, serializes with PROCESS_LOCK.
+     */
+    fun renamePhoneHardTarget(
+        relativePath: String,
+        newName: String,
+    ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) {
+        var target = PhoneHardTarget(relativePath = relativePath, isDirectory = false)
+        try {
+            val rootCanonical = rootDirectory.canonicalFile
+            val currentManifest = readManifest()
+            val source = resolveExistingEntry(relativePath)
+            val sourceRel = source.relativeTo(rootCanonical).invariantSeparatorsPath
+            val renamingDirectory = source.isDirectory
+            target = PhoneHardTarget(
+                id = currentManifest.firstOrNull { it.storedFilename == sourceRel }?.id,
+                relativePath = relativePath,
+                isDirectory = renamingDirectory,
+            )
+            require(sourceRel != LEGACY_MANIFEST_NAME && sourceRel.split('/').none { it.startsWith('.') }) {
+                "시스템 항목의 이름은 변경할 수 없습니다."
+            }
+
+            val name = newName.trim()
+            require(
+                name.isNotEmpty() && name != "." && name != ".." && '/' !in name && '\\' !in name &&
+                    name.none(Char::isISOControl)
+            ) { "올바르지 않은 이름입니다." }
+            require(name != MANIFEST_NAME && name != LEGACY_MANIFEST_NAME && !name.startsWith('.')) {
+                "예약된 시스템 이름으로는 변경할 수 없습니다."
+            }
+            if (name == source.name) {
+                return@synchronized PhoneHardOperationResult(listOf(target), emptyList())
+            }
+
+            val parent = source.parentFile ?: rootCanonical
+            val requested = File(parent, name)
+            require(!Files.exists(requested.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                "이미 같은 이름의 파일 또는 폴더가 존재합니다."
+            }
+            val destination = requested.canonicalFile
+            validateContainment(destination)
+            require(destination.parentFile == parent) { "안전하지 않은 대상 경로입니다." }
+            val destRel = destination.relativeTo(rootCanonical).invariantSeparatorsPath
+            require(currentManifest.none { it.storedFilename == destRel || it.storedFilename.startsWith("$destRel/") }) {
+                "이미 같은 이름의 파일 또는 폴더가 존재합니다."
+            }
+
+            val candidateManifest = currentManifest.map { record ->
+                if (record.storedFilename == sourceRel) {
+                    record.copy(storedFilename = destRel, originalFilename = name)
+                } else if (record.storedFilename.startsWith("$sourceRel/")) {
+                    val subPath = record.storedFilename.removePrefix("$sourceRel/")
+                    record.copy(storedFilename = "$destRel/$subPath")
+                } else {
+                    record
+                }
+            }
+            candidateManifest.forEach(::validateRecord)
+
+            moveWithoutReplacing(source, destination)
+            try {
+                hooks.commitManifest(manifestFile, encodeManifest(candidateManifest))
+            } catch (e: Exception) {
+                if (runCatching { moveWithoutReplacing(destination, source) }.isSuccess) {
+                    return@synchronized PhoneHardOperationResult(
+                        emptyList(),
+                        listOf(target to "이름 변경 후 매니페스트 저장에 실패하여 원래 이름으로 복구했습니다: ${e.message}"),
+                    )
+                }
+                // The entry stays renamed on disk; retry once so reconciliation does not mint new IDs.
+                if (runCatching { hooks.commitManifest(manifestFile, encodeManifest(candidateManifest)) }.isFailure) {
+                    return@synchronized PhoneHardOperationResult(
+                        emptyList(),
+                        listOf(target to "이름 변경 후 매니페스트 저장에 실패했으며 원래 이름 복구도 실패했습니다: ${e.message}"),
+                    )
+                }
+            }
+            snapshot = candidateManifest
+            PhoneHardOperationResult(
+                listOf(target),
+                emptyList(),
+                pathMappings = listOf(PhoneHardPathMapping(sourceRel, destRel, renamingDirectory)),
+            )
+        } catch (e: Exception) {
+            PhoneHardOperationResult(emptyList(), listOf(target to (e.message ?: "이름 변경에 실패했습니다.")))
+        }
     }
 
     /**
@@ -333,7 +550,7 @@ class SharedInboxStore private constructor(
                 }
 
                 val targetName = targetFile.name
-                val finalName = findUniqueNameInDirectory(destDir, targetName)
+                val finalName = findUniqueNameInDirectory(destDir, targetName, currentManifest)
                 val finalFile = File(destDir, finalName).canonicalFile
                 validateContainment(finalFile)
 
@@ -420,6 +637,7 @@ class SharedInboxStore private constructor(
 
         val succeeded = mutableListOf<PhoneHardTarget>()
         val failed = mutableListOf<Pair<PhoneHardTarget, String>>()
+        val removedPaths = mutableListOf<String>()
 
         var currentManifest = readManifest()
 
@@ -449,11 +667,12 @@ class SharedInboxStore private constructor(
 
                 snapshot = currentManifest
                 succeeded.add(target)
+                removedPaths.add(targetRel)
             } catch (e: Exception) {
                 failed.add(target to (e.message ?: "삭제에 실패했습니다."))
             }
         }
-        PhoneHardOperationResult(succeeded, failed)
+        PhoneHardOperationResult(succeeded, failed, removedPaths = removedPaths)
     }
 
     private fun resolveDirectory(relativeSubdirectory: String?): File {
@@ -507,14 +726,32 @@ class SharedInboxStore private constructor(
         return result
     }
 
-    private fun findUniqueNameInDirectory(parentDir: File, originalName: String): String {
+    private fun findUniqueNameInDirectory(
+        parentDir: File,
+        originalName: String,
+        manifest: List<SharedInboxRecord>? = null,
+    ): String {
+        val rootCanonical = rootDirectory.canonicalFile
+        val existingStoredNames = manifest?.mapTo(hashSetOf()) { it.storedFilename } ?: emptySet()
         val requested = File(parentDir, originalName)
-        if (!requested.exists()) return originalName
+        val requestedRel = runCatching {
+            requested.canonicalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+        }.getOrNull()
+
+        val isAvailable: (File, String?) -> Boolean = { file, rel ->
+            !file.exists() && (rel == null || (rel !in existingStoredNames && existingStoredNames.none { it.startsWith("$rel/") }))
+        }
+
+        if (isAvailable(requested, requestedRel)) return originalName
         val extension = requested.extension.takeIf(String::isNotEmpty)
         val stem = if (extension == null) requested.name else requested.name.removeSuffix(".$extension")
         for (index in 1..9_999) {
-            val candidate = if (extension == null) "$stem ($index)" else "$stem ($index).$extension"
-            if (!File(parentDir, candidate).exists()) return candidate
+            val candidateName = if (extension == null) "$stem ($index)" else "$stem ($index).$extension"
+            val candidateFile = File(parentDir, candidateName)
+            val candidateRel = runCatching {
+                candidateFile.canonicalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+            }.getOrNull()
+            if (isAvailable(candidateFile, candidateRel)) return candidateName
         }
         return "${UUID.randomUUID()}-$originalName"
     }
@@ -620,9 +857,22 @@ class SharedInboxStore private constructor(
         }
     }
 
-    private fun uniqueStoredFilename(original: String): String {
+    private fun uniqueStoredFilename(
+        original: String,
+        manifest: List<SharedInboxRecord>? = null,
+    ): String {
+        val rootCanonical = rootDirectory.canonicalFile
+        val existingStoredNames = manifest?.mapTo(hashSetOf()) { it.storedFilename } ?: emptySet()
         val requested = File(rootDirectory, original)
-        if (!requested.exists()) return original
+        val requestedRel = runCatching {
+            requested.canonicalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+        }.getOrNull()
+
+        val isAvailable: (File, String?) -> Boolean = { file, rel ->
+            !file.exists() && (rel == null || rel !in existingStoredNames)
+        }
+
+        if (isAvailable(requested, requestedRel)) return original
         val parentRelative = original.substringBeforeLast('/', "").takeIf { it.isNotEmpty() }
         val basename = requested.name
         val extension = requested.extension.takeIf(String::isNotEmpty)
@@ -630,7 +880,11 @@ class SharedInboxStore private constructor(
         for (index in 1..9_999) {
             val candidateName = if (extension == null) "$stem ($index)" else "$stem ($index).$extension"
             val candidatePath = if (parentRelative != null) "$parentRelative/$candidateName" else candidateName
-            if (!File(rootDirectory, candidatePath).exists()) return candidatePath
+            val candidateFile = File(rootDirectory, candidatePath)
+            val candidateRel = runCatching {
+                candidateFile.canonicalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+            }.getOrNull()
+            if (isAvailable(candidateFile, candidateRel)) return candidatePath
         }
         val fallbackName = "${UUID.randomUUID()}-$basename"
         return if (parentRelative != null) "$parentRelative/$fallbackName" else fallbackName
@@ -667,6 +921,13 @@ private fun validateMimeType(value: String?): String? {
     val mime = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
     require(mime.none(Char::isISOControl) && '/' in mime) { "MIME 형식이 올바르지 않습니다." }
     return mime
+}
+
+private fun getMimeTypeFromExtension(extension: String): String? {
+    if (extension.isBlank()) return null
+    return runCatching {
+        MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase())
+    }.getOrNull()
 }
 
 private fun encodeManifest(records: List<SharedInboxRecord>): ByteArray = buildString {

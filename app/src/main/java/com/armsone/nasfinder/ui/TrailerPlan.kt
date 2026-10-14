@@ -55,6 +55,7 @@ data class TrailerMusicTrack(
 enum class TrailerMusicPolicy(val title: String) {
     FIT_MUSIC_LENGTH("음악 길이에 맞추기"),
     LOOP_MUSIC("음악 반복"),
+    SINGLE("음악 한 번 재생"),
 }
 
 data class TrailerSession(
@@ -66,17 +67,20 @@ data class TrailerSession(
     val progress: Float? = null, val error: String? = null, val saved: Boolean = false,
     val isMusicOverlayMode: Boolean = false,
     val musicTrack: TrailerMusicTrack? = null,
-    val musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+    val musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+    val musicFitCount: Int = 1,
     val autoDucking: Boolean = true,
     val awaitingInitialSettings: Boolean = false,
+    // True only once every source is staged and analysed and the first plan exists.
+    val prepared: Boolean = false,
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
     val effectivePhotoClipLength: Double get() = if (!hasVideos) 1.0 else photoClipLength
     val originalTotal get() = sources.sumOf { if (it.isImage) effectivePhotoClipLength else it.duration }
     val scenes get() = if (isMusicOverlayMode) {
-        musicOverlayScenes(sources, 1.0, musicTrack, musicPolicy)
+        musicOverlayScenes(sources, 1.0, musicTrack, musicPolicy, musicFitCount)
     } else {
-        trailerScenes(sources, total, clipLength, effectivePhotoClipLength, musicTrack, musicPolicy)
+        trailerScenes(sources, total, clipLength, effectivePhotoClipLength, musicTrack, musicPolicy, musicFitCount)
     }
 }
 
@@ -90,13 +94,14 @@ internal fun trailerScenes(
     length: Double,
     photoLength: Double = defaultPhotoClipLength(length, sources.any { !it.isImage }),
     musicTrack: TrailerMusicTrack? = null,
-    musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+    musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+    musicFitCount: Int = 1,
 ): List<TrailerScene> {
     val actualPhotoLength = if (sources.none { !it.isImage }) 1.0 else photoLength
     if (sources.isEmpty() || !length.isFinite() || length <= 0 || !actualPhotoLength.isFinite() || actualPhotoLength <= 0 || !total.isFinite()) return emptyList()
 
     val targetTotal = if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
-        musicTrack.durationSeconds
+        musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1)
     } else {
         total
     }
@@ -141,7 +146,7 @@ internal fun trailerScenes(
     }
 
     if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
-        return fitScenesToTargetDuration(rawScenes, musicTrack.durationSeconds)
+        return fitScenesToTargetDuration(rawScenes, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1))
     }
     return rawScenes
 }
@@ -156,6 +161,7 @@ internal fun musicOverlayScenes(
     photoLength: Double,
     musicTrack: TrailerMusicTrack?,
     musicPolicy: TrailerMusicPolicy,
+    musicFitCount: Int = 1,
 ): List<TrailerScene> {
     if (sources.isEmpty()) return emptyList()
     // Photos always get a fixed 1s Ken Burns scene here regardless of the caller's photoLength;
@@ -168,7 +174,7 @@ internal fun musicOverlayScenes(
         }
     }
     if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
-        return fitScenesToTargetDuration(baseScenes, musicTrack.durationSeconds)
+        return fitScenesToTargetDuration(baseScenes, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1))
     }
     return baseScenes
 }

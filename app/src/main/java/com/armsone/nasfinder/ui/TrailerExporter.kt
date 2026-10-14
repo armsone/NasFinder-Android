@@ -70,7 +70,8 @@ internal object TrailerExporter {
         format: TrailerFormat,
         destination: File,
         musicTrack: TrailerMusicTrack? = null,
-        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = 1,
         autoDucking: Boolean = true,
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
@@ -213,8 +214,32 @@ internal object TrailerExporter {
                     )
                     accumulated += clipDuration
                 }
+            } else if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
+                // FIT_MUSIC_LENGTH: repeat music musicFitCount times, trimming tail to total video duration
+                val count = musicFitCount.coerceAtLeast(1)
+                var accumulated = 0.0
+                for (rep in 0 until count) {
+                    if (accumulated >= totalVideoDurationSeconds - 0.05) break
+                    val remaining = totalVideoDurationSeconds - accumulated
+                    val clipDuration = min(musicDurationSeconds, remaining)
+                    val input = MediaItem.Builder()
+                        .setUri(musicUri)
+                        .setClippingConfiguration(
+                            MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs(0L)
+                                .setEndPositionMs((clipDuration * 1000).toLong())
+                                .build()
+                        ).build()
+                    val musicEffects = makeMusicEffects(startOffsetSeconds = accumulated)
+                    musicItems.add(
+                        EditedMediaItem.Builder(input)
+                            .setEffects(musicEffects)
+                            .build()
+                    )
+                    accumulated += clipDuration
+                }
             } else {
-                // FIT_MUSIC_LENGTH: single music item matching total video duration
+                // SINGLE / MANUAL: play music once, trimmed at video end; after music ends, original sound only
                 val clipDuration = min(musicDurationSeconds, totalVideoDurationSeconds)
                 val input = MediaItem.Builder()
                     .setUri(musicUri)

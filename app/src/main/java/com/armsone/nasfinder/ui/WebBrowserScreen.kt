@@ -778,7 +778,7 @@ fun WebBrowserScreen(
         }
         if (musicCandidates.isNotEmpty() && activeDownload == null) {
             Surface(
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.primary,
                 shadowElevation = 4.dp,

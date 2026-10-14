@@ -24,6 +24,7 @@ data class PhoneHardItem(
     val modifiedAt: Instant,
     val mimeType: String? = null,
     val file: File,
+    val durationMillis: Long? = null,
 )
 
 /**
@@ -36,11 +37,25 @@ data class PhoneHardTarget(
 )
 
 /**
+ * Committed relocation of one PhoneHard entry (root-relative paths, '/' separated).
+ * A directory mapping also covers every descendant under [sourcePath].
+ */
+data class PhoneHardPathMapping(
+    val sourcePath: String,
+    val destinationPath: String,
+    val isDirectory: Boolean,
+)
+
+/**
  * Result of a batch file/folder operation in PhoneHard.
+ * [pathMappings] (move/rename) and [removedPaths] (delete) list only entries whose filesystem
+ * change and manifest update both committed; failed or unchanged targets never appear.
  */
 data class PhoneHardOperationResult(
     val succeeded: List<PhoneHardTarget>,
     val failed: List<Pair<PhoneHardTarget, String>>,
+    val pathMappings: List<PhoneHardPathMapping> = emptyList(),
+    val removedPaths: List<String> = emptyList(),
 ) {
     val isSuccess: Boolean get() = failed.isEmpty()
 }
