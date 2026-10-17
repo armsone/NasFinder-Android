@@ -23,7 +23,7 @@ data class TrailerDraft(
     val displayTitle: String get() {
         return if (isMusicOverlayMode) {
             val musicName = musicTrack?.name ?: "음악 미선택"
-            "음악 입히기 (${sources.size}개 미디어 · $musicName)"
+            "뮤직비디오 (${sources.size}개 미디어 · $musicName)"
         } else {
             val validOutput = output?.takeIf { it.exists() && it.length() > 0 }
             if (validOutput != null) "완성된 예고편 (${sources.size}개 미디어)"
@@ -38,72 +38,84 @@ data class TrailerDraft(
 }
 
 object TrailerDraftStore {
-    private var trailerDraft: TrailerDraft? = null
-    private var musicOverlayDraft: TrailerDraft? = null
+    private val drafts = mutableMapOf<String, TrailerDraft>()
+    private var canonicalTrailersRoot: String? = null
+
+    @Synchronized
+    fun configureTrailersRoot(cacheDir: File) {
+        canonicalTrailersRoot = runCatching { File(cacheDir, "trailers").canonicalPath }.getOrNull()
+    }
 
     @Synchronized
     fun saveDraft(draft: TrailerDraft) {
         if (!draft.isValid()) return
-        if (draft.isMusicOverlayMode) {
-            val old = musicOverlayDraft
-            if (old != null && old.directory != draft.directory) {
-                old.directory.deleteRecursively()
+        val existing = drafts.values.firstOrNull { it.id == draft.id || it.directory.canonicalPath == draft.directory.canonicalPath }
+        if (existing != null) {
+            drafts.remove(existing.id)
+            if (existing.directory.canonicalPath != draft.directory.canonicalPath) {
+                safeDeletePrivateTrailerDirectory(existing.directory)
             }
-            musicOverlayDraft = draft
-        } else {
-            val old = trailerDraft
-            if (old != null && old.directory != draft.directory) {
-                old.directory.deleteRecursively()
-            }
-            trailerDraft = draft
         }
+        drafts[draft.id] = draft
     }
 
     @Synchronized
-    fun getDraft(isMusicOverlay: Boolean): TrailerDraft? {
-        return if (isMusicOverlay) musicOverlayDraft else trailerDraft
+    fun detachDraft(draftId: String): TrailerDraft? {
+        val target = drafts.remove(draftId)
+        return target
     }
 
     @Synchronized
     fun getAllDrafts(): List<TrailerDraft> {
-        val list = mutableListOf<TrailerDraft>()
-        trailerDraft?.let { list.add(it) }
-        musicOverlayDraft?.let { list.add(it) }
-        return list
+        return drafts.values.sortedByDescending { it.timestamp }
     }
 
     @Synchronized
     fun draftCount(): Int {
-        var count = 0
-        if (trailerDraft != null) count++
-        if (musicOverlayDraft != null) count++
-        return count
+        return drafts.size
     }
 
     @Synchronized
-    fun hasAnyDraft(): Boolean = trailerDraft != null || musicOverlayDraft != null
+    fun hasAnyDraft(): Boolean = drafts.isNotEmpty()
 
     @Synchronized
     fun removeDraft(draft: TrailerDraft) {
-        if (trailerDraft?.id == draft.id || trailerDraft?.directory == draft.directory) {
-            trailerDraft = null
-            draft.directory.deleteRecursively()
-        }
-        if (musicOverlayDraft?.id == draft.id || musicOverlayDraft?.directory == draft.directory) {
-            musicOverlayDraft = null
-            draft.directory.deleteRecursively()
-        }
-    }
-
-    @Synchronized
-    fun clearDraft(isMusicOverlay: Boolean) {
-        val target = if (isMusicOverlay) musicOverlayDraft else trailerDraft
-        target?.directory?.deleteRecursively()
-        if (isMusicOverlay) musicOverlayDraft = null else trailerDraft = null
+        val target = drafts.remove(draft.id)
+            ?: drafts.values.firstOrNull { it.directory.canonicalPath == draft.directory.canonicalPath }?.also { drafts.remove(it.id) }
+        val dirToDelete = target?.directory ?: return
+        safeDeletePrivateTrailerDirectory(dirToDelete)
     }
 
     @Synchronized
     fun isDirectoryManagedAsDraft(directory: File): Boolean {
-        return trailerDraft?.directory == directory || musicOverlayDraft?.directory == directory
+        val canonical = runCatching { directory.canonicalPath }.getOrNull() ?: directory.absolutePath
+        return drafts.values.any { runCatching { it.directory.canonicalPath }.getOrNull() == canonical }
+    }
+
+    fun isSafePrivateTrailerDirectory(directory: File): Boolean {
+        val root = canonicalTrailersRoot ?: return false
+        return runCatching {
+            val canonicalDir = directory.canonicalFile
+            val canonicalParent = canonicalDir.parentFile ?: return false
+            if (canonicalParent.canonicalPath != root) return false
+            if (canonicalParent.name != "trailers") return false
+            val canonicalPath = canonicalDir.canonicalPath
+            if (!canonicalPath.contains("/trailers/") || canonicalPath.endsWith("/trailers")) return false
+            if (canonicalPath.contains("/phonehard") || canonicalPath.contains("/files/phonehard")) return false
+
+            // UUID leaf guard: trailer session directories are generated as UUIDs (using canonicalDir.name)
+            val leafName = canonicalDir.name
+            runCatching { UUID.fromString(leafName) }.isSuccess
+        }.getOrDefault(false)
+    }
+
+    @Synchronized
+    fun safeDeletePrivateTrailerDirectory(directory: File): Boolean {
+        if (!isSafePrivateTrailerDirectory(directory)) return false
+        val canonical = runCatching { directory.canonicalPath }.getOrNull()
+        if (canonical != null && drafts.values.any { runCatching { it.directory.canonicalPath }.getOrNull() == canonical }) {
+            return false
+        }
+        return directory.deleteRecursively()
     }
 }

@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "NasFinder"
 include(":app")
+include(":hanai-onnx")
+project(":hanai-onnx").projectDir = file("../HanAI/android/hanai-onnx")

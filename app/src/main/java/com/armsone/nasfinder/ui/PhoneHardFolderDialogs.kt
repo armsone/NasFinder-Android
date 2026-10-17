@@ -99,9 +99,14 @@ fun SelectPhoneHardDestinationDialog(
     targets: List<PhoneHardTarget>,
     onDismiss: () -> Unit,
     onSelectDestination: (String?) -> Unit,
+    confirmLabel: String? = null,
 ) {
     var currentSubpath by remember { mutableStateOf<String?>(null) }
-    val entries = remember(currentSubpath) { model.loadPhoneHardFolder(currentSubpath) }
+    var folderRevision by remember { mutableStateOf(0) }
+    var showCreateFolder by remember { mutableStateOf(false) }
+    var creatingFolder by remember { mutableStateOf(false) }
+    var folderError by remember { mutableStateOf<String?>(null) }
+    val entries = remember(currentSubpath, folderRevision) { model.loadPhoneHardFolder(currentSubpath) }
     val folderEntries = remember(entries) {
         entries.filter { it.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY }
     }
@@ -139,6 +144,14 @@ fun SelectPhoneHardDestinationDialog(
                     }
                 }
 
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { folderError = null; showCreateFolder = true }, enabled = !creatingFolder) {
+                        Icon(Icons.Default.CreateNewFolder, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (creatingFolder) "폴더 만드는 중" else "새 폴더")
+                    }
+                }
+                folderError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                 // Folder list
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth().heightIn(max = 280.dp),
@@ -198,12 +211,30 @@ fun SelectPhoneHardDestinationDialog(
             }
         },
         confirmButton = {
-            Button(onClick = { onSelectDestination(currentSubpath) }) {
-                Text(if (currentSubpath.isNullOrBlank()) "최상위로 이동/복사" else "현재 폴더로 선택")
+            Button(onClick = { onSelectDestination(currentSubpath) }, enabled = !creatingFolder) {
+                Text(confirmLabel ?: if (currentSubpath.isNullOrBlank()) "최상위로 이동/복사" else "현재 폴더로 선택")
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("취소") }
         },
     )
+    if (showCreateFolder) {
+        CreateFolderDialog(
+            parentPath = currentSubpath,
+            onDismiss = { showCreateFolder = false },
+            onConfirm = { name ->
+                val parent = currentSubpath
+                showCreateFolder = false
+                creatingFolder = true
+                model.createPhoneHardFolder(name, parent) { success, error ->
+                    creatingFolder = false
+                    if (success) {
+                        folderRevision++
+                        currentSubpath = if (parent.isNullOrBlank()) name else "$parent/$name"
+                    } else folderError = error
+                }
+            },
+        )
+    }
 }

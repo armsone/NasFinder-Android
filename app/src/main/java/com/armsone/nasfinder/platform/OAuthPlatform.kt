@@ -179,6 +179,7 @@ class OAuthAccessTokenProvider(context: Context) {
         connectionId: String,
         provider: CloudOAuthProvider,
         nowMillis: Long = System.currentTimeMillis(),
+        persistRefresh: Boolean = true,
     ): String? = refreshLock.withLock {
         val current = tokens.read(connectionId)?.takeIf { it.provider == provider } ?: return@withLock null
         current.usableAccessToken(nowMillis)?.let { return@withLock it }
@@ -187,7 +188,12 @@ class OAuthAccessTokenProvider(context: Context) {
         val refreshed = endpointClient.refresh(provider, clientId, refreshToken, refreshToken, nowMillis).let {
             if (it.scope == null && current.scope != null) it.copy(scope = current.scope) else it
         }
-        tokens.save(connectionId, refreshed)
+        if (clients.clientId(provider) != clientId) return@withLock null
+        if (persistRefresh) {
+            if (!tokens.saveIfUnchanged(connectionId, current, refreshed)) return@withLock null
+        } else if (tokens.read(connectionId) != current) {
+            return@withLock null
+        }
         refreshed.accessToken
     }
 

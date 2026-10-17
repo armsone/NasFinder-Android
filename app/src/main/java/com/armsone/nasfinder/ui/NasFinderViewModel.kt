@@ -131,6 +131,8 @@ data class AppState(
     val thumbnailTraffic: RemoteThumbnailTrafficSnapshot = RemoteThumbnailTrafficSnapshot(),
     val thumbnailCacheStatistics: RemoteThumbnailCacheStatistics? = null,
     val screenAwakeMode: ScreenAwakeMode = ScreenAwakeMode.AUTOMATIC,
+    val googlePhotosVisible: Boolean = true,
+    val googlePhotosName: String = "Google 포토",
     val googlePhotosConnected: Boolean = false,
     val googlePhotosDisclosureRequired: Boolean = false,
     val googlePhotosPhase: GooglePhotosPhase = GooglePhotosPhase.IDLE,
@@ -240,6 +242,8 @@ data class ImagePreviewState(
 
 enum class BuiltInPreviewKind { IMAGE, VIDEO, AUDIO, PDF }
 
+enum class LocalMediaEditIntent { NONE, TRAILER, MUSIC }
+
 sealed interface Screen {
     data object Dashboard : Screen
     data class AddConnection(val editing: RemoteConnection? = null) : Screen
@@ -258,7 +262,10 @@ sealed interface Screen {
     data object SuperThumbnailFolderPicker : Screen
     data object SuperThumbnailProgress : Screen
     data object SuperThumbnailReport : Screen
-    data object LocalPhotoLibrary : Screen
+    data class LocalPhotoLibrary(
+        val initialIntent: LocalMediaEditIntent = LocalMediaEditIntent.NONE,
+        val googlePhotosSource: Boolean = false,
+    ) : Screen
     data object WebBrowser : Screen
     data object WebHard : Screen
 }
@@ -286,6 +293,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var folderCountGeneration = 0L
     private val folderCountRequests = mutableSetOf<String>()
     private var connectionOpenJob: Job? = null
+    private val dropboxAccountRequests = mutableSetOf<String>()
     private var googlePhotosJob: Job? = null
     private val googlePhotosAccount = GooglePhotosAccountController(application)
     private var thumbnailTrafficObservation: Job? = null
@@ -321,6 +329,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             oauthClientIds = CloudOAuthProvider.entries.mapNotNull { provider ->
                 repository.oauthClients.clientId(provider)?.let { provider to it }
             }.toMap(),
+            googlePhotosVisible = repository.googlePhotosVisible(),
+            googlePhotosName = repository.googlePhotosName(),
             googlePhotosConnected = googlePhotosAccount.isConnected(),
             oauthConnectedConnectionIds = repository.load().mapNotNull { connection ->
                 connection.id.takeIf { repository.oauthTokens.read(it) != null }
@@ -334,6 +344,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var importedIntentSignature: String? = null
 
     init {
+        refreshDropboxAccountLabels()
+        TrailerDraftStore.configureTrailersRoot(application.cacheDir)
         runCatching(::cleanupOrphanedWebDownloads)
         refreshDownloadCacheSize()
         refreshThumbnailCacheStatistics()
@@ -392,6 +404,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * downloads, caches and files are untouched so the next foreground return starts on the dashboard.
      */
     fun returnToDashboardAfterBackground() {
+        // System media pickers and editor interruptions must retain the shared selection.
+        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.trailer != null) return
         connectionOpenJob?.cancel()
         connectionOpenJob = null
         thumbnailGeneration++
@@ -408,8 +422,55 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
     fun showInboxErrorMessage(message: String) { _state.update { it.copy(inboxErrorMessage = message) } }
 
+    fun saveGooglePhotosLocation(name: String, visible: Boolean = true) {
+        val displayName = name.trim().ifBlank { "Google 포토" }
+        repository.saveGooglePhotosLocation(displayName, visible)
+        _state.update { it.copy(googlePhotosName = displayName, googlePhotosVisible = visible) }
+    }
+
+    private fun refreshDropboxAccountLabels(connection: RemoteConnection? = null) {
+        val targets = connection?.let(::listOf) ?: _state.value.connections
+        targets.filter { it.kind == com.armsone.nasfinder.model.ConnectionKind.DROPBOX }
+            .filter { dropboxAccountRequests.add(it.id) }.forEach { target ->
+                viewModelScope.launch {
+                    try {
+                        val tokenSnapshot = repository.oauthTokens.read(target.id)
+                        val manualTokenSnapshot = repository.credentials.read(target.id)
+                        val label = withContext(Dispatchers.IO) {
+                            val token = com.armsone.nasfinder.platform.OAuthAccessTokenProvider(application)
+                                .accessToken(target.id, CloudOAuthProvider.from(target.kind)!!, persistRefresh = false)
+                                ?: manualTokenSnapshot.orEmpty()
+                            com.armsone.nasfinder.network.CloudDriveFileService(target, token).use { it.dropboxAccountDisplay() }
+                        }
+                        // Preserve edits, ordering, identity and removals that happened during the request.
+                        val current = _state.value.connections
+                        if (current.any { it == target } &&
+                            repository.oauthTokens.read(target.id) == tokenSnapshot &&
+                            repository.credentials.read(target.id) == manualTokenSnapshot
+                        ) {
+                            val updated = current.map { if (it == target) it.copy(username = label) else it }
+                            repository.save(updated)
+                            _state.update { it.copy(connections = updated) }
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        // Account lookup must never remove or invalidate an existing connection.
+                    } finally {
+                        dropboxAccountRequests.remove(target.id)
+                    }
+                }
+            }
+    }
+
     fun requestGooglePhotosImport() {
-        _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosDisclosureRequired = true, message = null) }
+        _state.update {
+            it.copy(
+                screen = Screen.LocalPhotoLibrary(googlePhotosSource = true),
+                googlePhotosDisclosureRequired = false,
+                message = null,
+            )
+        }
     }
 
     fun dismissGooglePhotosDisclosure() {
@@ -582,6 +643,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         repository.save(current)
         if (password.isNotBlank()) repository.credentials.save(connection.id, password)
         _state.update { it.copy(connections = current, screen = Screen.Dashboard) }
+        refreshDropboxAccountLabels(connection)
         invalidateFavoriteThumbnails()
         if (_state.value.superThumbnailConnectionId == null) selectSuperThumbnailConnection(connection.id)
         NasFinderAppWidgetProvider.updateAll(application)
@@ -2873,6 +2935,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 }
                 return
             }
+            if (succeeded) refreshDropboxAccountLabels()
             val pendingConnectionId = _state.value.oauthPendingConnectionId
             val connectedIds = _state.value.connections.mapNotNull { connection ->
                 connection.id.takeIf { repository.oauthTokens.read(it) != null }
@@ -2992,6 +3055,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun copyLocalMediaToInbox(
         uris: List<Uri>,
+        destinationSubdirectory: String? = null,
         onProgress: (current: Int, total: Int) -> Unit = { _, _ -> },
         onComplete: (successCount: Int, failedCount: Int) -> Unit = { _, _ -> },
     ) {
@@ -3006,7 +3070,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     runCatching {
                         val name = queryName(uri) ?: "폰하드 파일 ${index + 1}"
                         application.contentResolver.openInputStream(uri)?.use { input ->
-                            inboxStore.import(name, application.contentResolver.getType(uri), input)
+                            // Resolve and validate the selected folder through the existing PhoneHard store.
+                            inboxStore.listPhoneHardFolder(destinationSubdirectory)
+                            inboxStore.import(name, application.contentResolver.getType(uri), input, destinationSubdirectory = destinationSubdirectory)
                         } ?: error("파일을 열 수 없습니다.")
                         importedCount++
                     }.onFailure { failedCount++ }
@@ -3342,7 +3408,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 } ?: 0L
             }.getOrDefault(0L)
         }
-        prepareTrailer(names, captureTimes = captureTimes) { index, destination ->
+        prepareTrailer(names, captureTimes = captureTimes, motionSourceUris = activeUris) { index, destination ->
             val uri = activeUris[index]
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 application.contentResolver.openInputStream(uri)?.use { input ->
@@ -3574,6 +3640,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         prepareTrailer(
             names = names,
             captureTimes = captureTimes,
+            motionSourceUris = activeUris,
             isMusicOverlayMode = true,
             initialMusicTrack = musicTrack,
             initialMusicPolicy = musicPolicy,
@@ -3597,9 +3664,72 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    // Optionally improves a staged video's time-0 thumbnail using the already-computed audio
+    // highlight anchor: samples up to 3 nearby frames and keeps the sharpest/best-exposed one.
+    // Never touches analysis, scene selection, export or NAS traffic; keeps old thumbnail on any failure.
+    private suspend fun improveVideoThumbnail(file: File, duration: Double, anchorSeconds: Double, fallback: Bitmap?): Bitmap? {
+        if (!duration.isFinite() || duration <= 0.0) return fallback
+        return withContext(Dispatchers.IO) {
+            // Excludes the exact end-of-stream timestamp, which some decoders refuse to seek to.
+            val maxSeekable = Math.nextDown(duration).coerceAtLeast(0.0)
+            val candidates = ArrayList<Bitmap?>(3)
+            try {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val anchor = anchorSeconds.takeIf { it.isFinite() }?.coerceIn(0.0, maxSeekable) ?: 0.0
+                val candidateTimes = listOf(anchor, (anchor - .25).coerceIn(0.0, maxSeekable), (anchor + .25).coerceIn(0.0, maxSeekable))
+                val reader = android.media.MediaMetadataRetriever()
+                try {
+                    reader.setDataSource(file.absolutePath)
+                    for (t in candidateTimes) {
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        val micros = (t * 1_000_000).toLong()
+                        val frame = try {
+                            if (android.os.Build.VERSION.SDK_INT >= 27) {
+                                reader.getScaledFrameAtTime(micros, android.media.MediaMetadataRetriever.OPTION_CLOSEST, 180, 180)
+                            } else {
+                                reader.getFrameAtTime(micros, android.media.MediaMetadataRetriever.OPTION_CLOSEST)?.let { original ->
+                                    android.graphics.Bitmap.createScaledBitmap(original, 180, 180, true).also { if (it !== original) original.recycle() }
+                                }
+                            }
+                        } catch (interrupted: InterruptedException) {
+                            throw interrupted
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            null
+                        }
+                        candidates += frame
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    }
+                } finally {
+                    reader.release()
+                }
+                val bestIndex = selectBestVideoFrameIndex(candidates)
+                if (bestIndex == null) {
+                    candidates.forEach { it?.recycle() }
+                    return@withContext fallback
+                }
+                val best = candidates[bestIndex]
+                candidates.forEachIndexed { index, bitmap -> if (index != bestIndex) bitmap?.recycle() }
+                if (best != null && fallback != null && fallback !== best) fallback.recycle()
+                best ?: fallback
+            } catch (interrupted: InterruptedException) {
+                candidates.forEach { it?.recycle() }
+                throw interrupted
+            } catch (cancelled: CancellationException) {
+                candidates.forEach { it?.recycle() }
+                throw cancelled
+            } catch (e: Exception) {
+                candidates.forEach { it?.recycle() }
+                fallback
+            }
+        }
+    }
+
     private fun prepareTrailer(
         names: List<String>,
         captureTimes: List<Long> = emptyList(),
+        motionSourceUris: List<Uri> = emptyList(),
         initialExcludedCount: Int = 0,
         isMusicOverlayMode: Boolean = false,
         initialMusicTrack: TrailerMusicTrack? = null,
@@ -3609,36 +3739,6 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         stage: suspend (Int, File) -> Unit,
     ) {
         if (_state.value.trailer?.busy == true) return
-
-        val existingDraft = TrailerDraftStore.getDraft(isMusicOverlayMode)
-        if (!forceNew && existingDraft != null && existingDraft.isValid()) {
-            _state.update {
-                it.copy(
-                    trailerConflict = TrailerConflictConfirmation(
-                        title = if (isMusicOverlayMode) "음악 입히기 편집 재개" else "예고편 편집 재개",
-                        message = "이전에 작업 중이던 편집이 보관되어 있습니다. 이전 편집을 이어 진행할까요, 아니면 버리고 새로 시작할까요?",
-                        onResumeExisting = {
-                            resumeTrailerDraft(existingDraft)
-                        },
-                        onStartNew = {
-                            TrailerDraftStore.clearDraft(isMusicOverlayMode)
-                            prepareTrailer(
-                                names = names,
-                                captureTimes = captureTimes,
-                                initialExcludedCount = initialExcludedCount,
-                                isMusicOverlayMode = isMusicOverlayMode,
-                                initialMusicTrack = initialMusicTrack,
-                                initialMusicPolicy = initialMusicPolicy,
-                                initialMusicFitCount = initialMusicFitCount,
-                                forceNew = true,
-                                stage = stage,
-                            )
-                        }
-                    )
-                )
-            }
-            return
-        }
 
         closeTrailer(clearRetry = false)
         val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
@@ -3661,15 +3761,27 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val sources = mutableListOf<TrailerSource>()
                 var undecodableCount = 0
                 names.forEachIndexed { index, name ->
-                    val isImage = com.armsone.nasfinder.model.RemoteFileItem(name, name, name, false).isImage
+                    var sourceName = name
+                    var isImage = com.armsone.nasfinder.model.RemoteFileItem(name, name, name, false).isImage
                     updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · $name · ${if (isImage) "이미지" else "영상"}를 준비하는 중…", progress = null) }
-                    val file = File(directory, "source-$index.${name.substringAfterLast('.', if (isImage) "jpg" else "mp4")}")
+                    var file = File(directory, "source-$index.${name.substringAfterLast('.', if (isImage) "jpg" else "mp4")}")
                     stage(index, file)
+                    val primaryStagedFile = file
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (isImage) motionSourceUris.getOrNull(index)?.let { uri ->
+                        val chosen = TrailerMotionSelection.choose(application, uri, file)
+                        if (chosen.file != file) {
+                            // Retain the staged representative until the chosen form decodes successfully.
+                            file = chosen.file
+                            isImage = chosen.isImage
+                            sourceName = "${name.substringBeforeLast('.', name)}.${chosen.file.extension}"
+                        }
+                    }
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     if (!isMusicOverlayMode) {
                         updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · 한양이 장면을 고르는 중…", progress = null) }
                     }
-                    val decodedResult = withContext(Dispatchers.IO) {
+                    suspend fun decodeStagedSource() = withContext(Dispatchers.IO) {
                         try {
                             if (isImage) {
                                 val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -3772,13 +3884,23 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             null
                         }
                     }
+                    var decodedResult = decodeStagedSource()
+                    if (decodedResult == null && file != primaryStagedFile) {
+                        file.delete()
+                        file = primaryStagedFile
+                        isImage = true
+                        sourceName = name
+                        decodedResult = decodeStagedSource()
+                        android.util.Log.d("TrailerMotionSelection", "mode=representative_fallback downstream_decode=true")
+                    }
+                    if (decodedResult != null && file != primaryStagedFile) primaryStagedFile.delete()
                     if (decodedResult == null) {
                         undecodableCount++
                         file.delete()
                     } else {
                         val (metadata, thumbnail, capTime) = decodedResult
                         val analysis = if (isImage || isMusicOverlayMode) {
-                            // "영상에 음악 입히기" keeps whole original clips (musicOverlayScenes ignores
+                            // "영상에 뮤직비디오" keeps whole original clips (musicOverlayScenes ignores
                             // highlight data), and ducking at export reads raw PCM independently
                             // (TrailerExporter/AutoDuckingAudioProcessor), so skip the costly HanYang
                             // highlight analysis here.
@@ -3793,8 +3915,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first, (metadata.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
                         }
                         kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        val finalThumbnail = if (!isImage && !isMusicOverlayMode) {
+                            improveVideoThumbnail(file, metadata.first, analysis.peakTimeSeconds, thumbnail)
+                        } else {
+                            thumbnail
+                        }
                         val sourceIndex = sources.size
-                        sources += TrailerSource(sourceIndex, name, file, metadata.first, metadata.second, metadata.third, analysis, thumbnail, isImage = isImage, captureTimeMillis = capTime)
+                        sources += TrailerSource(sourceIndex, sourceName, file, metadata.first, metadata.second, metadata.third, analysis, finalThumbnail, isImage = isImage, captureTimeMillis = capTime)
                         updateTrailer(directory) { it.copy(sources = sources.toList()) }
                     }
                 }
@@ -3806,23 +3933,30 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     return@launch
                 }
                 // Sort sources by default chronological oldest first (captureTimeMillis > 0 first, then by name)
-                val sortedSources = sources.sortedWith(
+                val sortedSources = (if (motionSourceUris.isNotEmpty()) sources else sources.sortedWith(
                     compareBy<TrailerSource> { if (it.captureTimeMillis > 0L) it.captureTimeMillis else Long.MAX_VALUE }
                         .thenBy { it.name }
-                ).mapIndexed { newIndex, src -> src.copy(id = newIndex) }
+                )).mapIndexed { newIndex, src -> src.copy(id = newIndex) }
 
-                val lengths = sortedSources.map { it.recommendedLength }.sorted()
-                val videoDurations = sortedSources.filter { !it.isImage }.map { it.duration }
+                val preparedSources = if (!isMusicOverlayMode && sortedSources.any { it.isImage }) {
+                    updateTrailer(directory) { it.copy(status = "사진을 비교하는 중…", progress = null) }
+                    analyzeTrailerPhotos(application, sortedSources)
+                } else {
+                    sortedSources
+                }
+
+                val lengths = preparedSources.map { it.recommendedLength }.sorted()
+                val videoDurations = preparedSources.filter { !it.isImage }.map { it.duration }
                 val minVideoDuration = videoDurations.minOrNull() ?: 4.0
                 val length = if (isMusicOverlayMode) {
                     minVideoDuration.coerceAtLeast(1.0)
                 } else {
                     minOf(minVideoDuration, lengths[lengths.size / 2]).coerceAtLeast(1.0)
                 }
-                val hasVideos = sortedSources.any { !it.isImage }
-                val photoLength = defaultPhotoClipLength(length, hasVideos)
+                val hasVideos = preparedSources.any { !it.isImage }
+                val photoLength = if (isMusicOverlayMode) 1.0 else defaultPhotoClipLength(length, hasVideos)
                 val totalExcluded = initialExcludedCount + undecodableCount
-                val initialTotal = sortedSources.sumOf { if (it.isImage) photoLength else it.recommendedLength }
+                val initialTotal = preparedSources.sumOf { if (it.isImage) (if (isMusicOverlayMode) photoLength else it.weightedPhotoLength(length)) else maxOf(length, it.recommendedLength) }
                 val statusMessage = if (isMusicOverlayMode) {
                     "음악을 선택해 주세요."
                 } else if (totalExcluded > 0) {
@@ -3833,11 +3967,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 updateTrailer(directory) {
                     it.copy(
                         status = statusMessage,
-                        sources = sortedSources,
+                        sources = preparedSources,
                         total = initialTotal,
                         clipLength = length,
                         photoClipLength = photoLength,
-                        format = TrailerFormat.closest(sortedSources.first().width, sortedSources.first().height),
+                        format = TrailerFormat.closest(preparedSources.first().width, preparedSources.first().height),
                         busy = false,
                         isMusicOverlayMode = isMusicOverlayMode,
                         musicTrack = initialMusicTrack,
@@ -3876,11 +4010,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             updateTrailer(directory) { it.copy(error = "선택한 미디어 목록이 올바르지 않습니다.") }
             return
         }
+        if (!total.isFinite()) return
+        val requestedTotal = total.coerceIn(1.0, 7200.0)
         val sources = order.mapNotNull { existingMap[it] }
         val scenes = if (session.isMusicOverlayMode) {
             musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
         } else {
-            trailerScenes(sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount)
+            trailerScenes(sources, requestedTotal, length, photoLength, musicTrack, musicPolicy, musicFitCount)
         }
         if (scenes.isEmpty()) {
             updateTrailer(directory) { it.copy(error = "이 장면 길이로 만들 수 없습니다. 장면 길이를 줄여 주세요.") }; return
@@ -3889,7 +4025,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             it.copy(
                 trailer = session.copy(
                     sources = sources,
-                    total = total,
+                    total = requestedTotal,
                     clipLength = length,
                     photoClipLength = photoLength,
                     format = format,
@@ -3983,9 +4119,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val isManaged = TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)
             if (!isManaged) {
                 if (running?.isActive == true) {
-                    running.invokeOnCompletion { session.directory.deleteRecursively() }
+                    running.invokeOnCompletion { TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory) }
                     running.cancel()
-                } else session.directory.deleteRecursively()
+                } else TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory)
             } else if (running?.isActive == true) {
                 running.cancel()
             }
@@ -4017,10 +4153,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         // session's own partial directory is removed and no draft is stored.
         if (!session.prepared) {
             if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
-                if (wasRunning) running?.invokeOnCompletion { session.directory.deleteRecursively() }
-                else session.directory.deleteRecursively()
+                if (wasRunning) running?.invokeOnCompletion { TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory) }
+                else TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory)
             }
-            val cancelMsg = if (session.isMusicOverlayMode) "음악 입히기가 취소되었습니다." else "예고편 만들기가 취소되었습니다."
+            val cancelMsg = if (session.isMusicOverlayMode) "뮤직비디오가 취소되었습니다." else "예고편 만들기가 취소되었습니다."
             _state.update {
                 it.copy(
                     trailer = null,
@@ -4035,6 +4171,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
         if (draftSources.isNotEmpty()) {
             val draft = TrailerDraft(
+                id = session.draftId ?: UUID.randomUUID().toString(),
                 isMusicOverlayMode = session.isMusicOverlayMode,
                 directory = session.directory,
                 sources = draftSources,
@@ -4048,10 +4185,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 autoDucking = autoDucking ?: session.autoDucking,
                 output = finalOutput,
                 showingSettings = showingSettings,
+                timestamp = System.currentTimeMillis(),
             )
             TrailerDraftStore.saveDraft(draft)
         } else if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
-            session.directory.deleteRecursively()
+            TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory)
         }
 
         _state.update {
@@ -4076,6 +4214,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
 
+        TrailerDraftStore.detachDraft(draft.id)
+
         val restoredSession = TrailerSession(
             directory = draft.directory,
             sources = draft.sources,
@@ -4096,6 +4236,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             autoDucking = draft.autoDucking,
             awaitingInitialSettings = draft.showingSettings || draft.output == null,
             prepared = true,
+            draftId = draft.id,
         )
 
         _state.update {
@@ -4103,6 +4244,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 trailer = restoredSession,
                 imagePreview = null,
                 trailerDraftPicker = null,
+                trailerDraftCount = TrailerDraftStore.draftCount(),
             )
         }
     }
@@ -4113,7 +4255,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update {
             it.copy(
                 trailerDraftCount = remaining.size,
-                trailerDraftPicker = remaining.takeIf { it.isNotEmpty() },
+                trailerDraftPicker = remaining,
             )
         }
     }
@@ -4121,11 +4263,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun openPhoneHardLongTouch() {
         if (_state.value.trailer != null) return
         val drafts = TrailerDraftStore.getAllDrafts()
-        when {
-            drafts.isEmpty() -> return
-            drafts.size == 1 -> resumeTrailerDraft(drafts.first())
-            else -> _state.update { it.copy(trailerDraftPicker = drafts) }
-        }
+        _state.update { it.copy(trailerDraftPicker = drafts) }
     }
 
     fun dismissTrailerDraftPicker() {

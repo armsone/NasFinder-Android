@@ -4,12 +4,26 @@ import android.graphics.Bitmap
 import java.io.File
 import kotlin.math.*
 
+// Default .55 is the neutral HanYang quality/similarity ratio used until analyzeTrailerPhotos()
+// (TrailerPhotoAnalysis.kt) fills in a real per-photo measurement; kept stable across preview
+// recomposition, export and saved-draft re-open because it lives on this immutable source.
+const val DEFAULT_PHOTO_DURATION_RATIO: Double = .55
+const val MIN_PHOTO_DURATION_RATIO: Double = .05
+internal const val MIN_PHOTO_SCENE_DURATION: Double = 1.0 / 30.0
+
 data class TrailerSource(
     val id: Int, val name: String, val file: File, val duration: Double,
     val width: Int, val height: Int, val analysis: AudioAnalysisResult, val thumbnail: Bitmap?,
     val isImage: Boolean = false,
     val captureTimeMillis: Long = 0L,
+    // HanYang quality/similarity ratio of the configured video clip length this photo's scene
+    // should occupy: .35..75 ordinary (best photo highest, similar duplicates lower), down to
+    // MIN_PHOTO_DURATION_RATIO for extreme near-duplicates. Set by analyzeTrailerPhotos().
+    val photoDurationRatio: Double = DEFAULT_PHOTO_DURATION_RATIO,
 ) {
+    // Actual scene duration for this photo given the configured video-clip ("base clip") length.
+    fun weightedPhotoLength(clipLength: Double): Double =
+        max(MIN_PHOTO_SCENE_DURATION, clipLength * photoDurationRatio)
     val recommendedLength: Double get() {
         if (isImage) return 4.0
         val wave = analysis.waveform
@@ -73,21 +87,28 @@ data class TrailerSession(
     val awaitingInitialSettings: Boolean = false,
     // True only once every source is staged and analysed and the first plan exists.
     val prepared: Boolean = false,
+    val draftId: String? = null,
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
-    val effectivePhotoClipLength: Double get() = if (!hasVideos) 1.0 else photoClipLength
-    val originalTotal get() = sources.sumOf { if (it.isImage) effectivePhotoClipLength else it.duration }
+    // Music-overlay mode keeps every photo at a fixed 1s Ken Burns scene; trailer mode now weighs
+    // each photo's own HanYang quality/similarity ratio against the configured video clip length
+    // instead of forcing a uniform value, so this is only an estimate used for legacy callers.
+    val effectivePhotoClipLength: Double get() = if (isMusicOverlayMode) 1.0 else photoClipLength
+    val originalTotal get() = sources.sumOf {
+        if (!it.isImage) it.duration else if (isMusicOverlayMode) 1.0 else it.weightedPhotoLength(clipLength)
+    }
     val scenes get() = if (isMusicOverlayMode) {
         musicOverlayScenes(sources, 1.0, musicTrack, musicPolicy, musicFitCount)
     } else {
-        trailerScenes(sources, total, clipLength, effectivePhotoClipLength, musicTrack, musicPolicy, musicFitCount)
+        trailerScenes(sources, total, clipLength, photoClipLength, musicTrack, musicPolicy, musicFitCount)
     }
 }
 
-internal fun defaultPhotoClipLength(videoLength: Double, hasVideos: Boolean = true): Double =
-    if (!hasVideos) 1.0 else videoLength / 2.0
+internal fun defaultPhotoClipLength(videoLength: Double, hasVideos: Boolean = true): Double = videoLength / 2.0
 
 // Ported from VideoTrailerBatchPlan: distinct regions, equal lengths and proportional allocation.
+// Each photo's own scene length is its HanYang-weighted share of `length` (TrailerSource.weightedPhotoLength);
+// `photoLength` is kept only as a rough estimate for the scene-count budget below, never as the actual photo duration.
 internal fun trailerScenes(
     sources: List<TrailerSource>,
     total: Double,
@@ -97,39 +118,58 @@ internal fun trailerScenes(
     musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
     musicFitCount: Int = 1,
 ): List<TrailerScene> {
-    val actualPhotoLength = if (sources.none { !it.isImage }) 1.0 else photoLength
-    if (sources.isEmpty() || !length.isFinite() || length <= 0 || !actualPhotoLength.isFinite() || actualPhotoLength <= 0 || !total.isFinite()) return emptyList()
+    if (sources.isEmpty() || !length.isFinite() || length <= 0 || !photoLength.isFinite() || photoLength <= 0 || !total.isFinite()) return emptyList()
 
     val targetTotal = if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
         musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1)
     } else {
-        total
+        total.coerceIn(1.0, 7200.0)
     }
 
     val capacity = sources.map { source ->
-        if (source.isImage) 1 else floor(source.duration / length + .000001).toInt().coerceAtLeast(0)
+        if (source.isImage) 1 else if (source.duration.isFinite() && source.duration > 0) floor(source.duration / length + .000001).toInt().coerceAtLeast(1) else 0
     }
-    val avgUnit = if (sources.any { it.isImage } && sources.any { !it.isImage }) {
-        (length + actualPhotoLength) / 2.0
-    } else if (sources.all { it.isImage }) {
-        actualPhotoLength
-    } else {
-        length
+
+    val lengthFor = sources.map { source ->
+        if (source.isImage) source.weightedPhotoLength(length) else min(length, source.duration)
     }
-    val requested = min(capacity.sum(), max(1, floor(targetTotal / avgUnit + .5).toInt()))
+
     val counts = IntArray(sources.size)
-    var remaining = requested
-    sources.indices.filter { capacity[it] > 0 }.forEach { if (remaining > 0) { counts[it]++; remaining-- } }
-    while (remaining > 0) {
-        val index = sources.indices.filter { counts[it] < capacity[it] }.maxByOrNull {
-            if (sources[it].isImage) 0.0 else sources[it].duration / (counts[it] + 1)
-        } ?: break
-        counts[index]++; remaining--
+    var remainingTime = targetTotal
+
+    // First: allocate one to each source whose capacity > 0 and fits remaining time, preserving user order
+    for (i in sources.indices) {
+        if (capacity[i] > 0 && lengthFor[i] <= remainingTime + 1e-6) {
+            counts[i]++
+            remainingTime = (remainingTime - lengthFor[i]).coerceAtLeast(0.0)
+        }
     }
+
+    // Then: allocate additional video segments whose capacity remains, using existing duration / (counts + 1) priority and must fit remaining time
+    while (true) {
+        val candidates = sources.indices.filter {
+            !sources[it].isImage && counts[it] < capacity[it] && lengthFor[it] <= remainingTime + 1e-6
+        }
+        if (candidates.isEmpty()) break
+        val bestIndex = candidates.maxByOrNull {
+            sources[it].duration / (counts[it] + 1)
+        } ?: break
+        counts[bestIndex]++
+        remainingTime = (remainingTime - lengthFor[bestIndex]).coerceAtLeast(0.0)
+    }
+
+    // Fallback: if nothing fit but valid capacity exists, preserve previous at-least-one fallback deterministically
+    if (counts.all { it == 0 }) {
+        val firstEligible = sources.indices.firstOrNull { capacity[it] > 0 }
+        if (firstEligible != null) {
+            counts[firstEligible] = 1
+        }
+    }
+
     val rawScenes = sources.flatMapIndexed { index, source ->
         val count = counts[index]
         if (source.isImage) {
-            (0 until count).map { TrailerScene(source, 0.0, actualPhotoLength) }
+            (0 until count).map { TrailerScene(source, 0.0, source.weightedPhotoLength(length)) }
         } else {
             (0 until count).map { scene ->
                 val lower = scene * source.duration / count
@@ -140,7 +180,8 @@ internal fun trailerScenes(
                     if (time >= lower && time < upper) time to score else null
                 }.maxByOrNull { it.second }?.first
                 val peak = if (source.analysis.highlightSource == ClipHighlightSource.Fallback) (lower + upper) / 2 else peaks.firstOrNull() ?: wavePeak ?: (lower + upper) / 2
-                TrailerScene(source, max(lower, min(upper - length, peak - length / 2)), length)
+                val sceneLength = min(length, source.duration)
+                TrailerScene(source, max(lower, min(upper - sceneLength, peak - sceneLength / 2)), sceneLength)
             }
         }
     }
@@ -148,11 +189,11 @@ internal fun trailerScenes(
     if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
         return fitScenesToTargetDuration(rawScenes, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1))
     }
-    return rawScenes
+    return fitScenesToTargetDuration(rawScenes, targetTotal)
 }
 
 /**
- * "영상에 음악 입히기": Selected full original videos (in chosen order, NO HanYang cuts)
+ * "영상에 뮤직비디오": Selected full original videos (in chosen order, NO HanYang cuts)
  * plus photos at default 1.0s (or given photoLength) with Ken Burns zoom.
  * If musicPolicy is FIT_MUSIC_LENGTH, repeat scenes or trim tail to match music.
  */
@@ -189,10 +230,10 @@ private fun fitScenesToTargetDuration(scenes: List<TrailerScene>, targetDuration
 
     // Repeat base scenes sequence if needed
     var sceneIdx = 0
-    while (accumulated < targetDuration - 0.05) {
+    while (accumulated < targetDuration - 1e-6) {
         val next = scenes[sceneIdx % scenes.size]
         val remaining = targetDuration - accumulated
-        if (remaining <= 0.05) break
+        if (remaining <= 1e-6) break
         if (next.length <= remaining) {
             result.add(next)
             accumulated += next.length

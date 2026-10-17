@@ -44,6 +44,13 @@ class ConnectionRepository(context: Context) {
         preferences.edit().putString(KEY_CONNECTIONS, array.toString()).apply()
     }
 
+    fun googlePhotosVisible(): Boolean = preferences.getBoolean("google_photos.visible", true)
+    fun googlePhotosName(): String = preferences.getString("google_photos.name", null)?.takeIf(String::isNotBlank) ?: "Google 포토"
+    fun saveGooglePhotosLocation(name: String, visible: Boolean) {
+        preferences.edit().putString("google_photos.name", name.trim().ifBlank { "Google 포토" })
+            .putBoolean("google_photos.visible", visible).apply()
+    }
+
     fun preferredId(): String? = preferences.getString(KEY_PREFERRED, null)
 
     fun setPreferred(id: String?) {

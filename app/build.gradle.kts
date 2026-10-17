@@ -11,9 +11,9 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 412586
-        versionName = "2.6.2"
-        buildConfigField("String", "BUILD_NUMBER", "\"202610141226\"")
+        versionCode = 416664
+        versionName = "2.12.0"
+        buildConfigField("String", "BUILD_NUMBER", "\"202610170824\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
@@ -68,6 +68,8 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.github.mwiede:jsch:2.28.3")
     implementation("com.hierynomus:smbj:0.14.0")
+    implementation(project(":hanai-onnx"))
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.2")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

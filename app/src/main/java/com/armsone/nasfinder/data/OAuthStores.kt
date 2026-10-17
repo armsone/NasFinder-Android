@@ -94,6 +94,12 @@ class OAuthTokenStore(context: Context) {
         vault.save(connectionId, tokens.accessToken)
     }
 
+    fun saveIfUnchanged(connectionId: String, expected: OAuthTokenSet, tokens: OAuthTokenSet): Boolean = synchronized(lock) {
+        if (read(connectionId) != expected) return@synchronized false
+        save(connectionId, tokens)
+        true
+    }
+
     fun read(connectionId: String): OAuthTokenSet? = synchronized(lock) {
         vault.read(tokenKey(connectionId))?.let { runCatching { JSONObject(it).toTokenSet() }.getOrNull() }
     }

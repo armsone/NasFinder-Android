@@ -169,7 +169,7 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
         }
         if (confirmClose) AlertDialog(
             onDismissRequest = { confirmClose = false },
-            title = { Text(if (session.isMusicOverlayMode) "음악 입히기를 중단할까요?" else "예고편 만들기를 중단할까요?") },
+            title = { Text(if (session.isMusicOverlayMode) "뮤직비디오를 중단할까요?" else "예고편 만들기를 중단할까요?") },
             text = { Text("지금까지의 진행 상태는 보관되며 나중에 이어서 편집할 수 있습니다.") },
             dismissButton = {
                 TextButton(onClick = { confirmClose = false }) {
@@ -243,7 +243,6 @@ private fun TrailerSettings(
     var sources by sourcesState
     var total by totalState
     var length by lengthState
-    val hasImages = sources.any { it.isImage }
     val hasVideos = sources.any { !it.isImage }
     val photoLength = if (session.isMusicOverlayMode) 1.0 else defaultPhotoClipLength(length, hasVideos)
     var format by formatState
@@ -263,7 +262,7 @@ private fun TrailerSettings(
         }
     }
     val actual = scenes.sumOf { it.length }
-    val original = sources.sumOf { if (it.isImage) photoLength else it.duration }
+    val original = sources.sumOf { if (it.isImage) (if (session.isMusicOverlayMode) 1.0 else it.weightedPhotoLength(length)) else it.duration }
     val maxLength = min(30.0, sources.maxOfOrNull { if (it.isImage) 30.0 else it.duration } ?: 30.0)
     val excluded = sources.count { source -> scenes.none { it.source.id == source.id } }
     val liveSources by rememberUpdatedState(sources)
@@ -273,18 +272,17 @@ private fun TrailerSettings(
         if (from >= 0 && to in list.indices) { list.add(to, list.removeAt(from)); sources = list }
     }
     ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = onClose, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.fillMaxWidth().fillMaxHeight().padding(horizontal = 18.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(trailerLengthTitle(actual), Modifier.weight(1f), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                 val rateSubtitle = when {
-                    session.isMusicOverlayMode -> "${scenes.size}장면 · 영상 원본 그대로, 사진 1초씩"
-                    hasImages && hasVideos -> "${scenes.size}장면 · 영상 ${sceneLengthLabel(length)}, 사진 ${sceneLengthLabel(photoLength)}"
-                    hasImages -> "${scenes.size}장면 · 사진 1초씩 (사진 전용)"
-                    else -> "${scenes.size}장면 · 영상 ${sceneLengthLabel(length)}씩"
+                    session.isMusicOverlayMode -> "${scenes.size}장면 · 영상 원본 그대로"
+                    else -> "${scenes.size}장면"
                 }
                 Text(rateSubtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text("원본 ${trailerLengthTitle(original)} 중 ${"%.1f".format(if (original > 0) actual / original * 100 else 0.0)}%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if ((hasVideos || session.isMusicOverlayMode) && actual <= original + 1e-6) Text("원본 ${trailerLengthTitle(original)} 중 ${"%.1f".format(if (original > 0) actual / original * 100 else 0.0)}%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             HorizontalDivider()
             Text("배경 음악", style = MaterialTheme.typography.titleSmall)
             Surface(
@@ -400,12 +398,12 @@ private fun TrailerSettings(
             }
 
             if (session.isMusicOverlayMode) {
-                Text("원본 영상을 자르지 않고 그대로 이어 붙입니다. 사진은 1초씩 들어갑니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("원본 영상을 자르지 않고 그대로 이어 붙입니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
             Text("얼마나 길게 볼까요?", style = MaterialTheme.typography.titleSmall)
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
-                    TrailerChoice(trailerLengthTitle(value), abs(total - value) < .01, Modifier.weight(1f), value <= original) {
+                    TrailerChoice(trailerLengthTitle(value), abs(total - value) < .01, Modifier.weight(1f)) {
                         total = value
                         customTotal = false
                         if (musicTrack != null) {
@@ -417,14 +415,14 @@ private fun TrailerSettings(
             TextButton(onClick = { customTotal = !customTotal }, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
                 Text("다른 길이", Modifier.weight(1f)); Text(trailerLengthTitle(total)); Icon(if (customTotal) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null)
             }
-            if (customTotal && original > 1) Slider(value = total.toFloat(), onValueChange = {
-                total = it.roundToInt().toDouble()
-                if (musicTrack != null) {
-                    musicPolicy = TrailerMusicPolicy.SINGLE
-                }
-            }, valueRange = 1f..original.toFloat(), modifier = Modifier.semantics { contentDescription = "예고편 총길이" })
-            if (hasVideos) {
-                Text("영상 한 장면은 얼마나 볼까요?", style = MaterialTheme.typography.titleSmall)
+            if (customTotal) {
+                TrailerDurationSlider(value = total, onValueChange = {
+                    total = it
+                    if (musicTrack != null) musicPolicy = TrailerMusicPolicy.SINGLE
+                })
+            }
+            if (sources.isNotEmpty()) {
+                Text("클립 길이", style = MaterialTheme.typography.titleSmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     listOf(1.0, 1.5, 2.0, 4.0, 6.0).filter { it <= maxLength }.forEach { value ->
                         TrailerChoice(sceneLengthLabel(value), abs(length - value) < .01, Modifier.weight(1f)) {
@@ -439,33 +437,8 @@ private fun TrailerSettings(
                 if (customLength && maxLength >= 1) Slider(value = length.toFloat(), onValueChange = {
                     val newLen = it.roundToInt().toDouble().coerceAtLeast(1.0)
                     length = newLen
-                }, valueRange = 1f..maxLength.toFloat().coerceAtLeast(1f), modifier = Modifier.semantics { contentDescription = "영상 장면의 공통 길이" })
+                }, valueRange = 1f..maxLength.toFloat().coerceAtLeast(1f), modifier = Modifier.semantics { contentDescription = "클립 길이" })
             }
-            }
-            if (hasImages && !session.isMusicOverlayMode) {
-                Text("사진 한 장 길이", style = MaterialTheme.typography.titleSmall)
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(9.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant
-                ) {
-                    Row(
-                        Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "사진 재생 시간",
-                            Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Text(
-                            if (hasVideos) "${sceneLengthLabel(photoLength)} (영상 장면의 1/2)" else "1초 (사진 전용)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
             }
             Text("화면 크기", style = MaterialTheme.typography.titleSmall)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -743,6 +716,7 @@ private fun TrailerSettings(
                 Text("모든 미디어가 제외되었습니다. 미디어를 추가해 주세요.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
             }
             if (excluded > 0) Text("장면 길이와 개수에 따라 ${excluded}개 미디어는 제외됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Button(
                 onClick = { regenerate(sources.map { it.id }, total, length, photoLength, format, musicTrack, musicPolicy, musicFitCount, autoDucking) },
                 enabled = sources.isNotEmpty() && scenes.isNotEmpty() && (!session.isMusicOverlayMode || musicTrack != null),

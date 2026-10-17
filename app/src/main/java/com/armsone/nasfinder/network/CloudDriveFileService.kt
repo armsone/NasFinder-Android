@@ -56,6 +56,16 @@ class CloudDriveFileService(
         }
     }
 
+    suspend fun dropboxAccountDisplay(): String = withContext(Dispatchers.IO) {
+        require(connection.kind == ConnectionKind.DROPBOX)
+        val account = executeJson(authorized(Request.Builder()
+            .url("https://api.dropboxapi.com/2/users/get_current_account")
+            .post(ByteArray(0).toRequestBody(null))).build())
+        account.optString("email").trim().takeIf(String::isNotBlank)
+            ?: account.optJSONObject("name")?.optString("display_name")?.trim()?.takeIf(String::isNotBlank)
+            ?: throw IOException("계정 정보 확인 필요")
+    }
+
     override suspend fun testConnection() {
         list(connection.normalizedRootPath)
     }
