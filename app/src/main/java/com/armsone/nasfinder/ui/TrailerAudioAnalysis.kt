@@ -189,6 +189,181 @@ internal object AudioAnalysisService {
         }
     }
 
+    /**
+     * Extracts a continuous perceptual loudness envelope (`0.0f..1.0f`) at [binSeconds] resolution
+     * across the original clip's audio track.
+     *
+     * - Clips without an audio track return a zero-filled `FloatArray(bucketCount)` (pure silence -> full BGM gain).
+     * - Decoder errors return an empty `FloatArray(0)` so callers can apply a safe fallback.
+     * - Uses true RMS (`sqrt(mean(rms^2))`) per bin, and a fixed absolute full-scale dBFS mapping
+     *   (`-55.0` dBFS -> `0.0f`, `-25.0` dBFS -> `1.0f`) with no per-file normalization.
+     */
+    suspend fun extractLoudnessEnvelope(
+        context: Context,
+        uri: Uri,
+        sourceDurationSeconds: Double,
+        binSeconds: Double = 0.05,
+    ): FloatArray = runInterruptible(Dispatchers.Default) {
+        if (sourceDurationSeconds <= 0.0) return@runInterruptible FloatArray(0)
+        val safeBinSeconds = binSeconds.coerceAtLeast(0.01)
+        val bucketCount = max(1, kotlin.math.ceil(sourceDurationSeconds / safeBinSeconds).toInt())
+        runCatching {
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(context, uri, null)
+                val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
+                    extractor.getTrackFormat(index)
+                        .getString(MediaFormat.KEY_MIME)
+                        ?.startsWith("audio/") == true
+                } ?: return@runCatching FloatArray(bucketCount) { 0f }
+
+                extractor.selectTrack(trackIndex)
+                val format = extractor.getTrackFormat(trackIndex)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: return@runCatching FloatArray(bucketCount) { 0f }
+                val decoder = MediaCodec.createDecoderByType(mime)
+                val info = MediaCodec.BufferInfo()
+                val sumSquares = DoubleArray(bucketCount)
+                val peakPerBin = DoubleArray(bucketCount)
+                val counts = IntArray(bucketCount)
+
+                try {
+                    format.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                    decoder.configure(format, null, null, 0)
+                    decoder.start()
+
+                    var inputDone = false
+                    var outputDone = false
+                    var outputPcmEncoding = AudioFormat.ENCODING_PCM_16BIT
+                    while (!outputDone) {
+                        if (Thread.currentThread().isInterrupted) throw CancellationException()
+                        if (!inputDone) {
+                            val inputIndex = decoder.dequeueInputBuffer(10_000)
+                            if (inputIndex >= 0) {
+                                val inputBuffer = decoder.getInputBuffer(inputIndex)
+                                val sampleSize = if (inputBuffer != null) {
+                                    inputBuffer.clear()
+                                    extractor.readSampleData(inputBuffer, 0)
+                                } else {
+                                    -1
+                                }
+
+                                if (sampleSize < 0) {
+                                    decoder.queueInputBuffer(
+                                        inputIndex,
+                                        0,
+                                        0,
+                                        0,
+                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                    )
+                                    inputDone = true
+                                } else {
+                                    decoder.queueInputBuffer(
+                                        inputIndex,
+                                        0,
+                                        sampleSize,
+                                        max(0L, extractor.sampleTime),
+                                        0
+                                    )
+                                    extractor.advance()
+                                }
+                            }
+                        }
+
+                        when (val outputIndex = decoder.dequeueOutputBuffer(info, 10_000)) {
+                            MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                val outputFormat = decoder.outputFormat
+                                outputPcmEncoding = if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                                    outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                                } else {
+                                    AudioFormat.ENCODING_PCM_16BIT
+                                }
+                            }
+                            else -> if (outputIndex >= 0) {
+                                val buffer = decoder.getOutputBuffer(outputIndex)
+                                if (buffer != null && info.size > 0) {
+                                    buffer.position(info.offset)
+                                    buffer.limit(info.offset + info.size)
+                                    val pcmBuffer = buffer.slice().order(ByteOrder.LITTLE_ENDIAN)
+                                    val metrics = if (outputPcmEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                                        metricsFloatPcm(pcmBuffer)
+                                    } else {
+                                        metrics16BitPcm(pcmBuffer)
+                                    }
+                                    val timeSeconds = info.presentationTimeUs / 1_000_000.0
+                                    val bucket = (timeSeconds / safeBinSeconds).toInt()
+                                    if (bucket in 0 until bucketCount) {
+                                        sumSquares[bucket] += metrics.rms * metrics.rms
+                                        peakPerBin[bucket] = max(peakPerBin[bucket], metrics.peak)
+                                        counts[bucket] += 1
+                                    }
+                                }
+                                outputDone = outputDone ||
+                                    (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                                decoder.releaseOutputBuffer(outputIndex, false)
+                            }
+                        }
+                    }
+                } finally {
+                    runCatching { decoder.stop() }
+                    decoder.release()
+                }
+
+                val rawRms = DoubleArray(bucketCount)
+                for (i in 0 until bucketCount) {
+                    rawRms[i] = if (counts[i] > 0) {
+                        val rms = sqrt(sumSquares[i] / counts[i].toDouble())
+                        // Blend RMS with a fraction of peak to capture crisp consonant/transient speech attacks
+                        (rms * 0.82 + peakPerBin[i] * 0.18).coerceIn(0.0, 1.0)
+                    } else if (i > 0) {
+                        rawRms[i - 1] * 0.5
+                    } else {
+                        0.0
+                    }
+                }
+
+                val dbBins = DoubleArray(bucketCount) { idx ->
+                    val r = rawRms[idx]
+                    if (r <= 1e-5) -90.0 else 20.0 * kotlin.math.log10(r)
+                }
+
+                // Absolute full-scale mapping (no per-file normalization): -55 dBFS and below -> 0f,
+                // -25 dBFS and above -> 1f, so the momentary original amplitude drives the BGM ducking.
+                val adaptiveFloorDb = -55.0
+                val ceilingDb = -25.0
+                val spanDb = ceilingDb - adaptiveFloorDb
+
+                val rawLoudness = FloatArray(bucketCount) { idx ->
+                    val db = dbBins[idx]
+                    if (db <= adaptiveFloorDb) {
+                        0f
+                    } else {
+                        val normalized = ((db - adaptiveFloorDb) / spanDb).coerceIn(0.0, 1.0)
+                        normalized.toFloat()
+                    }
+                }
+
+                // Light 3-tap temporal smoothing so single-bin spikes or micro-dropouts transition smoothly
+                if (bucketCount < 3) {
+                    rawLoudness
+                } else {
+                    FloatArray(bucketCount) { idx ->
+                        when (idx) {
+                            0 -> (rawLoudness[0] * 0.7f + rawLoudness[1] * 0.3f).coerceIn(0f, 1f)
+                            bucketCount - 1 -> (rawLoudness[idx - 1] * 0.3f + rawLoudness[idx] * 0.7f).coerceIn(0f, 1f)
+                            else -> (rawLoudness[idx - 1] * 0.2f + rawLoudness[idx] * 0.6f + rawLoudness[idx + 1] * 0.2f).coerceIn(0f, 1f)
+                        }
+                    }
+                }
+            } finally {
+                extractor.release()
+            }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            FloatArray(0)
+        }
+    }
+
     private fun analyzePcm(
         context: Context,
         uri: Uri,

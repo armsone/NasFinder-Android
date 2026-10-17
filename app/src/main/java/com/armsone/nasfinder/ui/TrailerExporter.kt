@@ -167,25 +167,34 @@ internal object TrailerExporter {
                     .filter { !it.isImage }
                     .distinctBy { it.id }
 
-                val envelopes = mutableMapOf<Int, BooleanArray>()
+                val envelopes = mutableMapOf<Int, FloatArray>()
                 for (src in uniqueVideoSources) {
-                    val env = AudioAnalysisService.extractActivityEnvelope(
+                    val env = AudioAnalysisService.extractLoudnessEnvelope(
                         context = context,
                         uri = Uri.fromFile(src.file),
                         sourceDurationSeconds = src.duration,
-                        binSeconds = 0.1,
-                        silenceThresholdRms = 0.01,
+                        binSeconds = 0.05,
                     )
                     envelopes[src.id] = env
                 }
-                AudioDuckingTimeline.buildWithEnvelopes(scenes, envelopes, binSeconds = 0.1)
-            } else null
+                AudioDuckingTimeline.buildWithLoudnessEnvelopes(
+                    scenes = scenes,
+                    envelopes = envelopes,
+                    binSeconds = 0.05,
+                    originalClipGain = 1.0f,
+                )
+            } else {
+                AudioDuckingTimeline.constant()
+            }
 
             fun makeMusicEffects(startOffsetSeconds: Double): Effects {
-                val audioProcessors = mutableListOf<androidx.media3.common.audio.AudioProcessor>()
-                if (duckingTimeline != null) {
-                    audioProcessors.add(AutoDuckingAudioProcessor(duckingTimeline, outputStartOffsetSeconds = startOffsetSeconds))
-                }
+                val audioProcessors = listOf<androidx.media3.common.audio.AudioProcessor>(
+                    AutoDuckingAudioProcessor(
+                        timeline = duckingTimeline,
+                        outputStartOffsetSeconds = startOffsetSeconds,
+                        autoDucking = autoDucking,
+                    )
+                )
                 return Effects(audioProcessors, emptyList())
             }
 

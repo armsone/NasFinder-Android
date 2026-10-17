@@ -14,6 +14,8 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
 import android.webkit.URLUtil
 import android.webkit.WebResourceRequest
 import android.webkit.WebStorage
@@ -95,31 +97,133 @@ private fun isAudioResponse(url: String, mimeType: String?, contentDisposition: 
     return guessedName != null && hasMusicExtension(guessedName)
 }
 
+private const val MUSIC_SIGNAL_NAME = "NasFinderMusicSignal"
+
+/** One music file with the title that belongs to it, never a title borrowed from another file. */
+private data class BrowserMusicCandidate(val url: String, val title: String?, val playing: Boolean) {
+    /** Same exact file across rescans: full address incl. query (it can select the song), no fragment. Never shown or logged. */
+    val key: String get() = url.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build()?.toString() ?: url.substringBefore('#')
+    val displayName: String
+        get() = musicFilenameBase(title)
+            ?: android.net.Uri.parse(url).lastPathSegment?.ifBlank { null }
+            ?: "음악 파일"
+}
+
 private const val MUSIC_SCAN_JS = """
 (function(){
   try {
-    var audio = [];
-    document.querySelectorAll('audio').forEach(function(a){ var s = a.currentSrc || a.src; if (s) audio.push(s); });
-    document.querySelectorAll('audio source').forEach(function(s){ if (s.src) audio.push(s.src); });
-    var links = [];
-    document.querySelectorAll('a[href]').forEach(function(l){ if (l.href) links.push(l.href); });
-    return JSON.stringify({audio: audio, links: links});
-  } catch (e) { return '{"audio":[],"links":[]}'; }
+    var found = new Map();
+    var clean = function(v){ return typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, 160) : ''; };
+    var session = (navigator.mediaSession && navigator.mediaSession.metadata && clean(navigator.mediaSession.metadata.title)) || '';
+    var label = function(e){ return clean(e.getAttribute('title')) || clean(e.getAttribute('aria-label')) || clean(e.getAttribute('data-title')); };
+    var add = function(value, title, playing){
+      try {
+        if (!value) return;
+        var href = new URL(value, document.baseURI).href;
+        var old = found.get(href);
+        if (old) { old.p = old.p || playing; if (!old.t) old.t = title; return; }
+        found.set(href, {u: href, t: title || '', p: playing});
+      } catch (e) {}
+    };
+    var music = /\.(mp3|m4a|m4b|aac|wav|flac|ogg|oga|opus|aiff?|caf|wma)([?#]|${'$'})/i;
+    document.querySelectorAll('audio').forEach(function(a){
+      var playing = !a.paused && !a.ended;
+      var title = playing ? (session || label(a) || clean(document.title)) : label(a);
+      add(a.currentSrc || a.src, title, playing);
+      a.querySelectorAll('source').forEach(function(s){ add(s.src, title, playing); });
+    });
+    document.querySelectorAll('a[href]').forEach(function(l){
+      if (music.test(l.href)) add(l.href, label(l) || clean(l.textContent), false);
+    });
+    return JSON.stringify({items: Array.from(found.values()).slice(0, 200)});
+  } catch (e) { return '{"items":[]}'; }
 })()
 """
 
-private fun parseMusicScanResult(rawEvaluateJavascriptResult: String?): List<String> {
+/** Installed per document; it only asks the app to rescan, on media and SPA events. */
+private const val MUSIC_SIGNAL_JS = """
+(function(){
+  if (window.__nasFinderMusicSignal) return;
+  window.__nasFinderMusicSignal = true;
+  var timer = 0, kind = 'scan';
+  function send(next){
+    if (next === 'nav') kind = 'nav';
+    if (timer) return;
+    timer = setTimeout(function(){
+      timer = 0; var message = kind; kind = 'scan';
+      try { window.$MUSIC_SIGNAL_NAME.requestScan(message); } catch (e) {}
+    }, 250);
+  }
+  ['play','playing','loadstart','emptied','loadedmetadata','durationchange'].forEach(function(name){
+    document.addEventListener(name, function(e){ if (e.target && e.target.tagName === 'AUDIO') send('scan'); }, true);
+  });
+  window.addEventListener('popstate', function(){ send('nav'); });
+  window.addEventListener('hashchange', function(){ send('nav'); });
+})();
+"""
+
+/** The only thing a page can do through this bridge is request a rescan of itself. */
+private class MusicSignalBridge(private val onSignal: (isNavigation: Boolean) -> Unit) {
+    private val handler = Handler(Looper.getMainLooper())
+    @Volatile var active = true
+    private var lastAcceptedAt = 0L
+
+    @JavascriptInterface
+    fun requestScan(kind: String?) {
+        if (!active || (kind != "scan" && kind != "nav")) return
+        val navigation = kind == "nav"
+        // Untrusted pages can call this freely: coalesce bursts before touching the main thread.
+        synchronized(this) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (lastAcceptedAt != 0L && now - lastAcceptedAt < 250L) return
+            lastAcceptedAt = now
+        }
+        handler.post { if (active) onSignal(navigation) }
+    }
+}
+
+private fun parseMusicScanResult(rawEvaluateJavascriptResult: String?): List<BrowserMusicCandidate> {
     if (rawEvaluateJavascriptResult.isNullOrBlank()) return emptyList()
     return runCatching {
         // evaluateJavascript() returns the JS string result JSON-encoded (quoted/escaped); unwrap it first.
         val decoded = org.json.JSONArray("[$rawEvaluateJavascriptResult]").getString(0)
-        val obj = org.json.JSONObject(decoded)
-        val audio = obj.optJSONArray("audio")?.let { arr -> (0 until arr.length()).mapNotNull { arr.optString(it, null) } }.orEmpty()
-            .filter { it.startsWith("http://") || it.startsWith("https://") }
-        val links = obj.optJSONArray("links")?.let { arr -> (0 until arr.length()).mapNotNull { arr.optString(it, null) } }.orEmpty()
-            .filter { (it.startsWith("http://") || it.startsWith("https://")) && hasMusicExtension(it) }
-        (audio + links).distinct()
+        val items = org.json.JSONObject(decoded).optJSONArray("items") ?: return@runCatching emptyList()
+        val found = (0 until items.length()).mapNotNull { index ->
+            val item = items.optJSONObject(index) ?: return@mapNotNull null
+            val url = item.optString("u", "")
+            if (!(url.startsWith("http://") || url.startsWith("https://"))) return@mapNotNull null
+            BrowserMusicCandidate(url, item.optString("t", "").ifBlank { null }, item.optBoolean("p", false))
+        }.distinctBy { it.url }
+        found.filter { it.playing } + found.filterNot { it.playing }
     }.getOrDefault(emptyList())
+}
+
+/** A title that is safe as a file name: no control/forbidden characters, no address or token look-alikes. */
+private fun musicFilenameBase(title: String?): String? {
+    if (title == null) return null
+    var text = java.text.Normalizer.normalize(title, java.text.Normalizer.Form.NFC)
+    if (text.contains("://") || (text.contains('=') && text.contains('&'))) return null
+    text = text.map { c ->
+        if (c.isISOControl() || c in "/\\:*?\"<>|" || Character.getType(c) == Character.FORMAT.toInt() ||
+            Character.getType(c) == Character.UNASSIGNED.toInt() || c == '\uFFFD') ' ' else c
+    }.joinToString("")
+    text = text.split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ")
+    text = text.take(100).let { if (it.isNotEmpty() && it.last().isHighSurrogate()) it.dropLast(1) else it }
+        .trim('.', ' ')
+    if (text.isEmpty()) return null
+    // Long unbroken alphanumeric runs are tokens or ids, not song names.
+    if (' ' !in text && text.length >= 32 && text.all { it.code < 128 && (it.isLetterOrDigit() || it == '_' || it == '-') }) return null
+    return text
+}
+
+/** Song title first, then the server/URL based name, with an extension matching the audio type. */
+private fun musicDownloadFilename(title: String?, guessedName: String, mimeType: String?): String {
+    val guessedExt = guessedName.substringAfterLast('.', "").lowercase()
+    val mimeExt = mimeType?.substringBefore(';')?.trim()?.lowercase()?.takeIf { it.startsWith("audio/") }
+        ?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+    val ext = if (guessedExt in MUSIC_FILE_EXTENSIONS) guessedExt else mimeExt ?: guessedExt
+    val base = musicFilenameBase(title) ?: musicFilenameBase(guessedName.substringBeforeLast('.', guessedName)) ?: "음악"
+    return if (ext.isEmpty()) base else "$base.$ext"
 }
 
 private data class ActiveWebDownload(val filename: String, val received: Long, val total: Long?)
@@ -168,6 +272,8 @@ private suspend fun downloadWebFile(
     contentDisposition: String?,
     suggestedMimeType: String?,
     suggestedLength: Long,
+    musicDownload: Boolean = false,
+    musicTitle: String? = null,
     onProgress: suspend (ActiveWebDownload) -> Unit,
 ): PendingWebDownload = withContext(Dispatchers.IO) {
     var current = rawUrl.toHttpUrlOrNull()?.requireSafeWebUrl()
@@ -178,6 +284,7 @@ private suspend fun downloadWebFile(
     while (true) {
         currentCoroutineContext().ensureActive()
         val request = Request.Builder().url(current).apply {
+            if (musicDownload) cacheControl(okhttp3.CacheControl.Builder().noCache().noStore().build())
             if (!userAgent.isNullOrBlank()) header("User-Agent", userAgent.take(512))
             if (!cookie.isNullOrBlank() && current.originKey() == initialOrigin) header("Cookie", cookie.take(16_384))
         }.build()
@@ -203,7 +310,10 @@ private suspend fun downloadWebFile(
                     ?.takeIf(::isSafeMimeType)
                     ?: suggestedMimeType?.substringBefore(';')?.trim()?.takeIf(::isSafeMimeType)
                 val disposition = response.header("Content-Disposition") ?: contentDisposition
-                val filename = safeWebFilename(URLUtil.guessFileName(current.toString(), disposition, mimeType))
+                val guessedName = URLUtil.guessFileName(current.toString(), disposition, mimeType)
+                val filename = safeWebFilename(
+                    if (musicDownload) musicDownloadFilename(musicTitle, guessedName, mimeType) else guessedName
+                )
                 val cacheRoot = cacheDirectory.canonicalFile
                 val requestedRoot = File(cacheRoot, "web-downloads")
                 check(!java.nio.file.Files.isSymbolicLink(requestedRoot.toPath())) { "다운로드 임시 폴더가 안전하지 않습니다." }
@@ -444,7 +554,12 @@ fun WebBrowserScreen(
     var chooseNetworkConnection by remember { mutableStateOf(false) }
     var shortcut by remember { mutableStateOf<WebShortcut?>(null) }
     var fullscreenContent by remember { mutableStateOf<BrowserFullscreenContent?>(null) }
-    var musicCandidates by remember { mutableStateOf<List<String>>(emptyList()) }
+    var scannedMusic by remember { mutableStateOf<List<BrowserMusicCandidate>>(emptyList()) }
+    var fallbackMusicUrl by remember { mutableStateOf<String?>(null) }
+    var dismissedMusicKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val musicScanSequence = remember { intArrayOf(0) }
+    val lastPlayingMusicKey = remember { arrayOfNulls<String>(1) }
+    val musicSignalBridgeRef = remember { arrayOfNulls<MusicSignalBridge>(1) }
     var showMusicCandidates by remember { mutableStateOf(false) }
     var musicDownloadIntent by remember { mutableStateOf(false) }
     var musicSavedNotice by remember { mutableStateOf(false) }
@@ -452,6 +567,11 @@ fun WebBrowserScreen(
     var musicScanCount by remember { mutableIntStateOf(0) }
     val musicScanHandler = remember { Handler(Looper.getMainLooper()) }
     val musicRescanRunnableRef = remember { arrayOfNulls<Runnable>(1) }
+    // Page candidates replace each other on every scan; the latest audio response is only a
+    // fallback when the page shows nothing, and closed songs stay hidden.
+    val musicCandidates = scannedMusic
+        .ifEmpty { fallbackMusicUrl?.let { listOf(BrowserMusicCandidate(it, null, false)) }.orEmpty() }
+        .filter { it.key !in dismissedMusicKeys }
     val latestFullscreenContent by rememberUpdatedState(fullscreenContent)
     val lifecycleOwner = LocalLifecycleOwner.current
     val normalizedAddress = BrowserUrlPolicy.normalize(address)
@@ -464,6 +584,8 @@ fun WebBrowserScreen(
         disposition: String? = null,
         mimeType: String? = null,
         length: Long = -1,
+        musicTitle: String? = null,
+        musicKey: String? = null,
     ) {
         if (downloadJob?.isActive == true) {
             error = "이미 다운로드 중입니다. 현재 다운로드를 취소한 뒤 다시 시도해 주세요."
@@ -474,7 +596,11 @@ fun WebBrowserScreen(
             error = "HTTP 또는 HTTPS 파일만 다운로드할 수 있습니다."
             return
         }
-        val initialName = safeWebFilename(URLUtil.guessFileName(url, disposition, mimeType))
+        val isMusic = musicKey != null
+        val guessedInitialName = URLUtil.guessFileName(url, disposition, mimeType)
+        val initialName = safeWebFilename(
+            if (isMusic) musicDownloadFilename(musicTitle, guessedInitialName, mimeType) else guessedInitialName
+        )
         activeDownload = ActiveWebDownload(initialName, 0, length.takeIf { it >= 0 })
         downloadJob = scope.launch {
             runCatching {
@@ -486,11 +612,15 @@ fun WebBrowserScreen(
                     contentDisposition = disposition,
                     suggestedMimeType = mimeType,
                     suggestedLength = length,
+                    musicDownload = isMusic,
+                    musicTitle = musicTitle,
                     onProgress = { state -> withContext(Dispatchers.Main.immediate) { activeDownload = state } },
                 )
             }.onSuccess { downloaded ->
                 pendingDownload?.file?.let { cleanupLocalWebDownload(context.cacheDir, it) }
                 pendingDownload = downloaded
+                // Consumed: the saved song must not stay offered, whichever song plays now.
+                if (musicKey != null) dismissedMusicKeys = dismissedMusicKeys + musicKey
             }.onFailure { failure ->
                 if (failure !is CancellationException) error = failure.message ?: "파일을 다운로드하지 못했습니다."
             }
@@ -504,21 +634,41 @@ fun WebBrowserScreen(
         musicRescanRunnableRef[0] = null
     }
 
-    fun scheduleMusicRescan(view: WebView, token: Int) {
-        if (token != musicScanToken || musicScanCount >= MAX_MUSIC_RESCANS_PER_PAGE) return
+    fun scheduleMusicRescan(view: WebView, token: Int, fromSignal: Boolean = false) {
+        if (token != musicScanToken || (!fromSignal && musicScanCount >= MAX_MUSIC_RESCANS_PER_PAGE)) return
         musicRescanRunnableRef[0]?.let(musicScanHandler::removeCallbacks)
         val runnable = Runnable {
             if (token != musicScanToken) return@Runnable
             musicScanCount++
+            val sequence = ++musicScanSequence[0]
+            val scannedPage = view.url
             view.evaluateJavascript(MUSIC_SCAN_JS) { raw ->
-                if (token == musicScanToken) {
+                if (token == musicScanToken && sequence == musicScanSequence[0] && view.url == scannedPage) {
                     val found = parseMusicScanResult(raw)
-                    if (found.isNotEmpty()) musicCandidates = (musicCandidates + found).distinct()
+                    scannedMusic = found
+                    // A song that starts playing now is a new song, even if it was closed before.
+                    val playing = found.firstOrNull { it.playing }?.key
+                    if (playing != null && playing != lastPlayingMusicKey[0]) dismissedMusicKeys = dismissedMusicKeys - playing
+                    // Pause/emptied keeps the last known track so resuming it is not "new".
+                    if (playing != null) lastPlayingMusicKey[0] = playing
                 }
             }
         }
         musicRescanRunnableRef[0] = runnable
         musicScanHandler.postDelayed(runnable, MUSIC_RESCAN_DEBOUNCE_MILLIS)
+    }
+
+    fun onMusicSignal(isNavigation: Boolean) {
+        val view = webView ?: return
+        if (isNavigation) fallbackMusicUrl = null
+        scheduleMusicRescan(view, musicScanToken, fromSignal = true)
+    }
+
+    fun closeMusicNotice() {
+        showMusicCandidates = false
+        musicDownloadIntent = false
+        if (lastPlayingMusicKey[0] == null) lastPlayingMusicKey[0] = musicCandidates.firstOrNull { it.playing }?.key
+        dismissedMusicKeys = dismissedMusicKeys + musicCandidates.map { it.key }
     }
 
     fun navigate() {
@@ -587,6 +737,7 @@ fun WebBrowserScreen(
             latestPendingDownload?.file?.takeUnless { it == handedOffFile }
                 ?.let { cleanupLocalWebDownload(context.cacheDir, it) }
             cancelMusicRescan()
+            musicSignalBridgeRef[0]?.active = false
         }
     }
 
@@ -692,7 +843,10 @@ fun WebBrowserScreen(
                         }
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             loading = true
-                            musicCandidates = emptyList()
+                            scannedMusic = emptyList()
+                            fallbackMusicUrl = null
+                            dismissedMusicKeys = emptySet()
+                            lastPlayingMusicKey[0] = null
                             musicScanCount = 0
                             musicScanToken++
                             cancelMusicRescan()
@@ -703,8 +857,16 @@ fun WebBrowserScreen(
                             canGoBack = view?.canGoBack() == true
                             url?.let { address = it }
                             val directCandidate = url?.takeIf { hasMusicExtension(it) }
-                            if (directCandidate != null) musicCandidates = (musicCandidates + directCandidate).distinct()
+                            if (directCandidate != null) fallbackMusicUrl = directCandidate
+                            view?.evaluateJavascript(MUSIC_SIGNAL_JS, null)
                             view?.let { scheduleMusicRescan(it, musicScanToken) }
+                        }
+                        override fun onPageCommitVisible(view: WebView?, url: String?) {
+                            view?.evaluateJavascript(MUSIC_SIGNAL_JS, null)
+                        }
+                        override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                            // Single-page apps change the address without a page load.
+                            if (view != null && !loading) onMusicSignal(true)
                         }
                         override fun onLoadResource(view: WebView?, url: String?) {
                             if (view != null) scheduleMusicRescan(view, musicScanToken)
@@ -713,7 +875,7 @@ fun WebBrowserScreen(
                     setDownloadListener { url, agent, disposition, mime, length ->
                         when {
                             url.isNullOrBlank() -> error = "다운로드 주소가 없습니다."
-                            isAudioResponse(url, mime, disposition) -> musicCandidates = (musicCandidates + url).distinct()
+                            isAudioResponse(url, mime, disposition) -> fallbackMusicUrl = url
                             else -> startDownload(url, agent, disposition, mime, length)
                         }
                     }
@@ -727,6 +889,10 @@ fun WebBrowserScreen(
                         }
                         target != null
                     }
+                    musicSignalBridgeRef[0]?.active = false
+                    val bridge = MusicSignalBridge { navigation -> onMusicSignal(navigation) }
+                    musicSignalBridgeRef[0] = bridge
+                    addJavascriptInterface(bridge, MUSIC_SIGNAL_NAME)
                     webView = this
                     onResume()
                     if (retained.webView == null) {
@@ -740,6 +906,8 @@ fun WebBrowserScreen(
             },
             update = { webView = it },
             onRelease = { released ->
+                musicSignalBridgeRef[0]?.active = false
+                released.removeJavascriptInterface(MUSIC_SIGNAL_NAME)
                 latestFullscreenContent?.callback?.onCustomViewHidden()
                 fullscreenContent = null
                 sessionController.retain(released)
@@ -782,12 +950,27 @@ fun WebBrowserScreen(
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.primary,
                 shadowElevation = 4.dp,
-                onClick = { showMusicCandidates = true },
+                onClick = {
+                    val playing = musicCandidates.first()
+                    if (playing.playing) {
+                        musicDownloadIntent = true
+                        startDownload(playing.url, musicTitle = playing.title, musicKey = playing.key)
+                    } else {
+                        showMusicCandidates = true
+                    }
+                },
             ) {
-                Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.onPrimary)
                     Spacer(Modifier.width(6.dp))
                     Text("음악 다운로드", color = MaterialTheme.colorScheme.onPrimary)
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        Icons.Default.Close,
+                        "음악 알림 닫기",
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(24.dp).clickable { closeMusicNotice() },
+                    )
                 }
             }
         }
@@ -892,23 +1075,22 @@ fun WebBrowserScreen(
             },
         )
     }
-    if (showMusicCandidates) {
+    if (showMusicCandidates && musicCandidates.isNotEmpty()) {
         AlertDialog(
             onDismissRequest = { showMusicCandidates = false },
             title = { Text("음악 다운로드") },
             text = {
                 LazyColumn(Modifier.heightIn(max = 320.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    items(musicCandidates) { url ->
+                    items(musicCandidates) { candidate ->
                         ListItem(
                             headlineContent = {
-                                val displayName = android.net.Uri.parse(url).lastPathSegment?.ifBlank { null } ?: "음악 파일"
-                                Text(displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(candidate.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             },
                             leadingContent = { Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.primary) },
                             modifier = Modifier.clickable {
                                 showMusicCandidates = false
                                 musicDownloadIntent = true
-                                startDownload(url)
+                                startDownload(candidate.url, musicTitle = candidate.title, musicKey = candidate.key)
                             },
                         )
                     }

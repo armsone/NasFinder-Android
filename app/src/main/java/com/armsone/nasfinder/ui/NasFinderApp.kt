@@ -217,6 +217,7 @@ fun NasFinderApp(
     val hasActiveWork = state.isBusy || state.download != null || state.networkDownloadProgress != null || state.isDownloadingNetwork ||
         state.pendingInboxUpload?.isUploading == true ||
         state.pendingLocalUpload?.isUploading == true ||
+        state.inlineAudioPlayback?.isPlaying == true ||
         state.imagePreview?.kind in setOf(BuiltInPreviewKind.VIDEO, BuiltInPreviewKind.AUDIO) || state.trailer != null ||
         (state.screen == Screen.SuperThumbnailProgress && state.superThumbnailWork?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING))
     val keepScreenOn = state.screenAwakeMode == ScreenAwakeMode.ALWAYS ||
@@ -248,6 +249,19 @@ fun NasFinderApp(
     }
 
     val mediaLibraryStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
+    // The system picker (files/Google 포토) can outlive this process; remember the source screen so a restart returns to it, not the dashboard.
+    var libraryRouteRestored by remember { mutableStateOf(false) }
+    var libraryRoute by rememberSaveable { mutableStateOf<List<String>?>(null) }
+    if (state.screen is Screen.LocalPhotoLibrary) libraryRoute = (state.screen as Screen.LocalPhotoLibrary).let { listOf(it.initialIntent.name, it.googlePhotosSource.toString()) }
+    else if (libraryRouteRestored) libraryRoute = null
+    LaunchedEffect(Unit) {
+        val route = libraryRoute
+        if (route != null && state.screen == Screen.Dashboard) {
+            val intent = runCatching { LocalMediaEditIntent.valueOf(route[0]) }.getOrDefault(LocalMediaEditIntent.NONE)
+            model.show(Screen.LocalPhotoLibrary(intent, route.getOrNull(1) == "true"))
+        }
+        libraryRouteRestored = true
+    }
     NasFinderTheme(state.theme) {
         Box(Modifier.fillMaxSize().background(skyBrush(state.theme)).then(if (state.imagePreview != null) Modifier else Modifier.appSafeArea())) {
             SkyThemeDecoration(state.theme)
@@ -339,7 +353,7 @@ fun NasFinderApp(
             var draftToDelete by remember { mutableStateOf<TrailerDraft?>(null) }
             AlertDialog(
                 onDismissRequest = model::dismissTrailerDraftPicker,
-                title = { Text("보관된 편집 관리") },
+                title = { Text("보관한 편집") },
                 text = {
                     Column(
                         modifier = Modifier
@@ -362,7 +376,7 @@ fun NasFinderApp(
                                         tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                                     )
                                     Text(
-                                        "편집 중인 예고편이 없습니다",
+                                        "보관한 편집이 없습니다",
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -2187,7 +2201,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 DashboardCard {
                     DashboardRow(
                         Icons.Default.MovieFilter,
-                        "편집 중인 예고편",
+                        "보관한 편집",
                         if (state.trailerDraftCount > 0) "${state.trailerDraftCount}개 보관됨" else "없음",
                         iconTint = MaterialTheme.colorScheme.primary,
                         titleColor = MaterialTheme.colorScheme.onSurface,
@@ -2197,22 +2211,12 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     DashboardRowDivider()
                     DashboardRow(
                         Icons.Default.VideoCall,
-                        "예고편 만들기",
+                        "영상 만들기",
                         null,
                         iconTint = MaterialTheme.colorScheme.primary,
                         titleColor = MaterialTheme.colorScheme.onSurface,
                     ) {
                         model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER))
-                    }
-                    DashboardRowDivider()
-                    DashboardRow(
-                        Icons.Default.LibraryMusic,
-                        "뮤직비디오",
-                        null,
-                        iconTint = MaterialTheme.colorScheme.primary,
-                        titleColor = MaterialTheme.colorScheme.onSurface,
-                    ) {
-                        model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.MUSIC))
                     }
                 }
             }
@@ -3436,13 +3440,22 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     var confirmBatchDelete by remember { mutableStateOf(false) }
     val capabilities = remember(browser.connection.kind) { browserCapabilities(browser.connection.kind) }
     val accessibilityLayout = LocalConfiguration.current.fontScale >= 1.3f
-    val showsCoverFlow = browser.preferences.layout == BrowserLayout.LARGE_GRID &&
+    val pickMode = state.mediaPick != null
+    // Media-pick keeps its own layout (default SMALL_GRID); the general browser preference is never touched.
+    var pickLayout by rememberSaveable { mutableStateOf(BrowserLayout.SMALL_GRID) }
+    val effectiveLayout = if (pickMode) pickLayout else browser.preferences.layout
+    val showsCoverFlow = !pickMode && browser.preferences.layout == BrowserLayout.LARGE_GRID &&
         AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
             contentWidthDp = viewportSize.width / density,
             contentHeightDp = viewportSize.height / density,
             itemCount = browser.items.size,
-            selectionActive = selectionMode,
+            selectionActive = selectionMode || state.mediaPick != null,
         )
+    LaunchedEffect(effectiveLayout, showsCoverFlow, selectionMode) {
+        if (effectiveLayout != BrowserLayout.LIST || showsCoverFlow || selectionMode) {
+            model.stopInlineAudio()
+        }
+    }
     var coverFlowDark by rememberSaveable(browser.connection.id) { mutableStateOf(true) }
     val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::uploadDocument)
@@ -3525,7 +3538,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }
     BackHandler(selectionMode) { selectedIds.clear(); selectionMode = false }
     BackHandler(!selectionMode) {
-        if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
+        if (pickMode) model.cancelNetworkMediaPick()
+        else if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
         else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
         else if (parentPath == null) model.show(Screen.Dashboard)
         else model.openConnection(browser.connection, parentPath)
@@ -3548,6 +3562,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             }.combinedClickable(
                 onClick = {
             if (selectionMode) { selectedIds.clear(); selectionMode = false }
+            else if (parentPath == null && pickMode) model.cancelNetworkMediaPick()
             else if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
             else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
             else if (parentPath == null) model.show(Screen.Dashboard)
@@ -3586,15 +3601,26 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 },
                 onRefresh = model::refreshBrowser,
                 update = model::updateBrowserPreferences,
+                pickLayout = if (pickMode) pickLayout else null,
+                onPickLayout = { pickLayout = it },
             )
         }
     }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }, bottomBar = {
-        if (selectionMode) BottomAppBar {
+        if (pickMode) BottomAppBar {
+            val pickable = selectedItems.filter { !it.isDirectory && (it.isVideo || it.isImage) }
+            TextButton(onClick = model::cancelNetworkMediaPick, enabled = state.mediaPickStaging == null) { Text("돌아가기") }
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = { model.stageRemoteMediaForBasket(pickable); selectedIds.clear() },
+                enabled = pickable.isNotEmpty() && state.mediaPickStaging == null,
+                modifier = Modifier.padding(end = 12.dp),
+            ) { Text(if (pickable.isEmpty()) "사진·영상을 선택하세요" else "영상 만들기에 ${pickable.size}개 추가") }
+        } else if (selectionMode) BottomAppBar {
             val canTrailer = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }
             val canMusic = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }
             val canShare = selectedItems.isNotEmpty()
 
-            IconButton(onClick = { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = canTrailer) { Icon(Icons.Default.Movie, "선택 예고편 보기") }
+            IconButton(onClick = { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = canTrailer) { Icon(Icons.Default.Movie, "선택 영상 편집") }
             IconButton(onClick = { model.startRemoteMusicOverlay(selectedItems.toList(), null); selectedIds.clear(); selectionMode = false }, enabled = canMusic) { Icon(Icons.Default.MusicNote, "뮤직비디오") }
             IconButton(onClick = { pendingDownloadItems = selectedItems.toList(); showDownloadDestDialog = true }, enabled = selectedItems.isNotEmpty()) { Icon(Icons.Default.Download, "선택 항목 다운로드") }
             IconButton(onClick = { model.shareItems(selectedItems); selectedIds.clear(); selectionMode = false }, enabled = canShare) { Icon(Icons.Default.Share, "선택 항목 공유") }
@@ -3606,6 +3632,20 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             ThumbnailTrafficStatus(state.thumbnailTraffic)
+            state.mediaPickStaging?.let { staging ->
+                AlertDialog(
+                    onDismissRequest = {},
+                    title = { Text("선택한 파일 가져오는 중") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("${staging.current}/${staging.total} · ${staging.name}", maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            staging.progress?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth()) }
+                                ?: LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    },
+                    confirmButton = { TextButton(onClick = model::cancelMediaPickStaging) { Text("취소") } },
+                )
+            }
             state.pendingInboxUpload?.let { pending ->
                 Surface(
                     color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = .94f),
@@ -3700,25 +3740,31 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     description = "‘${searchText.trim()}’과 일치하는 항목을 찾지 못했습니다.",
                     modifier = Modifier.weight(1f),
                 )
-                browser.preferences.layout == BrowserLayout.LIST -> LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                effectiveLayout == BrowserLayout.LIST -> LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(displayedItems, key = { it.id }) { item ->
                         if (item.isImage || item.isVideo || item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, state.thumbnailGeneration, item.id, item.size, item.modifiedAt) { model.loadRemoteThumbnail(item) }
                         if (item.isDirectory) LaunchedEffect(browser.connection.id, browser.path, item.id, item.path, state.folderCountGeneration, browser.preferences.showHiddenFiles) { model.loadFolderChildCount(item) }
+                        val itemAudioKey = if (item.isAudio) model.inlineRemoteAudioKey(browser.connection.id, item) else null
+                        val activeInlineAudio = state.inlineAudioPlayback?.takeIf { itemAudioKey != null && it.key == itemAudioKey }
                         FileRow(
                             item,
                             thumbnail = state.remoteThumbnails[item.id],
                             theme = state.theme,
                             selected = item.id in selectedIds,
-                            selectionMode = selectionMode,
+                            selectionMode = selectionMode || pickMode,
                             accessibilityLayout = accessibilityLayout,
                             folderChildCount = if (item.isDirectory) state.folderCountCache[item.id] else null,
-                            onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
+                            inlineAudioState = activeInlineAudio,
+                            onToggleInlineAudio = if (item.isAudio && !selectionMode) {
+                                { model.toggleInlineRemoteAudio(item) }
+                            } else null,
+                            onClick = { if (pickMode && !item.isDirectory) toggleRemoteSelection(selectedIds, item.id) else if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
                             onLongClick = { actionItem = item },
                         )
                     }
                 }
                 else -> {
-                    val poster = browser.preferences.layout == BrowserLayout.LARGE_GRID
+                    val poster = effectiveLayout == BrowserLayout.LARGE_GRID
                     val minimumCellWidth = when {
                         poster && accessibilityLayout -> 270.dp
                         poster -> 158.dp
@@ -3741,9 +3787,9 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                             theme = state.theme,
                             poster = poster,
                             selected = item.id in selectedIds,
-                            selectionMode = selectionMode,
+                            selectionMode = selectionMode || pickMode,
                             folderChildCount = if (item.isDirectory) state.folderCountCache[item.id] else null,
-                            onClick = { if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
+                            onClick = { if (pickMode && !item.isDirectory) toggleRemoteSelection(selectedIds, item.id) else if (selectionMode) toggleRemoteSelection(selectedIds, item.id) else model.openItem(item) },
                             onLongClick = { actionItem = item },
                         )
                     }
@@ -3789,7 +3835,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     folderTrailerTarget?.let { folder ->
         AlertDialog(
             onDismissRequest = { folderTrailerTarget = null },
-            title = { Text("예고편 만들기") },
+            title = { Text("영상 만들기") },
             text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
             confirmButton = {
                 TextButton(onClick = {
@@ -3940,10 +3986,10 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             ),
             BaselineAction(
                 id = "trailer",
-                title = "예고편 보기",
+                title = "영상 만들기",
                 icon = Icons.Default.Movie,
                 enabled = canTrailer,
-                disabledReason = if (!canTrailer) "사진 또는 영상 파일만 예고편을 지원합니다." else null,
+                disabledReason = if (!canTrailer) "사진 또는 영상 파일만 영상 만들기를 지원합니다." else null,
                 onClick = {
                     actionItem = null
                     if (item.isDirectory) {
@@ -4443,21 +4489,65 @@ private fun FileRow(
     selectionMode: Boolean,
     accessibilityLayout: Boolean,
     folderChildCount: FolderChildCountState? = null,
+    inlineAudioState: InlineAudioPlaybackState? = null,
+    onToggleInlineAudio: (() -> Unit)? = null,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
     CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) { Surface(Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "작업 보기"), color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
             val artworkSide = if (accessibilityLayout) 50.dp else 58.dp
-            RemoteFileArtwork(item, thumbnail, theme, Modifier.size(artworkSide), 30.dp, 9.dp)
+            Box(
+                modifier = Modifier
+                    .size(artworkSide)
+                    .then(
+                        if (onToggleInlineAudio != null) {
+                            Modifier
+                                .clip(RoundedCornerShape(9.dp))
+                                .clickable(
+                                    onClickLabel = if (inlineAudioState?.isPlaying == true) "일시정지" else "재생",
+                                    onClick = onToggleInlineAudio,
+                                )
+                        } else {
+                            Modifier
+                        }
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                RemoteFileArtwork(item, thumbnail, theme, Modifier.fillMaxSize(), 30.dp, 9.dp)
+                if (item.isAudio && !selectionMode && onToggleInlineAudio != null) {
+                    InlineAudioThumbnailOverlay(
+                        state = inlineAudioState,
+                        cornerRadius = 9.dp,
+                    )
+                }
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(item.name, style = MaterialTheme.typography.bodyLarge, maxLines = if (accessibilityLayout) 3 else 2, overflow = TextOverflow.Ellipsis)
                 if (!item.isDirectory) {
+                    val baseMeta = listOfNotNull(
+                        item.extension.uppercase().takeIf(String::isNotBlank),
+                        formatBytes(item.size),
+                    )
+                    val inlineTimeLabel = inlineAudioState?.let { audioState ->
+                        when {
+                            audioState.isPreparing && audioState.downloadFraction != null ->
+                                "버퍼링 ${(audioState.downloadFraction * 100f).roundToInt().coerceIn(0, 100)}%"
+                            audioState.isPreparing -> "준비 중…"
+                            audioState.durationMillis > 0L -> {
+                                val pos = formatPlaybackDuration(audioState.positionMillis) ?: "0:00"
+                                val dur = formatPlaybackDuration(audioState.durationMillis) ?: "0:00"
+                                "$pos / $dur"
+                            }
+                            audioState.isPlaying -> "재생 중"
+                            else -> null
+                        }
+                    }
                     Text(
-                        listOfNotNull(item.extension.uppercase().takeIf(String::isNotBlank), formatBytes(item.size)).joinToString(" · "),
+                        (baseMeta + listOfNotNull(inlineTimeLabel)).joinToString(" · "),
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (inlineTimeLabel != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -4486,6 +4576,83 @@ private fun FileRow(
             if (selectionMode) Checkbox(selected, { onClick() })
         }
     } }
+}
+
+@Composable
+private fun InlineAudioThumbnailOverlay(
+    state: InlineAudioPlaybackState?,
+    cornerRadius: Dp,
+) {
+    val isActive = state != null
+    val isPlaying = state?.isPlaying == true
+    val isPreparing = state?.isPreparing == true
+    val progress = (state?.progress ?: 0f).coerceIn(0f, 1f)
+    val downloadFraction = state?.downloadFraction?.coerceIn(0f, 1f)
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(
+                Color.Black.copy(alpha = if (isActive) 0.42f else 0.24f)
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (isPreparing) {
+            if (downloadFraction != null && downloadFraction > 0f) {
+                CircularProgressIndicator(
+                    progress = { downloadFraction },
+                    modifier = Modifier.size(34.dp),
+                    color = Color.White,
+                    trackColor = Color.White.copy(alpha = 0.28f),
+                    strokeWidth = 2.75.dp,
+                )
+            } else {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(32.dp),
+                    color = Color.White,
+                    trackColor = Color.White.copy(alpha = 0.24f),
+                    strokeWidth = 2.75.dp,
+                )
+            }
+        } else if (isActive) {
+            CircularProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.size(36.dp),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = Color.White.copy(alpha = 0.30f),
+                strokeWidth = 3.dp,
+            )
+            Surface(
+                modifier = Modifier.size(28.dp),
+                shape = CircleShape,
+                color = Color.Black.copy(alpha = 0.55f),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        contentDescription = if (isPlaying) "일시정지" else "재생",
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        } else {
+            Surface(
+                modifier = Modifier.size(30.dp),
+                shape = CircleShape,
+                color = Color.Black.copy(alpha = 0.52f),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "재생",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -4586,7 +4753,11 @@ private fun RemoteFileArtwork(item: RemoteFileItem, thumbnail: android.graphics.
     } else {
         Box(modifier, contentAlignment = Alignment.Center) {
             Icon(
-                if (item.isDirectory) Icons.Default.Folder else if (item.isImage) Icons.Default.Image else if (item.isVideo) Icons.Default.Movie else Icons.Default.InsertDriveFile,
+                if (item.isDirectory) Icons.Default.Folder
+                else if (item.isImage) Icons.Default.Image
+                else if (item.isVideo) Icons.Default.Movie
+                else if (item.isAudio) Icons.Default.MusicNote
+                else Icons.Default.InsertDriveFile,
                 null,
                 modifier = Modifier.size(iconSize),
                 tint = if (item.isDirectory) folderColor(theme) else MaterialTheme.colorScheme.primary,
@@ -4685,6 +4856,8 @@ private fun BrowserMenu(
     onPaste: () -> Unit,
     onRefresh: () -> Unit,
     update: (BrowserPreferences) -> Unit,
+    pickLayout: BrowserLayout? = null,
+    onPickLayout: (BrowserLayout) -> Unit = {},
 ) {
     var expanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -4710,9 +4883,12 @@ private fun BrowserMenu(
             BrowserMenuSection("보기") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     BrowserLayout.entries.forEach { layout ->
-                        val title = when (layout) { BrowserLayout.LIST -> "자세히"; BrowserLayout.SMALL_GRID -> "작은 썸네일"; BrowserLayout.LARGE_GRID -> "포스터" }
+                        val title = when (layout) { BrowserLayout.LIST -> "자세히"; BrowserLayout.SMALL_GRID -> if (pickLayout != null) "썸네일" else "작은 썸네일"; BrowserLayout.LARGE_GRID -> "포스터" }
                         val icon = when (layout) { BrowserLayout.LIST -> Icons.Default.List; BrowserLayout.SMALL_GRID -> Icons.Default.GridView; BrowserLayout.LARGE_GRID -> Icons.Default.GridOn }
-                        BrowserChoice(title, preferences.layout == layout, Modifier.weight(1f), icon) { update(preferences.copy(layout = layout)); expanded = false }
+                        BrowserChoice(title, (pickLayout ?: preferences.layout) == layout, Modifier.weight(1f), icon) {
+                            if (pickLayout != null) onPickLayout(layout) else update(preferences.copy(layout = layout))
+                            expanded = false
+                        }
                     }
                 }
             }
@@ -4873,6 +5049,14 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             selectionActive = selectionMode,
         )
     val displayedLayout = if (showsAutomaticOverflow) InboxLayout.OVERFLOW else configuredLayout
+    LaunchedEffect(currentSubdirectory, displayedLayout, selectionMode) {
+        if (displayedLayout != InboxLayout.DETAILS || selectionMode) {
+            model.stopInlineAudio()
+        }
+    }
+    LaunchedEffect(currentSubdirectory) {
+        model.stopInlineAudio()
+    }
 
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         model.importPickedFiles(uris)
@@ -4890,11 +5074,15 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) model.refreshInbox()
-            if (event == Lifecycle.Event.ON_STOP) webHardConnection.stop()
+            if (event == Lifecycle.Event.ON_STOP) {
+                model.stopInlineAudio()
+                webHardConnection.stop()
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            model.stopInlineAudio()
             webHardConnection.stop()
         }
     }
@@ -5136,7 +5324,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         },
                         enabled = canTrailer,
                     ) {
-                        Icon(Icons.Default.Movie, "선택 예고편 보기")
+                        Icon(Icons.Default.Movie, "선택 영상 편집")
                     }
                     IconButton(
                         onClick = {
@@ -5396,6 +5584,9 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             // File items
                             items(displayedFiles, key = { it.id }) { file ->
                                 val selected = file.id in selectedFileIds
+                                val isAudio = file.isInboxAudio
+                                val itemAudioKey = if (isAudio) model.inlineInboxAudioKey(file) else null
+                                val activeInlineAudio = state.inlineAudioPlayback?.takeIf { itemAudioKey != null && it.key == itemAudioKey }
                                 Row(
                                     Modifier.fillMaxWidth().padding(vertical = 3.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -5427,14 +5618,36 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                                     tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                                 )
                                             }
-                                            InboxLeadingPreview(file)
+                                            InboxLeadingPreview(
+                                                file = file,
+                                                inlineAudioState = activeInlineAudio,
+                                                onToggleInlineAudio = if (isAudio && !selectionMode && !phoneHardOpBusy) {
+                                                    { model.toggleInlineInboxAudio(file) }
+                                                } else null,
+                                            )
                                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                                 Text(file.originalFilename, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                                 CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant) {
                                                     ProvideTextStyle(MaterialTheme.typography.labelSmall) {
+                                                        val inlineTimeLabel = activeInlineAudio?.let { audioState ->
+                                                            when {
+                                                                audioState.isPreparing -> "준비 중…"
+                                                                audioState.durationMillis > 0L -> {
+                                                                    val pos = formatPlaybackDuration(audioState.positionMillis) ?: "0:00"
+                                                                    val dur = formatPlaybackDuration(audioState.durationMillis) ?: "0:00"
+                                                                    "$pos / $dur"
+                                                                }
+                                                                audioState.isPlaying -> "재생 중"
+                                                                else -> null
+                                                            }
+                                                        }
                                                         Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                                                             Text(formatBytes(file.byteCount))
-                                                            formatPlaybackDuration(file.durationMillis)?.let { Text(it) }
+                                                            if (inlineTimeLabel != null) {
+                                                                Text(inlineTimeLabel, color = MaterialTheme.colorScheme.primary)
+                                                            } else {
+                                                                formatPlaybackDuration(file.durationMillis)?.let { Text(it) }
+                                                            }
                                                             Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(file.importedAt)))
                                                         }
                                                     }
@@ -5587,10 +5800,10 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                 ),
                 BaselineAction(
                     id = "trailer",
-                    title = "예고편 보기",
+                    title = "영상 만들기",
                     icon = Icons.Default.Movie,
                     enabled = isFolder || isVideo,
-                    disabledReason = if (!isFolder && !isVideo) "사진 또는 영상 파일만 예고편을 지원합니다." else null,
+                    disabledReason = if (!isFolder && !isVideo) "사진 또는 영상 파일만 영상 만들기를 지원합니다." else null,
                     onClick = {
                         actionTarget = null
                         if (isFolder) {
@@ -5718,7 +5931,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
         folderTrailerTarget?.let { folderRelPath ->
             AlertDialog(
                 onDismissRequest = { folderTrailerTarget = null },
-                title = { Text("예고편 만들기") },
+                title = { Text("영상 만들기") },
                 text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
                 confirmButton = {
                     TextButton(onClick = {
@@ -6413,9 +6626,40 @@ private val InboxDisplayItem.isInboxVideo: Boolean
 private val InboxDisplayItem.isInboxPdf: Boolean
     get() = mimeType == "application/pdf" || originalFilename.endsWith(".pdf", ignoreCase = true)
 
+private val InboxDisplayItem.isInboxAudio: Boolean
+    get() = BuiltInPreviewPolicy.kind(originalFilename, mimeType) == BuiltInPreviewKind.AUDIO
+
 @Composable
-private fun InboxLeadingPreview(file: InboxDisplayItem) {
-    InboxArtwork(file, requestedPixels = 112, modifier = Modifier.size(56.dp), cornerRadius = 9.dp)
+private fun InboxLeadingPreview(
+    file: InboxDisplayItem,
+    inlineAudioState: InlineAudioPlaybackState? = null,
+    onToggleInlineAudio: (() -> Unit)? = null,
+) {
+    Box(
+        modifier = Modifier
+            .size(56.dp)
+            .then(
+                if (onToggleInlineAudio != null) {
+                    Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .clickable(
+                            onClickLabel = if (inlineAudioState?.isPlaying == true) "일시정지" else "재생",
+                            onClick = onToggleInlineAudio,
+                        )
+                } else {
+                    Modifier
+                }
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        InboxArtwork(file, requestedPixels = 112, modifier = Modifier.fillMaxSize(), cornerRadius = 9.dp)
+        if (file.isInboxAudio && onToggleInlineAudio != null) {
+            InlineAudioThumbnailOverlay(
+                state = inlineAudioState,
+                cornerRadius = 9.dp,
+            )
+        }
+    }
 }
 
 @Composable
@@ -6429,6 +6673,7 @@ private fun InboxArtwork(
     val isImage = file.isInboxImage
     val isVideo = file.isInboxVideo
     val isPdf = file.isInboxPdf
+    val isAudio = file.isInboxAudio
     val preview by produceState(
         initialValue = InboxThumbnailResult(),
         key1 = if (isImage || isVideo || isPdf) "${file.file.path}:${file.file.lastModified()}:${file.file.length()}:$requestedPixels" else null,
@@ -6441,6 +6686,7 @@ private fun InboxArtwork(
         isImage -> Icons.Default.Image
         isVideo -> Icons.Default.Movie
         isPdf -> Icons.Default.PictureAsPdf
+        isAudio -> Icons.Default.MusicNote
         else -> Icons.Default.InsertDriveFile
     }
     val thumbnail = preview.bitmap

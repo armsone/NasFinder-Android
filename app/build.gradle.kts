@@ -11,9 +11,9 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 416664
-        versionName = "2.12.0"
-        buildConfigField("String", "BUILD_NUMBER", "\"202610170824\"")
+        versionCode = 418037
+        versionName = "2.16.0"
+        buildConfigField("String", "BUILD_NUMBER", "\"202610180717\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
@@ -49,6 +49,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.photopicker:photopicker-compose:1.0.0-alpha02")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.work:work-runtime-ktx:2.11.2")

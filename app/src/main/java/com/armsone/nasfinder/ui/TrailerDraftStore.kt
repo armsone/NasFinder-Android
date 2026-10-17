@@ -15,7 +15,7 @@ data class TrailerDraft(
     val musicTrack: TrailerMusicTrack?,
     val musicPolicy: TrailerMusicPolicy,
     val musicFitCount: Int,
-    val autoDucking: Boolean,
+    val autoDucking: Boolean = true,
     val output: File?,
     val showingSettings: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),

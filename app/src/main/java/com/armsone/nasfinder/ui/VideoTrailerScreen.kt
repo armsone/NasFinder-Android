@@ -88,6 +88,18 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
             settings = true
         }
     }
+    // After an in-editor mode switch finishes (analysis included), reload the derived plan values from the
+    // session; music choice, ducking and the source order stay as the user left them.
+    var syncedMusicMode by remember(session.directory.absolutePath) { mutableStateOf(session.isMusicOverlayMode) }
+    LaunchedEffect(session.directory.absolutePath, session.isMusicOverlayMode, session.busy) {
+        if (!session.busy && syncedMusicMode != session.isMusicOverlayMode) {
+            syncedMusicMode = session.isMusicOverlayMode
+            draftSources.value = session.sources
+            draftTotal.value = if (session.total > 0.0) session.total else session.scenes.sumOf { it.length }
+            draftLength.value = session.clipLength
+            draftInitialized = true
+        }
+    }
     if (browsingForMusic) return
     Dialog(onDismissRequest = ::requestClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false, dismissOnClickOutside = false, dismissOnBackPress = false)) {
         BackHandler { requestClose() }
@@ -104,13 +116,13 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
                             Icon(if (session.saved) Icons.Default.CheckCircle else Icons.Default.SaveAlt, if (session.saved) "폰하드에 저장됨" else "폰하드에 저장", tint = Color.White)
                         }
                         IconButton(onClick = { settings = true }, enabled = !session.busy) {
-                            Icon(Icons.Default.Tune, "예고편 조절", tint = Color.White)
+                            Icon(Icons.Default.Tune, "영상 편집", tint = Color.White)
                         }
                     })
             } else {
                 Column(Modifier.fillMaxSize().systemBarsPadding().padding(20.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("예고편 보기", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                        Text("영상 편집", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
                         TextButton(onClick = ::requestClose) { Text("취소") }
                     }
                     Spacer(Modifier.weight(1f))
@@ -133,11 +145,11 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
                         if (!session.busy && session.error == null) {
                             Text(
                                 if (session.isMusicOverlayMode) "영상을 준비했습니다. 배경 음악을 선택해 주세요."
-                                else "장면 분석을 마쳤습니다. 예고편 설정을 확인해 주세요.",
+                                else "장면 분석을 마쳤습니다. 영상 편집 설정을 확인해 주세요.",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                             Button(onClick = { settings = true }) {
-                                Text(if (session.isMusicOverlayMode) "음악 선택" else "예고편 조절")
+                                Text(if (session.isMusicOverlayMode) "음악 선택" else "영상 편집")
                             }
                         }
                     }
@@ -207,6 +219,7 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
             musicFitCountState = draftMusicFitCount,
             autoDuckingState = draftAutoDucking,
             onClose = { settings = false },
+            switchMode = { toMusic, order -> model.switchTrailerMode(toMusic, order) },
         ) { order, total, length, photoLength, format, musicTrack, musicPolicy, musicFitCount, autoDucking ->
             settings = false
             model.regenerateTrailer(
@@ -238,6 +251,7 @@ private fun TrailerSettings(
     musicFitCountState: MutableState<Int>,
     autoDuckingState: MutableState<Boolean>,
     onClose: () -> Unit,
+    switchMode: (Boolean, List<Int>) -> Unit,
     regenerate: (List<Int>, Double, Double, Double, TrailerFormat, TrailerMusicTrack?, TrailerMusicPolicy, Int, Boolean) -> Unit,
 ) {
     var sources by sourcesState
@@ -254,7 +268,7 @@ private fun TrailerSettings(
     var showMusicPicker by remember { mutableStateOf(initialShowMusicPicker) }
     var customTotal by remember { mutableStateOf(false) }
     var customLength by remember { mutableStateOf(false) }
-    val scenes = remember(sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount) {
+    val scenes = remember(session.isMusicOverlayMode, sources, total, length, photoLength, musicTrack, musicPolicy, musicFitCount) {
         if (session.isMusicOverlayMode) {
             musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
         } else {
@@ -274,6 +288,15 @@ private fun TrailerSettings(
     ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = onClose, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.fillMaxWidth().fillMaxHeight().padding(horizontal = 18.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("제작 방식", style = MaterialTheme.typography.titleSmall)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(false to "예고편", true to "뮤직비디오").forEach { (music, title) ->
+                    TrailerChoice(title, session.isMusicOverlayMode == music, Modifier.weight(1f), enabled = !session.busy) {
+                        if (session.isMusicOverlayMode != music) switchMode(music, liveSources.map { it.id })
+                    }
+                }
+            }
+            if (session.busy) Text(session.status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(trailerLengthTitle(actual), Modifier.weight(1f), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                 val rateSubtitle = when {
@@ -719,13 +742,13 @@ private fun TrailerSettings(
             }
             Button(
                 onClick = { regenerate(sources.map { it.id }, total, length, photoLength, format, musicTrack, musicPolicy, musicFitCount, autoDucking) },
-                enabled = sources.isNotEmpty() && scenes.isNotEmpty() && (!session.isMusicOverlayMode || musicTrack != null),
+                enabled = !session.busy && sources.isNotEmpty() && scenes.isNotEmpty() && (!session.isMusicOverlayMode || musicTrack != null),
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
                     if (session.isMusicOverlayMode && musicTrack == null) "배경 음악을 선택해 주세요"
-                    else if (session.output == null) "${trailerLengthTitle(actual)} 예고편 만들기"
-                    else "${trailerLengthTitle(actual)} 예고편 다시 만들기"
+                    else if (session.output == null) "${trailerLengthTitle(actual)} ${if (session.isMusicOverlayMode) "뮤직비디오" else "예고편"} 만들기"
+                    else "${trailerLengthTitle(actual)} ${if (session.isMusicOverlayMode) "뮤직비디오" else "예고편"} 다시 만들기"
                 )
             }
             Spacer(Modifier.height(8.dp))

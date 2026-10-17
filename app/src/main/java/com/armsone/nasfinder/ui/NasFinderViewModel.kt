@@ -137,12 +137,28 @@ data class AppState(
     val googlePhotosDisclosureRequired: Boolean = false,
     val googlePhotosPhase: GooglePhotosPhase = GooglePhotosPhase.IDLE,
     val googlePhotosImportedCount: Int = 0,
+    val mediaPick: MediaPickRequest? = null,
+    val mediaPickStaging: MediaPickStaging? = null,
+    val mediaPickDelivery: MediaPickDelivery? = null,
     val folderCountCache: Map<String, FolderChildCountState> = emptyMap(),
     val folderCountGeneration: Long = 0L,
     val trailerDraftCount: Int = 0,
     val trailerDraftPicker: List<TrailerDraft>? = null,
     val trailerDraftStaleNotice: String? = null,
     val trailerConflict: TrailerConflictConfirmation? = null,
+    val inlineAudioPlayback: InlineAudioPlaybackState? = null,
+)
+
+data class InlineAudioPlaybackState(
+    val key: String,
+    val title: String,
+    val isPreparing: Boolean = false,
+    val downloadFraction: Float? = null,
+    val isPlaying: Boolean = false,
+    val progress: Float = 0f,
+    val durationMillis: Long = 0L,
+    val positionMillis: Long = 0L,
+    val errorMessage: String? = null,
 )
 
 data class TrailerConflictConfirmation(
@@ -244,6 +260,11 @@ enum class BuiltInPreviewKind { IMAGE, VIDEO, AUDIO, PDF }
 
 enum class LocalMediaEditIntent { NONE, TRAILER, MUSIC }
 
+/** Network browse launched from the 영상 만들기 PLUS menu; selected media returns to [returnScreen]'s basket. */
+data class MediaPickRequest(val returnScreen: Screen.LocalPhotoLibrary)
+data class MediaPickStaging(val current: Int, val total: Int, val name: String, val progress: Float? = null)
+data class MediaPickDelivery(val id: Long, val uris: List<String>, val failedCount: Int, val message: String)
+
 sealed interface Screen {
     data object Dashboard : Screen
     data class AddConnection(val editing: RemoteConnection? = null) : Screen
@@ -289,6 +310,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var previewRequestGeneration = 0L
     private var previewJob: Job? = null
     private val trackedOwnedPreviewFiles = mutableSetOf<File>()
+    private var inlineAudioPlayer: androidx.media3.exoplayer.ExoPlayer? = null
+    private var inlineAudioStagingJob: Job? = null
+    private var inlineAudioProgressJob: Job? = null
+    private var inlineAudioGeneration = 0L
     private val folderCountSemaphore = kotlinx.coroutines.sync.Semaphore(2)
     private var folderCountGeneration = 0L
     private val folderCountRequests = mutableSetOf<String>()
@@ -391,11 +416,194 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun show(screen: Screen) {
+        stopInlineAudio()
         invalidateImagePreviewRequests()
         if (screen == Screen.Dashboard && _state.value.screen != Screen.Dashboard) {
             invalidateFavoriteThumbnails()
         }
+        if (screen !is Screen.Browser && _state.value.mediaPick != null) {
+            mediaPickJob?.cancel(); mediaPickJob = null
+            _state.update { it.copy(screen = screen, message = null, mediaPick = null, mediaPickStaging = null) }
+            return
+        }
         _state.update { it.copy(screen = screen, message = null) }
+    }
+
+    private var mediaPickJob: Job? = null
+    private var mediaPickDeliverySeq = 0L
+    // provider kind + connection + remote item path -> already staged own copy (no duplicate downloads).
+    private val stagedMediaByIdentity = java.util.concurrent.ConcurrentHashMap<String, File>()
+
+    fun beginNetworkMediaPick(connection: RemoteConnection, returnScreen: Screen.LocalPhotoLibrary, startPath: String = connection.normalizedRootPath) {
+        if (_state.value.mediaPickStaging != null) return
+        _state.update { it.copy(mediaPick = MediaPickRequest(returnScreen)) }
+        openConnection(connection, startPath)
+    }
+
+    /** Adds one favorite network media file to the basket; the original and the basket stay untouched on failure. */
+    fun addFavoriteFileToBasket(favorite: RemoteFavorite, returnScreen: Screen.LocalPhotoLibrary) {
+        if (_state.value.mediaPickStaging != null) return
+        val connection = _state.value.connections.firstOrNull { it.id == favorite.connectionId }
+        if (connection == null) {
+            _state.update { it.copy(message = "‘${favorite.name}’의 네트워크 연결을 찾을 수 없습니다. 연결을 확인해 주세요.") }
+            return
+        }
+        _state.update { it.copy(mediaPickStaging = MediaPickStaging(0, 1, favorite.name)) }
+        mediaPickJob = viewModelScope.launch {
+            val favoriteService = try {
+                withContext(Dispatchers.IO) {
+                    val credential = repository.credentials.read(connection.id).orEmpty()
+                    RemoteFileServiceFactory.create(connection, credential)
+                }
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(mediaPickStaging = null) }; throw cancelled
+            } catch (error: Exception) {
+                _state.update { it.copy(mediaPickStaging = null, message = "‘${favorite.name}’에 연결하지 못했습니다: ${error.message ?: "연결 오류"}") }
+                return@launch
+            }
+            val item = try {
+                withContext(Dispatchers.IO) { FavoriteItemResolver.resolve(favorite, connection, favoriteService) }
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(mediaPickStaging = null) }; throw cancelled
+            } catch (error: Exception) {
+                _state.update { it.copy(mediaPickStaging = null, message = error.message ?: "즐겨찾기 파일을 찾을 수 없습니다.") }
+                return@launch
+            }
+            if (item.isDirectory || !(item.isVideo || item.isImage)) {
+                _state.update { it.copy(mediaPickStaging = null, message = "‘${favorite.name}’은(는) 사진이나 영상이 아니라 담을 수 없습니다.") }
+                return@launch
+            }
+            stageMedia(listOf(item), connection, favoriteService, returnScreen)
+        }
+    }
+
+    /** Leaves the network browser without touching the existing basket. */
+    fun cancelNetworkMediaPick() {
+        mediaPickJob?.cancel(); mediaPickJob = null
+        connectionOpenJob?.cancel(); connectionOpenJob = null
+        thumbnailGeneration++
+        val returnScreen = _state.value.mediaPick?.returnScreen ?: Screen.Dashboard
+        _state.update { it.copy(screen = returnScreen, mediaPick = null, mediaPickStaging = null, isBusy = false, message = null) }
+    }
+
+    /** Cancels only the running staging; the browser and the prior basket stay as they are. */
+    fun cancelMediaPickStaging() { mediaPickJob?.cancel() }
+
+    fun consumeMediaPickDelivery(id: Long) {
+        _state.update { if (it.mediaPickDelivery?.id == id) it.copy(mediaPickDelivery = null) else it }
+    }
+
+    /** Downloads only the selected remote media into own cache copies and returns them to the basket screen. */
+    fun stageRemoteMediaForBasket(items: List<RemoteFileItem>) {
+        val request = _state.value.mediaPick ?: return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        val activeService = service ?: return
+        if (_state.value.mediaPickStaging != null) return
+        val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }.distinctBy { it.path }
+        if (media.isEmpty()) { _state.update { it.copy(message = "사진 또는 영상 파일을 선택해 주세요.") }; return }
+        mediaPickJob = viewModelScope.launch { stageMedia(media, browser.connection, activeService, request.returnScreen) }
+    }
+
+    private suspend fun stageMedia(media: List<RemoteFileItem>, connection: RemoteConnection, activeService: RemoteFileService, returnScreen: Screen.LocalPhotoLibrary) {
+        val root = File(application.cacheDir, "media_basket").also { it.mkdirs() }
+        run {
+            val staged = mutableListOf<String>()
+            val created = mutableListOf<File>()
+            var failed = 0
+            try {
+                media.forEachIndexed { index, item ->
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    _state.update { it.copy(mediaPickStaging = MediaPickStaging(index + 1, media.size, item.name)) }
+                    val identity = "${connection.kind.name}\u0000${connection.id}\u0000${item.path}"
+                    val existing = stagedMediaByIdentity[identity]?.takeIf { it.isFile && it.length() > 0 && (item.size <= 0 || it.length() == item.size) }
+                    if (existing != null) { staged += Uri.fromFile(existing).toString(); return@forEachIndexed }
+                    val directory = File(root, UUID.randomUUID().toString()).also { it.mkdirs() }
+                    val safeName = item.name.substringAfterLast('/').replace(Regex("[\\\\:*?\"<>|]"), "_").ifBlank { "media" }
+                    val destination = File(directory, safeName)
+                    created += directory
+                    try {
+                        activeService.download(item, destination) { received, total ->
+                            _state.update { current ->
+                                val live = current.mediaPickStaging ?: return@update current
+                                current.copy(mediaPickStaging = live.copy(progress = if (total > 0) received.toFloat() / total else null))
+                            }
+                        }
+                        check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다." }
+                        item.modifiedAt?.toEpochMilli()?.let { destination.setLastModified(it) }
+                        stagedMediaByIdentity[identity] = destination
+                        staged += Uri.fromFile(destination).toString()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        failed++
+                        directory.deleteRecursively()
+                    }
+                }
+                mediaPickJob = null
+                val message = when {
+                    staged.isEmpty() -> "선택한 파일을 가져오지 못했습니다."
+                    failed == 0 -> "${staged.size}개를 영상 만들기에 추가했습니다."
+                    else -> "${staged.size}개를 추가했고 ${failed}개는 가져오지 못했습니다."
+                }
+                _state.update {
+                    if (staged.isEmpty()) it.copy(mediaPickStaging = null, message = message)
+                    else it.copy(
+                        screen = returnScreen, mediaPick = null, mediaPickStaging = null, message = null, isBusy = false,
+                        mediaPickDelivery = MediaPickDelivery(++mediaPickDeliverySeq, staged.toList(), failed, message),
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                // Only copies created by this run are removed; earlier staged basket items stay.
+                withContext(NonCancellable) { created.filter { dir -> stagedMediaByIdentity.values.none { it.parentFile == dir } }.forEach { it.deleteRecursively() } }
+                _state.update { it.copy(mediaPickStaging = null, message = "가져오기를 취소했습니다.") }
+            } catch (error: Exception) {
+                withContext(NonCancellable) { created.filter { dir -> stagedMediaByIdentity.values.none { it.parentFile == dir } }.forEach { it.deleteRecursively() } }
+                _state.update { it.copy(mediaPickStaging = null, message = "선택한 파일을 가져오지 못했습니다.") }
+            }
+        }
+    }
+
+    /** Read-only file URIs for PhoneHard media favorites/selections; missing files are skipped. */
+    fun phoneHardFileUris(relativePaths: List<String>): List<String> = relativePaths.mapNotNull { path ->
+        resolvePhoneHardDiskFile(path).takeIf { it.isFile }?.let { Uri.fromFile(it).toString() }
+    }
+
+    /** Stages several favorite media files of ONE connection with a single explicit commit; the basket stays untouched on failure. */
+    fun addFavoriteFilesToBasket(favorites: List<RemoteFavorite>, returnScreen: Screen.LocalPhotoLibrary) {
+        if (_state.value.mediaPickStaging != null || favorites.isEmpty()) return
+        val connection = _state.value.connections.firstOrNull { it.id == favorites.first().connectionId }
+        if (connection == null) {
+            _state.update { it.copy(message = "네트워크 연결을 찾을 수 없습니다. 연결을 확인해 주세요.") }
+            return
+        }
+        _state.update { it.copy(mediaPickStaging = MediaPickStaging(0, favorites.size, favorites.first().name)) }
+        mediaPickJob = viewModelScope.launch {
+            try {
+                val (favoriteService, items) = withContext(Dispatchers.IO) {
+                    val credential = repository.credentials.read(connection.id).orEmpty()
+                    val created = RemoteFileServiceFactory.create(connection, credential)
+                    created to favorites.mapNotNull { favorite ->
+                        runCatching { FavoriteItemResolver.resolve(favorite, connection, created) }.getOrNull()
+                            ?.takeIf { !it.isDirectory && (it.isVideo || it.isImage) }
+                    }
+                }
+                if (items.isEmpty()) {
+                    _state.update { it.copy(mediaPickStaging = null, message = "선택한 즐겨찾기 파일을 찾을 수 없습니다.") }
+                    return@launch
+                }
+                stageMedia(items, connection, favoriteService, returnScreen)
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(mediaPickStaging = null) }; throw cancelled
+            } catch (error: Exception) {
+                _state.update { it.copy(mediaPickStaging = null, message = "즐겨찾기에 연결하지 못했습니다: ${error.message ?: "연결 오류"}") }
+            }
+        }
+    }
+
+    /** PhoneHard photo/video files for the basket picker; referenced in place, never re-imported. */
+    fun phoneHardMediaForBasket(): List<InboxDisplayItem> = inboxFiles().filter {
+        val kind = BuiltInPreviewPolicy.kind(it.originalFilename, it.mimeType)
+        (kind == BuiltInPreviewKind.IMAGE || kind == BuiltInPreviewKind.VIDEO) && it.file.isFile
     }
 
     /**
@@ -404,8 +612,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * downloads, caches and files are untouched so the next foreground return starts on the dashboard.
      */
     fun returnToDashboardAfterBackground() {
+        stopInlineAudio()
         // System media pickers and editor interruptions must retain the shared selection.
-        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.trailer != null) return
+        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.trailer != null || _state.value.mediaPick != null) return
         connectionOpenJob?.cancel()
         connectionOpenJob = null
         thumbnailGeneration++
@@ -1400,6 +1609,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         path: String = connection.normalizedRootPath,
         fallbackToRoot: Boolean = false,
     ) {
+        stopInlineAudio()
         invalidateImagePreviewRequests()
         connectionOpenJob?.cancel()
         val generation = ++thumbnailGeneration
@@ -1572,6 +1782,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun openItem(item: RemoteFileItem) {
         val browser = _state.value.screen as? Screen.Browser ?: return
+        stopInlineAudio()
         if (item.isDirectory) openConnection(browser.connection, item.path)
         else prepareRemoteFile(item, RemoteFileAction.PREVIEW)
     }
@@ -3068,7 +3279,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             withContext(Dispatchers.IO) {
                 selected.forEachIndexed { index, uri ->
                     runCatching {
-                        val name = queryName(uri) ?: "폰하드 파일 ${index + 1}"
+                        val name = copyDisplayName(uri, index)
                         application.contentResolver.openInputStream(uri)?.use { input ->
                             // Resolve and validate the selected folder through the existing PhoneHard store.
                             inboxStore.listPhoneHardFolder(destinationSubdirectory)
@@ -3105,7 +3316,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 var failedCount = 0
                 uris.forEachIndexed { index, uri ->
                     runCatching {
-                        val name = queryName(uri) ?: "폰하드 파일 ${index + 1}"
+                        val name = copyDisplayName(uri, index)
                         application.contentResolver.openInputStream(uri)?.use { input ->
                             inboxStore.import(name, application.contentResolver.getType(uri), input)
                         } ?: error("파일을 열 수 없습니다.")
@@ -3406,7 +3617,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         }
                     } else 0L
                 } ?: 0L
-            }.getOrDefault(0L)
+            }.getOrDefault(0L).takeIf { it > 0L }
+                ?: if (uri.scheme == "file") uri.path?.let { File(it).lastModified() } ?: 0L else 0L
         }
         prepareTrailer(names, captureTimes = captureTimes, motionSourceUris = activeUris) { index, destination ->
             val uri = activeUris[index]
@@ -3740,6 +3952,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         if (_state.value.trailer?.busy == true) return
 
+        stopInlineAudio()
         closeTrailer(clearRetry = false)
         val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
         directory.mkdirs()
@@ -3751,6 +3964,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     musicTrack = initialMusicTrack,
                     musicPolicy = initialMusicPolicy,
                     musicFitCount = initialMusicFitCount,
+                    highlightAnalyzed = !isMusicOverlayMode,
                 ),
                 imagePreview = null,
                 trailerDraftCount = TrailerDraftStore.draftCount(),
@@ -3979,6 +4193,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         musicFitCount = initialMusicFitCount,
                         awaitingInitialSettings = true,
                         prepared = true,
+                        highlightAnalyzed = !isMusicOverlayMode,
                     )
                 }
                 trailerJob = null
@@ -4064,6 +4279,93 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 output.delete()
                 updateTrailer(directory) { it.copy(busy = false, progress = null, error = failure.message ?: "다시 만들어 주세요.") }
+            }
+        }
+    }
+
+    private var trailerModeSwitchToken = 0L
+
+    // Switches the open editor between trailer and music-video modes in place. Keeps the raw sources,
+    // their order, the chosen music and ducking; only the derived output is cleared. Music-origin
+    // sources lack highlight/photo analysis, so switching to trailer runs the real analysis first.
+    fun switchTrailerMode(toMusicVideo: Boolean, order: List<Int>) {
+        val session = _state.value.trailer ?: return
+        if (session.busy || !session.prepared || session.isMusicOverlayMode == toMusicVideo) return
+        val directory = session.directory
+        val byId = session.sources.associateBy { it.id }
+        val ordered = order.distinct().mapNotNull { byId[it] }.ifEmpty { session.sources }
+        if (ordered.isEmpty()) return
+        val token = ++trailerModeSwitchToken
+
+        fun modeSession(base: TrailerSession, list: List<TrailerSource>): TrailerSession {
+            val videoDurations = list.filter { !it.isImage }.map { it.duration }
+            val minVideo = videoDurations.minOrNull() ?: 4.0
+            val hasVideos = list.any { !it.isImage }
+            val length = if (toMusicVideo) {
+                minVideo.coerceAtLeast(1.0)
+            } else {
+                val lengths = list.map { it.recommendedLength }.sorted()
+                minOf(minVideo, lengths[lengths.size / 2]).coerceAtLeast(1.0)
+            }
+            val photoLength = if (toMusicVideo) 1.0 else defaultPhotoClipLength(length, hasVideos)
+            val total = list.sumOf {
+                if (it.isImage) (if (toMusicVideo) photoLength else it.weightedPhotoLength(length))
+                else if (toMusicVideo) it.duration else maxOf(length, it.recommendedLength)
+            }
+            return base.copy(
+                sources = list,
+                isMusicOverlayMode = toMusicVideo,
+                clipLength = length,
+                photoClipLength = photoLength,
+                total = total,
+                output = null,
+                saved = false,
+                error = null,
+                progress = null,
+                busy = false,
+                awaitingInitialSettings = true,
+                highlightAnalyzed = base.highlightAnalyzed || !toMusicVideo,
+                status = if (toMusicVideo) "음악을 선택해 주세요." else "장면을 분석했습니다. 설정을 확인해 주세요.",
+            )
+        }
+
+        if (toMusicVideo || session.highlightAnalyzed) {
+            _state.update { current ->
+                val live = current.trailer?.takeIf { it.directory == directory && !it.busy } ?: return@update current
+                current.copy(trailer = modeSession(live, ordered))
+            }
+            return
+        }
+
+        updateTrailer(directory) { it.copy(busy = true, progress = null, error = null, status = "한양이 장면을 고르는 중…") }
+        trailerJob = viewModelScope.launch {
+            try {
+                val analyzed = ordered.mapIndexed { index, source ->
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (source.isImage) source else {
+                        updateTrailer(directory) { it.copy(status = "${index + 1}/${ordered.size} · 한양이 장면을 고르는 중…") }
+                        val analysis = AudioAnalysisService.analyze(application, Uri.fromFile(source.file), source.duration, (source.duration.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
+                        source.copy(analysis = analysis)
+                    }
+                }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val prepared = if (analyzed.any { it.isImage }) {
+                    updateTrailer(directory) { it.copy(status = "사진을 비교하는 중…") }
+                    analyzeTrailerPhotos(application, analyzed)
+                } else analyzed
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (token != trailerModeSwitchToken) return@launch
+                _state.update { current ->
+                    val live = current.trailer?.takeIf { it.directory == directory && it.busy && it.isMusicOverlayMode } ?: return@update current
+                    current.copy(trailer = modeSession(live, prepared).copy(highlightAnalyzed = true))
+                }
+                trailerJob = null
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (token != trailerModeSwitchToken) return@launch
+                updateTrailer(directory) { it.copy(busy = false, progress = null, status = "음악을 선택해 주세요.") }
+                _state.update { it.copy(message = failure.message ?: "예고편 분석에 실패했습니다.") }
             }
         }
     }
@@ -4202,6 +4504,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun resumeTrailerDraft(draft: TrailerDraft) {
         if (_state.value.trailer != null) return
+        stopInlineAudio()
         if (!draft.isValid()) {
             TrailerDraftStore.removeDraft(draft)
             _state.update {
@@ -4237,6 +4540,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             awaitingInitialSettings = draft.showingSettings || draft.output == null,
             prepared = true,
             draftId = draft.id,
+            highlightAnalyzed = !draft.isMusicOverlayMode,
         )
 
         _state.update {
@@ -4286,6 +4590,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun previewInboxFile(item: InboxDisplayItem) {
+        stopInlineAudio()
         val supported = _state.value.inboxFiles.mapNotNull { candidate ->
             val remote = candidate.asPreviewItem()
             if (remote.builtInPreviewKind() == null) null else remote to candidate.file
@@ -4385,6 +4690,19 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return normalized.map { id ->
             available[id] ?: throw IllegalArgumentException("선택한 폰하드 파일을 찾을 수 없습니다.")
         }
+    }
+
+    // Keeps the original display name and extension: provider name, then file-URI/path segment, then a generic label;
+    // the MIME-derived extension is appended only when the resolved name has none.
+    private fun copyDisplayName(uri: Uri, index: Int): String {
+        val base = queryName(uri)?.takeIf { it.isNotBlank() }
+            ?: uri.path?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+            ?: "폰하드 파일 ${index + 1}"
+        if (base.substringAfterLast('.', "").isNotEmpty()) return base
+        val extension = runCatching { application.contentResolver.getType(uri) }.getOrNull()
+            ?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+            ?.takeIf { it.isNotBlank() } ?: return base
+        return "$base.$extension"
     }
 
     private fun queryName(uri: Uri): String? = runCatching {
@@ -4494,6 +4812,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return runCatching {
             inboxStore.listPhoneHardFolder(subpath)
         }.getOrElse { emptyList() }
+    }
+
+    /** 미디어 소스 탐색 전용: 실패를 빈 목록으로 숨기지 않고 Result로 돌려준다. */
+    fun loadPhoneHardFolderResult(subpath: String?): Result<List<com.armsone.nasfinder.data.PhoneHardItem>> {
+        return try {
+            Result.success(inboxStore.listPhoneHardFolder(subpath))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     fun createPhoneHardFolder(name: String, parentSubdirectory: String?, onResult: (Boolean, String?) -> Unit) {
@@ -5106,7 +5435,292 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(isLocalThumbnailRunning = false, localThumbnailProgress = null) }
     }
 
+    fun inlineRemoteAudioKey(connectionId: String, item: RemoteFileItem): String =
+        "remote:$connectionId:${item.id}:${item.path}"
+
+    fun inlineInboxAudioKey(item: InboxDisplayItem): String =
+        "inbox:${item.id}"
+
+    fun stopInlineAudio() {
+        inlineAudioGeneration++
+        inlineAudioStagingJob?.cancel()
+        inlineAudioStagingJob = null
+        inlineAudioProgressJob?.cancel()
+        inlineAudioProgressJob = null
+        inlineAudioPlayer?.let { player ->
+            runCatching {
+                player.stop()
+                player.release()
+            }
+        }
+        inlineAudioPlayer = null
+        if (_state.value.inlineAudioPlayback != null) {
+            _state.update { it.copy(inlineAudioPlayback = null) }
+        }
+    }
+
+    fun toggleInlineRemoteAudio(item: RemoteFileItem) {
+        if (item.isDirectory || !item.isAudio) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        val connection = browser.connection
+        val key = inlineRemoteAudioKey(connection.id, item)
+        val current = _state.value.inlineAudioPlayback
+        if (current != null && current.key == key) {
+            handleActiveInlineAudioToggle(current)
+            return
+        }
+
+        val activeService = service ?: run {
+            _state.update { it.copy(message = "원격 연결을 다시 연 뒤 시도해 주세요.") }
+            return
+        }
+
+        stopInlineAudio()
+        val generation = ++inlineAudioGeneration
+        val route = RemoteMediaRoutePolicy.route(item.name, activeService.supportsRangeStreaming && item.size > 0)
+        if (route == RemoteMediaRoute.RANGE_MEDIA3) {
+            _state.update {
+                it.copy(
+                    inlineAudioPlayback = InlineAudioPlaybackState(
+                        key = key,
+                        title = item.name,
+                        isPreparing = true,
+                    )
+                )
+            }
+            val streamSpec = RemoteMediaStreamSpec(item, null, activeService)
+            startInlineExoPlayer(
+                generation = generation,
+                key = key,
+                title = item.name,
+                configureSource = { player ->
+                    player.setMediaSource(streamSpec.createMediaSource())
+                },
+            )
+            return
+        }
+
+        _state.update {
+            it.copy(
+                inlineAudioPlayback = InlineAudioPlaybackState(
+                    key = key,
+                    title = item.name,
+                    isPreparing = true,
+                    downloadFraction = 0f,
+                )
+            )
+        }
+        inlineAudioStagingJob = viewModelScope.launch {
+            val resolved = runCatching {
+                downloadCache.resolve(
+                    connectionId = connection.id,
+                    item = item,
+                    progress = { completed, reportedTotal ->
+                        val total = reportedTotal.takeIf { it > 0 }
+                            ?: item.size.takeIf { it > 0 }
+                            ?: 0L
+                        val fraction = if (total > 0L) {
+                            (completed.toDouble() / total.toDouble()).coerceIn(0.0, 1.0).toFloat()
+                        } else null
+                        if (generation == inlineAudioGeneration) {
+                            _state.update { state ->
+                                val active = state.inlineAudioPlayback
+                                if (active == null || active.key != key) state
+                                else state.copy(inlineAudioPlayback = active.copy(downloadFraction = fraction))
+                            }
+                        }
+                    },
+                    download = { destination, progress ->
+                        activeService.download(item, destination, progress)
+                    },
+                )
+            }
+            if (generation != inlineAudioGeneration) return@launch
+            resolved.onSuccess { file ->
+                startInlineExoPlayer(
+                    generation = generation,
+                    key = key,
+                    title = item.name,
+                    configureSource = { player ->
+                        player.setMediaItem(androidx.media3.common.MediaItem.fromUri(Uri.fromFile(file)))
+                    },
+                )
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                stopInlineAudio()
+                _state.update {
+                    it.copy(message = error.message ?: "${item.name}을(를) 재생할 수 없습니다.")
+                }
+            }
+        }
+    }
+
+    fun toggleInlineInboxAudio(item: InboxDisplayItem) {
+        val isAudio = BuiltInPreviewPolicy.kind(item.originalFilename, item.mimeType) == BuiltInPreviewKind.AUDIO ||
+            item.asPreviewItem().isAudio
+        if (!isAudio) return
+        val key = inlineInboxAudioKey(item)
+        val current = _state.value.inlineAudioPlayback
+        if (current != null && current.key == key) {
+            handleActiveInlineAudioToggle(current)
+            return
+        }
+        if (!item.file.isFile) {
+            _state.update { it.copy(inboxErrorMessage = "폰하드 음악 파일을 찾을 수 없습니다: ${item.originalFilename}") }
+            return
+        }
+
+        stopInlineAudio()
+        val generation = ++inlineAudioGeneration
+        _state.update {
+            it.copy(
+                inlineAudioPlayback = InlineAudioPlaybackState(
+                    key = key,
+                    title = item.originalFilename,
+                    isPreparing = true,
+                )
+            )
+        }
+        startInlineExoPlayer(
+            generation = generation,
+            key = key,
+            title = item.originalFilename,
+            configureSource = { player ->
+                player.setMediaItem(androidx.media3.common.MediaItem.fromUri(Uri.fromFile(item.file)))
+            },
+        )
+    }
+
+    private fun handleActiveInlineAudioToggle(current: InlineAudioPlaybackState) {
+        if (current.isPreparing) {
+            stopInlineAudio()
+            return
+        }
+        val player = inlineAudioPlayer ?: run {
+            stopInlineAudio()
+            return
+        }
+        if (player.isPlaying) {
+            player.pause()
+            updateInlineAudioProgressFromPlayer(player, isPlayingOverride = false)
+        } else {
+            if (player.playbackState == androidx.media3.common.Player.STATE_ENDED) {
+                player.seekTo(0L)
+            }
+            player.play()
+            updateInlineAudioProgressFromPlayer(player, isPlayingOverride = true)
+        }
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun startInlineExoPlayer(
+        generation: Long,
+        key: String,
+        title: String,
+        configureSource: (androidx.media3.exoplayer.ExoPlayer) -> Unit,
+    ) {
+        if (generation != inlineAudioGeneration) return
+        val player = runCatching {
+            androidx.media3.exoplayer.ExoPlayer.Builder(application)
+                .setAudioAttributes(
+                    androidx.media3.common.AudioAttributes.Builder()
+                        .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                        .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+                        .build(),
+                    true,
+                )
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+        }.getOrElse { error ->
+            stopInlineAudio()
+            _state.update { it.copy(message = error.message ?: "$title 재생기를 준비하지 못했습니다.") }
+            return
+        }
+
+        inlineAudioPlayer = player
+        player.addListener(object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (generation != inlineAudioGeneration) return
+                when (playbackState) {
+                    androidx.media3.common.Player.STATE_BUFFERING -> {
+                        _state.update { state ->
+                            val active = state.inlineAudioPlayback
+                            if (active == null || active.key != key) state
+                            else state.copy(inlineAudioPlayback = active.copy(isPreparing = true))
+                        }
+                    }
+                    androidx.media3.common.Player.STATE_READY -> {
+                        updateInlineAudioProgressFromPlayer(player, isPreparingOverride = false)
+                    }
+                    androidx.media3.common.Player.STATE_ENDED -> {
+                        stopInlineAudio()
+                    }
+                    androidx.media3.common.Player.STATE_IDLE -> Unit
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (generation != inlineAudioGeneration) return
+                updateInlineAudioProgressFromPlayer(player, isPlayingOverride = isPlaying)
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (generation != inlineAudioGeneration) return
+                stopInlineAudio()
+                _state.update {
+                    it.copy(message = "$title 파일을 재생할 수 없습니다.")
+                }
+            }
+        })
+
+        runCatching {
+            configureSource(player)
+            player.prepare()
+            player.playWhenReady = true
+        }.onFailure { error ->
+            stopInlineAudio()
+            _state.update { it.copy(message = error.message ?: "$title 파일을 재생할 수 없습니다.") }
+            return
+        }
+
+        inlineAudioProgressJob?.cancel()
+        inlineAudioProgressJob = viewModelScope.launch {
+            while (generation == inlineAudioGeneration && inlineAudioPlayer === player) {
+                updateInlineAudioProgressFromPlayer(player)
+                kotlinx.coroutines.delay(150L)
+            }
+        }
+    }
+
+    private fun updateInlineAudioProgressFromPlayer(
+        player: androidx.media3.exoplayer.ExoPlayer,
+        isPlayingOverride: Boolean? = null,
+        isPreparingOverride: Boolean? = null,
+    ) {
+        val duration = player.duration.takeIf { it > 0L } ?: 0L
+        val position = player.currentPosition.coerceAtLeast(0L)
+        val fraction = if (duration > 0L) {
+            (position.toDouble() / duration.toDouble()).coerceIn(0.0, 1.0).toFloat()
+        } else 0f
+        val isBuffering = isPreparingOverride ?: (player.playbackState == androidx.media3.common.Player.STATE_BUFFERING)
+        val playing = isPlayingOverride ?: player.isPlaying
+        _state.update { state ->
+            val active = state.inlineAudioPlayback ?: return@update state
+            state.copy(
+                inlineAudioPlayback = active.copy(
+                    isPreparing = isBuffering,
+                    downloadFraction = if (isBuffering) active.downloadFraction else null,
+                    isPlaying = playing,
+                    progress = fraction,
+                    durationMillis = duration,
+                    positionMillis = position,
+                )
+            )
+        }
+    }
+
     override fun onCleared() {
+        stopInlineAudio()
         localThumbnailJob?.cancel()
         dismissTrailer()
         networkDownloadJob?.cancel()

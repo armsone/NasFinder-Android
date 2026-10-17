@@ -88,6 +88,8 @@ data class TrailerSession(
     // True only once every source is staged and analysed and the first plan exists.
     val prepared: Boolean = false,
     val draftId: String? = null,
+    // False while sources only carry the placeholder analysis of music mode (no highlight/photo ratio data).
+    val highlightAnalyzed: Boolean = true,
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
     // Music-overlay mode keeps every photo at a fixed 1s Ken Burns scene; trailer mode now weighs

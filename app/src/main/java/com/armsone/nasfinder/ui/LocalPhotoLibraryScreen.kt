@@ -17,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,16 +41,26 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -66,9 +77,12 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -78,6 +92,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -97,17 +113,13 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
 
-private enum class LocalPhotoLibraryMode(val title: String) {
-    PHOTOS("사진"),
-    CALENDAR("달력"),
-}
 
 /**
  * Local-only photo/video picker for "내 사진·영상". Preserves existing user edits and Google Photos system picker.
  * Device MediaStore photos and calendar share one URI basket; files use the toolbar action.
  * Google Photos keeps the existing native cloud-enabled photo picker.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 internal fun LocalPhotoLibraryScreen(
     model: NasFinderViewModel,
@@ -123,6 +135,7 @@ internal fun LocalPhotoLibraryScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     var permissionState by remember { mutableStateOf(LocalPhotoLibraryCalendarRepository.checkPermissionState(context)) }
     var libraryRevision by remember { mutableStateOf(0) }
+    var sourceRevision by rememberSaveable { mutableStateOf(0) }
     var recentLimit by rememberSaveable { mutableStateOf(180) }
     var libraryQuery by rememberSaveable { mutableStateOf(LocalLibraryQuery()) }
     var previewUris by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -141,6 +154,7 @@ internal fun LocalPhotoLibraryScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 permissionState = LocalPhotoLibraryCalendarRepository.checkPermissionState(context)
                 libraryRevision++
+                sourceRevision++
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -172,7 +186,6 @@ internal fun LocalPhotoLibraryScreen(
     }
 
     val modeStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
-    var currentMode by rememberSaveable { mutableStateOf(LocalPhotoLibraryMode.PHOTOS) }
 
     var pickedUris by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
     var items by remember { mutableStateOf<List<LocalMediaItem>>(emptyList()) }
@@ -231,6 +244,38 @@ internal fun LocalPhotoLibraryScreen(
         else appendPickedUris(listOf(uriString))
     }
 
+    // PLUS menu sources: every source returns into this same basket and never clears it.
+    val appState by model.state.collectAsStateWithLifecycle()
+    // Direct source pages (like 사진/달력): swipe or tap tabs; the basket below is shared by every page.
+    val pages = remember(initialIntent, googlePhotosSource, appState.googlePhotosVisible) {
+        if (initialIntent == LocalMediaEditIntent.NONE || googlePhotosSource) listOf("photos" to "사진", "calendar" to "달력")
+        else buildList {
+            add("photos" to "사진"); add("calendar" to "달력"); add("phonehard" to "폰하드"); add("favorites" to "즐겨찾기")
+            add("network" to "NAS·네트워크"); add("files" to "파일")
+            if (appState.googlePhotosVisible) add("google" to "Google 포토")
+        }
+    }
+    var pageKey by rememberSaveable { mutableStateOf("photos") }
+    val pagerState = androidx.compose.foundation.pager.rememberPagerState(initialPage = pages.indexOfFirst { it.first == pageKey }.coerceAtLeast(0)) { pages.size }
+    LaunchedEffect(pagerState.currentPage, pages) { pages.getOrNull(pagerState.currentPage)?.let { pageKey = it.first } }
+    LaunchedEffect(pagerState.settledPage) { sourceRevision++ }
+    fun goToPage(key: String) { val index = pages.indexOfFirst { it.first == key }; if (index >= 0) libraryScope.launch { pagerState.animateScrollToPage(index) } }
+    var phoneHardPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var filesFolderId by rememberSaveable { mutableStateOf<Long?>(null) }
+    val chosenListSaver = androidx.compose.runtime.saveable.listSaver<androidx.compose.runtime.snapshots.SnapshotStateList<String>, String>(
+        save = { it.toList() },
+        restore = { saved -> mutableStateListOf<String>().apply { addAll(saved) } }
+    )
+    val chosenPhoneHard = rememberSaveable(saver = chosenListSaver) { mutableStateListOf<String>() }
+    val chosenFavorites = rememberSaveable(saver = chosenListSaver) { mutableStateListOf<String>() }
+    val returnScreen = Screen.LocalPhotoLibrary(initialIntent, googlePhotosSource)
+    LaunchedEffect(appState.mediaPickDelivery) {
+        val delivery = appState.mediaPickDelivery ?: return@LaunchedEffect
+        appendPickedUris(delivery.uris)
+        libraryNotice = delivery.message
+        model.consumeMediaPickDelivery(delivery.id)
+    }
+
     // Mode 1: Photo picker (Google Photos cloud provider supported, native system photo picker)
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(maxItems = 100),
@@ -262,7 +307,6 @@ internal fun LocalPhotoLibraryScreen(
     var hasAutoOpenedPicker by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(googlePhotosSource) {
-        if (googlePhotosSource) currentMode = LocalPhotoLibraryMode.PHOTOS
         if (googlePhotosSource && !hasAutoOpenedPicker && pickedUris.isEmpty()) {
             hasAutoOpenedPicker = true
             picker.launch(
@@ -292,7 +336,14 @@ internal fun LocalPhotoLibraryScreen(
             .distinctBy { canonicalKeyFor(it.uri.toString()) }
     }
 
-    BackHandler(onBack = onBack)
+    val handleBack: () -> Unit = {
+        if (pageKey == "phonehard" && phoneHardPath != null) phoneHardPath = phoneHardParent(phoneHardPath)
+        else if (pageKey == "files" && filesFolderId != null) filesFolderId = null
+        else if (pageKey != "photos" && pages.any { it.first == "photos" }) goToPage("photos")
+        else onBack()
+    }
+
+    BackHandler(onBack = handleBack)
 
     Scaffold(
         topBar = {
@@ -301,19 +352,21 @@ internal fun LocalPhotoLibraryScreen(
                     title = {
                         Text(
                             when (initialIntent) {
-                                LocalMediaEditIntent.TRAILER -> "예고편 만들기"
+                                LocalMediaEditIntent.TRAILER -> "영상 만들기"
                                 LocalMediaEditIntent.MUSIC -> "뮤직비디오"
                                 LocalMediaEditIntent.NONE -> if (googlePhotosSource) "Google 포토" else "내 사진·영상"
                             },
                         )
                     },
                     navigationIcon = {
-                        IconButton(onClick = onBack) {
+                        IconButton(onClick = handleBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
                         }
                     },
                     actions = {
-                        androidx.compose.material3.TextButton(onClick = { documentPicker.launch(arrayOf("image/*", "video/*")) }, enabled = !copying) { Text("파일에서 추가") }
+                        if (initialIntent == LocalMediaEditIntent.NONE) {
+                            androidx.compose.material3.TextButton(onClick = { documentPicker.launch(arrayOf("image/*", "video/*")) }, enabled = !copying) { Text("파일에서 추가") }
+                        }
                         Box {
                             IconButton(onClick = { showLibraryMenu = true }, enabled = !copying) { Icon(Icons.Default.MoreVert, "더 보기") }
                             androidx.compose.material3.DropdownMenu(expanded = showLibraryMenu, onDismissRequest = { showLibraryMenu = false }) {
@@ -327,19 +380,19 @@ internal fun LocalPhotoLibraryScreen(
                     },
                     colors = TopAppBarDefaults.centerAlignedTopAppBarColors(),
                 )
-                TabRow(
-                    selectedTabIndex = currentMode.ordinal,
+                androidx.compose.material3.ScrollableTabRow(
+                    selectedTabIndex = pagerState.currentPage.coerceIn(0, pages.lastIndex),
                     modifier = Modifier.fillMaxWidth(),
+                    edgePadding = 8.dp,
                 ) {
-                    LocalPhotoLibraryMode.values().forEach { mode ->
+                    pages.forEachIndexed { index, (key, title) ->
                         Tab(
-                            selected = currentMode == mode,
-                            onClick = { currentMode = mode },
-                            text = { Text(if (googlePhotosSource) { if (mode == LocalPhotoLibraryMode.CALENDAR) "기기 달력" else "선택한 사진" } else mode.title, fontWeight = if (currentMode == mode) FontWeight.Bold else FontWeight.Normal) },
+                            selected = pagerState.currentPage == index,
+                            onClick = { goToPage(key) },
+                            text = { Text(if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title, maxLines = 1, fontWeight = if (pagerState.currentPage == index) FontWeight.Bold else FontWeight.Normal) },
                         )
                     }
                 }
-
             }
         },
         bottomBar = {
@@ -353,9 +406,15 @@ internal fun LocalPhotoLibraryScreen(
                         Text("폰하드에 복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
                     }
                 }
+                BasketTray(
+                    selected = selected,
+                    items = deviceItems,
+                    enabled = !copying,
+                    onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
+                )
                 Text("${selected.size}개 선택됨", style = MaterialTheme.typography.bodyMedium)
                 val actionsEnabled = !loading && !copying && selected.isNotEmpty()
-                fun selectedUris() = pickedUris.filter { it in selected.toSet() }.map(Uri::parse)
+                fun selectedUris() = selected.map(Uri::parse)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (onCopyToPhoneHard != null) {
                         LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier.weight(1f)) {
@@ -363,17 +422,33 @@ internal fun LocalPhotoLibraryScreen(
                             if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
                         }
                     }
-                    LocalMediaActionButton("예고편 제작", actionsEnabled, Modifier.weight(1f)) { onCreateTrailer(selectedUris()) }
-                    if (onMusicOverlay != null) {
-                        LocalMediaActionButton("뮤직비디오", actionsEnabled, Modifier.weight(1f)) { onMusicOverlay(selectedUris()) }
+                    LocalMediaActionButton("영상 편집", actionsEnabled, Modifier.weight(1f)) {
+                        // Unified entry starts as a trailer; the editor switches modes inline.
+                        // An explicit music route keeps its original music-video start.
+                        if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
+                        else onCreateTrailer(selectedUris())
                     }
                 }
             }
         },
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            when (currentMode) {
-                LocalPhotoLibraryMode.PHOTOS -> {
+            androidx.compose.foundation.pager.HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                key = { pages.getOrNull(it)?.first ?: it },
+                beyondViewportPageCount = 1,
+            ) { pageIndex ->
+            // Neighbor pages stay composed (session/basket/path state) but must not take keyboard/D-pad focus.
+            // canFocus only reaches the nearest child focus target (e.g. a lazy list group) and not its items,
+            // so each page is an explicit focus group whose entry is cancelled while it is not the current page.
+            Box(
+                Modifier.fillMaxSize()
+                    .focusProperties { if (pagerState.currentPage != pageIndex) enter = { FocusRequester.Cancel } }
+                    .focusGroup(),
+            ) {
+            when (pages.getOrNull(pageIndex)?.first) {
+                "photos" -> {
                     Column(Modifier.fillMaxSize()) {
                         if (!googlePhotosSource) {
                             if (permissionState != CalendarMediaPermissionState.FULL_ACCESS) {
@@ -436,7 +511,7 @@ internal fun LocalPhotoLibraryScreen(
                     }
                 }
 
-                LocalPhotoLibraryMode.CALENDAR -> {
+                "calendar" -> {
                     modeStateHolder.SaveableStateProvider("calendar") {
                     LocalPhotoLibraryCalendarScreen(
                         commonPickedUris = selected,
@@ -449,13 +524,52 @@ internal fun LocalPhotoLibraryScreen(
                             previewIndex = sequence.indexOfFirst { it == uri }.coerceAtLeast(0)
                         },
                         onSwitchToPhotoTab = {
-                            currentMode = LocalPhotoLibraryMode.PHOTOS
+                            goToPage("photos")
                         },
                     )
                     }
                 }
 
+                "phonehard", "favorites", "network" -> MediaSourcePageContent(
+                    model = model,
+                    kind = pages[pageIndex].first,
+                    phoneHardPath = phoneHardPath,
+                    chosenPhoneHard = chosenPhoneHard,
+                    chosenFavorites = chosenFavorites,
+                    returnScreen = returnScreen,
+                    revision = sourceRevision,
+                    onOpenPhoneHard = { path -> phoneHardPath = path; goToPage("phonehard") },
+                    onCommitUris = { uris -> appendPickedUris(uris) },
+                )
 
+                "files" -> DeviceFolderBrowserPage(
+                    folderId = filesFolderId,
+                    onFolderChange = { filesFolderId = it },
+                    selectedKeys = selectedKeys,
+                    canonicalKey = ::canonicalKeyFor,
+                    selectionOrder = { raw -> val key = canonicalKeyFor(raw); selected.indexOfFirst { canonicalKeyFor(it) == key }.takeIf { it >= 0 }?.plus(1) },
+                    revision = libraryRevision,
+                    onToggle = ::toggleSelected,
+                    onLaunchDocumentPicker = { documentPicker.launch(arrayOf("image/*", "video/*")) },
+                    enabled = !copying,
+                )
+
+                "google" -> InlineGooglePhotosPage(
+                    basket = selected,
+                    canonicalKey = ::canonicalKeyFor,
+                    active = pagerState.settledPage == pageIndex && previewUris.isEmpty(),
+                    onGranted = { uris ->
+                        uris.forEach { uri -> runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } }
+                        appendPickedUris(uris.map(Uri::toString))
+                    },
+                    onRevoked = { uris ->
+                        val revokedKeys = uris.map { canonicalKeyFor(it.toString()) }.toSet()
+                        selected = selected.filterNot { canonicalKeyFor(it) in revokedKeys }
+                    },
+                    onLaunchFallback = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                )
+            }
+            }
             }
         }
     }
@@ -467,6 +581,14 @@ internal fun LocalPhotoLibraryScreen(
             onToggleSelection = { previewUris.getOrNull(previewIndex)?.let(::toggleSelected) },
             onIndexChanged = { previewIndex = it },
             onDismiss = { previewUris = emptyList() },
+        )
+    }
+    appState.mediaPickStaging?.let { staging ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = {},
+            title = { Text("가져오는 중") },
+            text = { Text(staging.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+            confirmButton = { androidx.compose.material3.TextButton(onClick = model::cancelMediaPickStaging) { Text("취소") } },
         )
     }
     pendingCopyUris?.let { snapshot ->
@@ -483,10 +605,47 @@ internal fun LocalPhotoLibraryScreen(
                     copying = true
                     copyCurrent = 0
                     copyTotal = snapshot.size
-                    copy(snapshot, destination, { current, total -> copyCurrent = current; copyTotal = total }, { _, _ -> copying = false })
+                    copy(snapshot, destination, { current, total -> copyCurrent = current; copyTotal = total }, { _, _ -> copying = false; sourceRevision++; libraryRevision++ })
                 }
             },
         )
+    }
+}
+
+/** Shared basket: the same ordered `selected` list the footer actions use; X removes only from the basket. */
+@Composable
+private fun BasketTray(selected: List<String>, items: List<LocalMediaItem>, enabled: Boolean, onRemove: (String) -> Unit) {
+    if (selected.isEmpty()) {
+        Text("여러 페이지에서 미디어를 골라 담으세요", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        return
+    }
+    val context = LocalContext.current
+    androidx.compose.foundation.lazy.LazyRow(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        items(selected, key = { it }) { raw ->
+            val uri = remember(raw) { Uri.parse(raw) }
+            val known = items.firstOrNull { it.uri.toString() == raw }
+            val loaded by produceState(known, raw) { value = loadCachedLocalMediaItem(context, uri) }
+            val item = loaded ?: known
+            val name = item?.displayName ?: uri.lastPathSegment.orEmpty()
+            Box(Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
+                item?.thumbnail?.let { bitmap ->
+                    SkinAwareThumbnailImage(bitmap = bitmap, cacheIdentity = "local-media:$raw", contentDescription = name, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                }
+                if (item?.isVideo == true) {
+                    Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.Center).size(20.dp), tint = Color.White)
+                    item.durationMs?.let { Text(formatLocalMediaDuration(it), color = Color.White, fontSize = 9.sp, maxLines = 1, modifier = Modifier.align(Alignment.BottomStart).padding(2.dp).background(Color.Black.copy(alpha = .6f), RoundedCornerShape(3.dp)).padding(horizontal = 2.dp)) }
+                }
+                Box(
+                    Modifier.align(Alignment.TopEnd).size(48.dp).clickable(enabled = enabled) { onRemove(raw) }.semantics { contentDescription = "$name 담기 목록에서 제거" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Default.Close, null, Modifier.size(16.dp).background(Color.Black.copy(alpha = .6f), CircleShape), tint = Color.White)
+                }
+            }
+        }
     }
 }
 
@@ -527,6 +686,7 @@ internal fun LocalMediaThumbnail(
     onTap: () -> Unit,
     onLongPress: () -> Unit = onTap,
     selectionOrder: Int? = null,
+    showSelection: Boolean = true,
 ) {
     val context = LocalContext.current
     var visibleItem by remember(item.uri) { mutableStateOf(item) }
@@ -572,7 +732,7 @@ internal fun LocalMediaThumbnail(
                 )
             }
         }
-        Box(
+        if (showSelection) Box(
             modifier = Modifier.align(Alignment.TopEnd).size(44.dp),
             contentAlignment = Alignment.Center,
         ) {
@@ -610,7 +770,8 @@ internal fun CalendarDayMedia.localMediaItem() = LocalMediaItem(uri, null, isVid
 private suspend fun loadLocalMediaItem(context: Context, uri: Uri, includeThumbnail: Boolean = true): LocalMediaItem =
     withContext(Dispatchers.IO) {
         val mimeType = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-        val isVideo = mimeType?.startsWith("video/") == true
+        val isVideo = mimeType?.startsWith("video/") == true ||
+            (mimeType == null && uri.scheme == "file" && uri.lastPathSegment?.let { com.armsone.nasfinder.model.RemoteFileItem(it, it, it, false).isVideo } == true)
 
         var displayName: String? = null
         var byteLength: Long? = null
@@ -667,6 +828,18 @@ private suspend fun loadLocalMediaItem(context: Context, uri: Uri, includeThumbn
             }
         }
 
+        if (uri.scheme == "file") {
+            // Own staged/PhoneHard copies are plain files without a content provider.
+            val file = uri.path?.let { java.io.File(it) }
+            if (displayName == null) displayName = uri.lastPathSegment
+            if (byteLength == null) byteLength = file?.length()?.takeIf { it > 0 }
+            if (captureTimeMs == null) file?.lastModified()?.takeIf { it > 0 }?.let { epochMs ->
+                captureTimeMs = epochMs
+                addedTimeMs = epochMs
+                dateText = Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).toLocalDateTime().format(DateTimeFormatter.ofPattern("yyyy.MM.dd"))
+            }
+        }
+
         if (dateText == null) {
             dateText = "날짜 정보 없음"
         }
@@ -696,7 +869,9 @@ private fun loadLocalMediaThumbnail(context: Context, uri: Uri, isVideo: Boolean
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         // Platform thumbnails never read the full-resolution media into memory.
         context.contentResolver.loadThumbnail(uri, Size(320, 320), null)
-    } else if (isVideo) {
+    } else null
+}.getOrNull() ?: runCatching {
+    if (isVideo) {
         MediaMetadataRetriever().run {
             try {
                 setDataSource(context, uri)
@@ -738,4 +913,530 @@ private fun formatLocalFileSize(bytes: Long): String {
         index++
     } while (size >= 1024 && index < units.lastIndex)
     return "%.1f %s".format(size, units[index])
+}
+
+private sealed interface MediaSourcePage {
+    data object Favorites : MediaSourcePage
+    data object Network : MediaSourcePage
+    data class PhoneHard(val path: String?) : MediaSourcePage
+}
+
+private fun phoneHardParent(path: String?): String? = path?.trim('/')?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }
+
+private enum class MediaSourceViewMode(val title: String) {
+    DETAILS("자세히"),
+    THUMBNAIL("썸네일"),
+    POSTER("포스터"),
+}
+
+@Composable
+private fun MediaSourceViewModeMenu(
+    mode: MediaSourceViewMode,
+    onSelectMode: (MediaSourceViewMode) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) {
+            Icon(Icons.Default.FilterList, contentDescription = "보기 모드")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            MediaSourceViewMode.entries.forEach { entry ->
+                DropdownMenuItem(
+                    text = { Text(entry.title) },
+                    leadingIcon = {
+                        val icon = when (entry) {
+                            MediaSourceViewMode.DETAILS -> Icons.Default.List
+                            MediaSourceViewMode.THUMBNAIL -> Icons.Default.GridView
+                            MediaSourceViewMode.POSTER -> Icons.Default.GridOn
+                        }
+                        Icon(icon, null)
+                    },
+                    trailingIcon = {
+                        if (mode == entry) Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary)
+                    },
+                    onClick = {
+                        expanded = false
+                        onSelectMode(entry)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** Embedded source page: every selection is explicit; only chosen items return to the same shared basket. */
+@Composable
+private fun MediaSourcePageContent(
+    model: NasFinderViewModel,
+    kind: String,
+    phoneHardPath: String?,
+    chosenPhoneHard: androidx.compose.runtime.snapshots.SnapshotStateList<String>,
+    chosenFavorites: androidx.compose.runtime.snapshots.SnapshotStateList<String>,
+    returnScreen: Screen.LocalPhotoLibrary,
+    revision: Int = 0,
+    onOpenPhoneHard: (String?) -> Unit,
+    onCommitUris: (List<String>) -> Unit,
+) {
+    val context = LocalContext.current
+    val state by model.state.collectAsStateWithLifecycle()
+    var viewMode by rememberSaveable { mutableStateOf(MediaSourceViewMode.THUMBNAIL) }
+    val page: MediaSourcePage = when (kind) {
+        "favorites" -> MediaSourcePage.Favorites
+        "network" -> MediaSourcePage.Network
+        else -> MediaSourcePage.PhoneHard(phoneHardPath)
+    }
+    val onPageChange: (MediaSourcePage?) -> Unit = { target -> if (target is MediaSourcePage.PhoneHard) onOpenPhoneHard(target.path) }
+    val onClose: () -> Unit = {}
+    val selectedCount = when (page) {
+        is MediaSourcePage.PhoneHard -> chosenPhoneHard.size
+        MediaSourcePage.Favorites -> chosenFavorites.size
+        MediaSourcePage.Network -> 0
+    }
+    Column(Modifier.fillMaxSize()) {
+        if (page is MediaSourcePage.PhoneHard) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (page.path != null) IconButton(onClick = { onOpenPhoneHard(phoneHardParent(page.path)) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "상위 폴더") }
+                Text(page.path?.let { "폰하드 / $it" } ?: "폰하드", style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                MediaSourceViewModeMenu(mode = viewMode, onSelectMode = { viewMode = it })
+            }
+        } else if (page is MediaSourcePage.Favorites) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("즐겨찾기", style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                MediaSourceViewModeMenu(mode = viewMode, onSelectMode = { viewMode = it })
+            }
+        }
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when (page) {
+                        MediaSourcePage.Network -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(state.connections, key = { it.id }) { connection ->
+                                androidx.compose.material3.Surface(
+                                    modifier = Modifier.fillMaxWidth().clickable {
+                                        onClose()
+                                        model.beginNetworkMediaPick(connection, returnScreen)
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    tonalElevation = 2.dp,
+                                ) {
+                                    Column(Modifier.padding(16.dp)) {
+                                        Text(connection.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(connection.kind.name, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                            }
+                        }
+                        MediaSourcePage.Favorites -> {
+                            if (state.remoteFavorites.isEmpty()) {
+                                Text("즐겨찾기가 없습니다. 파일 목록에서 사진·영상이나 폴더를 즐겨찾기에 추가하면 여기에 나타납니다.", Modifier.padding(24.dp))
+                            } else {
+                                val lockedConnection = state.remoteFavorites.firstOrNull { it.id in chosenFavorites && it.connectionId != "phonehard" }?.connectionId
+                                when (viewMode) {
+                                    MediaSourceViewMode.DETAILS -> {
+                                        LazyColumn(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            items(state.remoteFavorites, key = { it.id }) { favorite ->
+                                                val phoneHard = favorite.connectionId == "phonehard"
+                                                val connection = state.connections.firstOrNull { it.id == favorite.connectionId }
+                                                val kind = BuiltInPreviewPolicy.kind(favorite.name, favorite.mimeType)
+                                                val isMedia = kind == BuiltInPreviewKind.IMAGE || kind == BuiltInPreviewKind.VIDEO
+                                                LaunchedEffect(favorite.id, favorite.connectionId, favorite.path, favorite.size, favorite.modifiedAt, state.favoriteThumbnailGeneration, revision) {
+                                                    model.loadFavoriteThumbnail(favorite)
+                                                }
+                                                val usable = (favorite.isDirectory || isMedia) && (phoneHard || connection != null) &&
+                                                    (favorite.isDirectory || phoneHard || lockedConnection == null || lockedConnection == favorite.connectionId)
+                                                val metaList = buildList {
+                                                    if (phoneHard) add("폰하드") else if (connection != null) add(connection.name) else add("연결 없음")
+                                                    if (!favorite.isDirectory) {
+                                                        favorite.size?.let { add(formatLocalFileSize(it)) }
+                                                        favorite.modifiedAt?.let { modified ->
+                                                            runCatching {
+                                                                val formatter = DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm").withZone(ZoneId.systemDefault())
+                                                                add(formatter.format(modified))
+                                                            }
+                                                        }
+                                                    } else {
+                                                        add("폴더")
+                                                    }
+                                                }
+                                                SourceRow(
+                                                    title = favorite.name,
+                                                    subtitle = if (!usable && !favorite.isDirectory && !isMedia) "사진·영상 아님" else metaList.joinToString(" · "),
+                                                    bitmap = state.favoriteThumbnails[favorite.id],
+                                                    cacheIdentity = "favorite:${favorite.connectionId}:${favorite.remoteItemId ?: favorite.path}:${favorite.path}:${favorite.size}:${favorite.modifiedAt}:${favorite.thumbnailUrl}",
+                                                    isFolder = favorite.isDirectory,
+                                                    isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                    selectable = !favorite.isDirectory,
+                                                    selected = favorite.id in chosenFavorites,
+                                                    enabled = usable,
+                                                    onClick = {
+                                                        when {
+                                                            favorite.isDirectory && phoneHard -> onPageChange(MediaSourcePage.PhoneHard(favorite.path.trim('/').ifEmpty { null }))
+                                                            favorite.isDirectory && connection != null -> {
+                                                                onClose()
+                                                                model.beginNetworkMediaPick(connection, returnScreen, favorite.path)
+                                                            }
+                                                            favorite.id in chosenFavorites -> chosenFavorites.remove(favorite.id)
+                                                            else -> chosenFavorites.add(favorite.id)
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                    MediaSourceViewMode.THUMBNAIL, MediaSourceViewMode.POSTER -> {
+                                        val poster = viewMode == MediaSourceViewMode.POSTER
+                                        LazyVerticalGrid(
+                                            columns = GridCells.Adaptive(if (poster) 158.dp else 104.dp),
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentPadding = PaddingValues(if (poster) 12.dp else 8.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(if (poster) 12.dp else 6.dp),
+                                            verticalArrangement = Arrangement.spacedBy(if (poster) 16.dp else 6.dp),
+                                        ) {
+                                            items(state.remoteFavorites, key = { it.id }) { favorite ->
+                                                val phoneHard = favorite.connectionId == "phonehard"
+                                                val connection = state.connections.firstOrNull { it.id == favorite.connectionId }
+                                                val kind = BuiltInPreviewPolicy.kind(favorite.name, favorite.mimeType)
+                                                val isMedia = kind == BuiltInPreviewKind.IMAGE || kind == BuiltInPreviewKind.VIDEO
+                                                LaunchedEffect(favorite.id, favorite.connectionId, favorite.path, favorite.size, favorite.modifiedAt, state.favoriteThumbnailGeneration, revision) {
+                                                    model.loadFavoriteThumbnail(favorite)
+                                                }
+                                                val usable = (favorite.isDirectory || isMedia) && (phoneHard || connection != null) &&
+                                                    (favorite.isDirectory || phoneHard || lockedConnection == null || lockedConnection == favorite.connectionId)
+                                                val subtitleText = when {
+                                                    !favorite.isDirectory && !isMedia -> "사진·영상 아님"
+                                                    !phoneHard && connection == null -> "연결 없음"
+                                                    !usable -> "다른 연결과 함께 담을 수 없음"
+                                                    phoneHard -> "폰하드"
+                                                    else -> connection?.name.orEmpty()
+                                                }
+                                                val detailSubtitle = if (poster && !favorite.isDirectory) {
+                                                    buildList {
+                                                        add(subtitleText)
+                                                        favorite.size?.let { add(formatLocalFileSize(it)) }
+                                                        favorite.modifiedAt?.let { modified ->
+                                                            runCatching {
+                                                                val formatter = DateTimeFormatter.ofPattern("yyyy.MM.dd").withZone(ZoneId.systemDefault())
+                                                                add(formatter.format(modified))
+                                                            }
+                                                        }
+                                                    }.joinToString(" · ")
+                                                } else subtitleText
+                                                SourceTile(
+                                                    title = favorite.name,
+                                                    subtitle = detailSubtitle,
+                                                    bitmap = state.favoriteThumbnails[favorite.id],
+                                                    cacheIdentity = "favorite:${favorite.connectionId}:${favorite.remoteItemId ?: favorite.path}:${favorite.path}:${favorite.size}:${favorite.modifiedAt}:${favorite.thumbnailUrl}",
+                                                    isFolder = favorite.isDirectory,
+                                                    isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                    selectable = !favorite.isDirectory,
+                                                    selected = favorite.id in chosenFavorites,
+                                                    enabled = usable,
+                                                    poster = poster,
+                                                    onClick = {
+                                                        when {
+                                                            favorite.isDirectory && phoneHard -> onPageChange(MediaSourcePage.PhoneHard(favorite.path.trim('/').ifEmpty { null }))
+                                                            favorite.isDirectory && connection != null -> {
+                                                                onClose()
+                                                                model.beginNetworkMediaPick(connection, returnScreen, favorite.path)
+                                                            }
+                                                            favorite.id in chosenFavorites -> chosenFavorites.remove(favorite.id)
+                                                            else -> chosenFavorites.add(favorite.id)
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        is MediaSourcePage.PhoneHard -> {
+                            var retryTick by remember { mutableStateOf(0) }
+                            val loaded by produceState<Result<List<com.armsone.nasfinder.data.PhoneHardItem>>?>(null, page.path, revision, retryTick) {
+                                value = null
+                                value = withContext(Dispatchers.IO) { model.loadPhoneHardFolderResult(page.path) }
+                            }
+                            val loadError = loaded?.exceptionOrNull()
+                            val listing = loaded?.getOrNull()
+                            val entries = listing?.filter { entry ->
+                                entry.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY ||
+                                    BuiltInPreviewPolicy.kind(entry.name, entry.mimeType).let { it == BuiltInPreviewKind.IMAGE || it == BuiltInPreviewKind.VIDEO }
+                            }
+                            when {
+                                loadError != null -> Column(Modifier.align(Alignment.Center).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Text("폰하드 폴더를 불러오지 못했습니다: ${loadError.message ?: loadError.javaClass.simpleName}")
+                                    Button(onClick = { retryTick++ }) { Text("다시 시도") }
+                                    val parentPath = page.path?.trim('/')?.substringBeforeLast('/', "")?.ifEmpty { null }
+                                    if (page.path != null) {
+                                        OutlinedButton(onClick = { onPageChange(MediaSourcePage.PhoneHard(parentPath)) }) { Text("상위 폴더로") }
+                                    }
+                                }
+                                entries == null -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                                entries.isEmpty() -> Text("이 폴더에 사진·영상이나 하위 폴더가 없습니다.", Modifier.padding(24.dp))
+                                viewMode == MediaSourceViewMode.DETAILS -> {
+                                    LazyColumn(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        items(entries, key = { it.relativePath }) { entry ->
+                                            val isDirectory = entry.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY
+                                            val kind = BuiltInPreviewPolicy.kind(entry.name, entry.mimeType)
+                                            val thumbnail by produceState<Bitmap?>(null, entry.relativePath, entry.modifiedAt, entry.byteCount) {
+                                                value = if (isDirectory) null else withContext(Dispatchers.IO) {
+                                                    decodeInboxThumbnail(
+                                                        context, null, entry.file,
+                                                        isImage = kind == BuiltInPreviewKind.IMAGE,
+                                                        isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                        isPdf = false,
+                                                        maxPixelSize = 160,
+                                                    )
+                                                }
+                                            }
+                                            val metaList = buildList {
+                                                if (isDirectory) {
+                                                    add("폴더")
+                                                } else {
+                                                    add("폰하드")
+                                                    add(formatLocalFileSize(entry.byteCount))
+                                                    entry.modifiedAt?.let { modified ->
+                                                        runCatching {
+                                                            val formatter = DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm").withZone(ZoneId.systemDefault())
+                                                            add(formatter.format(modified))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            SourceRow(
+                                                title = entry.name,
+                                                subtitle = metaList.joinToString(" · "),
+                                                bitmap = thumbnail,
+                                                cacheIdentity = "phonehard-source:${entry.relativePath}:${entry.byteCount}:${entry.modifiedAt}",
+                                                isFolder = isDirectory,
+                                                isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                selectable = !isDirectory,
+                                                selected = entry.relativePath in chosenPhoneHard,
+                                                enabled = true,
+                                                onClick = {
+                                                    when {
+                                                        isDirectory -> onPageChange(MediaSourcePage.PhoneHard(entry.relativePath))
+                                                        entry.relativePath in chosenPhoneHard -> chosenPhoneHard.remove(entry.relativePath)
+                                                        else -> chosenPhoneHard.add(entry.relativePath)
+                                                    }
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                                else -> {
+                                    val poster = viewMode == MediaSourceViewMode.POSTER
+                                    LazyVerticalGrid(
+                                        columns = GridCells.Adaptive(if (poster) 158.dp else 104.dp),
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentPadding = PaddingValues(if (poster) 12.dp else 8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(if (poster) 12.dp else 6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(if (poster) 16.dp else 6.dp),
+                                    ) {
+                                        items(entries, key = { it.relativePath }) { entry ->
+                                            val isDirectory = entry.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY
+                                            val kind = BuiltInPreviewPolicy.kind(entry.name, entry.mimeType)
+                                            val thumbnail by produceState<Bitmap?>(null, entry.relativePath, entry.modifiedAt, entry.byteCount) {
+                                                value = if (isDirectory) null else withContext(Dispatchers.IO) {
+                                                    decodeInboxThumbnail(
+                                                        context, null, entry.file,
+                                                        isImage = kind == BuiltInPreviewKind.IMAGE,
+                                                        isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                        isPdf = false,
+                                                        maxPixelSize = if (poster) 320 else 160,
+                                                    )
+                                                }
+                                            }
+                                            val metaText = if (isDirectory) "폴더" else if (poster) {
+                                                buildList {
+                                                    add("폰하드")
+                                                    add(formatLocalFileSize(entry.byteCount))
+                                                    entry.modifiedAt?.let { modified ->
+                                                        runCatching {
+                                                            val formatter = DateTimeFormatter.ofPattern("yyyy.MM.dd").withZone(ZoneId.systemDefault())
+                                                            add(formatter.format(modified))
+                                                        }
+                                                    }
+                                                }.joinToString(" · ")
+                                            } else "폰하드"
+                                            SourceTile(
+                                                title = entry.name,
+                                                subtitle = metaText,
+                                                bitmap = thumbnail,
+                                                cacheIdentity = "phonehard-source:${entry.relativePath}:${entry.byteCount}:${entry.modifiedAt}",
+                                                isFolder = isDirectory,
+                                                isVideo = kind == BuiltInPreviewKind.VIDEO,
+                                                selectable = !isDirectory,
+                                                selected = entry.relativePath in chosenPhoneHard,
+                                                enabled = true,
+                                                poster = poster,
+                                                onClick = {
+                                                    when {
+                                                        isDirectory -> onPageChange(MediaSourcePage.PhoneHard(entry.relativePath))
+                                                        entry.relativePath in chosenPhoneHard -> chosenPhoneHard.remove(entry.relativePath)
+                                                        else -> chosenPhoneHard.add(entry.relativePath)
+                                                    }
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+            }
+        }
+        if (page !is MediaSourcePage.Network) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { chosenPhoneHard.clear(); chosenFavorites.clear() },
+                    enabled = selectedCount > 0,
+                    modifier = Modifier.weight(1f),
+                ) { Text("선택 해제") }
+                Button(
+                    enabled = selectedCount > 0,
+                    modifier = Modifier.weight(2f),
+                    onClick = {
+                        if (page is MediaSourcePage.PhoneHard) {
+                            onCommitUris(model.phoneHardFileUris(chosenPhoneHard.toList()))
+                            chosenPhoneHard.clear()
+                        } else {
+                            val picked = state.remoteFavorites.filter { it.id in chosenFavorites }
+                            val local = picked.filter { it.connectionId == "phonehard" }
+                            val remote = picked.filter { it.connectionId != "phonehard" }
+                            onCommitUris(model.phoneHardFileUris(local.map { it.path }))
+                            if (remote.isNotEmpty()) model.addFavoriteFilesToBasket(remote, returnScreen)
+                            chosenFavorites.clear()
+                        }
+                    },
+                ) { Text("선택한 항목 담기 ($selectedCount)") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceRow(
+    title: String,
+    subtitle: String,
+    bitmap: Bitmap?,
+    cacheIdentity: String,
+    isFolder: Boolean,
+    isVideo: Boolean,
+    selectable: Boolean,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth().semantics { contentDescription = "$title, $subtitle" + if (selected) ", 선택됨" else "" },
+    ) {
+        Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(Modifier.size(52.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
+                if (bitmap != null && !bitmap.isRecycled) {
+                    SkinAwareThumbnailImage(
+                        bitmap = bitmap,
+                        cacheIdentity = cacheIdentity,
+                        contentDescription = title,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                        isFolderCover = isFolder,
+                    )
+                } else {
+                    Icon(
+                        if (isFolder) Icons.Default.Folder else if (isVideo) Icons.Default.PlayCircle else Icons.Default.AddPhotoAlternate,
+                        null,
+                        Modifier.align(Alignment.Center).size(28.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f),
+                    )
+                }
+                if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(2.dp).size(16.dp), tint = Color.White)
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (selectable) {
+                Icon(
+                    if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                    null,
+                    modifier = Modifier.size(24.dp),
+                    tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceTile(
+    title: String,
+    subtitle: String,
+    bitmap: Bitmap?,
+    cacheIdentity: String,
+    isFolder: Boolean,
+    isVideo: Boolean,
+    selectable: Boolean,
+    selected: Boolean,
+    enabled: Boolean,
+    poster: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val cornerRadius = if (poster) 14.dp else 10.dp
+    Column(
+        Modifier
+            .clip(RoundedCornerShape(cornerRadius))
+            .clickable(enabled = enabled, onClick = onClick)
+            .semantics { contentDescription = "$title, $subtitle" + if (selected) ", 선택됨" else "" },
+        verticalArrangement = Arrangement.spacedBy(if (poster) 8.dp else 4.dp),
+    ) {
+        Box(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(cornerRadius)).background(MaterialTheme.colorScheme.surfaceVariant)) {
+            if (bitmap != null && !bitmap.isRecycled) {
+                SkinAwareThumbnailImage(
+                    bitmap = bitmap,
+                    cacheIdentity = cacheIdentity,
+                    contentDescription = title,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                    isFolderCover = isFolder,
+                )
+            } else {
+                Icon(
+                    if (isFolder) Icons.Default.Folder else if (isVideo) Icons.Default.PlayCircle else Icons.Default.AddPhotoAlternate,
+                    null,
+                    Modifier.align(Alignment.Center).size(if (poster) 48.dp else 36.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f),
+                )
+            }
+            if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(if (poster) 6.dp else 4.dp).size(if (poster) 24.dp else 20.dp), tint = Color.White)
+            if (selectable) Icon(
+                if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                null,
+                Modifier.align(Alignment.TopEnd).padding(if (poster) 6.dp else 4.dp).size(if (poster) 26.dp else 24.dp),
+                tint = if (selected) MaterialTheme.colorScheme.primary else Color.White,
+            )
+        }
+        Text(
+            title,
+            style = if (poster) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelSmall,
+            fontWeight = if (poster) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = if (poster) 2.dp else 4.dp),
+        )
+        Text(subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
 }
