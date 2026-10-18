@@ -4159,18 +4159,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     sortedSources
                 }
 
-                val lengths = preparedSources.map { it.recommendedLength }.sorted()
                 val videoDurations = preparedSources.filter { !it.isImage }.map { it.duration }
                 val minVideoDuration = videoDurations.minOrNull() ?: 4.0
-                val length = if (isMusicOverlayMode) {
-                    minVideoDuration.coerceAtLeast(1.0)
-                } else {
-                    minOf(minVideoDuration, lengths[lengths.size / 2]).coerceAtLeast(1.0)
-                }
+                val trailerDefaults = if (isMusicOverlayMode) null else recommendedTrailerDefaults(preparedSources)
+                val length = trailerDefaults?.clipLength ?: minVideoDuration.coerceAtLeast(1.0)
                 val hasVideos = preparedSources.any { !it.isImage }
                 val photoLength = if (isMusicOverlayMode) 1.0 else defaultPhotoClipLength(length, hasVideos)
                 val totalExcluded = initialExcludedCount + undecodableCount
-                val initialTotal = preparedSources.sumOf { if (it.isImage) (if (isMusicOverlayMode) photoLength else it.weightedPhotoLength(length)) else maxOf(length, it.recommendedLength) }
+                val initialTotal = trailerDefaults?.total
+                    ?: preparedSources.sumOf { if (it.isImage) photoLength else it.duration }
                 val statusMessage = if (isMusicOverlayMode) {
                     "음악을 선택해 주세요."
                 } else if (totalExcluded > 0) {
@@ -4226,8 +4223,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
         if (!total.isFinite()) return
-        val requestedTotal = total.coerceIn(1.0, 7200.0)
         val sources = order.mapNotNull { existingMap[it] }
+        // An unchanged recommended total (possibly under 1s for a sub-second video) must stay exact so the
+        // recommended distinct plan is recognised; every manual total keeps the 1s..2h clamp.
+        val requestedTotal = if (!session.isMusicOverlayMode && automaticTrailerPlan(sources, total, length) != null) total
+        else total.coerceIn(1.0, 7200.0)
         val scenes = if (session.isMusicOverlayMode) {
             musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
         } else {
@@ -4301,17 +4301,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val videoDurations = list.filter { !it.isImage }.map { it.duration }
             val minVideo = videoDurations.minOrNull() ?: 4.0
             val hasVideos = list.any { !it.isImage }
-            val length = if (toMusicVideo) {
-                minVideo.coerceAtLeast(1.0)
-            } else {
-                val lengths = list.map { it.recommendedLength }.sorted()
-                minOf(minVideo, lengths[lengths.size / 2]).coerceAtLeast(1.0)
-            }
+            val trailerDefaults = if (toMusicVideo) null else recommendedTrailerDefaults(list)
+            val length = trailerDefaults?.clipLength ?: minVideo.coerceAtLeast(1.0)
             val photoLength = if (toMusicVideo) 1.0 else defaultPhotoClipLength(length, hasVideos)
-            val total = list.sumOf {
-                if (it.isImage) (if (toMusicVideo) photoLength else it.weightedPhotoLength(length))
-                else if (toMusicVideo) it.duration else maxOf(length, it.recommendedLength)
-            }
+            val total = trailerDefaults?.total
+                ?: list.sumOf { if (it.isImage) photoLength else it.duration }
             return base.copy(
                 sources = list,
                 isMusicOverlayMode = toMusicVideo,

@@ -457,7 +457,7 @@ private fun TrailerSettings(
                 TextButton(onClick = { customLength = !customLength }, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
                     Text("다른 길이", Modifier.weight(1f)); Text(sceneLengthLabel(length)); Icon(if (customLength) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null)
                 }
-                if (customLength && maxLength >= 1) Slider(value = length.toFloat(), onValueChange = {
+                if (customLength && maxLength >= 1) Slider(value = length.toFloat().coerceIn(1f, maxLength.toFloat()), onValueChange = {
                     val newLen = it.roundToInt().toDouble().coerceAtLeast(1.0)
                     length = newLen
                 }, valueRange = 1f..maxLength.toFloat().coerceAtLeast(1f), modifier = Modifier.semantics { contentDescription = "클립 길이" })
@@ -690,7 +690,15 @@ private fun TrailerSettings(
                                                             if (revealedTrashSourceId == source.id) {
                                                                 revealedTrashSourceId = null
                                                             }
-                                                            sources = liveSources.filterNot { it.id == source.id }
+                                                            val remaining = liveSources.filterNot { it.id == source.id }
+                                                            // A recommended plan stays recommended for the remaining media;
+                                                            // a manually edited total/clip is left exactly as the user set it.
+                                                            if (!session.isMusicOverlayMode && remaining.isNotEmpty() && automaticTrailerPlan(liveSources, total, length) != null) {
+                                                                val defaults = recommendedTrailerDefaults(remaining)
+                                                                length = defaults.clipLength
+                                                                total = defaults.total
+                                                            }
+                                                            sources = remaining
                                                         }) {
                                                             Icon(
                                                                 Icons.Default.Delete,

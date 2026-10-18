@@ -24,30 +24,147 @@ data class TrailerSource(
     // Actual scene duration for this photo given the configured video-clip ("base clip") length.
     fun weightedPhotoLength(clipLength: Double): Double =
         max(MIN_PHOTO_SCENE_DURATION, clipLength * photoDurationRatio)
-    val recommendedLength: Double get() {
-        if (isImage) return 4.0
-        val wave = analysis.waveform
-        val baseline = wave.average().takeIf { it.isFinite() } ?: 0.0
-        val lengths = analysis.peakTimesSeconds.map { peak ->
-            if (wave.isEmpty()) min(4.0, duration) else {
-                val index = (peak / duration * wave.size).toInt().coerceIn(wave.indices)
-                val threshold = baseline + max(0.0, wave[index] - baseline) * .4
-                var left = index; var right = index
-                while (left > 0 && wave[left - 1] > threshold && index - left < 12) left--
-                while (right + 1 < wave.size && wave[right + 1] > threshold && right - index < 12) right++
-                min(duration, max(1.0, min(10.0, (right - left + 1) * duration / wave.size + 1)))
-            }
-        }.sorted()
-        return max(min(1.0, duration), min(duration, floor((lengths.getOrNull(lengths.size / 2) ?: 4.0) + .5)))
-    }
-    val recommendedTotal: Double get() {
-        if (isImage) return recommendedLength
-        val wave = analysis.waveform
-        val baseline = wave.average().takeIf { it.isFinite() } ?: 0.0
-        val strong = analysis.peakTimesSeconds.count { peak ->
-            wave.isNotEmpty() && wave[(peak / duration * wave.size).toInt().coerceIn(wave.indices)] >= max(baseline, (wave.maxOrNull() ?: 0.0) * .55)
+    // This source's own evidence-based clip length (see TrailerSourceEvidence), always within
+    // 0 < clip <= duration for a valid video, so sub-second videos stay valid.
+    val recommendedLength: Double get() =
+        if (isImage) UNKNOWN_CLIP_SECONDS else if (hasValidDuration) recommendationEvidence().clipLength else UNKNOWN_CLIP_SECONDS
+    // Total of the recommended plan when this source is edited alone (same counts as the batch plan).
+    val recommendedTotal: Double get() = recommendTrailerPlan(listOf(this))?.total ?: 0.0
+    internal val hasValidDuration: Boolean get() = duration.isFinite() && duration > 0.0
+}
+
+private const val UNKNOWN_CLIP_SECONDS = 4.0
+private const val MAX_RECOMMENDED_SCENES_PER_SOURCE = 8
+private const val MAX_TRAILER_TOTAL_SECONDS = 7200.0
+private const val AUTOMATIC_TOTAL_TOLERANCE = 0.0005
+
+// Per-source clip floor/ceiling: min(duration, clamp(duration/20, 2, 4)) .. min(duration, clamp(duration/8, 4, 10)).
+private fun recommendedClipBounds(duration: Double): ClosedFloatingPointRange<Double> =
+    min(duration, (duration / 20.0).coerceIn(2.0, 4.0))..min(duration, (duration / 8.0).coerceIn(4.0, 10.0))
+
+private class TrailerPeakEvidence(val time: Double, val score: Double)
+
+// clipLength: median continuous energetic span around the meaningful peaks (rounded to .5s, clamped to the
+// source bounds), or the bounded 4s default when there is no valid evidence. peaks: meaningful peaks,
+// strongest first; empty exactly when evidence is invalid (fallback source, silence, flat/NaN waveform, no peaks).
+private class TrailerSourceEvidence(val clipLength: Double, val peaks: List<TrailerPeakEvidence>) {
+    val hasEvidence: Boolean get() = peaks.isNotEmpty()
+}
+
+private fun TrailerSource.recommendationEvidence(): TrailerSourceEvidence {
+    val bounds = recommendedClipBounds(duration)
+    val unknown = TrailerSourceEvidence(UNKNOWN_CLIP_SECONDS.coerceIn(bounds), emptyList())
+    val wave = analysis.waveform
+    if (analysis.highlightSource == ClipHighlightSource.Fallback || wave.isEmpty()) return unknown
+    val finite = wave.filter { it.isFinite() }
+    if (finite.isEmpty()) return unknown
+    val top = finite.max()
+    val baseline = finite.average()
+    if (!(top > 0.0) || top - baseline < top * 0.15) return unknown
+    val strongCut = max(baseline, top * 0.55)
+    val indexed = analysis.peakTimesSeconds
+        .filter { it.isFinite() && it >= 0.0 && it <= duration }
+        .distinct()
+        .mapNotNull { time ->
+            val index = (time / duration * wave.size).toInt().coerceIn(0, wave.lastIndex)
+            val score = wave[index]
+            if (score.isFinite() && score >= strongCut) Triple(time, index, score) else null
         }
-        return min(max(1, (duration / recommendedLength).toInt()), max(1, min(8, strong))) * recommendedLength
+        .sortedByDescending { it.third }
+    if (indexed.isEmpty()) return unknown
+    val spans = indexed.map { (_, index, score) ->
+        val threshold = baseline + (score - baseline) * 0.4
+        var left = index
+        var right = index
+        while (left > 0 && wave[left - 1].let { it.isFinite() && it > threshold }) left--
+        while (right + 1 < wave.size && wave[right + 1].let { it.isFinite() && it > threshold }) right++
+        (right - left + 1).toDouble() / wave.size * duration
+    }.sorted()
+    val clip = (round(spans[spans.size / 2] * 2.0) / 2.0).coerceIn(bounds)
+    return TrailerSourceEvidence(clip, indexed.map { TrailerPeakEvidence(it.first, it.third) })
+}
+
+// Distinct, non-overlapping cut starts (chronological) a source contributes to the recommended plan.
+// Evidence sources: strongest peaks whose clip windows do not overlap. Fallback sources: a limited,
+// duration-based even spread. Both are capped by the per-source maximum, real capacity and half the source.
+private fun recommendedSourceStarts(source: TrailerSource, evidence: TrailerSourceEvidence, clip: Double): List<Double> {
+    val duration = source.duration
+    val sceneLength = min(clip, duration)
+    val capacity = floor(duration / sceneLength + 1e-6).toInt().coerceAtLeast(1)
+    val halfBudget = floor(duration / 2.0 / sceneLength + 1e-6).toInt().coerceAtLeast(1)
+    val limit = minOf(capacity, halfBudget, MAX_RECOMMENDED_SCENES_PER_SOURCE)
+    val maxStart = max(0.0, duration - sceneLength)
+    if (evidence.hasEvidence) {
+        val starts = mutableListOf<Double>()
+        for (peak in evidence.peaks) {
+            if (starts.size >= limit) break
+            val start = (peak.time - sceneLength / 2).coerceIn(0.0, maxStart)
+            if (starts.none { abs(it - start) < sceneLength - 1e-6 }) starts += start
+        }
+        return starts.sorted()
+    }
+    val count = when {
+        duration >= 60.0 -> 3
+        duration >= 20.0 -> 2
+        else -> 1
+    }.coerceAtMost(limit)
+    return (0 until count).map { index -> ((index + 0.5) * duration / count - sceneLength / 2).coerceIn(0.0, maxStart) }
+}
+
+internal class TrailerRecommendation(val clipLength: Double, val scenes: List<TrailerScene>) {
+    val total: Double get() = scenes.sumOf { it.length }
+}
+
+internal class TrailerDefaults(val clipLength: Double, val total: Double)
+
+// One shared policy for the common clip length: median of the video sources' own clips (valid evidence
+// preferred), never clamped to the shortest source. 4s when there is no video.
+private fun commonClipLength(evidences: List<TrailerSourceEvidence?>): Double {
+    val videos = evidences.filterNotNull()
+    if (videos.isEmpty()) return UNKNOWN_CLIP_SECONDS
+    val pool = videos.filter { it.hasEvidence }.ifEmpty { videos }
+    val sorted = pool.map { it.clipLength }.sorted()
+    return sorted[sorted.size / 2]
+}
+
+// Recommended plan: every photo once at its weighted length in user order, every valid video its own
+// distinct evidence-based cuts of min(commonClip, duration). The plan's total is exactly the scene sum,
+// no repeats and no trimming. Videos with an invalid duration contribute nothing (as in trailerScenes).
+internal fun recommendTrailerPlan(sources: List<TrailerSource>): TrailerRecommendation? {
+    if (sources.isEmpty()) return null
+    val evidences = sources.map { if (it.isImage || !it.hasValidDuration) null else it.recommendationEvidence() }
+    val clip = commonClipLength(evidences)
+    val scenes = sources.flatMapIndexed { index, source ->
+        val evidence = evidences[index]
+        when {
+            source.isImage -> listOf(TrailerScene(source, 0.0, source.weightedPhotoLength(clip)))
+            evidence == null -> emptyList()
+            else -> {
+                val sceneLength = min(clip, source.duration)
+                recommendedSourceStarts(source, evidence, clip).map { TrailerScene(source, it, sceneLength) }
+            }
+        }
+    }
+    return if (scenes.isEmpty()) null else TrailerRecommendation(clip, scenes)
+}
+
+internal fun recommendedTrailerDefaults(sources: List<TrailerSource>): TrailerDefaults {
+    val plan = recommendTrailerPlan(sources) ?: return TrailerDefaults(UNKNOWN_CLIP_SECONDS, 1.0)
+    // Not floored at 1s: a lone 0.4s video recommends exactly 0.4s. Above the 2h cap it is manual by design.
+    return TrailerDefaults(plan.clipLength, plan.total.coerceAtMost(MAX_TRAILER_TOTAL_SECONDS))
+}
+
+// The recommended plan is in effect exactly while the stored total and common clip still equal it (Apple
+// parity: |total - automaticTotal| < .0005). Any manual clip/total edit, or a music-length fit, makes this
+// null so trailerScenes keeps its explicit manual allocation/repetition semantics.
+internal fun automaticTrailerPlan(sources: List<TrailerSource>, total: Double, clipLength: Double): TrailerRecommendation? {
+    if (!total.isFinite() || !clipLength.isFinite()) return null
+    val plan = recommendTrailerPlan(sources) ?: return null
+    val planTotal = plan.total
+    return plan.takeIf {
+        planTotal in 0.0..MAX_TRAILER_TOTAL_SECONDS &&
+            abs(total - planTotal) < AUTOMATIC_TOTAL_TOLERANCE &&
+            abs(clipLength - it.clipLength) < AUTOMATIC_TOTAL_TOLERANCE
     }
 }
 
@@ -122,7 +239,11 @@ internal fun trailerScenes(
 ): List<TrailerScene> {
     if (sources.isEmpty() || !length.isFinite() || length <= 0 || !photoLength.isFinite() || photoLength <= 0 || !total.isFinite()) return emptyList()
 
-    val targetTotal = if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
+    val fitsMusicLength = musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0
+    // Unchanged recommended total + common clip: use the recommendation's own distinct cuts, no repeats.
+    if (!fitsMusicLength) automaticTrailerPlan(sources, total, length)?.let { return it.scenes }
+
+    val targetTotal = if (fitsMusicLength && musicTrack != null) {
         musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1)
     } else {
         total.coerceIn(1.0, 7200.0)
