@@ -44,7 +44,6 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -220,7 +219,7 @@ internal fun LocalPhotoLibraryCalendarScreen(
         val monthHeaderHeight = maxOf(44f, 24f * androidx.compose.ui.platform.LocalDensity.current.fontScale + 8f).dp
         Row(Modifier.fillMaxWidth().height(monthHeaderHeight), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             IconButton(modifier = Modifier.size(44.dp), onClick = { currentYearMonth = currentYearMonth.minusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "이전 달") }
-            androidx.compose.material3.TextButton(modifier = Modifier.height(monthHeaderHeight), onClick = { draftYear = currentYearMonth.year; draftMonth = currentYearMonth.monthValue; pickerVisible = true }) { Text("${currentYearMonth.year}년 ${currentYearMonth.monthValue}월", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
+            androidx.compose.material3.TextButton(modifier = Modifier.height(monthHeaderHeight), onClick = { draftYear = currentYearMonth.year; draftMonth = currentYearMonth.monthValue; pickerVisible = true }) { Text("${currentYearMonth.year}년 ${currentYearMonth.monthValue}월", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
             IconButton(modifier = Modifier.size(44.dp), onClick = { currentYearMonth = currentYearMonth.plusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "다음 달") }
         }
         CalendarMonthGrid(currentYearMonth, selectedDates, dateCounts, holidays, enabled = !selectionLoading, onSelectDate = ::toggleDate)
@@ -293,10 +292,10 @@ internal fun LocalPhotoLibraryCalendarScreen(
             text = {
                 Row(Modifier.fillMaxWidth().height(220.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f), state = androidx.compose.foundation.lazy.rememberLazyListState(initialFirstVisibleItemIndex = yearRange.indexOf(draftYear).coerceAtLeast(0))) {
-                        items(yearRange) { year -> androidx.compose.material3.TextButton(onClick = { draftYear = year }, modifier = Modifier.fillMaxWidth()) { Text("${year}년", fontWeight = if (year == draftYear) FontWeight.Bold else FontWeight.Normal) } }
+                        items(yearRange) { year -> androidx.compose.material3.TextButton(onClick = { draftYear = year }, modifier = Modifier.fillMaxWidth()) { Text("${year}년", fontWeight = if (year == draftYear) FontWeight.SemiBold else FontWeight.Normal) } }
                     }
                     androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f), state = androidx.compose.foundation.lazy.rememberLazyListState(initialFirstVisibleItemIndex = draftMonth - 1)) {
-                        items((1..12).toList()) { month -> androidx.compose.material3.TextButton(onClick = { draftMonth = month }, modifier = Modifier.fillMaxWidth()) { Text("${month}월", fontWeight = if (month == draftMonth) FontWeight.Bold else FontWeight.Normal) } }
+                        items((1..12).toList()) { month -> androidx.compose.material3.TextButton(onClick = { draftMonth = month }, modifier = Modifier.fillMaxWidth()) { Text("${month}월", fontWeight = if (month == draftMonth) FontWeight.SemiBold else FontWeight.Normal) } }
                     }
                 }
             },
@@ -456,7 +455,7 @@ private fun CalendarMediaThumbnailCell(
                     text = durationStr,
                     maxLines = 1,
                     color = Color.White,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Normal),
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .padding(2.dp)
@@ -469,12 +468,12 @@ private fun CalendarMediaThumbnailCell(
         if (isAlreadyInBasket) {
             Text(
                 text = "담김",
-                color = Color.White,
+                color = MaterialTheme.colorScheme.onPrimary,
                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold),
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(2.dp)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.8f), RoundedCornerShape(4.dp))
+                    .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
                     .padding(horizontal = 3.dp, vertical = 1.dp),
             )
         }
@@ -507,7 +506,7 @@ private fun CalendarActionText(label: String, enabled: Boolean, onClick: () -> U
     }
     androidx.compose.runtime.CompositionLocalProvider(androidx.compose.ui.platform.LocalViewConfiguration provides exactTarget) {
         Box(Modifier.size(44.dp).clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-            Text(label, fontSize = 13.sp, lineHeight = 16.sp, fontWeight = FontWeight.Normal, maxLines = 1,
+            Text(label, fontSize = 13.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1,
                 color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = .38f))
         }
     }

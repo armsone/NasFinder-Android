@@ -18,6 +18,7 @@ data class TrailerDraft(
     val autoDucking: Boolean = true,
     val output: File?,
     val showingSettings: Boolean = false,
+    val orderMode: String? = "추가순",
     val timestamp: Long = System.currentTimeMillis(),
 ) {
     val displayTitle: String get() {

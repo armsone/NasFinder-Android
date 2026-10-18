@@ -15,22 +15,30 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -63,7 +71,6 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -72,6 +79,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.lifecycle.Lifecycle
@@ -92,6 +100,9 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
+import com.armsone.nasfinder.ui.theme.LocalNasFinderTheme
+import com.armsone.nasfinder.ui.theme.folderColor
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
@@ -380,7 +391,35 @@ internal fun LocalPhotoLibraryScreen(
                     },
                     colors = TopAppBarDefaults.centerAlignedTopAppBarColors(),
                 )
-                androidx.compose.material3.ScrollableTabRow(
+                if (com.armsone.nasfinder.ui.theme.usesUnifiedLayout(com.armsone.nasfinder.ui.theme.LocalNasFinderTheme.current)) {
+                    // Approved 03-photos: compact photo-first filter pills (min 36, corner 8) over the same existing pages.
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(androidx.compose.foundation.rememberScrollState())
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        pages.forEachIndexed { index, (key, title) ->
+                            val active = pagerState.currentPage == index
+                            Box(
+                                Modifier.heightIn(min = 36.dp).widthIn(min = 64.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (active) com.armsone.nasfinder.ui.theme.themePalette().selected else MaterialTheme.colorScheme.surfaceVariant)
+                                    .selectable(selected = active, role = androidx.compose.ui.semantics.Role.Tab, onClick = { goToPage(key) })
+                                    .padding(horizontal = 14.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title,
+                                    maxLines = 1,
+                                    fontSize = 13.sp,
+                                    lineHeight = 18.sp,
+                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+                    }
+                } else androidx.compose.material3.ScrollableTabRow(
                     selectedTabIndex = pagerState.currentPage.coerceIn(0, pages.lastIndex),
                     modifier = Modifier.fillMaxWidth(),
                     edgePadding = 8.dp,
@@ -389,51 +428,68 @@ internal fun LocalPhotoLibraryScreen(
                         Tab(
                             selected = pagerState.currentPage == index,
                             onClick = { goToPage(key) },
-                            text = { Text(if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title, maxLines = 1, fontWeight = if (pagerState.currentPage == index) FontWeight.Bold else FontWeight.Normal) },
+                            text = { Text(if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title, maxLines = 1, fontWeight = if (pagerState.currentPage == index) FontWeight.SemiBold else FontWeight.Normal) },
                         )
                     }
                 }
             }
         },
         bottomBar = {
-            Column(
-                Modifier.fillMaxWidth().systemBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (copying) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Text("폰하드에 복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                BasketTray(
-                    selected = selected,
-                    items = deviceItems,
-                    enabled = !copying,
-                    onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
-                )
-                Text("${selected.size}개 선택됨", style = MaterialTheme.typography.bodyMedium)
-                val actionsEnabled = !loading && !copying && selected.isNotEmpty()
-                fun selectedUris() = selected.map(Uri::parse)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (onCopyToPhoneHard != null) {
-                        LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier.weight(1f)) {
-                            val uris = selectedUris()
-                            if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+            if (selected.isNotEmpty() || copying) {
+                Column(
+                    Modifier.fillMaxWidth().systemBarsPadding().padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (copying) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text("폰하드에 복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
                         }
                     }
-                    LocalMediaActionButton("영상 편집", actionsEnabled, Modifier.weight(1f)) {
-                        // Unified entry starts as a trailer; the editor switches modes inline.
-                        // An explicit music route keeps its original music-video start.
-                        if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
-                        else onCreateTrailer(selectedUris())
+                    BasketTray(
+                        selected = selected,
+                        items = deviceItems,
+                        enabled = !copying,
+                        onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "선택됨 ${selected.size}개",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(end = 4.dp),
+                        )
+                        Spacer(Modifier.weight(1f))
+                        val actionsEnabled = !loading && !copying && selected.isNotEmpty()
+                        fun selectedUris() = selected.map(Uri::parse)
+                        if (onCopyToPhoneHard != null) {
+                            LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier, isSecondary = true) {
+                                val uris = selectedUris()
+                                if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+                            }
+                        }
+                        LocalMediaActionButton("영상 편집", actionsEnabled, Modifier, isSecondary = false) {
+                            // Unified entry starts as a trailer; the editor switches modes inline.
+                            // An explicit music route keeps its original music-video start.
+                            if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
+                            else onCreateTrailer(selectedUris())
+                        }
                     }
                 }
             }
         },
     ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
-            androidx.compose.foundation.pager.HorizontalPager(
+        BoxWithConstraints(Modifier.fillMaxSize().padding(padding)) {
+            val isWide = maxWidth >= 840.dp
+            val sidePaneWidth = 260.dp
+            Row(Modifier.fillMaxSize()) {
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    androidx.compose.foundation.pager.HorizontalPager(
                 state = pagerState,
                 modifier = Modifier.fillMaxSize(),
                 key = { pages.getOrNull(it)?.first ?: it },
@@ -566,10 +622,54 @@ internal fun LocalPhotoLibraryScreen(
                         val revokedKeys = uris.map { canonicalKeyFor(it.toString()) }.toSet()
                         selected = selected.filterNot { canonicalKeyFor(it) in revokedKeys }
                     },
-                    onLaunchFallback = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
-                )
+                        onLaunchFallback = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                    )
+                }
             }
-            }
+        }
+    }
+                if (isWide && (selected.isNotEmpty() || copying)) {
+                    VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    Column(
+                        Modifier.width(sidePaneWidth).fillMaxHeight().background(MaterialTheme.colorScheme.surface).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "선택한 미디어 (${selected.size}개)",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        if (copying) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Text("복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                            BasketTray(
+                                selected = selected,
+                                items = deviceItems,
+                                enabled = !copying,
+                                onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
+                            )
+                        }
+                        val actionsEnabled = !loading && !copying && selected.isNotEmpty()
+                        fun selectedUris() = selected.map(Uri::parse)
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            LocalMediaActionButton("영상 편집", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = false) {
+                                if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
+                                else onCreateTrailer(selectedUris())
+                            }
+                            if (onCopyToPhoneHard != null) {
+                                LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
+                                    val uris = selectedUris()
+                                    if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -615,10 +715,7 @@ internal fun LocalPhotoLibraryScreen(
 /** Shared basket: the same ordered `selected` list the footer actions use; X removes only from the basket. */
 @Composable
 private fun BasketTray(selected: List<String>, items: List<LocalMediaItem>, enabled: Boolean, onRemove: (String) -> Unit) {
-    if (selected.isEmpty()) {
-        Text("여러 페이지에서 미디어를 골라 담으세요", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        return
-    }
+    if (selected.isEmpty()) return
     val context = LocalContext.current
     androidx.compose.foundation.lazy.LazyRow(
         Modifier.fillMaxWidth(),
@@ -650,15 +747,28 @@ private fun BasketTray(selected: List<String>, items: List<LocalMediaItem>, enab
 }
 
 @Composable
-private fun LocalMediaActionButton(label: String, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier.height(52.dp),
-        shape = MaterialTheme.shapes.medium,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-    ) {
-        Text(label, style = MaterialTheme.typography.labelLarge.copy(fontSize = 12.sp), textAlign = TextAlign.Center, minLines = 1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+private fun LocalMediaActionButton(label: String, enabled: Boolean, modifier: Modifier, isSecondary: Boolean = false, onClick: () -> Unit) {
+    if (isSecondary) {
+        OutlinedButton(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = modifier.heightIn(min = if (com.armsone.nasfinder.ui.theme.usesUnifiedLayout(com.armsone.nasfinder.ui.theme.LocalNasFinderTheme.current)) 44.dp else 32.dp),
+            shape = MaterialTheme.shapes.medium,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 7.dp),
+        ) {
+            Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center, minLines = 1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    } else {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            // Porcelain (03-photos proposal): action min 44; other themes keep 32.
+            modifier = modifier.heightIn(min = if (com.armsone.nasfinder.ui.theme.usesUnifiedLayout(com.armsone.nasfinder.ui.theme.LocalNasFinderTheme.current)) 44.dp else 32.dp),
+            shape = MaterialTheme.shapes.medium,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 7.dp),
+        ) {
+            Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center, minLines = 1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
     }
 }
 
@@ -692,24 +802,34 @@ internal fun LocalMediaThumbnail(
     var visibleItem by remember(item.uri) { mutableStateOf(item) }
     LaunchedEffect(item.uri) { visibleItem = loadCachedLocalMediaItem(context, item.uri) }
     val displayedItem = visibleItem
+    // iOS NasFinderPhotoGrid cell: corner 8; selected = graphite(folderBlue)×.16 cell fill, image scaled 0.86 with corner 9
+    // under a ×.18 overlay and 2.4pt border, and an 18pt check circle at the bottom-right (−5 / −6).
+    val selectionTint = folderColor(LocalNasFinderTheme.current)
+    val markSelected = showSelection && isSelected
     Box(
         modifier = Modifier
             .aspectRatio(1f)
-            .clip(RoundedCornerShape(10.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (markSelected) selectionTint.copy(alpha = .16f) else MaterialTheme.colorScheme.surfaceVariant)
             .combinedClickable(onClick = onTap, onLongClick = onLongPress),
     ) {
+        val imageModifier = if (markSelected) Modifier.fillMaxSize().graphicsLayer { scaleX = .86f; scaleY = .86f }.clip(RoundedCornerShape(9.dp)) else Modifier.fillMaxSize()
         displayedItem.thumbnail?.let { bitmap ->
             SkinAwareThumbnailImage(
                 bitmap = bitmap,
                 cacheIdentity = "local-media:${item.uri}",
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
+                modifier = imageModifier,
             )
         } ?: Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(modifier = Modifier.size(20.dp))
         }
+        if (markSelected) Box(
+            Modifier.fillMaxSize().graphicsLayer { scaleX = .86f; scaleY = .86f }
+                .background(selectionTint.copy(alpha = .18f), RoundedCornerShape(9.dp))
+                .border(2.4.dp, selectionTint, RoundedCornerShape(9.dp)),
+        )
         if (displayedItem.isMotionPhoto) Icon(Icons.Default.MotionPhotosOn, contentDescription = "모션 포토", modifier = Modifier.align(Alignment.BottomStart).background(Color.Black.copy(alpha = .6f), androidx.compose.foundation.shape.CircleShape).padding(3.dp).size(18.dp), tint = Color.White)
         if (displayedItem.isVideo) {
             Icon(
@@ -723,7 +843,7 @@ internal fun LocalMediaThumbnail(
                     formatLocalMediaDuration(durationMs),
                     maxLines = 1,
                     color = Color.White,
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Normal),
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .padding(4.dp)
@@ -733,18 +853,20 @@ internal fun LocalMediaThumbnail(
             }
         }
         if (showSelection) Box(
-            modifier = Modifier.align(Alignment.TopEnd).size(44.dp),
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 6.dp, bottom = 5.dp).size(18.dp)
+                .background(if (isSelected) selectionTint else Color.Black.copy(alpha = .4f), CircleShape)
+                .semantics {
+                    contentDescription = if (isSelected && selectionOrder != null) "${selectionOrder}번째 선택, 선택 해제" else if (isSelected) "선택 해제" else "선택"
+                },
             contentAlignment = Alignment.Center,
         ) {
-            if (isSelected && selectionOrder != null) {
-                Box(Modifier.size(24.dp).background(MaterialTheme.colorScheme.primary, CircleShape).semantics { contentDescription = "${selectionOrder}번째 선택, 선택 해제" }, contentAlignment = Alignment.Center) {
-                    Text(selectionOrder.toString(), color = MaterialTheme.colorScheme.onPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
-            } else Icon(
-                if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                contentDescription = if (isSelected) "선택 해제" else "선택",
-                tint = Color.White,
-                modifier = Modifier.size(22.dp).background(Color.Black.copy(alpha = .4f), CircleShape),
+            // The basket order number stays (Android basket); otherwise the iOS ✓ / ○ marks.
+            Text(
+                if (isSelected) selectionOrder?.toString() ?: "✓" else "○",
+                color = Color.White,
+                fontSize = if (isSelected && selectionOrder != null && selectionOrder > 9) 9.sp else 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
             )
         }
     }
@@ -1088,7 +1210,7 @@ private fun MediaSourcePageContent(
                                     MediaSourceViewMode.THUMBNAIL, MediaSourceViewMode.POSTER -> {
                                         val poster = viewMode == MediaSourceViewMode.POSTER
                                         LazyVerticalGrid(
-                                            columns = GridCells.Adaptive(if (poster) 158.dp else 104.dp),
+                                            columns = GridCells.Adaptive(sourceCellMinWidth(poster)),
                                             modifier = Modifier.fillMaxSize(),
                                             contentPadding = PaddingValues(if (poster) 12.dp else 8.dp),
                                             horizontalArrangement = Arrangement.spacedBy(if (poster) 12.dp else 6.dp),
@@ -1233,7 +1355,7 @@ private fun MediaSourcePageContent(
                                 else -> {
                                     val poster = viewMode == MediaSourceViewMode.POSTER
                                     LazyVerticalGrid(
-                                        columns = GridCells.Adaptive(if (poster) 158.dp else 104.dp),
+                                        columns = GridCells.Adaptive(sourceCellMinWidth(poster)),
                                         modifier = Modifier.fillMaxSize(),
                                         contentPadding = PaddingValues(if (poster) 12.dp else 8.dp),
                                         horizontalArrangement = Arrangement.spacedBy(if (poster) 12.dp else 6.dp),
@@ -1432,7 +1554,7 @@ private fun SourceTile(
         Text(
             title,
             style = if (poster) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelSmall,
-            fontWeight = if (poster) FontWeight.SemiBold else FontWeight.Normal,
+            fontWeight = FontWeight.Normal,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(top = if (poster) 2.dp else 4.dp),
@@ -1440,3 +1562,10 @@ private fun SourceTile(
         Text(subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
+
+/** Source-basket cells grow with the porcelain theme so covers and names stay readable on wide windows. */
+@Composable
+private fun sourceCellMinWidth(poster: Boolean) =
+    if (com.armsone.nasfinder.ui.theme.usesUnifiedLayout(com.armsone.nasfinder.ui.theme.LocalNasFinderTheme.current)) {
+        if (poster) 188.dp else 124.dp
+    } else if (poster) 158.dp else 104.dp

@@ -47,7 +47,7 @@ class MainActivity : ComponentActivity() {
             val updateState by appUpdateService.state.collectAsStateWithLifecycle()
             var ignoredUpdateVersion by rememberSaveable { mutableStateOf<Int?>(null) }
             var automaticDownloadEnabled by rememberSaveable { mutableStateOf(appUpdateService.automaticDownloadEnabled) }
-            NasFinderTheme(nasApplication.settings.theme()) {
+            NasFinderTheme(nasApplication.settings.theme(), nasApplication.settings.iconPack()) {
                 NasFinderApp(
                     model,
                     automaticDownloadEnabled,

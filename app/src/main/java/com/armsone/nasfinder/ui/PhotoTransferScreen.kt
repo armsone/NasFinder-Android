@@ -57,7 +57,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -877,7 +876,7 @@ private fun ReceiverTransferState(
                         tint = Color(0xff34a853),
                         modifier = Modifier.size(48.dp),
                     )
-                    Text("${peerTitle ?: "상대"} 기기와 연결되었습니다.", fontWeight = FontWeight.SemiBold)
+                    Text("${peerTitle ?: "상대"} 기기와 연결되었습니다.", fontWeight = FontWeight.Medium)
                     if (finished) {
                         Text(
                             "${results.size}개 받기 완료",
@@ -936,7 +935,7 @@ private fun SenderTransferState(
                         tint = Color(0xff34a853),
                         modifier = Modifier.size(48.dp),
                     )
-                    Text("$peerTitle 기기와 연결되었습니다.", fontWeight = FontWeight.SemiBold)
+                    Text("$peerTitle 기기와 연결되었습니다.", fontWeight = FontWeight.Medium)
                     when {
                         sentItemCount != null -> Text(
                             "${sentItemCount}개 보내기 완료",

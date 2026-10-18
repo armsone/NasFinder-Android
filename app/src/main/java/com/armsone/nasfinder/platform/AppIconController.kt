@@ -4,7 +4,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import com.armsone.nasfinder.model.AppTheme
 
 sealed interface AppIconChangeResult {
     val succeeded: Boolean
@@ -55,13 +54,6 @@ class AppIconController(context: Context) {
         LauncherAlias.NAS_RADAR to ComponentName(appContext, AppIconComponentContract.NAS_RADAR_ALIAS_CLASS),
         LauncherAlias.ENAMEL to ComponentName(appContext, AppIconComponentContract.ENAMEL_ALIAS_CLASS),
     )
-
-    /** Reconciles first-install/update state without touching MainActivity. */
-    fun restore(theme: AppTheme): AppIconChangeResult = applyTheme(theme)
-
-    fun applyTheme(theme: AppTheme): AppIconChangeResult {
-        return applyIcon(AppIconSwitchPolicy.iconFor(theme))
-    }
 
     fun applyIcon(requested: LauncherIconVariant): AppIconChangeResult {
         val result = synchronized(APP_ICON_LOCK) { applyIconLocked(requested) }

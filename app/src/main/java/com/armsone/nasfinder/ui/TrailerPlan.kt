@@ -168,12 +168,91 @@ internal fun automaticTrailerPlan(sources: List<TrailerSource>, total: Double, c
     }
 }
 
+object NaturalOrderComparator : Comparator<String> {
+    override fun compare(s1: String?, s2: String?): Int {
+        if (s1 == null && s2 == null) return 0
+        if (s1 == null) return -1
+        if (s2 == null) return 1
+        val collator = java.text.Collator.getInstance(java.util.Locale.KOREAN)
+        var i1 = 0
+        var i2 = 0
+        while (i1 < s1.length && i2 < s2.length) {
+            val c1 = s1[i1]
+            val c2 = s2[i2]
+            if (c1.isDigit() && c2.isDigit()) {
+                var j1 = i1
+                while (j1 < s1.length && s1[j1].isDigit()) j1++
+                var j2 = i2
+                while (j2 < s2.length && s2[j2].isDigit()) j2++
+
+                val numStr1 = s1.substring(i1, j1)
+                val numStr2 = s2.substring(i2, j2)
+
+                // Compare numeric values using BigInteger or Long fallback to avoid overflow
+                val diff = try {
+                    java.math.BigInteger(numStr1).compareTo(java.math.BigInteger(numStr2))
+                } catch (_: Exception) {
+                    numStr1.compareTo(numStr2)
+                }
+                if (diff != 0) return diff
+
+                // If numeric value is identical, compare leading zero count or representation length
+                if (numStr1.length != numStr2.length) {
+                    return numStr1.length.compareTo(numStr2.length)
+                }
+
+                i1 = j1
+                i2 = j2
+            } else {
+                var j1 = i1
+                while (j1 < s1.length && !s1[j1].isDigit()) j1++
+                var j2 = i2
+                while (j2 < s2.length && !s2[j2].isDigit()) j2++
+
+                val chunk1 = s1.substring(i1, j1)
+                val chunk2 = s2.substring(i2, j2)
+                val diff = collator.compare(chunk1, chunk2)
+                if (diff != 0) return diff
+
+                i1 = j1
+                i2 = j2
+            }
+        }
+        return s1.length.compareTo(s2.length)
+    }
+}
+
 data class TrailerScene(val source: TrailerSource, val start: Double, val length: Double)
 enum class TrailerFormat(val title: String, val width: Int, val height: Int) {
-    SQUARE("1:1", 1080, 1080), PORTRAIT("3:4", 1080, 1440), LANDSCAPE("4:3", 1440, 1080),
-    STORY("9:16", 1080, 1920), WIDE("16:9", 1920, 1080);
+    ORIGINAL("원본", 0, 0),
+    SQUARE("1:1", 1080, 1080),
+    PORTRAIT("3:4", 1080, 1440),
+    LANDSCAPE("4:3", 1440, 1080),
+    STORY("9:16", 1080, 1920),
+    WIDE("16:9", 1920, 1080);
+
+    // ORIGINAL follows the first video in the current source order (leading photos ignored), else the first photo.
+    // Source width/height are already display-oriented. Preview and export share this single resolution.
+    fun resolveDimensions(orderedSources: List<TrailerSource>): Pair<Int, Int> {
+        if (this != ORIGINAL) return width to height
+        val reference = orderedSources.firstOrNull { !it.isImage } ?: orderedSources.firstOrNull()
+        val srcW = reference?.width ?: 1920
+        val srcH = reference?.height ?: 1080
+        if (srcW <= 0 || srcH <= 0) return 1920 to 1080
+        val (w, h) = if (srcW >= srcH) {
+            val baseH = 1080
+            val calcW = ((1080.0 * srcW / srcH).roundToInt() / 2) * 2
+            calcW to baseH
+        } else {
+            val baseW = 1080
+            val calcH = ((1080.0 * srcH / srcW).roundToInt() / 2) * 2
+            baseW to calcH
+        }
+        return max(2, (w / 2) * 2) to max(2, (h / 2) * 2)
+    }
+
     companion object {
-        fun closest(width: Int, height: Int) = entries.minBy { abs(it.width.toDouble() / it.height - width.toDouble() / height.coerceAtLeast(1)) }
+        fun closest(width: Int, height: Int) = entries.filter { it != ORIGINAL }.minBy { abs(it.width.toDouble() / it.height - width.toDouble() / height.coerceAtLeast(1)) }
     }
 }
 
@@ -193,7 +272,7 @@ data class TrailerSession(
     val directory: File, val sources: List<TrailerSource> = emptyList(),
     val total: Double = 0.0, val clipLength: Double = 4.0,
     val photoClipLength: Double = defaultPhotoClipLength(clipLength, sources.any { !it.isImage }),
-    val format: TrailerFormat = TrailerFormat.WIDE,
+    val format: TrailerFormat = TrailerFormat.ORIGINAL,
     val output: File? = null, val busy: Boolean = true, val status: String = "영상을 준비하는 중…",
     val progress: Float? = null, val error: String? = null, val saved: Boolean = false,
     val isMusicOverlayMode: Boolean = false,
@@ -207,6 +286,7 @@ data class TrailerSession(
     val draftId: String? = null,
     // False while sources only carry the placeholder analysis of music mode (no highlight/photo ratio data).
     val highlightAnalyzed: Boolean = true,
+    val orderMode: String? = "추가순",
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
     // Music-overlay mode keeps every photo at a fixed 1s Ken Burns scene; trailer mode now weighs

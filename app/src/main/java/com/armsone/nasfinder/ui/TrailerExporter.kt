@@ -73,16 +73,18 @@ internal object TrailerExporter {
         musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
         musicFitCount: Int = 1,
         autoDucking: Boolean = true,
+        aspectSources: List<TrailerSource> = scenes.map { it.source },
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
         require(scenes.isNotEmpty()) { "이 장면 길이로 만들 수 있는 영상이 없습니다. 장면 길이를 줄여 주세요." }
         val totalClips = scenes.size
         val random = Random()
-        val presentation = Presentation.createForWidthAndHeight(format.width, format.height, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)
+        val (exportWidth, exportHeight) = format.resolveDimensions(aspectSources)
+        val presentation = Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)
 
         // Preprocess images at 60% resolution of output dimensions (even dimensions >= 2)
-        val targetWidth = ((kotlin.math.round(format.width * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
-        val targetHeight = ((kotlin.math.round(format.height * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
+        val targetWidth = ((kotlin.math.round(exportWidth * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
+        val targetHeight = ((kotlin.math.round(exportHeight * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
         val tempImages = mutableListOf<File>()
 
         val edited = try {

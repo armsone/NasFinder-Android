@@ -17,6 +17,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.time.Instant
@@ -160,52 +163,10 @@ internal fun LocalPhotoLibraryGrid(
     }
 
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            Box {
-                TextButton(onClick = { filterMenu = true }, enabled = !copying) { Text("필터") }
-                DropdownMenu(expanded = filterMenu, onDismissRequest = { filterMenu = false }) {
-                    DropdownMenuItem(text = { Text("전체") }, onClick = { onQueryChanged(query.copy(photos = true, motionPhotos = true, videos = true, durationMs = null)); filterMenu = false })
-                    listOf("사진" to query.photos, "모션 사진" to query.motionPhotos, "영상" to query.videos).forEachIndexed { index, (label, enabled) ->
-                        DropdownMenuItem(text = { Text(if (index == 1 && !motionPhotoSupported) "모션 사진 구분 불가" else "${if (enabled) "✓ " else ""}$label") }, enabled = index != 1 || motionPhotoSupported, onClick = {
-                            val flags = mutableListOf(query.photos, query.motionPhotos, query.videos)
-                            if (!flags[index] || flags.count { it } > 1) { flags[index] = !flags[index]; onQueryChanged(query.copy(photos = flags[0], motionPhotos = flags[1], videos = flags[2])) }
-                        })
-                    }
-                    HorizontalDivider()
-                    DropdownMenuItem(text = { Text(query.durationMs?.let { "영상 ${it / 1000}초 ${if (query.durationAtLeast) "이상" else "이하"}" } ?: "영상 시간 제한") }, onClick = {
-                        durationMinutes = ((query.durationMs ?: 60_000) / 60_000).toString(); durationSeconds = (((query.durationMs ?: 60_000) / 1000) % 60).toString(); durationAtLeast = query.durationAtLeast
-                        filterMenu = false; durationEditor = true
-                    })
-                    if (query.durationMs != null) DropdownMenuItem(text = { Text("시간 제한 해제") }, onClick = { clearDuration(); filterMenu = false })
-                    HorizontalDivider()
-                    listOf(true to "촬영일", false to "추가일").forEach { (capture, label) ->
-                        DropdownMenuItem(text = { Text("$label ${if (capture == query.captureSort) { if (query.ascending) "↑" else "↓" } else ""}") }, onClick = { onQueryChanged(query.copy(captureSort = capture, ascending = if (capture == query.captureSort) !query.ascending else true)); filterMenu = false })
-                    }
-                    HorizontalDivider()
-                    listOf(1, 3, 5, 8).forEach { count -> DropdownMenuItem(text = { Text("${if (columns == count) "✓ " else ""}${count}열") }, onClick = { columns = count; filterMenu = false }) }
-                    HorizontalDivider()
-                    DropdownMenuItem(text = { Text("표시한 항목 모두 선택") }, onClick = { onSetSelection(ordered.map { it.uri.toString() }, true); filterMenu = false }, enabled = ordered.isNotEmpty())
-                    if (onLoadMore != null) DropdownMenuItem(text = { Text("이전 사진·영상 더 보기") }, onClick = { onLoadMore(); filterMenu = false }, enabled = !loading)
-                }
-            }
-            TextButton(onClick = {
-                val selectedDates = media.filter { canonicalKey(it.uri.toString()) in selectedKeys }.mapNotNull(::day)
-                val dates = (dateCounts.keys + ordered.mapNotNull(::day)).toSet()
-                val target = if (selectedDates.isEmpty()) dates.minWithOrNull(compareBy<LocalDate> { abs(java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now().minusDays(1), it)) }.thenBy { it })
-                    else dates.filter { it < selectedDates.minOrNull()!! }.maxOrNull()
-                target?.let { navigate(it, true) }
-            }, enabled = !copying && !loading) { Text("전날") }
-            TextButton(onClick = {
-                val today = LocalDate.now()
-                val target = if (dateCounts.containsKey(today) || ordered.any { day(it) == today }) today else (dateCounts.keys + ordered.mapNotNull(::day)).maxOrNull()
-                if (target != null) { val select = todayArmed && target == today; navigate(target, select); todayArmed = target == today && !select }
-            }, enabled = !copying && !loading) { Text(if (todayArmed) "오늘 선택" else "오늘") }
-            TextButton(onClick = onClearDeviceSelection, enabled = !copying && selectedKeys.isNotEmpty()) { Text("해제") }
-            TextButton(onClick = onLaunchPicker, enabled = !copying) { Text("추가") }
-        }
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         Box(Modifier.fillMaxWidth().weight(1f).onSizeChanged { gridHeight = it.height }) {
-            LazyVerticalGrid(columns = GridCells.Fixed(columns), state = grid, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            // Collection insets: 12 left/right, 8 top/bottom now that floating overlay is replaced by compact toolbar row.
+            LazyVerticalGrid(columns = GridCells.Fixed(columns), state = grid, contentPadding = PaddingValues(start = 12.dp, top = 4.dp, end = 12.dp, bottom = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp), horizontalArrangement = Arrangement.spacedBy(2.dp),
                 modifier = Modifier.fillMaxSize().pointerInput(Unit) {
                     awaitEachGesture {
@@ -254,6 +215,54 @@ internal fun LocalPhotoLibraryGrid(
                 IconButton(onClick = { scope.launch { if (entries.isNotEmpty()) grid.animateScrollToItem(entries.lastIndex) } }, enabled = grid.canScrollForward) { Icon(Icons.Default.ArrowDownward, "맨 아래로") }
             }
         }
+        // Compact action toolbar: 44dp accessible height row outside the grid so actions never float over content.
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box {
+                CompactGridPill("필터", enabled = !copying) { filterMenu = true }
+                DropdownMenu(expanded = filterMenu, onDismissRequest = { filterMenu = false }) {
+                    DropdownMenuItem(text = { Text("전체") }, onClick = { onQueryChanged(query.copy(photos = true, motionPhotos = true, videos = true, durationMs = null)); filterMenu = false })
+                    listOf("사진" to query.photos, "모션 사진" to query.motionPhotos, "영상" to query.videos).forEachIndexed { index, (label, enabled) ->
+                        DropdownMenuItem(text = { Text(if (index == 1 && !motionPhotoSupported) "모션 사진 구분 불가" else "${if (enabled) "✓ " else ""}$label") }, enabled = index != 1 || motionPhotoSupported, onClick = {
+                            val flags = mutableListOf(query.photos, query.motionPhotos, query.videos)
+                            if (!flags[index] || flags.count { it } > 1) { flags[index] = !flags[index]; onQueryChanged(query.copy(photos = flags[0], motionPhotos = flags[1], videos = flags[2])) }
+                        })
+                    }
+                    HorizontalDivider()
+                    DropdownMenuItem(text = { Text(query.durationMs?.let { "영상 ${it / 1000}초 ${if (query.durationAtLeast) "이상" else "이하"}" } ?: "영상 시간 제한") }, onClick = {
+                        durationMinutes = ((query.durationMs ?: 60_000) / 60_000).toString(); durationSeconds = (((query.durationMs ?: 60_000) / 1000) % 60).toString(); durationAtLeast = query.durationAtLeast
+                        filterMenu = false; durationEditor = true
+                    })
+                    if (query.durationMs != null) DropdownMenuItem(text = { Text("시간 제한 해제") }, onClick = { clearDuration(); filterMenu = false })
+                    HorizontalDivider()
+                    listOf(true to "촬영일", false to "추가일").forEach { (capture, label) ->
+                        DropdownMenuItem(text = { Text("$label ${if (capture == query.captureSort) { if (query.ascending) "↑" else "↓" } else ""}") }, onClick = { onQueryChanged(query.copy(captureSort = capture, ascending = if (capture == query.captureSort) !query.ascending else true)); filterMenu = false })
+                    }
+                    HorizontalDivider()
+                    listOf(1, 3, 5, 8).forEach { count -> DropdownMenuItem(text = { Text("${if (columns == count) "✓ " else ""}${count}열") }, onClick = { columns = count; filterMenu = false }) }
+                    HorizontalDivider()
+                    DropdownMenuItem(text = { Text("표시한 항목 모두 선택") }, onClick = { onSetSelection(ordered.map { it.uri.toString() }, true); filterMenu = false }, enabled = ordered.isNotEmpty())
+                    if (onLoadMore != null) DropdownMenuItem(text = { Text("이전 사진·영상 더 보기") }, onClick = { onLoadMore(); filterMenu = false }, enabled = !loading)
+                }
+            }
+            CompactGridPill("전날", enabled = !copying && !loading) {
+                val selectedDates = media.filter { canonicalKey(it.uri.toString()) in selectedKeys }.mapNotNull(::day)
+                val dates = (dateCounts.keys + ordered.mapNotNull(::day)).toSet()
+                val target = if (selectedDates.isEmpty()) dates.minWithOrNull(compareBy<LocalDate> { abs(java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now().minusDays(1), it)) }.thenBy { it })
+                    else dates.filter { it < selectedDates.minOrNull()!! }.maxOrNull()
+                target?.let { navigate(it, true) }
+            }
+            CompactGridPill(if (todayArmed) "오늘 선택" else "오늘", enabled = !copying && !loading) {
+                val today = LocalDate.now()
+                val target = if (dateCounts.containsKey(today) || ordered.any { day(it) == today }) today else (dateCounts.keys + ordered.mapNotNull(::day)).maxOrNull()
+                if (target != null) { val select = todayArmed && target == today; navigate(target, select); todayArmed = target == today && !select }
+            }
+            CompactGridPill("해제", enabled = !copying && selectedKeys.isNotEmpty(), onClick = onClearDeviceSelection)
+            CompactGridPill("추가", enabled = !copying, onClick = onLaunchPicker)
+        }
     }
     if (durationEditor) AlertDialog(onDismissRequest = { durationEditor = false }, title = { Text("영상 시간 제한") }, text = {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -265,4 +274,37 @@ internal fun LocalPhotoLibraryGrid(
             Row { listOf(1, 3, 5, 10).forEach { minutes -> TextButton(onClick = { durationMinutes = minutes.toString(); durationSeconds = "0" }) { Text("${minutes}분") } } }
         }
     }, confirmButton = { TextButton(onClick = { applyDuration((durationMinutes.toLongOrNull() ?: 0) * 60 + (durationSeconds.toLongOrNull() ?: 0).coerceIn(0, 59)) }) { Text("적용") } }, dismissButton = { TextButton(onClick = { if (query.durationMs != null) clearDuration(); durationEditor = false }) { Text("제한 해제") } })
+}
+
+/** Compact accessible 44dp pill button for photo toolbar. */
+@Composable
+private fun CompactGridPill(title: String, enabled: Boolean, onClick: () -> Unit) {
+    val configuration = androidx.compose.ui.platform.LocalViewConfiguration.current
+    val exactTarget = remember(configuration) {
+        object : androidx.compose.ui.platform.ViewConfiguration by configuration {
+            override val minimumTouchTargetSize = androidx.compose.ui.unit.DpSize(44.dp, 44.dp)
+        }
+    }
+    val shape = RoundedCornerShape(8.dp)
+    CompositionLocalProvider(androidx.compose.ui.platform.LocalViewConfiguration provides exactTarget) {
+        Box(
+            Modifier
+                .heightIn(min = 44.dp)
+                .clip(shape)
+                .background(if (enabled) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .4f), shape)
+                .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = if (enabled) .6f else .25f), shape)
+                .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClickLabel = title, onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                title,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = .38f),
+                fontSize = 13.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+        }
+    }
 }

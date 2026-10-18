@@ -926,7 +926,7 @@ fun WebBrowserScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(download.filename, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                        Text(download.filename, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Normal)
                         if (download.total != null && download.total > 0) {
                             LinearProgressIndicator(
                                 progress = { (download.received.toFloat() / download.total).coerceIn(0f, 1f) },
@@ -1119,7 +1119,7 @@ fun WebBrowserScreen(
             Text(
                 if (selected.isImage) "이미지 메뉴" else "링크 메뉴",
                 style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
+                fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
             )
             Text(
@@ -1179,7 +1179,7 @@ fun WebBrowserScreen(
             Text(
                 "즐겨찾기",
                 style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
+                fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
             )
             if (favorites.isEmpty()) {

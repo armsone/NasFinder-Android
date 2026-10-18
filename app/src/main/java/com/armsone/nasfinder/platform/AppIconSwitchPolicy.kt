@@ -1,7 +1,5 @@
 package com.armsone.nasfinder.platform
 
-import com.armsone.nasfinder.model.AppTheme
-
 // User-visible order: Blue, Purple, Vibe Coder, Cyber Vault, NAS Radar.
 enum class LauncherIconVariant { DEFAULT, PURPLE_NAS, VIBE_CODER, CYBER_VAULT, NAS_RADAR, ENAMEL }
 
@@ -62,20 +60,12 @@ internal data class AliasMutation(
 
 /** Pure launcher policy kept separate from PackageManager for deterministic regression tests. */
 internal object AppIconSwitchPolicy {
-    fun iconFor(theme: AppTheme): LauncherIconVariant = when (theme) {
-        AppTheme.DIGITAL_RAIN -> LauncherIconVariant.VIBE_CODER
-        AppTheme.SKEUOMORPHIC -> LauncherIconVariant.ENAMEL
-        AppTheme.SYSTEM,
-        AppTheme.DAY,
-        AppTheme.NIGHT,
-        AppTheme.WINDY_MEADOW,
-        AppTheme.WORKBENCH,
-        -> LauncherIconVariant.DEFAULT
+    /** Icon an older version derived from its stored raw theme when no explicit icon was saved. */
+    fun legacyThemeIcon(rawTheme: String?): LauncherIconVariant = when (rawTheme) {
+        "SKEUOMORPHIC" -> LauncherIconVariant.ENAMEL
+        "DIGITAL_RAIN" -> LauncherIconVariant.VIBE_CODER
+        else -> LauncherIconVariant.DEFAULT
     }
-
-    fun restoredIcon(storedName: String?, legacyTheme: AppTheme): LauncherIconVariant =
-        storedName?.let { name -> LauncherIconVariant.entries.firstOrNull { it.name == name } }
-            ?: iconFor(legacyTheme)
 
     fun isApplied(state: LauncherAliasState, icon: LauncherIconVariant): Boolean {
         val target = icon.alias

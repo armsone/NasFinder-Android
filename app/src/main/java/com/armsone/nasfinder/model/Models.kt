@@ -91,18 +91,39 @@ enum class BrowserLayout { LIST, SMALL_GRID, LARGE_GRID }
 enum class SortField { NAME, KIND, SIZE, MODIFIED }
 enum class SortDirection { ASCENDING, DESCENDING }
 enum class NamePriority { NUMBERS_FIRST, KOREAN_FIRST, LATIN_FIRST }
-enum class AppTheme {
-    SYSTEM,
-    DAY,
-    NIGHT,
-    DIGITAL_RAIN,
-    WINDY_MEADOW,
-    WORKBENCH,
-    SKEUOMORPHIC;
+/**
+ * The six selectable colour themes in chooser order. [id] is the stored value. Every raw value written by an older
+ * version (SYSTEM, DAY, GRAPHITE_VERMILION, SKEUOMORPHIC, …) reads as [LIGHT]; nothing is rewritten on read.
+ */
+enum class AppTheme(val id: String, val title: String) {
+    LIGHT("light", "밝은"),
+    BKSTYLE("medium", "중간"),
+    NIGHT("dark", "어두운"),
+    JARVIS("jarvis", "자비스"),
+    FRIDAY("friday", "프라이데이"),
+    ULTRON("ultron", "울트론");
 
     val next: AppTheme
         get() = entries[(ordinal + 1) % entries.size]
+
+    companion object {
+        /** Former default name, kept readable for existing callers; it is simply the new default [LIGHT]. */
+        val SYSTEM: AppTheme get() = LIGHT
+
+        fun fromStored(raw: String?): AppTheme = when (raw) {
+            "light" -> LIGHT
+            "medium", "bkstyle" -> BKSTYLE
+            "dark", "night" -> NIGHT
+            "jarvis" -> JARVIS
+            "friday" -> FRIDAY
+            "ultron" -> ULTRON
+            else -> entries.firstOrNull { it.id == raw } ?: LIGHT
+        }
+    }
 }
+
+/** Interface glyph set, stored separately from [AppTheme] and from the launcher icon. */
+enum class InterfaceIconPack { SIMPLE, SOLID, DIMENSION, REALISTIC }
 
 data class BrowserPreferences(
     val layout: BrowserLayout = BrowserLayout.LIST,

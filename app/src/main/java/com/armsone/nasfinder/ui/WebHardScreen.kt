@@ -128,7 +128,8 @@ internal fun PhoneHardConnectionPanel(
     val configuration = LocalConfiguration.current
     val largeFont = configuration.fontScale >= 1.3f
     val theme = LocalNasFinderTheme.current
-    val enamel = theme == AppTheme.SKEUOMORPHIC
+    // The former BK Style enamel panel is no longer a selectable theme; every theme uses the standard panel.
+    val enamel = false
     val panelShape = RoundedCornerShape(16.dp)
     val fieldHeight = if (enamel) {
         if (largeFont) 48.dp else 40.dp
@@ -619,7 +620,6 @@ fun WebHardScreen(onClose: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        if (theme == AppTheme.SKEUOMORPHIC) PhoneHardMark(28.dp)
                         Text("폰하드")
                     }
                 },

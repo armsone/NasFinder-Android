@@ -21,6 +21,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.armsone.nasfinder.NasFinderApplication
 import com.armsone.nasfinder.model.AppTheme
+import com.armsone.nasfinder.model.InterfaceIconPack
 import com.armsone.nasfinder.model.BrowserPreferences
 import com.armsone.nasfinder.model.BrowserFavorite
 import com.armsone.nasfinder.model.BrowserUrlPolicy
@@ -86,6 +87,7 @@ data class AppState(
     val preferredId: String? = null,
     val screen: Screen = Screen.Dashboard,
     val theme: AppTheme = AppTheme.SYSTEM,
+    val iconPack: InterfaceIconPack = InterfaceIconPack.REALISTIC,
     val launcherIcon: LauncherIconVariant = LauncherIconVariant.DEFAULT,
     val pendingLauncherIcon: LauncherIconVariant? = null,
     val isBusy: Boolean = false,
@@ -96,6 +98,8 @@ data class AppState(
     val networkDownloadProgress: NetworkDownloadProgress? = null,
     val isDownloadingNetwork: Boolean = false,
     val initialInboxSubpath: String? = null,
+    val browserSelectRequest: BrowserSelectRequest? = null,
+    val homeFavoriteAction: HomeFavoriteAction? = null,
     val isLocalThumbnailRunning: Boolean = false,
     val localThumbnailProgress: Pair<Int, Int>? = null,
     val remoteFavorites: List<RemoteFavorite> = emptyList(),
@@ -260,6 +264,42 @@ enum class BuiltInPreviewKind { IMAGE, VIDEO, AUDIO, PDF }
 
 enum class LocalMediaEditIntent { NONE, TRAILER, MUSIC }
 
+/**
+ * 선택 chosen from the home favorite task panel: the folder [parentPath] of [connectionId] ("phonehard" for PhoneHard) opens
+ * and selects only the entry with [itemId] (remote item ID, PhoneHard file UUID or PhoneHard folder path) of the same kind.
+ */
+data class BrowserSelectRequest(
+    val connectionId: String,
+    val parentPath: String?,
+    val itemId: String,
+    val isDirectory: Boolean,
+    val name: String,
+)
+
+/**
+ * Home favorite hold-release task panel shown over the unchanged home screen. [favorite] is the immutable original entry and
+ * is only ever unregistered; file commands use the validated fresh [target] exclusively.
+ */
+data class HomeFavoriteAction(
+    val token: Long,
+    val favorite: RemoteFavorite,
+    val target: HomeFavoriteTarget,
+)
+
+sealed interface HomeFavoriteTarget {
+    data object Preparing : HomeFavoriteTarget
+    data class Remote(
+        val connection: RemoteConnection,
+        val parentPath: String,
+        val item: RemoteFileItem,
+        val preferences: BrowserPreferences,
+    ) : HomeFavoriteTarget
+    data class PhoneHardFolder(val folder: com.armsone.nasfinder.data.PhoneHardItem) : HomeFavoriteTarget
+    data class PhoneHardFile(val file: InboxDisplayItem) : HomeFavoriteTarget
+    /** File commands stay closed; only the original favorite's removal remains available. */
+    data class Unavailable(val reason: String) : HomeFavoriteTarget
+}
+
 /** Network browse launched from the 영상 만들기 PLUS menu; selected media returns to [returnScreen]'s basket. */
 data class MediaPickRequest(val returnScreen: Screen.LocalPhotoLibrary)
 data class MediaPickStaging(val current: Int, val total: Int, val name: String, val progress: Float? = null)
@@ -335,6 +375,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             connections = repository.load(),
             preferredId = repository.preferredId(),
             theme = settingsRepository.theme(),
+            iconPack = settingsRepository.iconPack(),
             launcherIcon = settingsRepository.icon(),
             screenAwakeMode = settingsRepository.screenAwakeMode(),
             superThumbnailHistory = loadSuperThumbnailHistory(),
@@ -423,10 +464,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         if (screen !is Screen.Browser && _state.value.mediaPick != null) {
             mediaPickJob?.cancel(); mediaPickJob = null
-            _state.update { it.copy(screen = screen, message = null, mediaPick = null, mediaPickStaging = null) }
+            _state.update { it.copy(screen = screen, message = null, mediaPick = null, mediaPickStaging = null, browserSelectRequest = null) }
             return
         }
-        _state.update { it.copy(screen = screen, message = null) }
+        _state.update { it.copy(screen = screen, message = null, browserSelectRequest = null) }
     }
 
     private var mediaPickJob: Job? = null
@@ -1622,6 +1663,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 screen = Screen.Browser(connection, path, emptyList(), preferences),
                 isBusy = true,
                 message = null,
+                browserSelectRequest = null,
                 remoteThumbnails = emptyMap(),
                 thumbnailGeneration = generation,
                 folderCountCache = emptyMap(),
@@ -1928,6 +1970,360 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(remoteFavorites = values) }
     }
 
+    /**
+     * Service owned by one home favorite action flow. It is created from the favorite's own connection and never shares,
+     * swaps or closes the browser's [service]. Every user (the visible panel/pickers flow, the background lookup and each
+     * deferred command) holds a lease; the service closes only after the last lease is released.
+     */
+    private class FavoriteActionServiceOwner(val connection: RemoteConnection, val service: RemoteFileService) {
+        private var leases = 1
+        private var closed = false
+
+        @Synchronized fun acquire(): Boolean {
+            if (closed) return false
+            leases++
+            return true
+        }
+
+        /** Returns true exactly once, when this release ended the last lease and the caller must close [service]. */
+        @Synchronized fun release(): Boolean {
+            if (closed) return false
+            leases--
+            if (leases > 0) return false
+            closed = true
+            return true
+        }
+
+        @Synchronized fun forceClose(): Boolean {
+            if (closed) return false
+            closed = true
+            return true
+        }
+    }
+
+    private var homeFavoriteToken = 0L
+    private var homeFavoritePrepJob: Job? = null
+    /** UI lease of the current home flow's owner; null while preparing, for PhoneHard and for unavailable targets. */
+    private var homeFavoriteOwner: FavoriteActionServiceOwner? = null
+    private val liveFavoriteOwners = java.util.Collections.synchronizedSet(mutableSetOf<FavoriteActionServiceOwner>())
+
+    private fun createFavoriteActionOwner(connection: RemoteConnection): FavoriteActionServiceOwner {
+        check(_state.value.connections.any { it.id == connection.id }) {
+            "연결 정보를 찾을 수 없습니다. 연결을 다시 연 뒤 시도해 주세요."
+        }
+        val credential = repository.credentials.read(connection.id)
+        val needsStoredToken = connection.kind == com.armsone.nasfinder.model.ConnectionKind.DROPBOX ||
+            connection.kind == com.armsone.nasfinder.model.ConnectionKind.ONEDRIVE ||
+            connection.kind == com.armsone.nasfinder.model.ConnectionKind.GOOGLE_DRIVE
+        check(!needsStoredToken || !credential.isNullOrBlank()) {
+            "${connection.name}의 저장된 로그인 정보를 읽을 수 없습니다. 다시 로그인한 뒤 시도해 주세요."
+        }
+        return FavoriteActionServiceOwner(connection, RemoteFileServiceFactory.create(connection, credential.orEmpty()))
+            .also { liveFavoriteOwners.add(it) }
+    }
+
+    private fun releaseFavoriteOwner(owner: FavoriteActionServiceOwner) {
+        if (!owner.release()) return
+        liveFavoriteOwners.remove(owner)
+        viewModelScope.launch(Dispatchers.IO + NonCancellable) { runCatching { owner.service.close() } }
+    }
+
+    /** Runs [block] with a fresh lease on [previous] or, once that flow has fully closed, with a new owner of its connection. */
+    private fun withRenewedFavoriteOwner(previous: FavoriteActionServiceOwner, block: (FavoriteActionServiceOwner) -> Unit) {
+        if (previous.acquire()) {
+            block(previous)
+            return
+        }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { createFavoriteActionOwner(previous.connection) } }
+                .onSuccess(block)
+                .onFailure { error -> _state.update { it.copy(message = error.message ?: "원격 연결을 다시 열 수 없습니다.") } }
+        }
+    }
+
+    /**
+     * Long-press-release on a home favorite: shows the standard item task panel over the unchanged home screen. Screen,
+     * history, browser path and the browser's own [service] are never touched; the containing folder is only listed in the
+     * background by a dedicated owner to validate the fresh current target (same connection, ID and kind).
+     */
+    fun openFavoriteActions(favorite: RemoteFavorite) {
+        endFavoriteActions()
+        val token = ++homeFavoriteToken
+        _state.update { it.copy(homeFavoriteAction = HomeFavoriteAction(token, favorite, HomeFavoriteTarget.Preparing)) }
+        if (favorite.connectionId == "phonehard") {
+            prepareHomePhoneHardFavorite(token, favorite)
+            return
+        }
+        val connection = _state.value.connections.firstOrNull { it.id == favorite.connectionId }
+        if (connection == null) {
+            setHomeFavoriteTarget(token, HomeFavoriteTarget.Unavailable("이 즐겨찾기의 네트워크 연결을 찾을 수 없습니다."))
+            return
+        }
+        val parent = remoteParentPath(favorite.path, connection.normalizedRootPath)
+        if (parent == null) {
+            setHomeFavoriteTarget(token, HomeFavoriteTarget.Unavailable("연결의 최상위 폴더 즐겨찾기는 파일 작업을 쓸 수 없습니다."))
+            return
+        }
+        val preferences = repository.browserPreferences()
+        homeFavoritePrepJob = viewModelScope.launch {
+            var created: FavoriteActionServiceOwner? = null
+            try {
+                val items = withContext(Dispatchers.IO) {
+                    val owner = createFavoriteActionOwner(connection)
+                    created = owner
+                    owner.service.list(parent)
+                }
+                // A favorite holding a remote ID binds only to the fresh item with that same ID and kind (its current path/name
+                // may differ after a rename); an ID-less legacy favorite binds only to the exact path and kind. No other fallback.
+                val itemId = favorite.remoteItemId?.takeIf { it.isNotBlank() }
+                val target = if (itemId != null) {
+                    items.firstOrNull { it.id == itemId && it.isDirectory == favorite.isDirectory }
+                } else {
+                    items.firstOrNull { it.path == favorite.path && it.isDirectory == favorite.isDirectory }
+                }
+                if (token != homeFavoriteToken) return@launch
+                if (target == null) {
+                    setHomeFavoriteTarget(token, HomeFavoriteTarget.Unavailable("‘${favorite.name}’ 항목을 원래 폴더에서 찾을 수 없습니다."))
+                } else {
+                    homeFavoriteOwner = created
+                    created = null
+                    setHomeFavoriteTarget(token, HomeFavoriteTarget.Remote(connection, parent, target, preferences))
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (token == homeFavoriteToken) {
+                    setHomeFavoriteTarget(token, HomeFavoriteTarget.Unavailable(error.message ?: "즐겨찾기 항목을 확인하지 못했습니다."))
+                }
+            } finally {
+                created?.let(::releaseFavoriteOwner)
+            }
+        }
+    }
+
+    private fun prepareHomePhoneHardFavorite(token: Long, favorite: RemoteFavorite) {
+        homeFavoritePrepJob = viewModelScope.launch {
+            val path = favorite.path.trim().removePrefix("/").removeSuffix("/")
+            val parent = path.substringBeforeLast('/', "").ifEmpty { null }
+            // Same main-thread read as refreshInbox(); only the folder listing below runs on IO.
+            val loadedFiles = runCatching { inboxFiles() }
+            val resolved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val files = loadedFiles.getOrThrow()
+                    // Folders have no stable ID: they keep the explicit legacy folder-path branch. For files a VALID canonical UUID
+                    // is recognised first and binds UUID-only, even when the stored path happens to equal that UUID text. Only a
+                    // blank ID or the legacy serialized form (`id ?: norm`, i.e. the ID equals the normalized path) may bind by
+                    // exact relative path; any other non-UUID ID fails closed.
+                    val rawFileId = favorite.remoteItemId
+                    val fileUuid = rawFileId?.takeIf { it.isNotBlank() }?.let { raw ->
+                        runCatching { UUID.fromString(raw) }.getOrNull()?.takeIf { it.toString() == raw.lowercase() }
+                    }
+                    val legacyPathKeyed = fileUuid == null &&
+                        (rawFileId.isNullOrBlank() || rawFileId.trim().removePrefix("/").removeSuffix("/") == path)
+                    val target: HomeFavoriteTarget? = if (favorite.isDirectory) {
+                        inboxStore.listPhoneHardFolder(parent)
+                            .firstOrNull { it.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY && it.relativePath == path }
+                            ?.let { HomeFavoriteTarget.PhoneHardFolder(it) }
+                    } else if (fileUuid != null) {
+                        files.firstOrNull { it.id == fileUuid }?.let { HomeFavoriteTarget.PhoneHardFile(it) }
+                    } else if (legacyPathKeyed) {
+                        files.firstOrNull { it.relativePath == path }?.let { HomeFavoriteTarget.PhoneHardFile(it) }
+                    } else {
+                        null
+                    }
+                    files to target
+                }
+            }
+            if (token != homeFavoriteToken) return@launch
+            resolved.onSuccess { (files, target) ->
+                _state.update { it.copy(inboxFiles = files) }
+                setHomeFavoriteTarget(
+                    token,
+                    target ?: HomeFavoriteTarget.Unavailable("‘${favorite.name}’ 항목을 폰하드에서 찾을 수 없습니다."),
+                )
+            }.onFailure { error ->
+                setHomeFavoriteTarget(token, HomeFavoriteTarget.Unavailable(error.message ?: "폰하드 항목을 확인하지 못했습니다."))
+            }
+        }
+    }
+
+    private fun setHomeFavoriteTarget(token: Long, target: HomeFavoriteTarget) {
+        _state.update { current ->
+            val action = current.homeFavoriteAction
+            if (action == null || action.token != token) current
+            else current.copy(homeFavoriteAction = action.copy(target = target))
+        }
+    }
+
+    /**
+     * Ends the home favorite flow [token] (or the current one): the panel/picker UI lease is released, so the dedicated
+     * service closes now unless a deferred command still holds its own lease. The home screen itself is never changed.
+     */
+    fun endFavoriteActions(token: Long? = null) {
+        if (token != null && token != homeFavoriteToken) return
+        homeFavoritePrepJob?.cancel()
+        homeFavoritePrepJob = null
+        homeFavoriteOwner?.let(::releaseFavoriteOwner)
+        homeFavoriteOwner = null
+        _state.update {
+            if (it.homeFavoriteAction == null || (token != null && it.homeFavoriteAction.token != token)) it
+            else it.copy(homeFavoriteAction = null)
+        }
+    }
+
+    private fun homeRemoteTarget(token: Long): HomeFavoriteTarget.Remote? =
+        _state.value.homeFavoriteAction?.takeIf { it.token == token }?.target as? HomeFavoriteTarget.Remote
+
+    /** A command lease on the current flow's owner, or null (with a message) when the flow is no longer current. */
+    private fun leaseHomeFavoriteOwner(token: Long): FavoriteActionServiceOwner? {
+        val owner = homeFavoriteOwner?.takeIf { token == homeFavoriteToken && it.acquire() }
+        if (owner == null) _state.update { it.copy(message = "즐겨찾기 작업이 끝났습니다. 다시 길게 눌러 주세요.") }
+        return owner
+    }
+
+    fun showMessage(message: String) {
+        _state.update { it.copy(message = message) }
+    }
+
+    /** 선택: opens the fresh target's own folder (an explicit command, never the hold itself) with only that entry selected. */
+    fun homeFavoriteSelect(token: Long) {
+        val action = _state.value.homeFavoriteAction?.takeIf { it.token == token } ?: return
+        when (val target = action.target) {
+            is HomeFavoriteTarget.Remote -> {
+                endFavoriteActions(token)
+                openConnection(target.connection, target.parentPath)
+                _state.update {
+                    it.copy(browserSelectRequest = BrowserSelectRequest(target.connection.id, target.parentPath, target.item.id, target.item.isDirectory, target.item.name))
+                }
+            }
+            is HomeFavoriteTarget.PhoneHardFolder -> selectInPhoneHard(token, target.folder.relativePath, target.folder.relativePath, true, target.folder.name)
+            is HomeFavoriteTarget.PhoneHardFile -> selectInPhoneHard(token, target.file.id.toString(), target.file.relativePath, false, target.file.originalFilename)
+            else -> Unit
+        }
+    }
+
+    private fun selectInPhoneHard(token: Long, itemId: String, relativePath: String, isDirectory: Boolean, name: String) {
+        val parent = relativePath.trim().removePrefix("/").removeSuffix("/").substringBeforeLast('/', "").ifEmpty { null }
+        endFavoriteActions(token)
+        show(Screen.Inbox)
+        _state.update {
+            it.copy(initialInboxSubpath = parent, browserSelectRequest = BrowserSelectRequest("phonehard", parent, itemId, isDirectory, name))
+        }
+    }
+
+    /** Drops [request] only if it is still the pending one, so a newer request is never cleared by an older browser. */
+    fun consumeBrowserSelectRequest(request: BrowserSelectRequest, missingMessage: String? = null) {
+        _state.update {
+            if (it.browserSelectRequest !== request) it
+            else it.copy(browserSelectRequest = null, message = missingMessage ?: it.message)
+        }
+    }
+
+    /** 복사/이동: the existing destination flow is the browser, so this explicit command opens the target's folder with it pending. */
+    fun homeFavoriteBeginTransfer(token: Long, action: RemoteTransferAction) {
+        val target = homeRemoteTarget(token) ?: return
+        endFavoriteActions(token)
+        openConnection(target.connection, target.parentPath)
+        _state.update {
+            it.copy(
+                pendingTransfer = PendingRemoteTransfer(target.connection.id, listOf(target.item), action),
+                pendingInboxUpload = null,
+            )
+        }
+    }
+
+    fun homeFavoriteRename(token: Long, newName: String) {
+        val target = homeRemoteTarget(token) ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        runHomeFavoriteMutation(owner, "이름을 변경했습니다.") { it.rename(target.item, newName.trim()) }
+    }
+
+    fun homeFavoriteDelete(token: Long) {
+        val target = homeRemoteTarget(token) ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        runHomeFavoriteMutation(owner, if (target.item.isDirectory) "폴더를 삭제했습니다." else "파일을 삭제했습니다.") {
+            it.delete(listOf(target.item))
+        }
+    }
+
+    /** Runs a mutation on the leased owner service; the browser's listing/service stay untouched and the lease always ends. */
+    private fun runHomeFavoriteMutation(
+        owner: FavoriteActionServiceOwner,
+        successMessage: String,
+        operation: suspend (RemoteFileService) -> Unit,
+    ) {
+        viewModelScope.launch {
+            try {
+                _state.update { it.copy(isBusy = true, message = null) }
+                val result = withContext(Dispatchers.IO) {
+                    try {
+                        Result.success(operation(owner.service))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Result.failure(error)
+                    }
+                }
+                _state.update {
+                    it.copy(isBusy = false, message = result.exceptionOrNull()?.let { error -> error.message ?: "원격 파일 작업을 완료하지 못했습니다." } ?: successMessage)
+                }
+            } finally {
+                releaseFavoriteOwner(owner)
+            }
+        }
+    }
+
+    fun homeFavoriteShare(token: Long) {
+        val target = homeRemoteTarget(token) ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        shareRemoteItems(target.connection, listOf(target.item), onFinished = { releaseFavoriteOwner(owner) }) { block -> block(owner.service) }
+    }
+
+    fun homeFavoriteDownload(token: Long, destination: NetworkDownloadDestination) {
+        val target = homeRemoteTarget(token) ?: return
+        downloadRemoteItems(target.connection, listOf(target.item), destination)
+    }
+
+    fun homeFavoriteTrailer(token: Long) {
+        val target = homeRemoteTarget(token) ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        startRemoteTrailer(listOf(target.item), owner.service, owner)
+    }
+
+    fun homeFavoriteMusicOverlay(token: Long) {
+        val target = homeRemoteTarget(token) ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        startRemoteMusicOverlay(listOf(target.item), null, activeService = owner.service, owner = owner)
+    }
+
+    /** Checks the folder target for subfolders on the owner service; [onResult] runs only while flow [token] is current. */
+    fun homeFavoriteCheckSubfolders(token: Long, onResult: (Boolean) -> Unit, onFailure: () -> Unit) {
+        val target = homeRemoteTarget(token)?.takeIf { it.item.isDirectory } ?: return onFailure()
+        val owner = leaseHomeFavoriteOwner(token) ?: return onFailure()
+        checkRemoteFolderHasSubfolders(
+            folder = target.item,
+            connection = target.connection,
+            preferences = target.preferences,
+            serviceFor = { owner.service },
+            isStillCurrent = { token == homeFavoriteToken },
+            onFinished = { releaseFavoriteOwner(owner) },
+            onFailure = onFailure,
+            onResult = onResult,
+        )
+    }
+
+    fun homeFavoriteFolderTrailer(token: Long, includeSubfolders: Boolean) {
+        val target = homeRemoteTarget(token)?.takeIf { it.item.isDirectory } ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        startRemoteFolderTrailer(target.item, includeSubfolders, target.connection, target.preferences, owner)
+    }
+
+    fun homeFavoriteFolderMusicOverlay(token: Long, includeSubfolders: Boolean) {
+        val target = homeRemoteTarget(token)?.takeIf { it.item.isDirectory } ?: return
+        val owner = leaseHomeFavoriteOwner(token) ?: return
+        startRemoteFolderMusicOverlay(target.item, includeSubfolders, target.connection, target.preferences, owner)
+    }
+
     private fun invalidateFavoriteThumbnails() {
         favoriteThumbnailGeneration++
         favoriteThumbnailJobs.values.forEach { it.cancel() }
@@ -2151,49 +2547,63 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val browser = _state.value.screen as? Screen.Browser ?: return
         // Captured up front so a later connection switch cannot redirect this share.
         val connection = browser.connection
+        shareRemoteItems(connection, items) { block -> withDedicatedRemoteService(connection, block) }
+    }
+
+    /** Shares [items] of [connection] using the service lent by [withService]; [onFinished] runs once the share is prepared or failed. */
+    private fun shareRemoteItems(
+        connection: RemoteConnection,
+        items: List<RemoteFileItem>,
+        onFinished: () -> Unit = {},
+        withService: suspend (suspend (RemoteFileService) -> List<File>) -> List<File>,
+    ) {
         val selected = items.distinctBy(RemoteFileItem::id)
         val hasDirectory = selected.any(RemoteFileItem::isDirectory)
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = if (hasDirectory) "공유 항목을 압축하는 중입니다…" else null) }
-            // Folder or mixed selection: package all into ONE isolated unique zip
-            val zipFile = if (hasDirectory) {
-                val sharesDir = File(application.cacheDir, "shares").apply { mkdirs() }
-                File(sharesDir, "remote_share_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.zip")
-            } else null
-            val result = runCatching {
-                val prepared = withContext(Dispatchers.IO) {
-                    withDedicatedRemoteService(connection) { ownService ->
-                        if (zipFile == null) {
-                            selected.map { item ->
-                                downloadCache.resolve(
-                                    connectionId = connection.id,
-                                    item = item,
-                                    progress = { _, _ -> },
-                                    download = { destination, progress -> ownService.download(item, destination, progress) },
-                                )
+            try {
+                _state.update { it.copy(isBusy = true, message = if (hasDirectory) "공유 항목을 압축하는 중입니다…" else null) }
+                // Folder or mixed selection: package all into ONE isolated unique zip
+                val zipFile = if (hasDirectory) {
+                    val sharesDir = File(application.cacheDir, "shares").apply { mkdirs() }
+                    File(sharesDir, "remote_share_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.zip")
+                } else null
+                val result = runCatching {
+                    val prepared = withContext(Dispatchers.IO) {
+                        withService { ownService ->
+                            if (zipFile == null) {
+                                selected.map { item ->
+                                    downloadCache.resolve(
+                                        connectionId = connection.id,
+                                        item = item,
+                                        progress = { _, _ -> },
+                                        download = { destination, progress -> ownService.download(item, destination, progress) },
+                                    )
+                                }
+                            } else {
+                                writeRemoteShareZip(connection, ownService, selected, zipFile)
+                                listOf(zipFile)
                             }
-                        } else {
-                            writeRemoteShareZip(connection, ownService, selected, zipFile)
-                            listOf(zipFile)
                         }
                     }
+                    val shareIntent = if (prepared.size == 1) {
+                        NasFinderShareIntentFactory.create(application, prepared)
+                    } else {
+                        NasFinderShareIntentFactory.createMultiple(application, prepared)
+                    }
+                    application.startActivity(
+                        Intent.createChooser(shareIntent, if (zipFile != null) "압축 파일 공유" else "파일 공유")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
                 }
-                val shareIntent = if (prepared.size == 1) {
-                    NasFinderShareIntentFactory.create(application, prepared)
-                } else {
-                    NasFinderShareIntentFactory.createMultiple(application, prepared)
+                if (result.isFailure) zipFile?.delete()
+                _state.update {
+                    it.copy(
+                        isBusy = false,
+                        message = result.exceptionOrNull()?.let { error -> error.message ?: "선택한 항목을 공유하지 못했습니다." },
+                    )
                 }
-                application.startActivity(
-                    Intent.createChooser(shareIntent, if (zipFile != null) "압축 파일 공유" else "파일 공유")
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            if (result.isFailure) zipFile?.delete()
-            _state.update {
-                it.copy(
-                    isBusy = false,
-                    message = result.exceptionOrNull()?.let { error -> error.message ?: "선택한 항목을 공유하지 못했습니다." },
-                )
+            } finally {
+                onFinished()
             }
         }
     }
@@ -2996,6 +3406,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    fun setIconPack(pack: InterfaceIconPack) {
+        settingsRepository.setIconPack(pack)
+        _state.update { it.copy(iconPack = pack) }
+    }
+
     fun setLauncherIcon(icon: LauncherIconVariant) {
         if (_state.value.pendingLauncherIcon != null || _state.value.launcherIcon == icon) return
         _state.update { it.copy(pendingLauncherIcon = icon, message = null) }
@@ -3374,42 +3789,69 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (!folder.isDirectory) return
         val browser = _state.value.screen as? Screen.Browser ?: return
         val activeConnection = browser.connection
+        checkRemoteFolderHasSubfolders(
+            folder = folder,
+            connection = activeConnection,
+            preferences = browser.preferences,
+            serviceFor = { browserServiceFor(activeConnection) },
+            isStillCurrent = { (_state.value.screen as? Screen.Browser)?.connection?.id == activeConnection.id },
+            onResult = onResult,
+        )
+    }
+
+    /** The browser's own lazily reopened [service]; only browser-originated commands use it. */
+    private fun browserServiceFor(connection: RemoteConnection): RemoteFileService = service ?: run {
+        val credential = repository.credentials.read(connection.id).orEmpty()
+        RemoteFileServiceFactory.create(connection, credential).also { service = it }
+    }
+
+    private fun checkRemoteFolderHasSubfolders(
+        folder: RemoteFileItem,
+        connection: RemoteConnection,
+        preferences: BrowserPreferences,
+        serviceFor: () -> RemoteFileService,
+        isStillCurrent: () -> Boolean,
+        onFinished: () -> Unit = {},
+        onFailure: () -> Unit = {},
+        onResult: (hasSubfolders: Boolean) -> Unit,
+    ) {
         val requestedPath = folder.path
-        val preferencesSnapshot = browser.preferences
+        val preferencesSnapshot = preferences
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, message = null) }
-            val checkResult = withContext(Dispatchers.IO) {
-                try {
-                    val activeService = service ?: run {
-                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
-                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+            val checkResult = try {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val activeService = serviceFor()
+                        val rawEntries = activeService.list(requestedPath)
+                        val visibleChildFolders = rawEntries.filter { entry ->
+                            if (!entry.isDirectory) return@filter false
+                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") return@filter false
+                            val normEntryPath = entry.path.trimEnd('/')
+                            val normReqPath = requestedPath.trimEnd('/')
+                            if (normEntryPath == normReqPath) return@filter false
+                            if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) return@filter false
+                            true
+                        }
+                        Result.success(visibleChildFolders.isNotEmpty())
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        Result.failure(e)
                     }
-                    val rawEntries = activeService.list(requestedPath)
-                    val visibleChildFolders = rawEntries.filter { entry ->
-                        if (!entry.isDirectory) return@filter false
-                        if (entry.name.isBlank() || entry.name == "." || entry.name == "..") return@filter false
-                        val normEntryPath = entry.path.trimEnd('/')
-                        val normReqPath = requestedPath.trimEnd('/')
-                        if (normEntryPath == normReqPath) return@filter false
-                        if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) return@filter false
-                        true
-                    }
-                    Result.success(visibleChildFolders.isNotEmpty())
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    Result.failure(e)
                 }
+            } finally {
+                onFinished()
             }
             _state.update { it.copy(isBusy = false) }
-            val currentBrowser = _state.value.screen as? Screen.Browser
-            if (currentBrowser == null || currentBrowser.connection.id != activeConnection.id) {
+            if (!isStillCurrent()) {
                 return@launch
             }
             checkResult.onSuccess { hasSubfolders ->
                 onResult(hasSubfolders)
             }.onFailure { error ->
                 _state.update { it.copy(message = error.message ?: "폴더 내용을 불러오지 못했습니다.") }
+                onFailure()
             }
         }
     }
@@ -3443,103 +3885,158 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun startRemoteFolderTrailer(folder: RemoteFileItem, includeSubfolders: Boolean = false) {
         if (!folder.isDirectory) return
         val browser = _state.value.screen as? Screen.Browser ?: return
-        val activeConnection = browser.connection
-        val preferencesSnapshot = browser.preferences
+        startRemoteFolderTrailer(folder, includeSubfolders, browser.connection, browser.preferences, owner = null)
+    }
+
+    /**
+     * Collects [folder]'s media and stages it into a trailer. With [owner] (a held lease) every listing and download uses the
+     * owner's service and the lease ends when staging finishes; without it the browser's own [service] is used as before.
+     */
+    private fun startRemoteFolderTrailer(
+        folder: RemoteFileItem,
+        includeSubfolders: Boolean,
+        activeConnection: RemoteConnection,
+        preferencesSnapshot: BrowserPreferences,
+        owner: FavoriteActionServiceOwner?,
+    ) {
+        if (!folder.isDirectory) {
+            owner?.let(::releaseFavoriteOwner)
+            return
+        }
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = null) }
-            val (mediaCandidates, skippedCount) = withContext(Dispatchers.IO) {
-                try {
-                    val activeService = service ?: run {
-                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
-                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
-                    }
-                    val media = mutableListOf<RemoteFileItem>()
-                    var nonMediaCount = 0
-                    if (includeSubfolders) {
-                        val queue = java.util.ArrayDeque<String>()
-                        val visitedPaths = mutableSetOf<String>()
-                        queue.add(folder.path)
-                        visitedPaths.add(folder.path.trimEnd('/'))
-                        while (queue.isNotEmpty()) {
-                            val currentPath = queue.removeFirst()
-                            val entries = activeService.list(currentPath)
-                            for (entry in entries) {
-                                if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
-                                if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
-                                val normPath = entry.path.trimEnd('/')
-                                if (entry.isDirectory) {
-                                    if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
-                                        queue.add(entry.path)
+            var stagingOwner = owner
+            try {
+                _state.update { it.copy(isBusy = true, message = null) }
+                val (mediaCandidates, skippedCount) = withContext(Dispatchers.IO) {
+                    try {
+                        val activeService = owner?.service ?: browserServiceFor(activeConnection)
+                        val media = mutableListOf<RemoteFileItem>()
+                        var nonMediaCount = 0
+                        if (includeSubfolders) {
+                            val queue = java.util.ArrayDeque<String>()
+                            val visitedPaths = mutableSetOf<String>()
+                            queue.add(folder.path)
+                            visitedPaths.add(folder.path.trimEnd('/'))
+                            while (queue.isNotEmpty()) {
+                                val currentPath = queue.removeFirst()
+                                val entries = activeService.list(currentPath)
+                                for (entry in entries) {
+                                    if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                                    if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+                                    val normPath = entry.path.trimEnd('/')
+                                    if (entry.isDirectory) {
+                                        if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
+                                            queue.add(entry.path)
+                                        }
+                                    } else if (entry.isVideo || entry.isImage) {
+                                        media.add(entry)
+                                    } else {
+                                        nonMediaCount++
                                     }
-                                } else if (entry.isVideo || entry.isImage) {
-                                    media.add(entry)
-                                } else {
-                                    nonMediaCount++
                                 }
                             }
+                        } else {
+                            val children = activeService.list(folder.path)
+                            val validChildren = children.filter { entry ->
+                                if (entry.name.isBlank() || entry.name == "." || entry.name == "..") false
+                                else if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) false
+                                else entry.path.trimEnd('/') != folder.path.trimEnd('/')
+                            }
+                            media.addAll(validChildren.filter { !it.isDirectory && (it.isVideo || it.isImage) })
+                            nonMediaCount = validChildren.count { !it.isDirectory && !it.isVideo && !it.isImage }
                         }
-                    } else {
-                        val children = activeService.list(folder.path)
-                        val validChildren = children.filter { entry ->
-                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") false
-                            else if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) false
-                            else entry.path.trimEnd('/') != folder.path.trimEnd('/')
-                        }
-                        media.addAll(validChildren.filter { !it.isDirectory && (it.isVideo || it.isImage) })
-                        nonMediaCount = validChildren.count { !it.isDirectory && !it.isVideo && !it.isImage }
+                        media to nonMediaCount
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        null to 0
                     }
-                    media to nonMediaCount
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    null to 0
                 }
-            }
-            _state.update { it.copy(isBusy = false) }
-            if (mediaCandidates == null) {
-                _state.update { it.copy(message = "폴더 내용을 불러오지 못했습니다.") }
-                return@launch
-            }
-            if (mediaCandidates.isEmpty()) {
-                _state.update { it.copy(message = "예고편을 만들 수 있는 사진이나 영상이 없습니다.") }
-                return@launch
-            }
-            trailerRetry = { startRemoteFolderTrailer(folder, includeSubfolders) }
-            val activeService = service ?: return@launch
-            val candidatesWithTime = mediaCandidates.map { it to (it.modifiedAt?.toEpochMilli() ?: 0L) }
-            prepareTrailer(
-                names = candidatesWithTime.map { it.first.name },
-                captureTimes = candidatesWithTime.map { it.second },
-                initialExcludedCount = skippedCount,
-                stage = { index, destination ->
-                    val item = candidatesWithTime[index].first
-                    activeService.download(item, destination) { received, total ->
-                        _state.update { current ->
-                            if (current.trailer?.directory != destination.parentFile) return@update current
-                            current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                _state.update { it.copy(isBusy = false) }
+                if (mediaCandidates == null) {
+                    _state.update { it.copy(message = "폴더 내용을 불러오지 못했습니다.") }
+                    return@launch
+                }
+                if (mediaCandidates.isEmpty()) {
+                    _state.update { it.copy(message = "예고편을 만들 수 있는 사진이나 영상이 없습니다.") }
+                    return@launch
+                }
+                trailerRetry = if (owner == null) {
+                    { startRemoteFolderTrailer(folder, includeSubfolders) }
+                } else {
+                    { withRenewedFavoriteOwner(owner) { renewed -> startRemoteFolderTrailer(folder, includeSubfolders, activeConnection, preferencesSnapshot, renewed) } }
+                }
+                val activeService = owner?.service ?: service ?: return@launch
+                val candidatesWithTime = mediaCandidates.map { it to (it.modifiedAt?.toEpochMilli() ?: 0L) }
+                stagingOwner = null
+                launchTrailerStaging(owner) {
+                    prepareTrailer(
+                        names = candidatesWithTime.map { it.first.name },
+                        captureTimes = candidatesWithTime.map { it.second },
+                        initialExcludedCount = skippedCount,
+                        stage = { index, destination ->
+                            val item = candidatesWithTime[index].first
+                            activeService.download(item, destination) { received, total ->
+                                _state.update { current ->
+                                    if (current.trailer?.directory != destination.parentFile) return@update current
+                                    current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                                }
+                            }
+                            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
                         }
-                    }
-                    check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+                    )
                 }
-            )
+            } finally {
+                stagingOwner?.let(::releaseFavoriteOwner)
+            }
+        }
+    }
+
+    /**
+     * Runs [start] (which may begin a new [trailerJob]); a held [owner] lease then ends exactly when that staging job
+     * completes, or immediately when no new job was started.
+     */
+    private fun launchTrailerStaging(owner: FavoriteActionServiceOwner?, start: () -> Unit) {
+        val previous = trailerJob
+        try {
+            start()
+        } finally {
+            if (owner != null) {
+                val job = trailerJob
+                if (job != null && job !== previous) job.invokeOnCompletion { releaseFavoriteOwner(owner) }
+                else releaseFavoriteOwner(owner)
+            }
         }
     }
 
     fun startRemoteTrailer(items: List<RemoteFileItem>) {
         val activeService = service ?: return
+        startRemoteTrailer(items, activeService, owner = null)
+    }
+
+    private fun startRemoteTrailer(items: List<RemoteFileItem>, activeService: RemoteFileService, owner: FavoriteActionServiceOwner?) {
         val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }
-        if (media.size != items.size || media.isEmpty()) return
-        trailerRetry = { startRemoteTrailer(media) }
+        if (media.size != items.size || media.isEmpty()) {
+            owner?.let(::releaseFavoriteOwner)
+            return
+        }
+        trailerRetry = if (owner == null) {
+            { startRemoteTrailer(media) }
+        } else {
+            { withRenewedFavoriteOwner(owner) { renewed -> startRemoteTrailer(media, renewed.service, renewed) } }
+        }
         val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
-        prepareTrailer(media.map { it.name }, captureTimes = captureTimes) { index, destination ->
-            val item = media[index]
-            activeService.download(item, destination) { received, total ->
-                _state.update { current ->
-                    if (current.trailer?.directory != destination.parentFile) return@update current
-                    current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+        launchTrailerStaging(owner) {
+            prepareTrailer(media.map { it.name }, captureTimes = captureTimes) { index, destination ->
+                val item = media[index]
+                activeService.download(item, destination) { received, total ->
+                    _state.update { current ->
+                        if (current.trailer?.directory != destination.parentFile) return@update current
+                        current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                    }
                 }
-            }
-            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+                check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+        }
         }
     }
 
@@ -3760,26 +4257,46 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         musicFitCount: Int = 1,
     ) {
         val activeService = service ?: return
+        startRemoteMusicOverlay(items, musicTrack, musicPolicy, musicFitCount, activeService, owner = null)
+    }
+
+    private fun startRemoteMusicOverlay(
+        items: List<RemoteFileItem>,
+        musicTrack: TrailerMusicTrack?,
+        musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+        musicFitCount: Int = 1,
+        activeService: RemoteFileService,
+        owner: FavoriteActionServiceOwner?,
+    ) {
         val media = items.filter { !it.isDirectory && (it.isVideo || it.isImage) }
-        if (media.size != items.size || media.isEmpty()) return
-        trailerRetry = { startRemoteMusicOverlay(media, musicTrack, musicPolicy, musicFitCount) }
+        if (media.size != items.size || media.isEmpty()) {
+            owner?.let(::releaseFavoriteOwner)
+            return
+        }
+        trailerRetry = if (owner == null) {
+            { startRemoteMusicOverlay(media, musicTrack, musicPolicy, musicFitCount) }
+        } else {
+            { withRenewedFavoriteOwner(owner) { renewed -> startRemoteMusicOverlay(media, musicTrack, musicPolicy, musicFitCount, renewed.service, renewed) } }
+        }
         val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
-        prepareTrailer(
-            names = media.map { it.name },
-            captureTimes = captureTimes,
-            isMusicOverlayMode = true,
-            initialMusicTrack = musicTrack,
-            initialMusicPolicy = musicPolicy,
-            initialMusicFitCount = musicFitCount,
-        ) { index, destination ->
-            val item = media[index]
-            activeService.download(item, destination) { received, total ->
-                _state.update { current ->
-                    if (current.trailer?.directory != destination.parentFile) return@update current
-                    current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+        launchTrailerStaging(owner) {
+            prepareTrailer(
+                names = media.map { it.name },
+                captureTimes = captureTimes,
+                isMusicOverlayMode = true,
+                initialMusicTrack = musicTrack,
+                initialMusicPolicy = musicPolicy,
+                initialMusicFitCount = musicFitCount,
+            ) { index, destination ->
+                val item = media[index]
+                activeService.download(item, destination) { received, total ->
+                    _state.update { current ->
+                        if (current.trailer?.directory != destination.parentFile) return@update current
+                        current.copy(trailer = current.trailer?.copy(progress = if (total > 0) received.toFloat() / total else null))
+                    }
                 }
-            }
-            check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+                check(destination.length() > 0 && (item.size <= 0 || destination.length() == item.size)) { "파일을 끝까지 받지 못했습니다. 다시 시도해 주세요." }
+        }
         }
     }
 
@@ -4146,11 +4663,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     updateTrailer(directory) { it.copy(busy = false, error = err, progress = null) }
                     return@launch
                 }
-                // Sort sources by default chronological oldest first (captureTimeMillis > 0 first, then by name)
-                val sortedSources = (if (motionSourceUris.isNotEmpty()) sources else sources.sortedWith(
-                    compareBy<TrailerSource> { if (it.captureTimeMillis > 0L) it.captureTimeMillis else Long.MAX_VALUE }
-                        .thenBy { it.name }
-                )).mapIndexed { newIndex, src -> src.copy(id = newIndex) }
+                // Retain immutable original addition order as default
+                val sortedSources = sources.toList()
 
                 val preparedSources = if (!isMusicOverlayMode && sortedSources.any { it.isImage }) {
                     updateTrailer(directory) { it.copy(status = "사진을 비교하는 중…", progress = null) }
@@ -4182,7 +4696,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         total = initialTotal,
                         clipLength = length,
                         photoClipLength = photoLength,
-                        format = TrailerFormat.closest(preparedSources.first().width, preparedSources.first().height),
+                        format = TrailerFormat.ORIGINAL,
+                        orderMode = "추가순",
                         busy = false,
                         isMusicOverlayMode = isMusicOverlayMode,
                         musicTrack = initialMusicTrack,
@@ -4268,6 +4783,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     musicPolicy = musicPolicy,
                     musicFitCount = musicFitCount,
                     autoDucking = autoDucking,
+                    aspectSources = sources,
                 ) { status, progress ->
                     updateTrailer(directory) { it.copy(status = status, progress = progress) }
                 }
@@ -4435,6 +4951,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         musicPolicy: TrailerMusicPolicy? = null,
         musicFitCount: Int? = null,
         autoDucking: Boolean? = null,
+        orderMode: String? = null,
         wasCancelled: Boolean = false,
     ) {
         val session = _state.value.trailer ?: return
@@ -4481,6 +4998,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 autoDucking = autoDucking ?: session.autoDucking,
                 output = finalOutput,
                 showingSettings = showingSettings,
+                orderMode = orderMode ?: session.orderMode,
                 timestamp = System.currentTimeMillis(),
             )
             TrailerDraftStore.saveDraft(draft)
@@ -4535,6 +5053,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             prepared = true,
             draftId = draft.id,
             highlightAnalyzed = !draft.isMusicOverlayMode,
+            orderMode = draft.orderMode,
         )
 
         _state.update {
@@ -4992,67 +5511,87 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun startRemoteFolderMusicOverlay(folder: RemoteFileItem, includeSubfolders: Boolean = false) {
         if (!folder.isDirectory) return
         val browser = _state.value.screen as? Screen.Browser ?: return
-        val activeConnection = browser.connection
-        val preferencesSnapshot = browser.preferences
+        startRemoteFolderMusicOverlay(folder, includeSubfolders, browser.connection, browser.preferences, owner = null)
+    }
+
+    /** Same ownership rule as the folder trailer: a held [owner] lease covers listing and staging, then ends. */
+    private fun startRemoteFolderMusicOverlay(
+        folder: RemoteFileItem,
+        includeSubfolders: Boolean,
+        activeConnection: RemoteConnection,
+        preferencesSnapshot: BrowserPreferences,
+        owner: FavoriteActionServiceOwner?,
+    ) {
+        if (!folder.isDirectory) {
+            owner?.let(::releaseFavoriteOwner)
+            return
+        }
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = null) }
-            val (mediaCandidates, _) = withContext(Dispatchers.IO) {
-                try {
-                    val activeService = service ?: run {
-                        val credential = repository.credentials.read(activeConnection.id).orEmpty()
-                        RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
-                    }
-                    val media = mutableListOf<RemoteFileItem>()
-                    var nonMediaCount = 0
-                    if (includeSubfolders) {
-                        val queue = java.util.ArrayDeque<String>()
-                        val visitedPaths = mutableSetOf<String>()
-                        queue.add(folder.path)
-                        visitedPaths.add(folder.path.trimEnd('/'))
-                        while (queue.isNotEmpty()) {
-                            val currentPath = queue.removeFirst()
-                            val entries = activeService.list(currentPath)
+            var stagingOwner = owner
+            try {
+                _state.update { it.copy(isBusy = true, message = null) }
+                val (mediaCandidates, _) = withContext(Dispatchers.IO) {
+                    try {
+                        val activeService = owner?.service ?: browserServiceFor(activeConnection)
+                        val media = mutableListOf<RemoteFileItem>()
+                        var nonMediaCount = 0
+                        if (includeSubfolders) {
+                            val queue = java.util.ArrayDeque<String>()
+                            val visitedPaths = mutableSetOf<String>()
+                            queue.add(folder.path)
+                            visitedPaths.add(folder.path.trimEnd('/'))
+                            while (queue.isNotEmpty()) {
+                                val currentPath = queue.removeFirst()
+                                val entries = activeService.list(currentPath)
+                                for (entry in entries) {
+                                    if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                                    if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+                                    val normPath = entry.path.trimEnd('/')
+                                    if (entry.isDirectory) {
+                                        if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
+                                            queue.add(entry.path)
+                                        }
+                                    } else if (entry.isVideo || entry.isImage) {
+                                        media.add(entry)
+                                    } else {
+                                        nonMediaCount++
+                                    }
+                                }
+                            }
+                        } else {
+                            val entries = activeService.list(folder.path)
                             for (entry in entries) {
                                 if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
                                 if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
-                                val normPath = entry.path.trimEnd('/')
-                                if (entry.isDirectory) {
-                                    if (normPath != currentPath.trimEnd('/') && visitedPaths.add(normPath)) {
-                                        queue.add(entry.path)
-                                    }
-                                } else if (entry.isVideo || entry.isImage) {
+                                if (entry.isDirectory) continue
+                                if (entry.isVideo || entry.isImage) {
                                     media.add(entry)
                                 } else {
                                     nonMediaCount++
                                 }
                             }
                         }
-                    } else {
-                        val entries = activeService.list(folder.path)
-                        for (entry in entries) {
-                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
-                            if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
-                            if (entry.isDirectory) continue
-                            if (entry.isVideo || entry.isImage) {
-                                media.add(entry)
-                            } else {
-                                nonMediaCount++
-                            }
-                        }
+                        media to nonMediaCount
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        emptyList<RemoteFileItem>() to 0
                     }
-                    media to nonMediaCount
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    emptyList<RemoteFileItem>() to 0
                 }
+                _state.update { it.copy(isBusy = false) }
+                if (mediaCandidates.isEmpty()) {
+                    _state.update { it.copy(message = "폴더에 음악을 입힐 사진이나 영상이 없습니다.") }
+                    return@launch
+                }
+                if (owner == null) {
+                    startRemoteMusicOverlay(mediaCandidates, null)
+                } else {
+                    stagingOwner = null
+                    startRemoteMusicOverlay(mediaCandidates, null, activeService = owner.service, owner = owner)
+                }
+            } finally {
+                stagingOwner?.let(::releaseFavoriteOwner)
             }
-            _state.update { it.copy(isBusy = false) }
-            if (mediaCandidates.isEmpty()) {
-                _state.update { it.copy(message = "폴더에 음악을 입힐 사진이나 영상이 없습니다.") }
-                return@launch
-            }
-            startRemoteMusicOverlay(mediaCandidates, null)
         }
     }
 
@@ -5726,6 +6265,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         superThumbnailObservation?.cancel()
         superThumbnailPickerJob?.cancel()
         closeSuperThumbnailPickerService()
+        homeFavoritePrepJob?.cancel()
+        liveFavoriteOwners.toList().forEach { owner -> if (owner.forceClose()) runCatching { owner.service.close() } }
+        liveFavoriteOwners.clear()
         service?.close()
         thumbnailRepository.close()
     }

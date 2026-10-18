@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -26,13 +27,12 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material3.AlertDialog
+import androidx.activity.compose.BackHandler
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -60,6 +60,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFavorite
 import com.armsone.nasfinder.model.RemoteFileItem
@@ -177,72 +178,127 @@ fun UnifiedMusicPickerDialog(
         }
     }
 
-    AlertDialog(
-        onDismissRequest = {
-            if (importingItemIds.isEmpty()) {
-                auditionController.stop()
-                onDismiss()
-            }
-        },
-        title = {
-            Text("배경 음악 선택", fontWeight = FontWeight.SemiBold)
-        },
-        text = {
-            Column(
+    BackHandler(enabled = true) {
+        if (importingItemIds.isEmpty()) {
+            auditionController.stop()
+            onDismiss()
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize().zIndex(90f),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .appSafeArea()
+        ) {
+            // Compact Header: Back, Title, Confirm ("닫기"), No-Music ("음악 없음")
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 340.dp, max = 460.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .heightIn(min = 48.dp)
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                PrimaryTabRow(
-                    selectedTabIndex = selectedTabIndex,
-                    modifier = Modifier.fillMaxWidth()
+                IconButton(
+                    onClick = {
+                        if (importingItemIds.isEmpty()) {
+                            auditionController.stop()
+                            onDismiss()
+                        }
+                    },
+                    enabled = importingItemIds.isEmpty(),
                 ) {
-                    tabs.forEachIndexed { index, tab ->
-                        Tab(
-                            selected = selectedTabIndex == index,
-                            onClick = {
-                                if (selectedTabIndex != index) {
-                                    selectedTabIndex = index
-                                    auditionController.stop()
-                                    browseJob?.cancel()
-                                    browseJob = null
-                                    activeConnection = null
-                                    currentRemotePath = ""
-                                    boundaryRootPath = ""
-                                    remoteItems = emptyList()
-                                    remoteErrorMessage = null
-                                    isRemoteLoading = false
-                                }
-                            },
-                            text = {
-                                Text(
-                                    tab.title,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.labelMedium
-                                )
-                            },
-                            icon = {
-                                when (tab) {
-                                    MusicSourceTab.PHONE_HARD -> Icon(Icons.Default.Smartphone, null, Modifier.size(18.dp))
-                                    MusicSourceTab.FAVORITES -> Icon(Icons.Default.FolderSpecial, null, Modifier.size(18.dp))
-                                    MusicSourceTab.NETWORK -> Icon(Icons.Default.Cloud, null, Modifier.size(18.dp))
-                                }
-                            }
-                        )
-                    }
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
                 }
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "배경 음악 선택",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                TextButton(
+                    onClick = {
+                        if (importingItemIds.isEmpty()) {
+                            auditionController.stop()
+                            onSelectTrack(null)
+                        }
+                    },
+                    enabled = importingItemIds.isEmpty(),
+                ) {
+                    Text("음악 없음", style = MaterialTheme.typography.labelMedium)
+                }
+                TextButton(
+                    onClick = {
+                        if (importingItemIds.isEmpty()) {
+                            auditionController.stop()
+                            onDismiss()
+                        }
+                    },
+                    enabled = importingItemIds.isEmpty(),
+                ) {
+                    Text("닫기", style = MaterialTheme.typography.labelMedium)
+                }
+            }
 
-                HorizontalDivider()
+            PrimaryTabRow(
+                selectedTabIndex = selectedTabIndex,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                tabs.forEachIndexed { index, tab ->
+                    Tab(
+                        selected = selectedTabIndex == index,
+                        onClick = {
+                            if (selectedTabIndex != index) {
+                                selectedTabIndex = index
+                                auditionController.stop()
+                                browseJob?.cancel()
+                                browseJob = null
+                                activeConnection = null
+                                currentRemotePath = ""
+                                boundaryRootPath = ""
+                                remoteItems = emptyList()
+                                remoteErrorMessage = null
+                                isRemoteLoading = false
+                            }
+                        },
+                        text = {
+                            Text(
+                                tab.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        },
+                        icon = {
+                            when (tab) {
+                                MusicSourceTab.PHONE_HARD -> Icon(Icons.Default.Smartphone, null, Modifier.size(18.dp))
+                                MusicSourceTab.FAVORITES -> Icon(Icons.Default.FolderSpecial, null, Modifier.size(18.dp))
+                                MusicSourceTab.NETWORK -> Icon(Icons.Default.Cloud, null, Modifier.size(18.dp))
+                            }
+                        }
+                    )
+                }
+            }
 
+            HorizontalDivider()
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
                 when (tabs[selectedTabIndex]) {
                     MusicSourceTab.PHONE_HARD -> {
                         if (phoneHardTracks.isEmpty()) {
                             Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f),
+                                modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
@@ -253,9 +309,7 @@ fun UnifiedMusicPickerDialog(
                             }
                         } else {
                             LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f),
+                                modifier = Modifier.fillMaxSize(),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 items(phoneHardTracks, key = { it.file.absolutePath }) { track ->
@@ -341,9 +395,7 @@ fun UnifiedMusicPickerDialog(
                         } else {
                             if (folderFavorites.isEmpty()) {
                                 Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .weight(1f),
+                                    modifier = Modifier.fillMaxSize(),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
@@ -354,9 +406,7 @@ fun UnifiedMusicPickerDialog(
                                 }
                             } else {
                                 LazyColumn(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .weight(1f),
+                                    modifier = Modifier.fillMaxSize(),
                                     verticalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     items(folderFavorites, key = { it.id }) { fav ->
@@ -373,9 +423,7 @@ fun UnifiedMusicPickerDialog(
                         if (activeConnection == null) {
                             if (connections.isEmpty()) {
                                 Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .weight(1f),
+                                    modifier = Modifier.fillMaxSize(),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
@@ -386,9 +434,7 @@ fun UnifiedMusicPickerDialog(
                                 }
                             } else {
                                 LazyColumn(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .weight(1f),
+                                    modifier = Modifier.fillMaxSize(),
                                     verticalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     items(connections, key = { it.id }) { conn ->
@@ -465,34 +511,8 @@ fun UnifiedMusicPickerDialog(
                     }
                 }
             }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    if (importingItemIds.isEmpty()) {
-                        auditionController.stop()
-                        onDismiss()
-                    }
-                },
-                enabled = importingItemIds.isEmpty()
-            ) {
-                Text("닫기")
-            }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = {
-                    if (importingItemIds.isEmpty()) {
-                        auditionController.stop()
-                        onSelectTrack(null)
-                    }
-                },
-                enabled = importingItemIds.isEmpty()
-            ) {
-                Text("음악 없음")
-            }
         }
-    )
+    }
 }
 
 private fun safeRemoteParent(path: String, boundaryRoot: String): String? {
@@ -529,7 +549,7 @@ private fun FavoriteFolderRow(
             Icon(Icons.Default.FolderSpecial, null, tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(favorite.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(favorite.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                 Text(
                     conn?.name ?: "연결 없음 (${favorite.path})",
                     style = MaterialTheme.typography.labelSmall,
@@ -560,7 +580,7 @@ private fun ConnectionRow(
             Icon(Icons.Default.Cloud, null, tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(connection.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(connection.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                 Text(
                     connection.host,
                     style = MaterialTheme.typography.labelSmall,
