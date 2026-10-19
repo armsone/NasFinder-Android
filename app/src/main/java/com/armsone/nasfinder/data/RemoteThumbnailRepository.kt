@@ -86,6 +86,7 @@ class RemoteThumbnailRepository(
     trafficLimits: RemoteThumbnailTrafficLimits = RemoteThumbnailTrafficLimits(),
     private val onCacheCommitted: ((String) -> Unit)? = null,
     diskCacheDir: File? = null,
+    unlimitedTraffic: () -> Boolean = { false },
 ) : Closeable {
     private val appContext = context.applicationContext
     private val httpClient = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
@@ -96,7 +97,7 @@ class RemoteThumbnailRepository(
     private val thumbnailFetchPermits = Semaphore(2)
     private val inFlight = mutableMapOf<String, Deferred<Bitmap?>>()
     private val negativeUntil = ConcurrentHashMap<String, Long>()
-    private val trafficBudget = RemoteThumbnailTrafficBudget(trafficLimits)
+    private val trafficBudget = RemoteThumbnailTrafficBudget(trafficLimits, unlimitedTraffic)
     val trafficSnapshot: StateFlow<RemoteThumbnailTrafficSnapshot> = trafficBudget.snapshot.asStateFlow()
     private val vaultDirectoryCache = RemoteThumbnailVaultDirectoryCache()
     private val memory = WeightedLruCache<String, Bitmap>(MEMORY_CACHE_BYTES) { bitmap ->
@@ -147,7 +148,9 @@ class RemoteThumbnailRepository(
     ): Bitmap? {
         require(maxPixelSize in 1..MAX_ALLOWED_PIXEL_SIZE) { "올바르지 않은 썸네일 크기입니다." }
         val vaultKey = RemoteThumbnailCacheKey.createVault(connection.id, item, maxPixelSize)
-        memory[vaultKey]?.let { return it }
+        // File keys already carry path/size/mtime. A folder key only carries the folder's own mtime, so folders
+        // are validated against the current NAS sheet signature in loadFolderSheet before any local hit is used.
+        if (!item.isDirectory) memory[vaultKey]?.let { return it }
 
         val standardKey = RemoteThumbnailCacheKey.create(connection.id, item, maxPixelSize)
         if ((negativeUntil[vaultKey] ?: 0L) > System.currentTimeMillis() &&
@@ -459,6 +462,91 @@ class RemoteThumbnailRepository(
         }
     }
 
+    private fun cachedBitmap(key: String): Bitmap? {
+        memory[key]?.let { return it }
+        disk.get(key)?.let { cached ->
+            decodeBounded(cached)?.let { bitmap ->
+                memory.put(key, bitmap)
+                return bitmap
+            }
+            disk.remove(key)
+        }
+        return null
+    }
+
+    /**
+     * Folder order: local sheet keyed by the current NAS sheet signature (size + mtime of the Vault JPEG, the
+     * folder's own size/mtime and path), else the current NAS sheet, else the legacy local copy.
+     * A new NAS sheet changes the signature, so only that folder's derivative cache is replaced; the old entry
+     * stays until the new one is committed and is later evicted by the normal age/size bounds.
+     */
+    private suspend fun loadFolderSheet(
+        vaultKey: String,
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+    ): Bitmap? {
+        val entries = try {
+            thumbnailFetchPermits.withPermit { folderVaultEntries(connection, item, activeService) }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Throwable) {
+            null
+        }
+        val hasEmptyMarker = entries?.containsKey(SuperThumbnailVault.folderEmptyMarkerFilename(item.name)) == true
+        val sheet = if (hasEmptyMarker) null else entries?.get(SuperThumbnailVault.folderFilename(item.name))
+        val signatureKey = sheet?.let {
+            RemoteThumbnailCacheKey.createFolderSheet(
+                connection.id, item, maxPixelSize, it.size, it.modifiedAt?.toEpochMilli() ?: 0L,
+            )
+        }
+        if (signatureKey != null) cachedBitmap(signatureKey)?.let { return it }
+        // No usable NAS sheet metadata (listing failed, sheet absent, or empty marker): keep the legacy order.
+        if (signatureKey == null) cachedBitmap(vaultKey)?.let { return it }
+
+        val bitmap = thumbnailFetchPermits.withPermit {
+            restoreFolderFromVault(connection, item, activeService, vaultKey)
+        }
+        if (bitmap == null) return signatureKey?.let { cachedBitmap(vaultKey) }
+
+        val targetKey = signatureKey ?: vaultKey
+        val encoded = disk.temporaryFile("encoded-folder-vault")
+        try {
+            encodeThumbnail(bitmap, encoded)
+            currentCoroutineContext().ensureActive()
+            disk.commit(targetKey, encoded)
+            if (disk.contains(targetKey)) runCatching { onCacheCommitted?.invoke(targetKey) }
+            memory.put(targetKey, bitmap)
+            negativeUntil.remove(vaultKey)
+            return bitmap
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Throwable) {
+            return bitmap
+        } finally {
+            encoded.delete()
+        }
+    }
+
+    private suspend fun folderVaultEntries(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+        activeService: RemoteFileService,
+    ): Map<String, RemoteFileItem>? {
+        val boundary = runCatching { SuperThumbnailTraversal(connection.normalizedRootPath, SuperThumbnailBudget()) }
+            .getOrNull() ?: return null
+        val safeParent = runCatching { boundary.requireInsideRoot(parentDirectory(item.path)) }.getOrNull()
+            ?: return null
+        val vaultPath = runCatching { boundary.requireInsideRoot(appendVaultDirectory(safeParent)) }.getOrNull()
+            ?: return null
+        return vaultDirectoryCache.listVault(
+            cacheKey = "${connection.id}\u0000$vaultPath",
+            vaultPath = vaultPath,
+            service = activeService,
+            scope = scope,
+        )
+    }
+
     private suspend fun loadInternal(
         vaultKey: String,
         standardKey: String,
@@ -466,38 +554,11 @@ class RemoteThumbnailRepository(
         item: RemoteFileItem,
         activeService: RemoteFileService,
     ): Bitmap? {
-        memory[vaultKey]?.let { return it }
-        disk.get(vaultKey)?.let { cached ->
-            decodeBounded(cached)?.let { bitmap ->
-                memory.put(vaultKey, bitmap)
-                return bitmap
-            }
-            disk.remove(vaultKey)
-        }
+        if (item.isDirectory) return loadFolderSheet(vaultKey, connection, item, activeService)
+
+        cachedBitmap(vaultKey)?.let { return it }
 
         val sourcePolicy = RemoteThumbnailFetchPolicy.source(item, activeService.supportsRangeStreaming)
-
-        if (sourcePolicy == RemoteThumbnailSource.FOLDER_VAULT) {
-            val bitmap = thumbnailFetchPermits.withPermit {
-                restoreFolderFromVault(connection, item, activeService, vaultKey)
-            } ?: return null
-            val encoded = disk.temporaryFile("encoded-folder-vault")
-            try {
-                encodeThumbnail(bitmap, encoded)
-                currentCoroutineContext().ensureActive()
-                disk.commit(vaultKey, encoded)
-                if (disk.contains(vaultKey)) runCatching { onCacheCommitted?.invoke(vaultKey) }
-                memory.put(vaultKey, bitmap)
-                negativeUntil.remove(vaultKey)
-                return bitmap
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (_: Throwable) {
-                return bitmap
-            } finally {
-                encoded.delete()
-            }
-        }
 
         val vaultBitmap = try {
             thumbnailFetchPermits.withPermit {
@@ -914,6 +975,7 @@ internal class SparseVideoRangeSession(
     @Volatile private var requestCount = 0
     @Volatile private var expectedBytes = 0L
     @Volatile private var actualBytes = 0L
+    private var cachedBytes = 0L
 
     init { require(itemSize > 0) { "영상 파일 크기가 필요합니다." } }
 
@@ -932,8 +994,11 @@ internal class SparseVideoRangeSession(
             if (count > 0) return@withLock bytes.copyOfRange(offset, offset + count)
         }
 
-        if (requestCount >= limits.maxRequests || expectedBytes >= limits.maxExpectedBytes ||
-            actualBytes >= limits.maxActualBytes
+        // Wi-Fi follows the same dynamic policy as the global budget (re-evaluated every read):
+        // no per-video cumulative caps. Cellular keeps the original per-video limits/counters.
+        val wifi = trafficBudget.isUnlimitedTraffic()
+        if (!wifi && (requestCount >= limits.maxRequests || expectedBytes >= limits.maxExpectedBytes ||
+                actualBytes >= limits.maxActualBytes)
         ) throw RemoteThumbnailTrafficLimitReached()
 
         // Read ahead once and serve MediaMetadataRetriever's overlapping tiny reads from
@@ -943,25 +1008,32 @@ internal class SparseVideoRangeSession(
             maxOf(requestedLength, readAhead).toLong(),
             limits.maxRequestBytes.toLong(),
             itemSize - position,
-            limits.maxExpectedBytes - expectedBytes,
+            if (wifi) Long.MAX_VALUE else limits.maxExpectedBytes - expectedBytes,
         ).toInt()
         if (boundedLength <= 0) throw RemoteThumbnailTrafficLimitReached()
         val ticket = trafficBudget.reserve(boundedLength.toLong())
             ?: throw RemoteThumbnailTrafficLimitReached()
-        requestCount += 1
-        expectedBytes += boundedLength
+        if (requestCount < Int.MAX_VALUE) requestCount += 1
+        expectedBytes = saturatedAdd(expectedBytes, boundedLength.toLong())
 
         val bytes = fetch(position, boundedLength)
         currentCoroutineContext().ensureActive()
         sessionJob.ensureActive()
         val globallyAllowed = trafficBudget.recordActual(ticket, bytes.size.toLong())
-        actualBytes += bytes.size
-        if (!globallyAllowed || bytes.size > boundedLength || actualBytes > limits.maxActualBytes) {
+        actualBytes = saturatedAdd(actualBytes, bytes.size.toLong())
+        val perVideoExceeded = !trafficBudget.isUnlimitedTraffic() && actualBytes > limits.maxActualBytes
+        if (!globallyAllowed || bytes.size > boundedLength || perVideoExceeded) {
             throw RemoteThumbnailTrafficLimitReached()
         }
-        if (bytes.isNotEmpty()) {
-            blocks[position] = bytes
-            while (blocks.size > MAX_RANGE_BLOCKS) blocks.remove(blocks.entries.first().key)
+        // Retained range memory stays at the original 4MB per session; oversized reads are served
+        // from this call only and never cached.
+        if (bytes.isNotEmpty() && bytes.size <= MAX_RANGE_CACHE_BYTES) {
+            blocks.put(position, bytes)?.let { cachedBytes -= it.size }
+            cachedBytes += bytes.size
+            while ((blocks.size > MAX_RANGE_BLOCKS || cachedBytes > MAX_RANGE_CACHE_BYTES) && blocks.isNotEmpty()) {
+                val oldest = blocks.entries.first().key
+                blocks.remove(oldest)?.let { cachedBytes -= it.size }
+            }
         }
         bytes.copyOfRange(0, minOf(requestedLength, bytes.size))
     }
@@ -982,6 +1054,9 @@ internal class SparseVideoRangeSession(
     private companion object {
         const val RANGE_READ_AHEAD_BYTES = 64 * 1024
         const val MAX_RANGE_BLOCKS = 32
+        const val MAX_RANGE_CACHE_BYTES = 4 * 1024 * 1024
+
+        fun saturatedAdd(a: Long, b: Long): Long = if (a > Long.MAX_VALUE - b) Long.MAX_VALUE else a + b
     }
 }
 
@@ -1026,13 +1101,19 @@ data class RemoteThumbnailTrafficSnapshot(
 
 internal data class RemoteThumbnailTrafficTicket(val session: Long)
 
-internal class RemoteThumbnailTrafficBudget(private val limits: RemoteThumbnailTrafficLimits) {
+internal class RemoteThumbnailTrafficBudget(
+    private val baseLimits: RemoteThumbnailTrafficLimits,
+    // Evaluated on every reservation/accounting step (Wi-Fi only); cellular keeps baseLimits.
+    private val unlimited: () -> Boolean = { false },
+) {
     val snapshot = MutableStateFlow(RemoteThumbnailTrafficSnapshot())
 
     @Synchronized fun reserve(expectedBytes: Long): RemoteThumbnailTrafficTicket? {
         val current = snapshot.value
         val expected = expectedBytes.coerceAtLeast(0)
-        if (current.limitReached || current.requestCount >= limits.maxRequests ||
+        val wifi = unlimited()
+        val limits = limitsFor(wifi)
+        if ((current.limitReached && !wifi) || current.requestCount >= limits.maxRequests ||
             expected > limits.maxExpectedBytes - current.expectedBytes
         ) {
             snapshot.value = current.copy(limitReached = true)
@@ -1050,20 +1131,30 @@ internal class RemoteThumbnailTrafficBudget(private val limits: RemoteThumbnailT
         require(bytes >= 0)
         val current = snapshot.value
         if (ticket.session != current.session) return false
+        val limits = limitsFor(unlimited())
         val updated = current.copy(actualBytes = current.actualBytes + bytes).withLimit(limits)
         snapshot.value = updated
         return updated.actualBytes <= limits.maxActualBytes
     }
 
+    fun isUnlimitedTraffic(): Boolean = unlimited()
+
     @Synchronized fun reset() {
         snapshot.value = RemoteThumbnailTrafficSnapshot(session = snapshot.value.session + 1)
     }
+
+    private fun limitsFor(wifi: Boolean): RemoteThumbnailTrafficLimits =
+        if (wifi) WIFI_UNLIMITED else baseLimits
 
     private fun RemoteThumbnailTrafficSnapshot.withLimit(limits: RemoteThumbnailTrafficLimits): RemoteThumbnailTrafficSnapshot =
         copy(
             limitReached = requestCount >= limits.maxRequests || expectedBytes >= limits.maxExpectedBytes ||
                 actualBytes >= limits.maxActualBytes,
         )
+
+    private companion object {
+        val WIFI_UNLIMITED = RemoteThumbnailTrafficLimits(Int.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE)
+    }
 }
 
 internal class RemoteThumbnailTrafficLimitReached : IOException("썸네일 네트워크 예산에 도달했습니다.")
@@ -1168,6 +1259,21 @@ internal object RemoteThumbnailCacheKey {
 
     fun createVault(connectionId: String, item: RemoteFileItem, maxPixelSize: Int): String =
         create(connectionId, item, maxPixelSize, isVault = true)
+
+    /** Local-only key for a folder sheet: folder identity plus the NAS sheet JPEG's own size/mtime. */
+    fun createFolderSheet(
+        connectionId: String,
+        item: RemoteFileItem,
+        maxPixelSize: Int,
+        sheetSize: Long,
+        sheetModifiedMillis: Long,
+    ): String = MessageDigest.getInstance("SHA-256").digest(
+        listOf(
+            "vault-folder-sheet", connectionId, item.path, item.size.toString(),
+            (item.modifiedAt?.toEpochMilli() ?: 0L).toString(), maxPixelSize.toString(),
+            sheetSize.toString(), sheetModifiedMillis.toString(),
+        ).joinToString("\u0000").toByteArray(Charsets.UTF_8)
+    ).joinToString("") { byte -> "%02x".format(byte) }
 
     fun create(connectionId: String, item: RemoteFileItem, maxPixelSize: Int, isVault: Boolean): String {
         val value = if (isVault) {

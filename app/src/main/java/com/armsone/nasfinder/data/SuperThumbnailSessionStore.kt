@@ -134,22 +134,32 @@ class SuperThumbnailSessionStore(private val storageFile: File) {
         }
     }
 
-    fun recordVaultVerification(sessionKey: String, storedItemIds: Set<String>, verifiedAt: Instant) =
-        update { sessions ->
-            val session = sessions[sessionKey] ?: return@update
-            session.items.replaceAll { itemId, state ->
-                when {
-                    state.vaultStatus == null -> state
-                    itemId in storedItemIds -> state.copy(vaultStatus = SuperThumbnailVaultStatus.UPLOADED, vaultError = null)
-                    state.vaultStatus == SuperThumbnailVaultStatus.UPLOADED -> state.copy(
-                        vaultStatus = SuperThumbnailVaultStatus.PENDING_UPLOAD,
-                        vaultError = null,
-                    )
-                    else -> state
-                }
+    /**
+     * [checkedItemIds] limits the result to items whose NAS listing was actually observed;
+     * unobserved items keep their state. `null` keeps the legacy whole-session behavior.
+     */
+    fun recordVaultVerification(
+        sessionKey: String,
+        storedItemIds: Set<String>,
+        verifiedAt: Instant,
+        checkedItemIds: Set<String>? = null,
+    ) = update { sessions ->
+        val session = sessions[sessionKey] ?: return@update
+        if (checkedItemIds != null && checkedItemIds.isEmpty()) return@update
+        session.items.replaceAll { itemId, state ->
+            when {
+                state.vaultStatus == null -> state
+                checkedItemIds != null && itemId !in checkedItemIds -> state
+                itemId in storedItemIds -> state.copy(vaultStatus = SuperThumbnailVaultStatus.UPLOADED, vaultError = null)
+                state.vaultStatus == SuperThumbnailVaultStatus.UPLOADED -> state.copy(
+                    vaultStatus = SuperThumbnailVaultStatus.PENDING_UPLOAD,
+                    vaultError = null,
+                )
+                else -> state
             }
-            session.vaultLastVerifiedAt = verifiedAt
         }
+        session.vaultLastVerifiedAt = verifiedAt
+    }
 
     fun markVaultRemoved(sessionKey: String, verifiedAt: Instant = Instant.now()) = update { sessions ->
         val session = sessions[sessionKey] ?: return@update

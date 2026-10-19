@@ -179,6 +179,7 @@ internal fun PorcelainWideHost(
     model: NasFinderViewModel,
     selectedConnectionId: String? = null,
     phoneHardSelected: Boolean = false,
+    fullscreen: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { model.importPickedFiles(it) }
@@ -192,11 +193,14 @@ internal fun PorcelainWideHost(
             content()
         } else {
             Row(Modifier.fillMaxSize()) {
-                PorcelainSidebar(
-                    state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
-                    Modifier.width(sidebarWidthFor(this@BoxWithConstraints.maxWidth)).fillMaxHeight(), selectedConnectionId, phoneHardSelected,
-                )
-                VerticalDividerLine()
+                // Only the sidebar is skipped when fullscreen; the content slot keeps its position so its state survives.
+                if (!fullscreen) {
+                    PorcelainSidebar(
+                        state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
+                        Modifier.width(sidebarWidthFor(this@BoxWithConstraints.maxWidth)).fillMaxHeight(), selectedConnectionId, phoneHardSelected,
+                    )
+                    VerticalDividerLine()
+                }
                 Box(Modifier.weight(1f).fillMaxHeight()) { content() }
             }
         }

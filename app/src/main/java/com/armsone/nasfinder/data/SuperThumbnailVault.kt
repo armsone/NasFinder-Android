@@ -405,6 +405,49 @@ class SuperThumbnailVault(private val workDirectory: File) {
         return stored
     }
 
+    /**
+     * Metadata-only NAS listing check. Unlike [verifyStoredItemIds] it reports which items were
+     * actually observed, so a failed or out-of-root parent listing stays unknown instead of
+     * being treated as missing. Derived names come from the passed (current) item metadata.
+     */
+    suspend fun verifyItems(
+        items: List<RemoteFileItem>,
+        rootPath: String,
+        service: RemoteFileService,
+    ): SuperThumbnailVaultVerification {
+        val boundary = SuperThumbnailTraversal(rootPath, SuperThumbnailBudget())
+        val stored = linkedSetOf<String>()
+        val checked = linkedSetOf<String>()
+        items.groupBy { parentDirectory(it.path) }.forEach { (parent, folderItems) ->
+            currentCoroutineContext().ensureActive()
+            val names: Set<String>? = try {
+                boundary.requireInsideRoot(parent)
+                val siblings = service.list(parent)
+                if (siblings.none { it.isDirectory && it.name == DIRECTORY_NAME }) {
+                    emptySet()
+                } else {
+                    val vaultPath = boundary.requireInsideRoot(append(DIRECTORY_NAME, parent))
+                    service.list(vaultPath).asSequence().filterNot(RemoteFileItem::isDirectory).mapTo(hashSetOf()) { it.name }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                null
+            }
+            if (names == null) return@forEach
+            folderItems.forEach { item ->
+                checked += item.id
+                val present = if (item.isDirectory) {
+                    folderFilename(item.name) in names || folderEmptyMarkerFilename(item.name) in names
+                } else {
+                    compatibleFilenames(item).any { it in names }
+                }
+                if (present) stored += item.id
+            }
+        }
+        return SuperThumbnailVaultVerification(stored, checked)
+    }
+
     suspend fun removeVaults(
         rootPath: String,
         service: RemoteFileService,
@@ -757,3 +800,9 @@ class SuperThumbnailCooperationSession(
         const val PEER_DISCOVERY_DELAY_MILLIS = 750L
     }
 }
+
+/** [checkedItemIds] are the items whose parent NAS listings were actually read. */
+data class SuperThumbnailVaultVerification(
+    val storedItemIds: Set<String>,
+    val checkedItemIds: Set<String>,
+)

@@ -397,13 +397,18 @@ internal object AdaptiveOverflowPolicy {
     const val MIN_HEIGHT_DP = 320f
     const val MIN_LANDSCAPE_ASPECT = 1.20f
 
+    // 회전에 불변인 smallestScreenWidthDp 로 폰/펼친 폴드·태블릿을 구분한다.
+    const val PHONE_MAX_SMALLEST_WIDTH_DP = 600
+
     fun shouldUseAutomaticOverflow(
         contentWidthDp: Float,
         contentHeightDp: Float,
         itemCount: Int,
         selectionActive: Boolean,
+        smallestScreenWidthDp: Int,
     ): Boolean = itemCount > 0 &&
         !selectionActive &&
+        smallestScreenWidthDp < PHONE_MAX_SMALLEST_WIDTH_DP &&
         contentWidthDp >= MIN_WIDTH_DP &&
         contentHeightDp >= MIN_HEIGHT_DP &&
         contentWidthDp / contentHeightDp.coerceAtLeast(1f) >= MIN_LANDSCAPE_ASPECT

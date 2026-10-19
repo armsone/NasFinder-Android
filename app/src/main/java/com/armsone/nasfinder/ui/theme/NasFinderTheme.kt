@@ -250,21 +250,28 @@ object ThemeVectors {
             viewportWidth = 24f,
             viewportHeight = 24f,
         ).apply {
-            // <circle cx="12" cy="12" r="9" .../> with transform="rotate(-80 12 12)"
-            // Outer dashed circle in SVG is represented as the outer ring at stroke 1.7
-            // Center is (12, 12), r = 9
+            // <circle cx="12" cy="12" r="9" stroke-dasharray="15.4 3.45" transform="rotate(-80 12 12)"/>
+            // ImageVector paths have no dash support: circumference 2*pi*9 = 56.549 = 3 periods of 18.85,
+            // so the dashes are three separate arcs (15.4 long, starting every 18.85 from 3 o'clock, clockwise),
+            // endpoints = (12 + 9cos(s/9), 12 + 9sin(s/9)) for arc length s.
             group(
                 rotate = -80f,
                 pivotX = 12f,
                 pivotY = 12f,
             ) {
-                addPath(
-                    pathData = addPathNodes("M 12 3 a 9 9 0 1 0 0.001 0 Z"),
-                    stroke = SolidColor(Color.White),
-                    strokeLineWidth = 1.7f,
-                    strokeLineCap = StrokeCap.Round,
-                    strokeLineJoin = StrokeJoin.Round,
-                )
+                listOf(
+                    "M 21 12 A 9 9 0 0 1 10.7413 20.9115",
+                    "M 7.4996 19.794 A 9 9 0 0 1 4.912 6.4538",
+                    "M 7.5008 4.2053 A 9 9 0 0 1 20.3473 8.6351",
+                ).forEach { arc ->
+                    addPath(
+                        pathData = addPathNodes(arc),
+                        stroke = SolidColor(Color.White),
+                        strokeLineWidth = 1.7f,
+                        strokeLineCap = StrokeCap.Round,
+                        strokeLineJoin = StrokeJoin.Round,
+                    )
+                }
             }
             // <circle cx="12" cy="12" r="5" stroke-width="1.4"/>
             addPath(

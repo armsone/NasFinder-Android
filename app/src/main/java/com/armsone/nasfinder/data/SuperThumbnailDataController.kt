@@ -57,8 +57,10 @@ class SuperThumbnailDataController(context: Context) {
                 if (result.failures.isNotEmpty()) {
                     val observed = sessions.observedItems(sessionKey)
                     if (observed.isNotEmpty()) {
-                        runCatching { vault.verifyStoredItemIds(observed, safeRoot, service) }
-                            .onSuccess { sessions.recordVaultVerification(sessionKey, it, Instant.now()) }
+                        runCatching { vault.verifyItems(observed, safeRoot, service) }
+                            .onSuccess {
+                                sessions.recordVaultVerification(sessionKey, it.storedItemIds, Instant.now(), it.checkedItemIds)
+                            }
                     }
                 }
             }

@@ -277,12 +277,29 @@ fun NasFinderApp(
         }
         libraryRouteRestored = true
     }
+    // Presentation-only flag reported by BrowserScreen while its existing CoverFlow is showing; the whole app screen is then used.
+    var browserCoverFlowFullscreen by remember { mutableStateOf(false) }
+    val coverFlowFullscreen = browserCoverFlowFullscreen && state.screen is Screen.Browser && state.imagePreview == null && state.trailer == null
     NasFinderTheme(state.theme, state.iconPack) {
-        Box(Modifier.fillMaxSize().background(skyBrush(state.theme)).then(if (state.imagePreview != null || state.trailer != null) Modifier else Modifier.appSafeArea())) {
+        Box(
+            Modifier.fillMaxSize()
+                .then(if (coverFlowFullscreen) Modifier.background(Color.Black) else Modifier.background(skyBrush(state.theme)))
+                .then(
+                    when {
+                        coverFlowFullscreen -> Modifier.windowInsetsPadding(
+                            WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Horizontal),
+                        )
+                        state.imagePreview != null || state.trailer != null -> Modifier
+                        else -> Modifier.appSafeArea()
+                    },
+                ),
+        ) {
             when (val screen = state.screen) {
                 Screen.Dashboard -> DashboardScreen(state, model)
                 is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
-                is Screen.Browser -> PorcelainWideHost(state, model, selectedConnectionId = screen.connection.id.toString()) { BrowserScreen(screen, state, model) }
+                is Screen.Browser -> PorcelainWideHost(state, model, selectedConnectionId = screen.connection.id.toString(), fullscreen = coverFlowFullscreen) {
+                    BrowserScreen(screen, state, model, onCoverFlowFullscreen = { browserCoverFlowFullscreen = it })
+                }
                 Screen.Inbox, Screen.WebHard -> PorcelainWideHost(state, model, phoneHardSelected = true) { InboxScreen(state, model) }
                 Screen.PhotoTransfer -> PhotoTransferScreen(
                     onBack = { model.show(Screen.Dashboard) },
@@ -2021,52 +2038,54 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         expanded = themeMenuExpanded,
                         onDismissRequest = { themeMenuExpanded = false },
                     ) {
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    "병기스타일 테마",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            },
-                            onClick = {},
-                            enabled = false,
-                        )
-                        HorizontalDivider()
                         AppTheme.entries.forEach { theme ->
                             val isCurrent = theme == state.theme
-                            val swatch = paletteFor(theme)
+                            val badge = themeChooserBadge(theme)
                             DropdownMenuItem(
+                                modifier = Modifier.height(44.dp),
+                                contentPadding = PaddingValues(0.dp),
                                 text = {
                                     Row(
+                                        modifier = Modifier.fillMaxWidth().padding(start = 10.dp),
                                         verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .clip(CircleShape)
+                                                .background(badge.fill)
+                                                .border(1.dp, badge.glyph, CircleShape),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                themeIcon(theme),
+                                                contentDescription = null,
+                                                modifier = Modifier.size(20.dp),
+                                                tint = badge.glyph,
+                                            )
+                                        }
+                                        Spacer(Modifier.width(10.dp))
                                         Text(
                                             themeTitle(theme),
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                            modifier = Modifier.weight(1f),
+                                            fontSize = 14.sp,
+                                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
                                             color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
                                         )
-                                    }
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        themeIcon(theme),
-                                        contentDescription = null,
-                                        modifier = Modifier.size(20.dp),
-                                        tint = swatch.accent,
-                                    )
-                                },
-                                trailingIcon = {
-                                    if (isCurrent) {
-                                        Icon(
-                                            Icons.Default.Check,
-                                            contentDescription = "선택됨",
-                                            modifier = Modifier.size(18.dp),
-                                            tint = swatch.accent,
-                                        )
+                                        Box(
+                                            modifier = Modifier.padding(end = 12.dp).width(20.dp),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            if (isCurrent) {
+                                                Icon(
+                                                    Icons.Default.Check,
+                                                    contentDescription = "선택됨",
+                                                    modifier = Modifier.size(12.dp),
+                                                    tint = badge.glyph,
+                                                )
+                                            }
+                                        }
                                     }
                                 },
                                 onClick = {
@@ -3877,7 +3896,7 @@ internal fun NetworkDownloadProgressDialog(
 }
 
 @Composable
-private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFinderViewModel) {
+private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFinderViewModel, onCoverFlowFullscreen: (Boolean) -> Unit = {}) {
     var searchText by remember(browser.connection.id, browser.path) { mutableStateOf("") }
     var searchVisible by rememberSaveable(browser.connection.id, browser.path) { mutableStateOf(false) }
     var creatingFolder by remember { mutableStateOf(false) }
@@ -3899,13 +3918,24 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     // Media-pick keeps its own layout (default SMALL_GRID); the general browser preference is never touched.
     var pickLayout by rememberSaveable { mutableStateOf(BrowserLayout.SMALL_GRID) }
     val effectiveLayout = if (pickMode) pickLayout else browser.preferences.layout
-    val showsCoverFlow = !pickMode && browser.preferences.layout == BrowserLayout.LARGE_GRID &&
-        AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
-            contentWidthDp = viewportSize.width / density,
-            contentHeightDp = viewportSize.height / density,
-            itemCount = browser.items.size,
-            selectionActive = selectionMode || state.mediaPick != null,
+    // Explicit 커버플로우 (menu button): bypasses the size/aspect policy only; media-pick, selection and empty folders stay excluded.
+    var explicitCoverFlow by rememberSaveable(browser.connection.id, browser.path) { mutableStateOf(false) }
+    // Set after leaving the explicit mode so the automatic entry does not immediately re-open it for this folder.
+    var autoCoverFlowSuppressed by rememberSaveable(browser.connection.id, browser.path) { mutableStateOf(false) }
+    val showsCoverFlow = !pickMode && (
+        (explicitCoverFlow && !selectionMode && browser.items.isNotEmpty()) ||
+            (!autoCoverFlowSuppressed && browser.preferences.layout == BrowserLayout.LARGE_GRID &&
+                AdaptiveOverflowPolicy.shouldUseAutomaticOverflow(
+                    contentWidthDp = viewportSize.width / density,
+                    contentHeightDp = viewportSize.height / density,
+                    itemCount = browser.items.size,
+                    selectionActive = selectionMode || state.mediaPick != null,
+                    smallestScreenWidthDp = LocalConfiguration.current.smallestScreenWidthDp,
+                ))
         )
+    val currentOnCoverFlowFullscreen by rememberUpdatedState(onCoverFlowFullscreen)
+    SideEffect { currentOnCoverFlowFullscreen(showsCoverFlow) }
+    DisposableEffect(Unit) { onDispose { currentOnCoverFlowFullscreen(false) } }
     LaunchedEffect(effectiveLayout, showsCoverFlow, selectionMode) {
         if (effectiveLayout != BrowserLayout.LIST || showsCoverFlow || selectionMode) {
             model.stopInlineAudio()
@@ -3960,29 +3990,40 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }
     LaunchedEffect(browser.items) { selectedIds.removeAll { id -> browser.items.none { it.id == id } } }
     if (showsCoverFlow) {
+        // Manual and automatic CoverFlow both close back to this same folder/view; automatic re-entry stays off until the user opts in again.
         BackHandler {
-            if (parentPath == null) model.show(Screen.Dashboard)
-            else model.openConnection(browser.connection, parentPath)
+            explicitCoverFlow = false
+            autoCoverFlowSuppressed = true
         }
-        val browserViewModes = remember(browser.preferences.layout) {
+        val browserViewModes = remember(browser.preferences.layout, explicitCoverFlow) {
             listOf(
                 CoverFlowViewModeOption(
                     title = "자세히",
                     selected = browser.preferences.layout == BrowserLayout.LIST,
                     icon = Icons.Default.List,
-                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LIST)) },
+                    onSelect = { explicitCoverFlow = false; model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LIST)) },
                 ),
                 CoverFlowViewModeOption(
-                    title = "작은 썸네일",
+                    title = "썸네일",
                     selected = browser.preferences.layout == BrowserLayout.SMALL_GRID,
                     icon = Icons.Default.GridView,
-                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.SMALL_GRID)) },
+                    onSelect = { explicitCoverFlow = false; model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.SMALL_GRID)) },
                 ),
                 CoverFlowViewModeOption(
                     title = "포스터",
-                    selected = browser.preferences.layout == BrowserLayout.LARGE_GRID,
+                    selected = browser.preferences.layout == BrowserLayout.LARGE_GRID && !explicitCoverFlow,
                     icon = Icons.Default.GridOn,
-                    onSelect = { model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LARGE_GRID)) },
+                    onSelect = {
+                        autoCoverFlowSuppressed = true
+                        explicitCoverFlow = false
+                        model.updateBrowserPreferences(browser.preferences.copy(layout = BrowserLayout.LARGE_GRID))
+                    },
+                ),
+                CoverFlowViewModeOption(
+                    title = "플로잉",
+                    selected = explicitCoverFlow,
+                    icon = Icons.Default.ViewCarousel,
+                    onSelect = { explicitCoverFlow = true },
                 ),
             )
         }
@@ -3993,8 +4034,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             title = browser.connection.name,
             usesDarkBackground = coverFlowDark,
             onBack = {
-                if (parentPath == null) model.show(Screen.Dashboard)
-                else model.openConnection(browser.connection, parentPath)
+                explicitCoverFlow = false
+                autoCoverFlowSuppressed = true
             },
             onDashboard = { model.show(Screen.Dashboard) },
             viewModes = browserViewModes,
@@ -4086,6 +4127,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 update = model::updateBrowserPreferences,
                 pickLayout = if (pickMode) pickLayout else null,
                 onPickLayout = { pickLayout = it },
+                onCoverFlow = if (!pickMode && browser.items.isNotEmpty()) ({ explicitCoverFlow = true }) else null,
+                onLayoutChosen = { explicitCoverFlow = false; autoCoverFlowSuppressed = false },
             )
         }
     }, colors = TopAppBarDefaults.topAppBarColors(containerColor = if (selectionMode && usesUnifiedLayout(state.theme)) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)) }, bottomBar = {
@@ -4671,14 +4714,25 @@ internal fun RemoteBrowserCoverFlow(
     val statusBarController = remember(context, hostView) {
         context.findHostActivity()?.window?.let { WindowInsetsControllerCompat(it, hostView) }
     }
-    SideEffect {
-        statusBarController?.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        statusBarController?.hide(WindowInsetsCompat.Type.statusBars())
-    }
-    DisposableEffect(statusBarController) {
-        statusBarController?.hide(WindowInsetsCompat.Type.statusBars())
-        onDispose { statusBarController?.show(WindowInsetsCompat.Type.statusBars()) }
+    DisposableEffect(statusBarController, hostView) {
+        val controller = statusBarController
+        if (controller == null) {
+            onDispose { }
+        } else {
+            val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(hostView)
+            val statusWasVisible = rootInsets?.isVisible(WindowInsetsCompat.Type.statusBars()) ?: true
+            val navigationWasVisible = rootInsets?.isVisible(WindowInsetsCompat.Type.navigationBars()) ?: true
+            val previousBehavior = controller.systemBarsBehavior
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            onDispose {
+                if (statusWasVisible) controller.show(WindowInsetsCompat.Type.statusBars())
+                else controller.hide(WindowInsetsCompat.Type.statusBars())
+                if (navigationWasVisible) controller.show(WindowInsetsCompat.Type.navigationBars())
+                else controller.hide(WindowInsetsCompat.Type.navigationBars())
+                controller.systemBarsBehavior = previousBehavior
+            }
+        }
     }
     var backgroundMenu by remember { mutableStateOf(false) }
     val boundedInitialIndex = initialSelectedIndex.coerceIn(0, items.lastIndex.coerceAtLeast(0))
@@ -4732,7 +4786,7 @@ internal fun RemoteBrowserCoverFlow(
             .fillMaxSize()
             .background(background)
             .semantics {
-                contentDescription = "오버플로우 보기"
+                contentDescription = "플로잉 보기"
                 customActions = listOf(
                     CustomAccessibilityAction("이전 항목") { moveSelection(-1) },
                     CustomAccessibilityAction("다음 항목") { moveSelection(1) },
@@ -4885,7 +4939,7 @@ internal fun RemoteBrowserCoverFlow(
             }
         }
         Row(
-            Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 4.dp),
+            Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)).padding(horizontal = 12.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -4894,7 +4948,7 @@ internal fun RemoteBrowserCoverFlow(
                     modifier = Modifier
                         .size(44.dp)
                         .semantics(mergeDescendants = true) {
-                            contentDescription = "이전 폴더"
+                            contentDescription = "플로잉 닫기"
                             customActions = listOf(
                                 CustomAccessibilityAction("NasFinder 첫 화면") {
                                     (onDashboard ?: onBack)()
@@ -4919,7 +4973,7 @@ internal fun RemoteBrowserCoverFlow(
             Text(title, color = chromeForeground, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             Box {
                 Surface(onClick = { backgroundMenu = true }, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
-                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "오버플로우 배경", tint = MaterialTheme.colorScheme.primary) }
+                    Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "플로잉 배경", tint = MaterialTheme.colorScheme.primary) }
                 }
                 DropdownMenu(backgroundMenu, onDismissRequest = { backgroundMenu = false }) {
                     if (viewModes.isNotEmpty()) {
@@ -5398,6 +5452,9 @@ private fun BrowserMenu(
     pasteImports: Boolean = false,
     /** PhoneHard only: the existing Google 포토 entry, shown while that location is not hidden. */
     onGooglePhotos: (() -> Unit)? = null,
+    /** NAS browser only: explicit 커버플로우 button right of 포스터; null (PhoneHard/pickers) hides it. */
+    onCoverFlow: (() -> Unit)? = null,
+    onLayoutChosen: () -> Unit = {},
 ) {
     var expanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -5432,11 +5489,17 @@ private fun BrowserMenu(
             BrowserMenuSection("보기") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     BrowserLayout.entries.forEach { layout ->
-                        val title = when (layout) { BrowserLayout.LIST -> "자세히"; BrowserLayout.SMALL_GRID -> if (pickLayout != null) "썸네일" else "작은 썸네일"; BrowserLayout.LARGE_GRID -> "포스터" }
+                        val title = when (layout) { BrowserLayout.LIST -> "자세히"; BrowserLayout.SMALL_GRID -> if (pickLayout != null || onCoverFlow != null) "썸네일" else "작은 썸네일"; BrowserLayout.LARGE_GRID -> "포스터" }
                         val icon = when (layout) { BrowserLayout.LIST -> Icons.Default.List; BrowserLayout.SMALL_GRID -> Icons.Default.GridView; BrowserLayout.LARGE_GRID -> Icons.Default.GridOn }
-                        BrowserChoice(title, (pickLayout ?: preferences.layout) == layout, Modifier.weight(1f), icon) {
-                            if (pickLayout != null) onPickLayout(layout) else update(preferences.copy(layout = layout))
+                        BrowserChoice(title, (pickLayout ?: preferences.layout) == layout, Modifier.weight(1f), icon, labelMaxLines = if (onCoverFlow != null) 2 else 1) {
+                            if (pickLayout != null) onPickLayout(layout) else { onLayoutChosen(); update(preferences.copy(layout = layout)) }
                             expanded = false
+                        }
+                    }
+                    if (onCoverFlow != null && pickLayout == null) {
+                        BrowserChoice("플로잉", false, Modifier.weight(1f), Icons.Default.ViewCarousel, labelMaxLines = 2) {
+                            expanded = false
+                            onCoverFlow()
                         }
                     }
                 }
@@ -5513,12 +5576,12 @@ private fun BrowserActionTile(label: String, icon: androidx.compose.ui.graphics.
 
 /** iOS CompactPanelButton(isSelected:) for icon choices and CompactPanelOptionButton (minHeight 44, corner 10, 12pt) for text choices. */
 @Composable
-private fun BrowserChoice(label: String, selected: Boolean, modifier: Modifier, icon: androidx.compose.ui.graphics.vector.ImageVector? = null, onClick: () -> Unit) {
+private fun BrowserChoice(label: String, selected: Boolean, modifier: Modifier, icon: androidx.compose.ui.graphics.vector.ImageVector? = null, labelMaxLines: Int = 1, onClick: () -> Unit) {
     val shape = RoundedCornerShape(10.dp)
     val accent = MaterialTheme.colorScheme.primary
     Column(
         modifier
-            .then(if (icon == null) Modifier.heightIn(min = 44.dp) else Modifier.height(52.dp))
+            .then(if (icon == null) Modifier.heightIn(min = 44.dp) else if (labelMaxLines > 1) Modifier.heightIn(min = 72.dp) else Modifier.height(52.dp))
             .clip(shape)
             .background(if (selected) accent else compactPanelFill(), shape)
             .border(.75.dp, if (selected) accent else MaterialTheme.colorScheme.outline.copy(alpha = .24f), shape)
@@ -5534,7 +5597,8 @@ private fun BrowserChoice(label: String, selected: Boolean, modifier: Modifier, 
             fontSize = if (icon == null) 12.sp else 10.sp,
             fontWeight = if (icon != null || selected) FontWeight.SemiBold else FontWeight.Normal,
             color = content,
-            maxLines = 1,
+            textAlign = TextAlign.Center,
+            maxLines = labelMaxLines,
             overflow = TextOverflow.Ellipsis,
         )
     }
@@ -5791,6 +5855,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             contentHeightDp = viewportSize.height / density,
             itemCount = files.size,
             selectionActive = selectionMode,
+            smallestScreenWidthDp = LocalConfiguration.current.smallestScreenWidthDp,
         )
     val displayedLayout = if (showsAutomaticOverflow) InboxLayout.OVERFLOW else configuredLayout
     LaunchedEffect(currentSubdirectory, displayedLayout, selectionMode) {
@@ -7724,8 +7789,9 @@ private fun rememberSuperThumbnailRuntimeConditions(): SuperThumbnailRuntimeCond
         val status = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
         val plugged = battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
         return SuperThumbnailRuntimeConditions(
+            // Wi-Fi transport counts even when metered; cellular stays outside the normal run.
             hasUnmeteredWifi = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
             hasExternalPower = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                 status == BatteryManager.BATTERY_STATUS_FULL || plugged != 0,
         )
@@ -8972,6 +9038,17 @@ private fun protocolSupport(kind: ConnectionKind) = when (kind) {
 
 private fun themeTitle(theme: AppTheme) = theme.title
 private fun themeIcon(theme: AppTheme) = ThemeVectors.vectorFor(theme)
+
+private class ThemeChooserBadge(val fill: Color, val glyph: Color)
+
+private fun themeChooserBadge(theme: AppTheme) = when (theme) {
+    AppTheme.LIGHT -> ThemeChooserBadge(Color(0xFFF5F4F0), Color(0xFF5C6B3C))
+    AppTheme.BKSTYLE -> ThemeChooserBadge(Color(0xFFD9D3C7), Color(0xFF46532B))
+    AppTheme.NIGHT -> ThemeChooserBadge(Color(0xFF1C1C1A), Color(0xFF93B163))
+    AppTheme.JARVIS -> ThemeChooserBadge(Color(0xFF0C1520), Color(0xFF4DC2E6))
+    AppTheme.FRIDAY -> ThemeChooserBadge(Color(0xFFF8EFE3), Color(0xFFB8651B))
+    AppTheme.ULTRON -> ThemeChooserBadge(Color(0xFF121316), Color(0xFFF2566A))
+}
 @Composable
 private fun AutoShrinkThemeTitle(text: String, color: Color) {
     var size by remember(text) { mutableFloatStateOf(12f) }

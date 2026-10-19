@@ -1,6 +1,9 @@
 package com.armsone.nasfinder.data
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import com.armsone.nasfinder.model.RemoteFileItem
 import java.util.ArrayDeque
 
@@ -21,9 +24,31 @@ internal data class SuperThumbnailBudget(
         val safeNext = nextItemBytes.coerceAtLeast(1L)
         return consumed <= maxEstimatedBytes && safeNext <= maxEstimatedBytes - consumed
     }
+
+    companion object {
+        /** Wi-Fi: no item-count or byte-estimate quota. Depth stays bounded; cycles are stopped by the traversal's seen set. */
+        fun unlimitedForWifi(maxDepth: Int = 24): SuperThumbnailBudget = SuperThumbnailBudget(
+            maxItems = Int.MAX_VALUE,
+            maxDepth = maxDepth,
+            maxEstimatedBytes = Long.MAX_VALUE,
+        )
+    }
+}
+
+/** Evaluated at each operation boundary so a Wi-Fi to cellular switch never keeps unlimited quotas. */
+internal object SuperThumbnailNetworkPolicy {
+    fun isWifi(context: Context): Boolean = runCatching {
+        val manager = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+            ?: return@runCatching false
+        val capabilities = manager.getNetworkCapabilities(manager.activeNetwork ?: return@runCatching false)
+            ?: return@runCatching false
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+    }.getOrDefault(false)
 }
 
 internal data class SuperThumbnailRuntimeConstraints(
+    /** Name kept for compatibility: now means "requires Wi-Fi transport"; metered Wi-Fi is allowed. */
     val requiresUnmeteredNetwork: Boolean,
     val requiresExternalPower: Boolean,
     val requiresBatteryNotLow: Boolean,

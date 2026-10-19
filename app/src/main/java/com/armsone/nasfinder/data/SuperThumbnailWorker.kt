@@ -1,6 +1,8 @@
 package com.armsone.nasfinder.data
 
 import android.content.Context
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.PowerManager
 import androidx.lifecycle.LiveData
@@ -60,20 +62,25 @@ object SuperThumbnailWorkController {
             putBoolean(SuperThumbnailWorker.KEY_RESUME_EXISTING, resumeExisting)
         }.build()
         val runtimeConstraints = SuperThumbnailRuntimeConstraints.forRun(allowsConstrainedRun)
+        val constraints = Constraints.Builder().apply {
+            if (runtimeConstraints.requiresUnmeteredNetwork && Build.VERSION.SDK_INT >= 28) {
+                // Wi-Fi transport (metered included). Cellular keeps the worker ENQUEUED instead of failing files.
+                setRequiredNetworkRequest(
+                    NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .build(),
+                    NetworkType.CONNECTED,
+                )
+            } else {
+                // Below API 28 (or explicit constrained run) any network; the worker's runtime Wi-Fi gate applies.
+                setRequiredNetworkType(NetworkType.CONNECTED)
+            }
+            setRequiresCharging(runtimeConstraints.requiresExternalPower)
+            setRequiresBatteryNotLow(runtimeConstraints.requiresBatteryNotLow)
+        }.build()
         val request = OneTimeWorkRequestBuilder<SuperThumbnailWorker>()
-            .setConstraints(
-                Constraints.Builder()
-                    .setRequiredNetworkType(
-                        if (runtimeConstraints.requiresUnmeteredNetwork) {
-                            NetworkType.UNMETERED
-                        } else {
-                            NetworkType.CONNECTED
-                        }
-                    )
-                    .setRequiresCharging(runtimeConstraints.requiresExternalPower)
-                    .setRequiresBatteryNotLow(runtimeConstraints.requiresBatteryNotLow)
-                    .build()
-            )
+            .setConstraints(constraints)
             .setInputData(input)
             .addTag(TAG)
             .build()
@@ -134,11 +141,19 @@ class SuperThumbnailWorker(
     override suspend fun doWork(): Result {
         val connectionId = inputData.getString(KEY_CONNECTION_ID)
             ?.takeIf(String::isNotBlank) ?: return Result.failure(failureData())
+        val requiresWifi = !inputData.getBoolean(KEY_ALLOWS_CONSTRAINED_RUN, false)
+        // Eligibility wait (not a file failure): retry later without touching the network or the retry-by-error budget.
+        if (requiresWifi && !SuperThumbnailNetworkPolicy.isWifi(applicationContext)) return Result.retry()
         val repository = ConnectionRepository(applicationContext)
         val connection = repository.load().firstOrNull { it.id == connectionId }
             ?: return Result.failure(failureData())
         val requestedRoot = inputData.getString(KEY_ROOT_PATH) ?: connection.normalizedRootPath
         val budget = SuperThumbnailBudget()
+        // Wi-Fi transport only: no item/byte quotas. Re-evaluated per item so a switch to cellular restores the caps.
+        val wifiBudget = SuperThumbnailBudget.unlimitedForWifi(budget.maxDepth)
+        val budgetProvider: () -> SuperThumbnailBudget = {
+            if (SuperThumbnailNetworkPolicy.isWifi(applicationContext)) wifiBudget else budget
+        }
         val traversal = runCatching { SuperThumbnailTraversal(connection.normalizedRootPath, budget) }
             .getOrElse { return Result.failure(failureData()) }
         val root = runCatching { traversal.requireInsideRoot(requestedRoot) }
@@ -170,6 +185,7 @@ class SuperThumbnailWorker(
                 RemoteThumbnailRepository(
                     applicationContext,
                     onCacheCommitted = cacheKeyStore::record,
+                    unlimitedTraffic = { SuperThumbnailNetworkPolicy.isWifi(applicationContext) },
                 ).use { thumbnails ->
                     coroutineScope {
                         val cooperation = if (vaultOptions.enabled &&
@@ -180,9 +196,9 @@ class SuperThumbnailWorker(
                         cooperation?.start(this)
                         try {
                             runTraversal(
-                                connection, service, thumbnails, scopedTraversal, budget,
+                                connection, service, thumbnails, scopedTraversal, budgetProvider,
                                 root, sessionKey, sessionStore, vault, vaultOptions, resumeItemIds,
-                                cooperation,
+                                cooperation, requiresWifi,
                             )
                         } finally {
                             cooperation?.stop()
@@ -202,7 +218,7 @@ class SuperThumbnailWorker(
         service: com.armsone.nasfinder.network.RemoteFileService,
         thumbnails: RemoteThumbnailRepository,
         traversal: SuperThumbnailTraversal,
-        budget: SuperThumbnailBudget,
+        budgetProvider: () -> SuperThumbnailBudget,
         rootPath: String,
         sessionKey: String,
         sessionStore: SuperThumbnailSessionStore,
@@ -210,6 +226,7 @@ class SuperThumbnailWorker(
         vaultOptions: SuperThumbnailVaultOptions,
         resumeItemIds: Set<String>?,
         cooperation: SuperThumbnailCooperationSession?,
+        requiresWifi: Boolean,
     ): Result {
         var visited = 0
         var generated = 0
@@ -221,6 +238,12 @@ class SuperThumbnailWorker(
         val delayedVaultItems = mutableListOf<RemoteFileItem>()
         val visitedDirectoryNodes = mutableListOf<String>()
         val dirChildrenMap = mutableMapOf<String, List<RemoteFileItem>>()
+        // Session items re-seen in current listings (before resume/budget filters) so the final
+        // NAS check uses current metadata for the whole session, not only this run's subset.
+        val sessionItemIds = if (vaultOptions.enabled) {
+            sessionStore.observedItems(sessionKey).mapTo(hashSetOf()) { it.id }
+        } else emptySet()
+        val currentListed = linkedMapOf<String, RemoteFileItem>()
 
         while (true) {
             currentCoroutineContext().ensureActive()
@@ -235,10 +258,19 @@ class SuperThumbnailWorker(
             }
             val visibleItems = items.filterNot { it.name.startsWith('.') }
             dirChildrenMap[directory.path] = visibleItems
+            if (sessionItemIds.isNotEmpty()) {
+                visibleItems.forEach { listed ->
+                    if (listed.id !in sessionItemIds) return@forEach
+                    val listedPath = runCatching { traversal.requireInsideRoot(listed.path) }.getOrNull() ?: return@forEach
+                    currentListed[listed.id] = listed.copy(path = listedPath)
+                }
+            }
             val completedInFolder = mutableListOf<RemoteFileItem>()
             itemLoop@ for (item in visibleItems) {
                 currentCoroutineContext().ensureActive()
                 if (!allowsThermalWork()) return Result.retry()
+                if (requiresWifi && !SuperThumbnailNetworkPolicy.isWifi(applicationContext)) return Result.retry()
+                val budget = budgetProvider()
                 // Resume scans still need directories, but unrelated files must not consume
                 // the bounded item budget before a saved pending item is reached.
                 if (!item.isDirectory && resumeItemIds != null && item.id !in resumeItemIds) continue
@@ -307,15 +339,18 @@ class SuperThumbnailWorker(
                             }
                         }
                     }
+                    // A bad file is isolated: it counts as failed (PARTIAL result) and the remaining files keep going.
                     val cached = try {
                         if (wasCached) {
                             thumbnails.load(connection, safeItem, service)
                         } else {
                             thumbnails.generateSuperThumbnail(connection, safeItem, service)
                         }
-                    } catch (error: Throwable) {
+                    } catch (error: CancellationException) {
                         cooperativeLease?.let { cooperation?.release(it) }
                         throw error
+                    } catch (_: Throwable) {
+                        null
                     }
                     if (cached == null) {
                         cooperativeLease?.let { cooperation?.release(it) }
@@ -360,7 +395,7 @@ class SuperThumbnailWorker(
                     delayedVaultItems += completedInFolder
                 }
             }
-            if (visited >= budget.maxItems) {
+            if (visited >= budgetProvider().maxItems) {
                 budgetReached = true
                 break
             }
@@ -379,6 +414,8 @@ class SuperThumbnailWorker(
         }
         // Bottom-up folder Super Thumbnail production
         val unblurredFolderSheets = mutableMapOf<String, Bitmap>()
+        // Folders whose published sheet is fully backed by real tiles (or that are genuinely empty).
+        val completeFolderPaths = hashSetOf<String>()
         try {
             for (dirPath in visitedDirectoryNodes.asReversed()) {
                 val childFolders = dirChildrenMap[dirPath].orEmpty().filter { it.isDirectory }
@@ -398,6 +435,7 @@ class SuperThumbnailWorker(
                             vault.storeFolderEmptyMarkerWithRetry(folderItem, rootPath, service)
                         }
                         sessionStore.recordSuccess(sessionKey, folderItem)
+                        completeFolderPaths += folderItem.path
                     } else {
                         // Always rebuild from unblurred run-scoped sources. A normal
                         // generation pass therefore upgrades legacy fixed-blur sheets at
@@ -408,8 +446,28 @@ class SuperThumbnailWorker(
                             if (child.isDirectory) {
                                 unblurredFolderSheets[child.path]
                             } else if (thumbnails.hasCached(connection, child)) {
-                                thumbnails.load(connection, child, service)
+                                try {
+                                    thumbnails.load(connection, child, service)
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (_: Throwable) {
+                                    null
+                                }
                             } else null
+                        }
+                        // Never publish a sheet whose selected media/folder tile is missing (failed, unsupported or over budget).
+                        val missingTile = selected.any { child ->
+                            when {
+                                child.isDirectory -> child.path !in completeFolderPaths &&
+                                    dirChildrenMap[child.path]?.isEmpty() != true
+                                child.isImage || child.isVideo -> tileBitmaps[child] == null
+                                else -> false
+                            }
+                        }
+                        if (missingTile) {
+                            failed++
+                            sessionStore.recordFailure(sessionKey, folderItem, "일부 하위 항목 썸네일이 없어 폴더 썸네일을 보류했습니다.")
+                            continue
                         }
                         val rawSheet = FolderSuperThumbnailComposer.composeRawSheet(selected, tileBitmaps::get)
                         unblurredFolderSheets.put(folderItem.path, rawSheet)?.let { previous ->
@@ -427,6 +485,7 @@ class SuperThumbnailWorker(
                                     vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
                                 }
                                 generated++
+                                completeFolderPaths += folderItem.path
                                 sessionStore.recordSuccess(sessionKey, folderItem)
                             } else {
                                 failed++
@@ -444,9 +503,24 @@ class SuperThumbnailWorker(
             unblurredFolderSheets.values.forEach { if (!it.isRecycled) it.recycle() }
             unblurredFolderSheets.clear()
         }
-        if (vaultOptions.enabled && observedMedia.isNotEmpty()) {
-            runCatching { vault.verifyStoredItemIds(observedMedia, rootPath, service) }
-                .onSuccess { sessionStore.recordVaultVerification(sessionKey, it, Instant.now()) }
+        if (vaultOptions.enabled && (observedMedia.isNotEmpty() || currentListed.isNotEmpty())) {
+            // Changed sources get fresh state first so an old completion is never kept.
+            val sessionNow = sessionStore.observedItems(sessionKey).associateBy { it.id }
+            val changed = currentListed.values.filter { current ->
+                val old = sessionNow[current.id]
+                old != null && (old.size != current.size || old.modifiedAt != current.modifiedAt)
+            }
+            if (changed.isNotEmpty()) {
+                sessionStore.prepare(sessionKey = sessionKey, rootPath = rootPath, items = changed, vaultEnabled = true)
+            }
+            val verifyItems = LinkedHashMap<String, RemoteFileItem>().apply {
+                currentListed.forEach { (id, item) -> put(id, item) }
+                observedMedia.forEach { put(it.id, it) }
+            }.values.toList()
+            runCatching { vault.verifyItems(verifyItems, rootPath, service) }
+                .onSuccess {
+                    sessionStore.recordVaultVerification(sessionKey, it.storedItemIds, Instant.now(), it.checkedItemIds)
+                }
         }
         if (resumeItemIds == null && !budgetReached && !listingFailed) {
             sessionStore.reconcileObserved(sessionKey, observedMedia)

@@ -545,6 +545,7 @@ fun WebHardScreen(onClose: () -> Unit) {
             contentHeightDp = viewportSize.height / density,
             itemCount = fileItems.size,
             selectionActive = false,
+            smallestScreenWidthDp = configuration.smallestScreenWidthDp,
         )
 
     fun stop() {

@@ -339,11 +339,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val networkDownloadCoordinator: NetworkDownloadCoordinator = NetworkDownloadCoordinator.create(application, inboxStore)
     private var networkDownloadJob: Job? = null
     private val downloadCache = DownloadCache(application)
-    private val thumbnailRepository = RemoteThumbnailRepository(application)
+    private val thumbnailRepository = RemoteThumbnailRepository(
+        application,
+        unlimitedTraffic = { com.armsone.nasfinder.data.SuperThumbnailNetworkPolicy.isWifi(application) },
+    )
     private val superThumbnailDataController = SuperThumbnailDataController(application)
     private var service: RemoteFileService? = null
     private var thumbnailGeneration = 0L
     private val thumbnailRequests = mutableSetOf<String>()
+    private val thumbnailJobs = mutableMapOf<String, Job>()
+    private val thumbnailFailures = mutableMapOf<String, Int>()
     private var favoriteThumbnailGeneration = 0L
     private val favoriteThumbnailRequests = mutableSetOf<String>()
     private val favoriteThumbnailJobs = mutableMapOf<String, Job>()
@@ -1655,6 +1660,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         connectionOpenJob?.cancel()
         val generation = ++thumbnailGeneration
         val countGen = ++folderCountGeneration
+        thumbnailJobs.values.forEach(Job::cancel)
+        thumbnailJobs.clear()
+        thumbnailFailures.clear()
         thumbnailRequests.clear()
         folderCountRequests.clear()
         val preferences = repository.browserPreferences()
@@ -1731,8 +1739,20 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (!thumbnailRequests.add(requestKey)) return
         val connectionId = browser.connection.id
         val path = browser.path
-        viewModelScope.launch {
-            val bitmap = thumbnailRepository.load(browser.connection, item, activeService) ?: return@launch
+        val job = viewModelScope.launch {
+            val bitmap = try {
+                thumbnailRepository.load(browser.connection, item, activeService)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // Traffic limit or network error must not crash the UI; allow a bounded number of later re-requests.
+                if (generation == thumbnailGeneration) {
+                    val failures = (thumbnailFailures[requestKey] ?: 0) + 1
+                    thumbnailFailures[requestKey] = failures
+                    if (failures < MAX_THUMBNAIL_UI_ATTEMPTS) thumbnailRequests.remove(requestKey)
+                }
+                null
+            } ?: return@launch
             val current = _state.value.screen as? Screen.Browser ?: return@launch
             if (generation != thumbnailGeneration || current.connection.id != connectionId || current.path != path ||
                 current.items.none { it.id == item.id && it.path == item.path }
@@ -1742,6 +1762,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 else state.copy(remoteThumbnails = state.remoteThumbnails + (item.id to bitmap))
             }
         }
+        thumbnailJobs[requestKey] = job
+        job.invokeOnCompletion { viewModelScope.launch { if (thumbnailJobs[requestKey] === job) thumbnailJobs.remove(requestKey) } }
     }
 
     fun loadFolderChildCount(item: RemoteFileItem) {
@@ -6273,6 +6295,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     private companion object {
+        const val MAX_THUMBNAIL_UI_ATTEMPTS = 3
         const val KEY_SUPER_THUMBNAIL_CONNECTION = "selected_connection_id"
         const val KEY_SUPER_THUMBNAIL_PATH = "selected_path_v1"
         const val KEY_SUPER_THUMBNAIL_TITLE = "selected_title_v1"
