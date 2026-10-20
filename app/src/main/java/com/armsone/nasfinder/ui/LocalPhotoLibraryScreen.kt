@@ -473,6 +473,16 @@ internal fun LocalPhotoLibraryScreen(
                                 if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
                             }
                         }
+                        LocalMediaActionButton("재료함 담기", actionsEnabled, Modifier, isSecondary = true) {
+                            val uris = selectedUris()
+                            if (uris.isNotEmpty()) {
+                                model.addLocalMediaToMaterialBasket(uris, deviceItems)
+                            }
+                        }
+                        LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier, isSecondary = true) {
+                            // Opens the 사본/참조 confirmation; the selection itself is kept either way.
+                            model.stageCollectionImport(selectedUris().map { it to null })
+                        }
                         LocalMediaActionButton("영상 편집", actionsEnabled, Modifier, isSecondary = false) {
                             // Unified entry starts as a trailer; the editor switches modes inline.
                             // An explicit music route keeps its original music-video start.
@@ -660,6 +670,15 @@ internal fun LocalPhotoLibraryScreen(
                             LocalMediaActionButton("영상 편집", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = false) {
                                 if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
                                 else onCreateTrailer(selectedUris())
+                            }
+                            LocalMediaActionButton("재료함 담기", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
+                                val uris = selectedUris()
+                                if (uris.isNotEmpty()) {
+                                    model.addLocalMediaToMaterialBasket(uris, deviceItems)
+                                }
+                            }
+                            LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
+                                model.stageCollectionImport(selectedUris().map { it to null })
                             }
                             if (onCopyToPhoneHard != null) {
                                 LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {

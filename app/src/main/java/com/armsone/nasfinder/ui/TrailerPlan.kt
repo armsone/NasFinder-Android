@@ -20,6 +20,9 @@ data class TrailerSource(
     // should occupy: .35..75 ordinary (best photo highest, similar duplicates lower), down to
     // MIN_PHOTO_DURATION_RATIO for extreme near-duplicates. Set by analyzeTrailerPhotos().
     val photoDurationRatio: Double = DEFAULT_PHOTO_DURATION_RATIO,
+    // Stable identity of the Finder item this source was prepared from ("remote:<conn>:<path>",
+    // "phonehard:<uuid>", "local:<uri>", "web:<path>"); null for legacy drafts. Only used to show 사용 중.
+    val originKey: String? = null,
 ) {
     // Actual scene duration for this photo given the configured video-clip ("base clip") length.
     fun weightedPhotoLength(clipLength: Double): Double =
@@ -222,7 +225,20 @@ object NaturalOrderComparator : Comparator<String> {
     }
 }
 
-data class TrailerScene(val source: TrailerSource, val start: Double, val length: Double)
+/** How a scene fills the output frame: FILL crops to cover (focus picks the visible part), FIT letterboxes. */
+enum class SceneFit(val title: String) { FILL("채우기"), FIT("맞추기") }
+
+data class TrailerScene(
+    val source: TrailerSource,
+    val start: Double,
+    val length: Double,
+    val fit: SceneFit = SceneFit.FILL,
+    // -1..1 horizontal/vertical focus of the visible crop window when [fit] is FILL; 0 is centered.
+    val focusX: Float = 0f,
+    val focusY: Float = 0f,
+    // Original clip audio gain (0 = mute, 1 = as recorded); independent of the whole-video music volume.
+    val sourceVolume: Float = 1f,
+)
 enum class TrailerFormat(val title: String, val width: Int, val height: Int) {
     ORIGINAL("원본", 0, 0),
     SQUARE("1:1", 1080, 1080),
@@ -277,9 +293,14 @@ data class TrailerSession(
     val progress: Float? = null, val error: String? = null, val saved: Boolean = false,
     val isMusicOverlayMode: Boolean = false,
     val musicTrack: TrailerMusicTrack? = null,
+    // The stored music choice whose file is unreadable right now. Kept (and saved) until the user explicitly
+    // removes or replaces it; never used for playback/export while unavailable.
+    val unavailableMusic: TrailerMusicTrack? = null,
     val musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
     val musicFitCount: Int = 1,
     val autoDucking: Boolean = true,
+    // Export was requested while [unavailableMusic] is unresolved: the user must reconnect, reselect or skip it.
+    val musicExportPrompt: Boolean = false,
     val awaitingInitialSettings: Boolean = false,
     // True only once every source is staged and analysed and the first plan exists.
     val prepared: Boolean = false,
@@ -287,6 +308,20 @@ data class TrailerSession(
     // False while sources only carry the placeholder analysis of music mode (no highlight/photo ratio data).
     val highlightAnalyzed: Boolean = true,
     val orderMode: String? = "추가순",
+    // Explicit, editable scene list of the CURRENT project (null only while staging). Export and autosave use it.
+    val editor: EditorProject? = null,
+    // Incremented on every editor change; export snapshots and autosave compare against it.
+    val revision: Long = 0L,
+    val title: String? = null,
+    val saveState: EditorSaveState = EditorSaveState.IDLE,
+    val saveError: String? = null,
+    val export: EditorExportState? = null,
+    // Editor revision the current [output] was rendered from.
+    val outputRevision: Long? = null,
+    // Finder items being prepared for THIS project (download/copy/analysis), with real per-item state.
+    val pendingAdds: List<EditorPendingAdd> = emptyList(),
+    val canUndo: Boolean = false,
+    val canRedo: Boolean = false,
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
     // Music-overlay mode keeps every photo at a fixed 1s Ken Burns scene; trailer mode now weighs
@@ -296,11 +331,20 @@ data class TrailerSession(
     val originalTotal get() = sources.sumOf {
         if (!it.isImage) it.duration else if (isMusicOverlayMode) 1.0 else it.weightedPhotoLength(clipLength)
     }
-    val scenes get() = if (isMusicOverlayMode) {
-        musicOverlayScenes(sources, 1.0, musicTrack, musicPolicy, musicFitCount)
+    val scenes: List<TrailerScene> get() = editor?.toTrailerScenes(sources) ?: autoPlanScenes()
+
+    /** The recommended/automatic plan for the current parameters (what [editor] mirrors while autoPlan is true). */
+    fun autoPlanScenes(): List<TrailerScene> = if (isMusicOverlayMode) {
+        musicOverlayScenes(sources, 1.0, plannedMusic, musicPolicy, musicFitCount)
     } else {
-        trailerScenes(sources, total, clipLength, photoClipLength, musicTrack, musicPolicy, musicFitCount)
+        trailerScenes(sources, total, clipLength, photoClipLength, plannedMusic, musicPolicy, musicFitCount)
     }
+
+    /** Music the plan follows: the stored choice even while its file is unavailable (only its length is used). */
+    val plannedMusic: TrailerMusicTrack? get() = musicTrack ?: unavailableMusic
+
+    val displayTitle: String get() = title?.takeIf { it.isNotBlank() }
+        ?: if (isMusicOverlayMode) "뮤직비디오 (${sources.size}개 미디어)" else "예고편 편집 (${sources.size}개 미디어)"
 }
 
 internal fun defaultPhotoClipLength(videoLength: Double, hasVideos: Boolean = true): Double = videoLength / 2.0
@@ -442,7 +486,7 @@ private fun fitScenesToTargetDuration(scenes: List<TrailerScene>, targetDuration
             accumulated += next.length
         } else {
             // Trim this last clip to remaining exact duration
-            result.add(TrailerScene(next.source, next.start, remaining))
+            result.add(next.copy(length = remaining))
             accumulated += remaining
             break
         }

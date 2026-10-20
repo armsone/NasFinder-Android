@@ -197,7 +197,7 @@ internal fun PorcelainWideHost(
                 if (!fullscreen) {
                     PorcelainSidebar(
                         state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
-                        Modifier.width(sidebarWidthFor(this@BoxWithConstraints.maxWidth)).fillMaxHeight(), selectedConnectionId, phoneHardSelected,
+                        Modifier.width(sidebarWidthFor(this@BoxWithConstraints.maxWidth)).fillMaxHeight().navigationBarsPadding(), selectedConnectionId, phoneHardSelected,
                     )
                     VerticalDividerLine()
                 }
@@ -547,9 +547,9 @@ private fun CompactAction(title: String, glyph: PackGlyph, modifier: Modifier, d
  */
 @Composable
 private fun PorcelainVideo(state: AppState, model: NasFinderViewModel) {
-    PorcelainSection("영상 작업") {
+    PorcelainSection("영상") {
         Surface(
-            onClick = { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)) },
+            onClick = { model.selectVideoDestination(VideoNavigationDestination.CREATE) },
             shape = RoundedCornerShape(10.dp),
             color = MaterialTheme.colorScheme.primary,
             contentColor = MaterialTheme.colorScheme.onPrimary,
@@ -562,17 +562,33 @@ private fun PorcelainVideo(state: AppState, model: NasFinderViewModel) {
                 Box(Modifier.size(32.dp).background(MaterialTheme.colorScheme.onPrimary, CircleShape), contentAlignment = Alignment.Center) {
                     PackIcon(PackGlyph.VIDEO, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
                 }
-                Text("영상 만들기", Modifier.weight(1f), style = HomeType.Cta, color = MaterialTheme.colorScheme.onPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("영상 제작", Modifier.weight(1f), style = HomeType.Cta, color = MaterialTheme.colorScheme.onPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Icon(Icons.Default.ChevronRight, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary)
             }
         }
         PorcelainPanel(Modifier.fillMaxWidth()) {
             PorcelainRow(
-                "보관한 편집",
+                "재료함",
+                PackGlyph.GRID,
+                subtitle = "영상에 쓸 미디어 모음",
+                trailing = { Text("${state.materials.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                onClick = { model.selectVideoDestination(VideoNavigationDestination.MATERIALS) },
+            )
+            PorcelainDivider()
+            PorcelainRow(
+                "편집본",
                 PackGlyph.DRAFTS,
-                subtitle = "메모리에만 보관 · 앱을 끝내면 사라집니다",
+                subtitle = "저장된 영상 프로젝트",
                 trailing = { Text("${state.trailerDraftCount}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                onClick = model::openPhoneHardLongTouch,
+                onClick = { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) },
+            )
+            PorcelainDivider()
+            PorcelainRow(
+                "컬렉션",
+                PackGlyph.VIDEO,
+                subtitle = "완성된 영상 및 재생 보관소",
+                trailing = { Text("${state.collections.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                onClick = { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
             )
         }
     }
@@ -677,7 +693,11 @@ private fun PorcelainSidebar(
         SidebarItem("폰하드", PackGlyph.PHONEHARD, selected = phoneHardSelected, onLongClick = model::openPhoneHardLongTouch) { model.show(Screen.Inbox) }
         if (state.googlePhotosVisible) SidebarItem(state.googlePhotosName, PackGlyph.PHOTOS, googleMark = true, onClick = model::requestGooglePhotosImport)
         SidebarDivider()
-        SidebarItem("영상 작업", PackGlyph.VIDEO) { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)) }
+        SidebarItem("영상 제작", PackGlyph.VIDEO) { model.selectVideoDestination(VideoNavigationDestination.CREATE) }
+        SidebarItem("재료함", PackGlyph.GRID) { model.selectVideoDestination(VideoNavigationDestination.MATERIALS) }
+        SidebarItem("편집본", PackGlyph.DRAFTS) { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) }
+        SidebarItem("컬렉션", PackGlyph.VIDEO) { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) }
+        SidebarDivider()
         SidebarItem("기기 간 사진 전송", PackGlyph.TRANSFER) { model.show(Screen.PhotoTransfer) }
         SidebarItem("기기 저장공간", PackGlyph.STORAGE, onClick = onImportFiles)
         SidebarDivider()

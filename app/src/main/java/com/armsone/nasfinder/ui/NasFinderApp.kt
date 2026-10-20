@@ -201,15 +201,17 @@ import kotlinx.coroutines.withContext
 @Composable
 internal fun Modifier.appSafeArea(): Modifier = windowInsetsPadding(
     WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility),
-).appBottomSafety()
+)
 
+// App root: the background runs to the physical bottom edge. Each screen's bottom bar (or its Scaffold
+// content padding) owns the navigation inset; only the keyboard inset is taken here, once for every screen.
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun Modifier.appBottomSafety(): Modifier {
-    val metrics = LocalContext.current.resources.displayMetrics
-    val density = LocalDensity.current
-    val bottom = with(density) { (metrics.ydpi * 5f / 25.4f).toDp() }.coerceAtLeast(32.dp)
-    return padding(bottom = bottom)
-}
+private fun Modifier.appRootSafeArea(): Modifier = windowInsetsPadding(
+    WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility)
+        .only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)
+        .union(WindowInsets.ime),
+)
 
 @Composable
 fun NasFinderApp(
@@ -289,8 +291,8 @@ fun NasFinderApp(
                         coverFlowFullscreen -> Modifier.windowInsetsPadding(
                             WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Horizontal),
                         )
-                        state.imagePreview != null || state.trailer != null -> Modifier
-                        else -> Modifier.appSafeArea()
+                        state.imagePreview != null || (state.trailer != null && !state.trailerMinimized) -> Modifier
+                        else -> Modifier.appRootSafeArea()
                     },
                 ),
         ) {
@@ -341,8 +343,36 @@ fun NasFinderApp(
                     onSendDownloadedFile = model::importWebDownloadToNas,
                     onDiscardDownloadedFile = model::discardWebDownload,
                 )
+                Screen.MaterialBasket -> MaterialBasketScreen(state, model, onBack = { model.show(Screen.Dashboard) })
+                Screen.VideoDrafts -> VideoDraftsScreen(state, model, onBack = { model.show(Screen.Dashboard) })
+                Screen.VideoCollections -> VideoCollectionsScreen(state, model, onBack = { model.show(Screen.Dashboard) })
             }
-            state.trailer?.let { VideoTrailerScreen(it, model, browsingForMusic = state.screen == Screen.WebBrowser) }
+            state.trailer?.let { session ->
+                if (!state.trailerMinimized && state.screen != Screen.WebBrowser) {
+                    VideoTrailerScreen(session, model, browsingForMusic = false)
+                } else {
+                    // The project stays open (export/adds keep running) while another destination is visited.
+                    Surface(
+                        onClick = model::restoreEditor,
+                        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 88.dp, start = 16.dp, end = 16.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        shadowElevation = 6.dp,
+                    ) {
+                        Row(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            PackIcon(PackGlyph.VIDEO, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                            Spacer(Modifier.width(8.dp))
+                            val running = session.export?.running == true
+                            Text(
+                                "편집으로 돌아가기 · ${session.displayTitle}${if (running) " (내보내는 중)" else ""}",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
             state.imagePreview?.let { preview ->
                 BuiltInPreviewScreen(
                     preview = preview,
@@ -391,6 +421,18 @@ fun NasFinderApp(
                 confirmButton = {
                     TextButton(onClick = model::dismissTrailerDraftStaleNotice) { Text("확인") }
                 }
+            )
+        }
+        state.pendingCollectionImport?.let { pending ->
+            PendingCollectionImportDialog(pending, model)
+        }
+        state.collectionCopyOffer?.let { offer ->
+            AlertDialog(
+                onDismissRequest = model::dismissCollectionCopyOffer,
+                title = { Text("외부 참조로 보관할 수 없습니다") },
+                text = { Text(offer.message) },
+                confirmButton = { Button(onClick = model::acceptCollectionCopyOffer) { Text("앱 안에 사본 보관") } },
+                dismissButton = { TextButton(onClick = model::dismissCollectionCopyOffer) { Text("취소") } },
             )
         }
         state.trailerConflict?.let { conflict ->
@@ -1535,7 +1577,6 @@ private fun MediaPreviewContent(
                     .fillMaxWidth()
                     .background(Color.Black.copy(alpha = .72f))
                     .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal))
-                    .appBottomSafety()
                     .padding(16.dp),
             ) {
                 Slider(
@@ -1660,10 +1701,11 @@ private fun TrailerDraftManager(drafts: List<TrailerDraft>, model: NasFinderView
                     if (porcelain) PackIcon(PackGlyph.DRAFTS, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     else Icon(Icons.Default.MovieFilter, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("보관한 편집이 없습니다", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                    val metadataProblem = TrailerDraftStore.metadataProblem()
                     Text(
-                        "보관한 편집은 메모리에만 있고 앱을 끝내면 사라집니다.",
+                        metadataProblem ?: "편집을 닫으면 앱 저장 공간에 보관되어 앱을 다시 열어도 이어서 편집할 수 있습니다.",
                         fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (metadataProblem != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center,
                     )
                 }
@@ -2099,6 +2141,30 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
             }
             if (!usesUnifiedLayout(state.theme)) settingsButton()
         }, expandedHeight = 52.dp, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent))
+    }, bottomBar = {
+        NavigationBar(
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+            tonalElevation = 2.dp
+        ) {
+            NavigationBarItem(
+                selected = state.activeMainTab == MainNavigationDestination.FINDER,
+                onClick = { model.selectMainDestination(MainNavigationDestination.FINDER) },
+                icon = { PackIcon(PackGlyph.HOME, null, Modifier.size(22.dp)) },
+                label = { Text("파인더", fontSize = 12.sp) }
+            )
+            NavigationBarItem(
+                selected = state.activeMainTab == MainNavigationDestination.VIDEO,
+                onClick = { model.selectMainDestination(MainNavigationDestination.VIDEO) },
+                icon = { PackIcon(PackGlyph.VIDEO, null, Modifier.size(22.dp)) },
+                label = { Text("영상", fontSize = 12.sp) }
+            )
+            NavigationBarItem(
+                selected = state.activeMainTab == MainNavigationDestination.TOOLS,
+                onClick = { model.selectMainDestination(MainNavigationDestination.TOOLS) },
+                icon = { PackIcon(PackGlyph.SETTINGS, null, Modifier.size(22.dp)) },
+                label = { Text("도구", fontSize = 12.sp) }
+            )
+        }
     }) { padding ->
         val favoritesItems: LazyListScope.() -> Unit = {
             item { SectionTitle("즐겨찾기", Icons.Default.Star) }
@@ -2768,7 +2834,7 @@ private fun HomeFavoriteActionFlow(action: HomeFavoriteAction, state: AppState, 
     }
 
     operationStatus?.let { status ->
-        Box(Modifier.fillMaxSize().padding(bottom = 72.dp), contentAlignment = Alignment.BottomCenter) {
+        Box(Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 72.dp), contentAlignment = Alignment.BottomCenter) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = MaterialTheme.colorScheme.inverseSurface,
@@ -2788,7 +2854,7 @@ private fun HomeFavoriteActionFlow(action: HomeFavoriteAction, state: AppState, 
             delay(2200)
             toastMessage = null
         }
-        Box(Modifier.fillMaxSize().padding(bottom = 72.dp), contentAlignment = Alignment.BottomCenter) {
+        Box(Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 72.dp), contentAlignment = Alignment.BottomCenter) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = MaterialTheme.colorScheme.inverseSurface,
@@ -3634,7 +3700,6 @@ internal fun AppleBaselineActionSheet(
     onShowDisabledReason: (String) -> Unit,
 ) {
     ModalBottomSheet(
-        modifier = Modifier.appBottomSafety(),
         onDismissRequest = onDismiss,
         containerColor = MaterialTheme.colorScheme.background,
     ) {
@@ -4159,6 +4224,9 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedItems.isNotEmpty() && capabilities.copy) { batchTransfer = RemoteTransferAction.COPY },
                     BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedItems.isNotEmpty() && capabilities.move) { batchTransfer = RemoteTransferAction.MOVE },
                     BrowserSelectionAction("삭제", Icons.Default.Delete, selectedItems.isNotEmpty() && capabilities.delete, destructive = true) { confirmBatchDelete = true },
+                    BrowserSelectionAction("재료함 담기", Icons.Default.Inbox, canTrailer) { model.addRemoteFilesToMaterialBasket(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
+                    // NAS/cloud paths are never durable references: this always stores an app-owned copy.
+                    BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, selectedItems.any { it.isVideo }) { model.importRemoteFilesToCollection(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("뮤직비디오", Icons.Default.MusicNote, canMusic) { model.startRemoteMusicOverlay(selectedItems.toList(), null); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("다운로드", Icons.Default.Download, selectedItems.isNotEmpty()) { pendingDownloadItems = selectedItems.toList(); showDownloadDestDialog = true },
@@ -4666,7 +4734,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             actionToastMessage = null
         }
         Box(
-            modifier = Modifier.fillMaxSize().padding(bottom = 72.dp),
+            modifier = Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 72.dp),
             contentAlignment = Alignment.BottomCenter,
         ) {
             Surface(
@@ -5459,7 +5527,7 @@ private fun BrowserMenu(
     var expanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     BrowserMoreButton { expanded = true }
-    if (expanded) ModalBottomSheet(modifier = Modifier.appBottomSafety(),
+    if (expanded) ModalBottomSheet(
         onDismissRequest = { expanded = false },
         sheetState = sheetState,
         dragHandle = null,
@@ -6020,6 +6088,8 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             modifier = Modifier.onSizeChanged { viewportSize = it },
+            // The cover flow owns its own bottom inset (name caption), so the content slot must not add it again.
+            contentWindowInsets = if (showsAutomaticOverflow) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets,
             containerColor = Color.Transparent,
             topBar = {
                 if (!showsAutomaticOverflow) TopAppBar(
@@ -6145,6 +6215,23 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { copyTargetsDialog = selectedTargets },
                             BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { moveTargetsDialog = selectedTargets },
                             BrowserSelectionAction("삭제", Icons.Default.Delete, selectedTargets.isNotEmpty() && !phoneHardOpBusy, destructive = true) { deleteTargetsDialog = selectedTargets },
+                            BrowserSelectionAction("재료함 담기", Icons.Default.Inbox, canTrailer) {
+                                val targets = displayedFiles.filter { it.id in selectedFileIds }
+                                selectedFileIds.clear()
+                                selectedFolderPaths.clear()
+                                selectionMode = false
+                                model.addPhoneHardToMaterialBasket(targets)
+                            },
+                            // PhoneHard files are app-private storage, not a durable external reference: always copied.
+                            BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, displayedFiles.any { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }) {
+                                val targets = displayedFiles.filter { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }
+                                selectedFileIds.clear()
+                                selectedFolderPaths.clear()
+                                selectionMode = false
+                                targets.forEach { target ->
+                                    model.importVideoUriToCollection(android.net.Uri.fromFile(target.file), copyToStorage = true)
+                                }
+                            },
                             BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) {
                                 val ids = selectedFileIds.toList()
                                 selectedFileIds.clear()
@@ -7042,7 +7129,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                 actionToastMessage = null
             }
             Box(
-                modifier = Modifier.fillMaxSize().padding(bottom = 72.dp),
+                modifier = Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 72.dp),
                 contentAlignment = Alignment.BottomCenter,
             ) {
                 Surface(
@@ -8168,7 +8255,7 @@ private fun SuperThumbnailFolderPickerScreen(state: AppState, model: NasFinderVi
                 Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface, tonalElevation = 3.dp) {
                     Button(
                         onClick = model::selectCurrentSuperThumbnailFolder,
-                        modifier = Modifier.fillMaxWidth().padding(16.dp).heightIn(min = 54.dp),
+                        modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp).heightIn(min = 54.dp),
                         shape = RoundedCornerShape(14.dp),
                     ) {
                         Icon(Icons.Default.CheckCircle, null)
@@ -8252,14 +8339,14 @@ private fun SuperThumbnailProgressScreen(state: AppState, model: NasFinderViewMo
                 if (active) {
                     OutlinedButton(
                         onClick = model::cancelSuperThumbnail,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
+                        modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     ) { Text("작업 중단") }
                 } else {
                     Button(
                         onClick = model::closeSuperThumbnailProgressOrReport,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
+                        modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 12.dp).heightIn(min = 54.dp),
                         shape = RoundedCornerShape(14.dp),
                     ) { Text("완료") }
                 }

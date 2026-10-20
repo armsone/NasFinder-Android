@@ -61,6 +61,76 @@ private class ImageKenBurnsTransformation(
     }
 }
 
+/** Constant per-scene original-audio gain (0 mutes); applied only to that scene's own clip audio. */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal class SceneGainAudioProcessor(private val gain: Float) : androidx.media3.common.audio.BaseAudioProcessor() {
+    override fun onConfigure(inputAudioFormat: androidx.media3.common.audio.AudioProcessor.AudioFormat): androidx.media3.common.audio.AudioProcessor.AudioFormat {
+        if (inputAudioFormat.encoding != androidx.media3.common.C.ENCODING_PCM_16BIT && inputAudioFormat.encoding != androidx.media3.common.C.ENCODING_PCM_FLOAT) {
+            throw androidx.media3.common.audio.AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+        }
+        return inputAudioFormat
+    }
+
+    override fun queueInput(inputBuffer: java.nio.ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining == 0) return
+        val output = replaceOutputBuffer(remaining)
+        val input = inputBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        output.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        if (inputAudioFormat.encoding == androidx.media3.common.C.ENCODING_PCM_16BIT) {
+            while (input.remaining() >= 2) {
+                val scaled = (input.short * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                output.putShort(scaled.toShort())
+            }
+        } else {
+            while (input.remaining() >= 4) output.putFloat((input.float * gain).coerceIn(-1f, 1f))
+        }
+        output.flip()
+    }
+}
+
+/**
+ * Per-scene framing effects shared by export and the editor's playback preview (ExoPlayer.setVideoEffects), so both
+ * render the same fit/focus in the same output size. FIT letterboxes; FILL crops to cover. A non-centered FILL focus
+ * first scales the clip to its cover size, crops the output-shaped window at the focus, then normalizes to the exact
+ * output size (all supported Media3 effects).
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal fun sceneFramingVideoEffects(
+    fit: SceneFit,
+    focusX: Float,
+    focusY: Float,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    outputWidth: Int,
+    outputHeight: Int,
+): List<androidx.media3.common.Effect> {
+    val fitPresentation = Presentation.createForWidthAndHeight(outputWidth, outputHeight, Presentation.LAYOUT_SCALE_TO_FIT)
+    if (fit == SceneFit.FIT) return listOf(fitPresentation)
+    if ((focusX == 0f && focusY == 0f) || sourceWidth <= 0 || sourceHeight <= 0) {
+        return listOf(Presentation.createForWidthAndHeight(outputWidth, outputHeight, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP))
+    }
+    val sourceAspect = sourceWidth.toDouble() / sourceHeight
+    val outputAspect = outputWidth.toDouble() / outputHeight
+    val (coverWidth, coverHeight) = if (sourceAspect > outputAspect) {
+        (outputHeight * sourceAspect) to outputHeight.toDouble()
+    } else {
+        outputWidth.toDouble() to (outputWidth / sourceAspect)
+    }
+    val evenCoverWidth = (((coverWidth / 2.0).toInt()) * 2).coerceAtLeast(outputWidth)
+    val evenCoverHeight = (((coverHeight / 2.0).toInt()) * 2).coerceAtLeast(outputHeight)
+    val halfWidth = (outputWidth.toFloat() / evenCoverWidth).coerceIn(0.01f, 1f)
+    val halfHeight = (outputHeight.toFloat() / evenCoverHeight).coerceIn(0.01f, 1f)
+    val centerX = focusX.coerceIn(-1f, 1f) * (1f - halfWidth)
+    // focusY -1 = top of the picture; NDC +1 is the top edge.
+    val centerY = -focusY.coerceIn(-1f, 1f) * (1f - halfHeight)
+    return listOf(
+        Presentation.createForWidthAndHeight(evenCoverWidth, evenCoverHeight, Presentation.LAYOUT_SCALE_TO_FIT),
+        androidx.media3.effect.Crop(centerX - halfWidth, centerX + halfWidth, centerY - halfHeight, centerY + halfHeight),
+        fitPresentation,
+    )
+}
+
 // HanClip's composition, crop presentation and cancellation/export validation path.
 @androidx.annotation.OptIn(UnstableApi::class)
 internal object TrailerExporter {
@@ -74,6 +144,7 @@ internal object TrailerExporter {
         musicFitCount: Int = 1,
         autoDucking: Boolean = true,
         aspectSources: List<TrailerSource> = scenes.map { it.source },
+        musicVolume: Float = 1f,
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
         require(scenes.isNotEmpty()) { "이 장면 길이로 만들 수 있는 영상이 없습니다. 장면 길이를 줄여 주세요." }
@@ -81,6 +152,10 @@ internal object TrailerExporter {
         val random = Random()
         val (exportWidth, exportHeight) = format.resolveDimensions(aspectSources)
         val presentation = Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)
+        val musicGain = musicVolume.coerceIn(0f, 2f)
+
+        fun videoEffects(scene: TrailerScene): List<androidx.media3.common.Effect> =
+            sceneFramingVideoEffects(scene.fit, scene.focusX, scene.focusY, scene.source.width, scene.source.height, exportWidth, exportHeight)
 
         // Preprocess images at 60% resolution of output dimensions (even dimensions >= 2)
         val targetWidth = ((kotlin.math.round(exportWidth * 0.60) / 2.0).toInt() * 2).coerceAtLeast(2)
@@ -89,17 +164,18 @@ internal object TrailerExporter {
 
         val edited = try {
             withContext(Dispatchers.IO) {
-                val preprocessedBySource = mutableMapOf<Int, File>()
+                val preprocessedBySource = mutableMapOf<String, File>()
                 scenes.mapIndexed { index, scene ->
                     val clipIndex = index + 1
                     withContext(Dispatchers.Main) {
                         progress("${clipIndex}/${totalClips}개 클립 연결 준비 중…", clipIndex.toFloat() / totalClips)
                     }
                     if (scene.source.isImage) {
-                        val preprocessedFile = preprocessedBySource.getOrPut(scene.source.id) {
+                        val framingKey = "${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}"
+                        val preprocessedFile = preprocessedBySource.getOrPut(framingKey) {
                             val tempFile = File(destination.parentFile ?: context.cacheDir, "preprocessed-${scene.source.id}-${UUID.randomUUID()}.jpg")
                             tempImages.add(tempFile)
-                            preprocessImage(scene.source.file, targetWidth, targetHeight, tempFile)
+                            preprocessImage(scene.source.file, targetWidth, targetHeight, tempFile, scene.fit, scene.focusX, scene.focusY)
                             tempFile
                         }
                         val inputUri = Uri.fromFile(preprocessedFile)
@@ -123,8 +199,10 @@ internal object TrailerExporter {
                             .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder()
                                 .setStartPositionMs((scene.start * 1000).toLong())
                                 .setEndPositionMs(((scene.start + scene.length) * 1000).toLong()).build()).build()
+                        val gain = scene.sourceVolume.coerceIn(0f, 2f)
+                        val audioEffects = if (abs(gain - 1f) < 0.005f) emptyList() else listOf<androidx.media3.common.audio.AudioProcessor>(SceneGainAudioProcessor(gain))
                         EditedMediaItem.Builder(input).setFrameRate(30)
-                            .setEffects(Effects(emptyList(), listOf(presentation)))
+                            .setEffects(Effects(audioEffects, videoEffects(scene)))
                             .build()
                     }
                 }
@@ -195,6 +273,9 @@ internal object TrailerExporter {
                         timeline = duckingTimeline,
                         outputStartOffsetSeconds = startOffsetSeconds,
                         autoDucking = autoDucking,
+                        duckedGain = 0.18f * musicGain,
+                        fullGain = 0.85f * musicGain,
+                        constantGain = 0.85f * musicGain,
                     )
                 )
                 return Effects(audioProcessors, emptyList())
@@ -322,7 +403,7 @@ internal object TrailerExporter {
         }
     }
 
-    private fun preprocessImage(source: File, targetW: Int, targetH: Int, output: File) {
+    private fun preprocessImage(source: File, targetW: Int, targetH: Int, output: File, fit: SceneFit = SceneFit.FILL, focusX: Float = 0f, focusY: Float = 0f) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(source.absolutePath, bounds)
         check(bounds.outWidth > 0 && bounds.outHeight > 0) { "이미지를 읽을 수 없습니다: ${source.name}" }
@@ -379,15 +460,27 @@ internal object TrailerExporter {
 
             val srcW = orientedBitmap.width.toFloat()
             val srcH = orientedBitmap.height.toFloat()
-            val scale = maxOf(targetW / srcW, targetH / srcH)
-            val cropW = targetW / scale
-            val cropH = targetH / scale
-            val cropX = (srcW - cropW) / 2f
-            val cropY = (srcH - cropH) / 2f
+            if (fit == SceneFit.FIT) {
+                // Letterbox: whole photo visible on black.
+                canvas.drawColor(android.graphics.Color.BLACK)
+                val scale = minOf(targetW / srcW, targetH / srcH)
+                val drawW = srcW * scale
+                val drawH = srcH * scale
+                val left = (targetW - drawW) / 2f
+                val top = (targetH - drawH) / 2f
+                canvas.drawBitmap(orientedBitmap, null, RectF(left, top, left + drawW, top + drawH), paint)
+            } else {
+                val scale = maxOf(targetW / srcW, targetH / srcH)
+                val cropW = targetW / scale
+                val cropH = targetH / scale
+                // focus -1..1 moves the crop window from the left/top edge to the right/bottom edge.
+                val cropX = (srcW - cropW) / 2f * (1f + focusX.coerceIn(-1f, 1f))
+                val cropY = (srcH - cropH) / 2f * (1f + focusY.coerceIn(-1f, 1f))
 
-            val srcRect = Rect(cropX.toInt(), cropY.toInt(), (cropX + cropW).toInt(), (cropY + cropH).toInt())
-            val dstRect = Rect(0, 0, targetW, targetH)
-            canvas.drawBitmap(orientedBitmap, srcRect, dstRect, paint)
+                val srcRect = Rect(cropX.toInt(), cropY.toInt(), (cropX + cropW).toInt(), (cropY + cropH).toInt())
+                val dstRect = Rect(0, 0, targetW, targetH)
+                canvas.drawBitmap(orientedBitmap, srcRect, dstRect, paint)
+            }
 
             FileOutputStream(output).use { fos ->
                 resultBitmap.compress(Bitmap.CompressFormat.JPEG, 92, fos)

@@ -655,7 +655,7 @@ private fun PhotoTransferPairingModal(
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         Scaffold(
-            modifier = Modifier.fillMaxSize().appSafeArea(),
+            modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).appSafeArea(),
             containerColor = MaterialTheme.colorScheme.background,
             topBar = {
                 CenterAlignedTopAppBar(

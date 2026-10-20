@@ -1115,7 +1115,7 @@ fun WebBrowserScreen(
         )
     }
     shortcut?.let { selected ->
-        ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = { shortcut = null }) {
+        ModalBottomSheet(onDismissRequest = { shortcut = null }) {
             Text(
                 if (selected.isImage) "이미지 메뉴" else "링크 메뉴",
                 style = MaterialTheme.typography.titleLarge,
@@ -1175,7 +1175,7 @@ fun WebBrowserScreen(
         )
     }
     if (showFavorites) {
-        ModalBottomSheet(modifier = Modifier.appBottomSafety(), onDismissRequest = { showFavorites = false }) {
+        ModalBottomSheet(onDismissRequest = { showFavorites = false }) {
             Text(
                 "즐겨찾기",
                 style = MaterialTheme.typography.titleLarge,
@@ -1235,6 +1235,7 @@ fun WebBrowserScreen(
                     }
                 }
             }
+            Spacer(Modifier.navigationBarsPadding())
         }
     }
     editingFavorite?.let { favorite ->

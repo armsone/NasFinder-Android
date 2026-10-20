@@ -252,7 +252,8 @@ internal class AudioDuckingTimeline(
                             scene.source.duration > 0.0 -> 0.65f
                             else -> 0f
                         }
-                        val effectiveLoudness = (rawLoudness * safeOriginalGain).coerceIn(0f, 1f)
+                        // A muted/quieter scene ducks the music proportionally less.
+                        val effectiveLoudness = (rawLoudness * safeOriginalGain * scene.sourceVolume.coerceIn(0f, 2f)).coerceIn(0f, 1f)
                         timelineBins[b] = max(timelineBins[b], effectiveLoudness)
                     }
                 }

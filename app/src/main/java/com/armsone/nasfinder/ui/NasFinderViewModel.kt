@@ -15,6 +15,8 @@ import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkInfo
@@ -149,9 +151,33 @@ data class AppState(
     val trailerDraftCount: Int = 0,
     val trailerDraftPicker: List<TrailerDraft>? = null,
     val trailerDraftStaleNotice: String? = null,
+    // Bumped whenever draft records change without the count changing (migration, availability recheck).
+    val trailerDraftsVersion: Long = 0L,
+    val collectionCopyOffer: CollectionCopyOffer? = null,
+    val pendingCollectionImport: PendingCollectionImport? = null,
     val trailerConflict: TrailerConflictConfirmation? = null,
     val inlineAudioPlayback: InlineAudioPlaybackState? = null,
+    val activeMainTab: MainNavigationDestination = MainNavigationDestination.FINDER,
+    val activeVideoTab: VideoNavigationDestination = VideoNavigationDestination.CREATE,
+    val materials: List<MaterialItem> = emptyList(),
+    val collections: List<CollectionItem> = emptyList(),
+    // The open editor is kept alive (export/adds continue) while the user visits Finder/Tools from its rail.
+    val trailerMinimized: Boolean = false,
+    val compression: CollectionCompressionState? = null,
 )
+
+enum class MainNavigationDestination {
+    FINDER,
+    VIDEO,
+    TOOLS
+}
+
+enum class VideoNavigationDestination {
+    CREATE,
+    MATERIALS,
+    DRAFTS,
+    COLLECTIONS
+}
 
 data class InlineAudioPlaybackState(
     val key: String,
@@ -164,6 +190,33 @@ data class InlineAudioPlaybackState(
     val positionMillis: Long = 0L,
     val errorMessage: String? = null,
 )
+
+/** An external reference that cannot be kept durably: explains why and offers an app-owned copy instead. */
+data class CollectionCopyOffer(
+    val message: String,
+    val copy: () -> Unit,
+)
+
+/** One picked video waiting for the user's 사본/참조 choice before anything is added to the collection. */
+data class PendingImportEntry(
+    val uri: String,
+    val title: String,
+    val sizeBytes: Long,
+    // Read flag the picker actually returned as persistable (0 when none was offered or the flags are unknown).
+    val persistableReadFlag: Int,
+    // Why a durable reference is impossible for this entry; null when it is supported.
+    val referenceBlocker: String?,
+)
+
+/** Picked videos kept until the user adds them (copy by default) or cancels; a failed reference attempt keeps them here. */
+data class PendingCollectionImport(
+    val entries: List<PendingImportEntry>,
+    val working: Boolean = false,
+    val problem: String? = null,
+    val excludedNote: String? = null,
+) {
+    val referenceSupported: Boolean get() = entries.isNotEmpty() && entries.all { it.referenceBlocker == null }
+}
 
 data class TrailerConflictConfirmation(
     val title: String,
@@ -329,6 +382,9 @@ sealed interface Screen {
     ) : Screen
     data object WebBrowser : Screen
     data object WebHard : Screen
+    data object MaterialBasket : Screen
+    data object VideoDrafts : Screen
+    data object VideoCollections : Screen
 }
 
 class NasFinderViewModel(private val application: NasFinderApplication) : ViewModel() {
@@ -416,7 +472,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     init {
         refreshDropboxAccountLabels()
-        TrailerDraftStore.configureTrailersRoot(application.cacheDir)
+        DurableMaterialStore.initialize(application)
+        DurableCollectionStore.initialize(application)
+        TrailerDraftStore.configureTrailersRoot(application.cacheDir, application.filesDir)
+        // A project folder is never deleted while a collection record still points inside it.
+        TrailerDraftStore.setExternalReferenceGuard { directory -> DurableCollectionStore.referencesInside(directory) }
+        migrateEphemeralProjectData()
         runCatching(::cleanupOrphanedWebDownloads)
         refreshDownloadCacheSize()
         refreshThumbnailCacheStatistics()
@@ -4048,8 +4109,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             { withRenewedFavoriteOwner(owner) { renewed -> startRemoteTrailer(media, renewed.service, renewed) } }
         }
         val captureTimes = media.map { it.modifiedAt?.toEpochMilli() ?: 0L }
+        // Origin identity is only recorded when the connection is certain (the open browser); favorites stay null.
+        val originConnectionId = if (owner == null) (_state.value.screen as? Screen.Browser)?.connection?.id else null
         launchTrailerStaging(owner) {
-            prepareTrailer(media.map { it.name }, captureTimes = captureTimes) { index, destination ->
+            prepareTrailer(media.map { it.name }, captureTimes = captureTimes, originKeys = media.map { item -> originConnectionId?.let { editorOriginRemote(it, item.path) } }) { index, destination ->
                 val item = media[index]
                 activeService.download(item, destination) { received, total ->
                     _state.update { current ->
@@ -4139,7 +4202,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }.getOrDefault(0L).takeIf { it > 0L }
                 ?: if (uri.scheme == "file") uri.path?.let { File(it).lastModified() } ?: 0L else 0L
         }
-        prepareTrailer(names, captureTimes = captureTimes, motionSourceUris = activeUris) { index, destination ->
+        prepareTrailer(names, captureTimes = captureTimes, motionSourceUris = activeUris, originKeys = activeUris.map { editorOriginLocal(it.toString()) }) { index, destination ->
             val uri = activeUris[index]
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 application.contentResolver.openInputStream(uri)?.use { input ->
@@ -4163,7 +4226,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (selected.isEmpty() || selected.any { val item = it.asPreviewItem(); !item.isVideo && !item.isImage }) return
         trailerRetry = { startInboxTrailer(ids) }
         val captureTimes = selected.map { it.importedAt.toEpochMilli() }
-        prepareTrailer(selected.map { it.originalFilename }, captureTimes = captureTimes) { index, destination ->
+        prepareTrailer(selected.map { it.originalFilename }, captureTimes = captureTimes, originKeys = selected.map { editorOriginPhoneHard(it.id.toString()) }) { index, destination ->
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 selected[index].file.inputStream().buffered().use { input ->
                     destination.outputStream().buffered().use { output ->
@@ -4487,14 +4550,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         initialMusicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
         initialMusicFitCount: Int = 1,
         forceNew: Boolean = false,
+        originKeys: List<String?> = emptyList(),
         stage: suspend (Int, File) -> Unit,
     ) {
         if (_state.value.trailer?.busy == true) return
+        if (_state.value.trailer?.export?.running == true) {
+            _state.update { it.copy(message = "내보내는 중인 프로젝트가 있습니다. 내보내기가 끝나거나 취소한 뒤 새 영상을 만들어 주세요.") }
+            return
+        }
 
         stopInlineAudio()
+        // An open, prepared project is saved as a draft before a newly confirmed selection replaces it; when that
+        // save fails the open project is kept (closing an unregistered project would remove its directory).
+        _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { open ->
+            if (!saveEditorDraftNow(open)) {
+                _state.update {
+                    it.copy(
+                        trailerMinimized = false,
+                        message = "열려 있는 ‘${open.displayTitle}’을(를) 저장하지 못해 새 영상을 시작하지 않았습니다. 저장 공간을 확인해 주세요.",
+                    )
+                }
+                return
+            }
+        }
         closeTrailer(clearRetry = false)
-        val directory = File(application.cacheDir, "trailers/${UUID.randomUUID()}")
-        directory.mkdirs()
+        val directory = TrailerDraftStore.newProjectDirectory(application.cacheDir)
         _state.update {
             it.copy(
                 trailer = TrailerSession(
@@ -4506,6 +4586,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     highlightAnalyzed = !isMusicOverlayMode,
                 ),
                 imagePreview = null,
+                trailerMinimized = false,
                 trailerDraftCount = TrailerDraftStore.draftCount(),
             )
         }
@@ -4534,7 +4615,69 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     if (!isMusicOverlayMode) {
                         updateTrailer(directory) { it.copy(status = "${index + 1}/${names.size} · 한양이 장면을 고르는 중…", progress = null) }
                     }
-                    suspend fun decodeStagedSource() = withContext(Dispatchers.IO) {
+                    suspend fun decodeStagedSource() = decodeStagedTrailerFile(file, name, isImage, captureTimes.getOrNull(index) ?: 0L)
+                    var decodedResult = decodeStagedSource()
+                    if (decodedResult == null && file != primaryStagedFile) {
+                        file.delete()
+                        file = primaryStagedFile
+                        isImage = true
+                        sourceName = name
+                        decodedResult = decodeStagedSource()
+                        android.util.Log.d("TrailerMotionSelection", "mode=representative_fallback downstream_decode=true")
+                    }
+                    if (decodedResult != null && file != primaryStagedFile) primaryStagedFile.delete()
+                    if (decodedResult == null) {
+                        undecodableCount++
+                        file.delete()
+                    } else {
+                        val (metadata, thumbnail, capTime) = decodedResult
+                        val analysis = if (isImage || isMusicOverlayMode) {
+                            // "영상에 뮤직비디오" keeps whole original clips (musicOverlayScenes ignores
+                            // highlight data), and ducking at export reads raw PCM independently
+                            // (TrailerExporter/AutoDuckingAudioProcessor), so skip the costly HanYang
+                            // highlight analysis here.
+                            AudioAnalysisResult(
+                                waveform = emptyList(),
+                                peakTimeSeconds = 0.0,
+                                peakTimesSeconds = listOf(0.0),
+                                audioAvailability = ClipAudioAvailability.NoTrack,
+                                highlightSource = ClipHighlightSource.Fallback
+                            )
+                        } else {
+                            AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first, (metadata.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
+                        }
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        val finalThumbnail = if (!isImage && !isMusicOverlayMode) {
+                            improveVideoThumbnail(file, metadata.first, analysis.peakTimeSeconds, thumbnail)
+                        } else {
+                            thumbnail
+                        }
+                        val sourceIndex = sources.size
+                        sources += TrailerSource(sourceIndex, sourceName, file, metadata.first, metadata.second, metadata.third, analysis, finalThumbnail, isImage = isImage, captureTimeMillis = capTime, originKey = originKeys.getOrNull(index))
+                        updateTrailer(directory) { it.copy(sources = sources.toList()) }
+                    }
+                }
+                if (sources.isEmpty()) {
+                    val totalSkipped = initialExcludedCount + undecodableCount
+                    val err = if (totalSkipped > 0) "사용 가능한 사진이나 영상이 없습니다 (지원되지 않거나 손상된 ${totalSkipped}개 제외)."
+                    else "사용 가능한 사진이나 영상이 없습니다."
+                    updateTrailer(directory) { it.copy(busy = false, error = err, progress = null) }
+                    return@launch
+                }
+                finishTrailerPreparation(directory, sources.toList(), initialExcludedCount + undecodableCount, isMusicOverlayMode, initialMusicTrack, initialMusicPolicy, initialMusicFitCount)
+                trailerJob = null
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "예고편을 만들지 못했습니다.", progress = null) } }
+        }
+    }
+
+    /** Reads display-oriented size, capture time and a thumbnail of one staged file; null when it is not usable media. */
+    private suspend fun decodeStagedTrailerFile(
+        file: File,
+        name: String,
+        isImage: Boolean,
+        fallbackCaptureTime: Long,
+    ): Triple<Triple<Double, Int, Int>, Bitmap, Long>? = withContext(Dispatchers.IO) {
                         try {
                             if (isImage) {
                                 val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -4548,7 +4691,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                     height = decoded.height
                                     decoded.recycle()
                                 }
-                                var parsedCaptureTime = captureTimes.getOrNull(index) ?: 0L
+                                var parsedCaptureTime = fallbackCaptureTime
                                 runCatching {
                                     val exif = androidx.exifinterface.media.ExifInterface(file.absolutePath)
                                     val orientation = exif.getAttributeInt(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL)
@@ -4584,7 +4727,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                     val rotation = reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
                                     if (rotation % 180 != 0) { val old = width; width = height; height = old }
 
-                                    var parsedCaptureTime = captureTimes.getOrNull(index) ?: 0L
+                                    var parsedCaptureTime = fallbackCaptureTime
                                     if (parsedCaptureTime <= 0L) {
                                         reader.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE)?.let { dateStr ->
                                             val formats = listOf(
@@ -4636,57 +4779,23 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         } catch (e: Exception) {
                             null
                         }
-                    }
-                    var decodedResult = decodeStagedSource()
-                    if (decodedResult == null && file != primaryStagedFile) {
-                        file.delete()
-                        file = primaryStagedFile
-                        isImage = true
-                        sourceName = name
-                        decodedResult = decodeStagedSource()
-                        android.util.Log.d("TrailerMotionSelection", "mode=representative_fallback downstream_decode=true")
-                    }
-                    if (decodedResult != null && file != primaryStagedFile) primaryStagedFile.delete()
-                    if (decodedResult == null) {
-                        undecodableCount++
-                        file.delete()
-                    } else {
-                        val (metadata, thumbnail, capTime) = decodedResult
-                        val analysis = if (isImage || isMusicOverlayMode) {
-                            // "영상에 뮤직비디오" keeps whole original clips (musicOverlayScenes ignores
-                            // highlight data), and ducking at export reads raw PCM independently
-                            // (TrailerExporter/AutoDuckingAudioProcessor), so skip the costly HanYang
-                            // highlight analysis here.
-                            AudioAnalysisResult(
-                                waveform = emptyList(),
-                                peakTimeSeconds = 0.0,
-                                peakTimesSeconds = listOf(0.0),
-                                audioAvailability = ClipAudioAvailability.NoTrack,
-                                highlightSource = ClipHighlightSource.Fallback
-                            )
-                        } else {
-                            AudioAnalysisService.analyze(application, Uri.fromFile(file), metadata.first, (metadata.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
-                        }
-                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                        val finalThumbnail = if (!isImage && !isMusicOverlayMode) {
-                            improveVideoThumbnail(file, metadata.first, analysis.peakTimeSeconds, thumbnail)
-                        } else {
-                            thumbnail
-                        }
-                        val sourceIndex = sources.size
-                        sources += TrailerSource(sourceIndex, sourceName, file, metadata.first, metadata.second, metadata.third, analysis, finalThumbnail, isImage = isImage, captureTimeMillis = capTime)
-                        updateTrailer(directory) { it.copy(sources = sources.toList()) }
-                    }
-                }
-                if (sources.isEmpty()) {
-                    val totalSkipped = initialExcludedCount + undecodableCount
-                    val err = if (totalSkipped > 0) "사용 가능한 사진이나 영상이 없습니다 (지원되지 않거나 손상된 ${totalSkipped}개 제외)."
-                    else "사용 가능한 사진이나 영상이 없습니다."
-                    updateTrailer(directory) { it.copy(busy = false, error = err, progress = null) }
-                    return@launch
-                }
+    }
+
+    /**
+     * Turns the staged/analysed sources into the first project: recommended plan materialized as explicit editor
+     * scenes, a draft id, and an immediate autosave so the confirmed selection survives process death.
+     */
+    private suspend fun finishTrailerPreparation(
+        directory: File,
+        stagedSources: List<TrailerSource>,
+        totalExcluded: Int,
+        isMusicOverlayMode: Boolean,
+        initialMusicTrack: TrailerMusicTrack?,
+        initialMusicPolicy: TrailerMusicPolicy,
+        initialMusicFitCount: Int,
+    ) {
                 // Retain immutable original addition order as default
-                val sortedSources = sources.toList()
+                val sortedSources = stagedSources
 
                 val preparedSources = if (!isMusicOverlayMode && sortedSources.any { it.isImage }) {
                     updateTrailer(directory) { it.copy(status = "사진을 비교하는 중…", progress = null) }
@@ -4701,7 +4810,6 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val length = trailerDefaults?.clipLength ?: minVideoDuration.coerceAtLeast(1.0)
                 val hasVideos = preparedSources.any { !it.isImage }
                 val photoLength = if (isMusicOverlayMode) 1.0 else defaultPhotoClipLength(length, hasVideos)
-                val totalExcluded = initialExcludedCount + undecodableCount
                 val initialTotal = trailerDefaults?.total
                     ?: preparedSources.sumOf { if (it.isImage) photoLength else it.duration }
                 val statusMessage = if (isMusicOverlayMode) {
@@ -4728,73 +4836,628 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         awaitingInitialSettings = true,
                         prepared = true,
                         highlightAnalyzed = !isMusicOverlayMode,
-                    )
+                    ).let { prepared ->
+                        prepared.copy(
+                            editor = EditorProject.fromPlan(prepared.autoPlanScenes(), autoPlan = true),
+                            draftId = prepared.draftId ?: UUID.randomUUID().toString(),
+                            revision = prepared.revision + 1,
+                        )
+                    }
                 }
-                trailerJob = null
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "예고편을 만들지 못했습니다.", progress = null) } }
+                scheduleEditorAutosave(directory, immediate = true)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Current-project editor: explicit scenes, undo/redo, autosave, Finder adds and snapshot export.
+    // ---------------------------------------------------------------------------------------------
+
+    private val editorHistories = mutableMapOf<String, EditorHistory>()
+    private val editorFinderSelections = mutableMapOf<String, SnapshotStateMap<String, EditorAddCandidate>>()
+    private var editorAutosaveJob: Job? = null
+    private var editorExportJob: Job? = null
+    private var editorAddJob: Job? = null
+    private val pendingAddCandidates = linkedMapOf<String, EditorAddCandidate>()
+
+    private fun editorHistory(directory: File): EditorHistory =
+        editorHistories.getOrPut(directory.absolutePath) { EditorHistory() }
+
+    fun editorFinderSelection(directoryKey: String): SnapshotStateMap<String, EditorAddCandidate> =
+        editorFinderSelections.getOrPut(directoryKey) { mutableStateMapOf() }
+
+    private fun draftFromSession(session: TrailerSession, showingSettings: Boolean = false): TrailerDraft? {
+        val draftId = session.draftId ?: return null
+        if (!session.prepared || session.sources.isEmpty()) return null
+        val validOutput = session.output?.takeIf { it.exists() && it.length() > 0 }
+        return TrailerDraft(
+            id = draftId,
+            isMusicOverlayMode = session.isMusicOverlayMode,
+            directory = session.directory,
+            sources = session.sources,
+            total = session.total,
+            clipLength = session.clipLength,
+            photoClipLength = session.photoClipLength,
+            format = session.format,
+            // An unavailable stored music choice is saved as-is; only an explicit remove/replace clears it.
+            musicTrack = session.musicTrack ?: session.unavailableMusic,
+            musicPolicy = session.musicPolicy,
+            musicFitCount = session.musicFitCount,
+            autoDucking = session.autoDucking,
+            output = validOutput,
+            showingSettings = showingSettings,
+            orderMode = session.orderMode,
+            timestamp = System.currentTimeMillis(),
+            customTitle = session.title,
+            editor = session.editor,
+            revision = session.revision,
+            outputRevision = if (validOutput != null) session.outputRevision else null,
+        )
+    }
+
+    /** Writes the project now (main-thread callers that are about to close it). */
+    private fun saveEditorDraftNow(session: TrailerSession): Boolean {
+        val draft = draftFromSession(session) ?: return false
+        return TrailerDraftStore.saveDraft(draft)
+    }
+
+    /** Debounced autosave of the CURRENT project with saving/saved/failed state. */
+    private fun scheduleEditorAutosave(directory: File, immediate: Boolean = false) {
+        editorAutosaveJob?.cancel()
+        updateTrailer(directory) { it.copy(saveState = EditorSaveState.SAVING, saveError = null) }
+        editorAutosaveJob = viewModelScope.launch {
+            if (!immediate) kotlinx.coroutines.delay(700)
+            val session = _state.value.trailer?.takeIf { it.directory == directory } ?: return@launch
+            val revision = session.revision
+            val draft = draftFromSession(session)
+            val saved = draft != null && withContext(Dispatchers.IO) { TrailerDraftStore.saveDraft(draft) }
+            _state.update { current ->
+                val live = current.trailer?.takeIf { it.directory == directory } ?: return@update current
+                current.copy(
+                    trailer = live.copy(
+                        saveState = when {
+                            !saved -> EditorSaveState.FAILED
+                            live.revision == revision -> EditorSaveState.SAVED
+                            else -> EditorSaveState.SAVING
+                        },
+                        saveError = if (saved) null else "자동 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요.",
+                    ),
+                    trailerDraftCount = TrailerDraftStore.draftCount(),
+                )
+            }
         }
     }
 
-    fun regenerateTrailer(
-        order: List<Int>,
-        total: Double,
-        length: Double,
-        photoLength: Double = defaultPhotoClipLength(length),
-        format: TrailerFormat,
-        musicTrack: TrailerMusicTrack? = _state.value.trailer?.musicTrack,
-        musicPolicy: TrailerMusicPolicy = _state.value.trailer?.musicPolicy ?: TrailerMusicPolicy.LOOP_MUSIC,
-        musicFitCount: Int = _state.value.trailer?.musicFitCount ?: 1,
-        autoDucking: Boolean = _state.value.trailer?.autoDucking ?: true,
-    ) {
+    fun retryEditorAutosave() {
         val session = _state.value.trailer ?: return
-        if (session.busy) return
+        scheduleEditorAutosave(session.directory, immediate = true)
+    }
+
+    /**
+     * Applies one editor action atomically: [transform] must be pure. The prior state goes to undo history, the
+     * revision is bumped and an autosave is scheduled. Returns false when nothing changed.
+     */
+    private fun editProject(transform: (TrailerSession) -> TrailerSession?): Boolean {
+        var before: EditorSnapshot? = null
+        var directory: File? = null
+        _state.update { current ->
+            val live = current.trailer ?: return@update current
+            if (!live.prepared || live.editor == null || live.busy) return@update current
+            val updated = transform(live) ?: return@update current
+            val snapshot = live.editorSnapshot()
+            if (updated.editorSnapshot() == snapshot) return@update current
+            before = snapshot
+            directory = live.directory
+            current.copy(trailer = updated.copy(revision = live.revision + 1, error = null))
+        }
+        val dir = directory ?: return false
+        val history = editorHistory(dir)
+        before?.let(history::record)
+        updateTrailer(dir) { it.copy(canUndo = history.canUndo, canRedo = history.canRedo) }
+        scheduleEditorAutosave(dir)
+        return true
+    }
+
+    fun editorUndo() = editorStep(undo = true)
+    fun editorRedo() = editorStep(undo = false)
+
+    private fun editorStep(undo: Boolean) {
+        val session = _state.value.trailer ?: return
+        if (!session.prepared || session.busy) return
+        val history = editorHistory(session.directory)
+        val target = (if (undo) history.undo(session.editorSnapshot()) else history.redo(session.editorSnapshot())) ?: return
+        updateTrailer(session.directory) {
+            it.applyEditorSnapshot(target).copy(revision = it.revision + 1, canUndo = history.canUndo, canRedo = history.canRedo)
+        }
+        scheduleEditorAutosave(session.directory)
+    }
+
+    private fun TrailerSession.withManualScenes(scenes: List<EditorScene>): TrailerSession? {
+        val project = editor ?: return null
+        return copy(editor = project.copy(scenes = scenes, autoPlan = false))
+    }
+
+    /** Regenerates the scenes from the recommended plan; only valid while the project is still automatic. */
+    private fun TrailerSession.withRegeneratedPlan(): TrailerSession {
+        val project = editor ?: return this
+        return copy(editor = EditorProject.fromPlan(autoPlanScenes(), autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey))
+    }
+
+    private fun TrailerSession.defaultSceneFor(source: TrailerSource, key: Long): EditorScene {
+        val (start, length) = when {
+            source.isImage -> 0.0 to if (isMusicOverlayMode) 1.0 else source.weightedPhotoLength(clipLength)
+            isMusicOverlayMode -> 0.0 to source.duration
+            else -> {
+                val recommended = recommendTrailerPlan(listOf(source))?.scenes?.firstOrNull()
+                (recommended?.start ?: 0.0) to kotlin.math.min(clipLength, source.duration)
+            }
+        }
+        val (safeStart, safeLength) = clampSceneWindow(source, start, length)
+        return EditorScene(key, source.id, safeStart, safeLength)
+    }
+
+    fun editorMoveScene(key: Long, delta: Int) {
+        editProject { session ->
+            val scenes = session.editor?.scenes ?: return@editProject null
+            val from = scenes.indexOfFirst { it.key == key }
+            val to = from + delta
+            if (from < 0 || to !in scenes.indices) return@editProject null
+            session.withManualScenes(scenes.toMutableList().apply { add(to, removeAt(from)) })
+        }
+    }
+
+    fun editorMoveSceneTo(key: Long, targetIndex: Int) {
+        editProject { session ->
+            val scenes = session.editor?.scenes ?: return@editProject null
+            val from = scenes.indexOfFirst { it.key == key }
+            val to = targetIndex.coerceIn(0, scenes.lastIndex)
+            if (from < 0 || from == to) return@editProject null
+            session.withManualScenes(scenes.toMutableList().apply { add(to, removeAt(from)) })
+        }
+    }
+
+    /** Duplicates a scene right after itself; returns the new scene key (or null). */
+    fun editorDuplicateScene(key: Long): Long? {
+        var newKey: Long? = null
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val index = project.scenes.indexOfFirst { it.key == key }
+            if (index < 0) return@editProject null
+            val copyScene = project.scenes[index].copy(key = project.nextKey)
+            newKey = copyScene.key
+            session.copy(editor = project.copy(
+                scenes = project.scenes.toMutableList().apply { add(index + 1, copyScene) },
+                autoPlan = false,
+                nextKey = project.nextKey + 1,
+            ))
+        }
+        return newKey
+    }
+
+    /** Removes a scene from the project only; the source file and other scenes using it stay. */
+    fun editorRemoveScene(key: Long) {
+        editProject { session ->
+            val scenes = session.editor?.scenes ?: return@editProject null
+            if (scenes.none { it.key == key }) return@editProject null
+            session.withManualScenes(scenes.filterNot { it.key == key })
+        }
+    }
+
+    fun editorTrimScene(key: Long, start: Double, length: Double) {
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val scene = project.scene(key) ?: return@editProject null
+            val source = session.sources.firstOrNull { it.id == scene.sourceId } ?: return@editProject null
+            val (safeStart, safeLength) = clampSceneWindow(source, start, length)
+            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(start = safeStart, length = safeLength) else it })
+        }
+    }
+
+    fun editorSetSceneFraming(key: Long, fit: SceneFit, focusX: Float, focusY: Float) {
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scene(key) == null) return@editProject null
+            session.withManualScenes(project.scenes.map {
+                if (it.key == key) it.copy(fit = fit, focusX = focusX.coerceIn(-1f, 1f), focusY = focusY.coerceIn(-1f, 1f)) else it
+            })
+        }
+    }
+
+    fun editorSetSceneVolume(key: Long, volume: Float) {
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scene(key) == null) return@editProject null
+            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(sourceVolume = volume.coerceIn(0f, 2f)) else it })
+        }
+    }
+
+    /** Whole-video aspect; separate from each scene's fit/fill/position. */
+    fun editorSetFormat(format: TrailerFormat) {
+        editProject { it.copy(format = format) }
+    }
+
+    fun editorSetMusicVolume(volume: Float) {
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            session.copy(editor = project.copy(musicVolume = volume.coerceIn(0f, 2f)))
+        }
+    }
+
+    fun editorSetAutoDucking(enabled: Boolean) {
+        editProject { it.copy(autoDucking = enabled) }
+    }
+
+    /** Explicit user choice (select, replace or remove): this is the only path that discards an unavailable stored music choice. */
+    fun editorSetMusic(track: TrailerMusicTrack?, policy: TrailerMusicPolicy, fitCount: Int) {
+        editProject { session ->
+            var next = session.copy(
+                musicTrack = track,
+                unavailableMusic = null,
+                musicExportPrompt = false,
+                musicPolicy = policy,
+                musicFitCount = fitCount.coerceAtLeast(1),
+            )
+            if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
+                next = next.copy(total = track.durationSeconds * fitCount.coerceAtLeast(1))
+            }
+            if (session.editor?.autoPlan == true) next.withRegeneratedPlan() else next
+        }
+    }
+
+    /**
+     * "다시 확인" for a stored music choice whose file was unreadable: when the same file is readable again it becomes
+     * the active music (same descriptor, policy, volume and ducking). Nothing is cleared when it is still missing.
+     */
+    fun editorRecheckMusic(silent: Boolean = false) {
+        val session = _state.value.trailer ?: return
+        val stored = session.unavailableMusic ?: return
         val directory = session.directory
-        val existingMap = session.sources.associateBy { it.id }
-        if (order.isEmpty()) {
-            updateTrailer(directory) { it.copy(error = "예고편에 포함할 미디어를 선택해 주세요.") }
-            return
+        viewModelScope.launch {
+            val readable = withContext(Dispatchers.IO) { isMusicFileReadable(stored) }
+            if (readable) {
+                updateTrailer(directory) { live ->
+                    if (live.unavailableMusic != stored) live
+                    else live.copy(musicTrack = stored, unavailableMusic = null, musicExportPrompt = false)
+                }
+                if (!silent) _state.update { it.copy(message = "음악 ‘${stored.name}’을(를) 다시 찾아 연결했습니다.") }
+            } else if (!silent) {
+                _state.update { it.copy(message = "음악 ‘${stored.name}’ 파일을 아직 찾을 수 없습니다. 음악 설정은 그대로 보관합니다. 다른 음악을 고르거나, 필요 없으면 직접 선택을 해제해 주세요.") }
+            }
         }
-        if (order.size != order.toSet().size || !order.all { existingMap.containsKey(it) }) {
-            updateTrailer(directory) { it.copy(error = "선택한 미디어 목록이 올바르지 않습니다.") }
-            return
+    }
+
+    private fun isMusicFileReadable(track: TrailerMusicTrack): Boolean =
+        runCatching { track.file.isFile && track.file.canRead() && track.file.length() > 0L && track.durationSeconds > 0.0 }.getOrDefault(false)
+
+    fun dismissMusicExportPrompt() {
+        val directory = _state.value.trailer?.directory ?: return
+        updateTrailer(directory) { it.copy(musicExportPrompt = false) }
+    }
+
+    /** Explicit one-time choice from the export prompt: render without the unavailable music; the stored choice stays saved. */
+    fun exportEditorProjectWithoutUnavailableMusic() {
+        dismissMusicExportPrompt()
+        exportEditorProjectInternal(skipUnavailableMusic = true)
+    }
+
+    /** Plan parameters only regenerate scenes while the project is automatic; manual edits are never overwritten. */
+    fun editorSetPlanTotal(total: Double) {
+        editProject { session ->
+            if (session.editor?.autoPlan != true || !total.isFinite()) return@editProject null
+            session.copy(
+                total = total.coerceIn(1.0, 7200.0),
+                musicPolicy = if (session.musicTrack != null) TrailerMusicPolicy.SINGLE else session.musicPolicy,
+            ).withRegeneratedPlan()
         }
-        if (!total.isFinite()) return
-        val sources = order.mapNotNull { existingMap[it] }
-        // An unchanged recommended total (possibly under 1s for a sub-second video) must stay exact so the
-        // recommended distinct plan is recognised; every manual total keeps the 1s..2h clamp.
-        val requestedTotal = if (!session.isMusicOverlayMode && automaticTrailerPlan(sources, total, length) != null) total
-        else total.coerceIn(1.0, 7200.0)
-        val scenes = if (session.isMusicOverlayMode) {
-            musicOverlayScenes(sources, photoLength, musicTrack, musicPolicy, musicFitCount)
-        } else {
-            trailerScenes(sources, requestedTotal, length, photoLength, musicTrack, musicPolicy, musicFitCount)
+    }
+
+    fun editorSetPlanClipLength(length: Double) {
+        editProject { session ->
+            if (session.editor?.autoPlan != true || !length.isFinite() || length <= 0.0) return@editProject null
+            session.copy(clipLength = length, photoClipLength = defaultPhotoClipLength(length, session.hasVideos)).withRegeneratedPlan()
         }
-        if (scenes.isEmpty()) {
-            updateTrailer(directory) { it.copy(error = "이 장면 길이로 만들 수 없습니다. 장면 길이를 줄여 주세요.") }; return
+    }
+
+    /** Order presets: regenerate the automatic plan, or reorder the explicit scenes keeping their trims. */
+    fun editorApplyOrder(mode: String) {
+        editProject { session ->
+            fun sorted(sources: List<TrailerSource>): List<TrailerSource> = when (mode) {
+                "추가순" -> sources.sortedBy { it.id }
+                "시간순" -> sources.sortedWith(compareBy<TrailerSource> {
+                    if (it.captureTimeMillis > 0L) it.captureTimeMillis else it.file.lastModified().takeIf { t -> t > 0L } ?: Long.MAX_VALUE
+                }.thenBy { it.id })
+                "가나다순" -> sources.sortedWith(compareBy<TrailerSource, String>(NaturalOrderComparator) { it.name }.thenBy { it.id })
+                "랜덤" -> sources.shuffled()
+                else -> sources
+            }
+            val orderedSources = sorted(session.sources)
+            val project = session.editor ?: return@editProject null
+            if (project.autoPlan) {
+                session.copy(sources = orderedSources, orderMode = mode).withRegeneratedPlan()
+            } else {
+                val rank = orderedSources.mapIndexed { index, source -> source.id to index }.toMap()
+                val scenes = if (mode == "랜덤") project.scenes.shuffled()
+                else project.scenes.sortedWith(compareBy<EditorScene> { rank[it.sourceId] ?: Int.MAX_VALUE }.thenBy { it.start })
+                session.copy(sources = orderedSources, orderMode = mode, editor = project.copy(scenes = scenes))
+            }
         }
-        _state.update {
-            it.copy(
-                trailer = session.copy(
-                    sources = sources,
-                    total = requestedTotal,
-                    clipLength = length,
-                    photoClipLength = photoLength,
-                    format = format,
-                    musicTrack = musicTrack,
-                    musicPolicy = musicPolicy,
-                    musicFitCount = musicFitCount,
-                    autoDucking = autoDucking,
-                    awaitingInitialSettings = false,
-                    busy = true,
-                    status = "선택한 장면을 이어 붙이는 중…",
-                    error = null,
-                    progress = null,
-                )
+    }
+
+    /** Explicitly replaces manual scenes with a fresh recommendation (undoable). */
+    fun editorResetToAutoPlan() {
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val defaults = if (session.isMusicOverlayMode) null else recommendedTrailerDefaults(session.sources)
+            val base = if (defaults != null) session.copy(
+                clipLength = defaults.clipLength,
+                total = defaults.total,
+                photoClipLength = defaultPhotoClipLength(defaults.clipLength, session.hasVideos),
+            ) else session
+            base.copy(editor = EditorProject.fromPlan(base.autoPlanScenes(), autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey))
+        }
+    }
+
+    fun editorRename(title: String) {
+        editProject { it.copy(title = title.trim().takeIf(String::isNotBlank)) }
+    }
+
+    /** Intentionally uses an already-present source as one more scene (no hash/duplicate inference). */
+    fun editorUseSourceAgain(sourceId: Int, afterKey: Long? = null): Long? {
+        var newKey: Long? = null
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val source = session.sources.firstOrNull { it.id == sourceId } ?: return@editProject null
+            val scene = session.defaultSceneFor(source, project.nextKey)
+            newKey = scene.key
+            val insertAt = afterKey?.let { key -> project.scenes.indexOfFirst { it.key == key }.takeIf { it >= 0 }?.plus(1) } ?: project.scenes.size
+            session.copy(editor = project.copy(
+                scenes = project.scenes.toMutableList().apply { add(insertAt, scene) },
+                autoPlan = false,
+                nextKey = project.nextKey + 1,
+            ))
+        }
+        return newKey
+    }
+
+    /** Lists one NAS/cloud folder for the editor Finder with a dedicated service; the browser screen is untouched. */
+    suspend fun listEditorFinderFolder(connection: RemoteConnection, path: String): Result<List<RemoteFileItem>> = withContext(Dispatchers.IO) {
+        runCatching {
+            withDedicatedRemoteService(connection) { svc ->
+                svc.list(path).filter { entry ->
+                    entry.name.isNotBlank() && entry.name != "." && entry.name != ".." &&
+                        !entry.name.startsWith('.') && entry.path.trimEnd('/') != path.trimEnd('/') &&
+                        (entry.isDirectory || entry.isVideo || entry.isImage)
+                }.sortedWith(compareBy<RemoteFileItem> { !it.isDirectory }.thenBy(NaturalOrderComparator) { it.name })
+            }
+        }
+    }
+
+    /**
+     * Adds Finder selections to the CURRENT project: each item gets its own visible prepare/download/analysis state,
+     * is copied into this project's directory, then appended as scenes (after [afterKey] when given).
+     */
+    fun editorAddCandidates(candidates: List<EditorAddCandidate>, afterKey: Long? = null) {
+        val session = _state.value.trailer ?: return
+        if (!session.prepared || session.editor == null) return
+        val directory = session.directory
+        val pending = candidates.distinctBy { it.originKey }.map { candidate ->
+            val id = UUID.randomUUID().toString()
+            pendingAddCandidates[id] = candidate
+            EditorPendingAdd(id, candidate.originKey, candidate.name, candidate.isVideo)
+        }
+        if (pending.isEmpty()) return
+        updateTrailer(directory) { it.copy(pendingAdds = it.pendingAdds + pending) }
+        pendingAddAnchor = afterKey
+        runEditorAddQueue(directory)
+    }
+
+    private var pendingAddAnchor: Long? = null
+
+    fun retryEditorAdd(id: String) {
+        val session = _state.value.trailer ?: return
+        if (session.pendingAdds.none { it.id == id && it.phase == EditorAddPhase.FAILED }) return
+        updateTrailer(session.directory) { live ->
+            live.copy(pendingAdds = live.pendingAdds.map { if (it.id == id) it.copy(phase = EditorAddPhase.QUEUED, progress = null, error = null) else it })
+        }
+        runEditorAddQueue(session.directory)
+    }
+
+    /** Explicit skip of a queued/failed item; the original source is never touched. */
+    fun dismissEditorAdd(id: String) {
+        val session = _state.value.trailer ?: return
+        val item = session.pendingAdds.firstOrNull { it.id == id } ?: return
+        if (item.phase != EditorAddPhase.FAILED && item.phase != EditorAddPhase.QUEUED) return
+        pendingAddCandidates.remove(id)
+        updateTrailer(session.directory) { live -> live.copy(pendingAdds = live.pendingAdds.filterNot { it.id == id }) }
+    }
+
+    private fun runEditorAddQueue(directory: File) {
+        if (editorAddJob?.isActive == true) return
+        editorAddJob = viewModelScope.launch {
+            while (true) {
+                val live = _state.value.trailer?.takeIf { it.directory == directory } ?: break
+                val next = live.pendingAdds.firstOrNull { it.phase == EditorAddPhase.QUEUED } ?: break
+                val candidate = pendingAddCandidates[next.id]
+                if (candidate == null) {
+                    updateTrailer(directory) { s -> s.copy(pendingAdds = s.pendingAdds.filterNot { it.id == next.id }) }
+                    continue
+                }
+                try {
+                    val source = stageEditorCandidate(directory, next, candidate)
+                    appendPreparedSource(directory, next.id, source)
+                    pendingAddCandidates.remove(next.id)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    setPendingAdd(directory, next.id) { it.copy(phase = EditorAddPhase.FAILED, progress = null, error = failure.message ?: "재료를 준비하지 못했습니다.") }
+                }
+            }
+            editorAddJob = null
+        }
+    }
+
+    private fun setPendingAdd(directory: File, id: String, transform: (EditorPendingAdd) -> EditorPendingAdd) {
+        updateTrailer(directory) { live -> live.copy(pendingAdds = live.pendingAdds.map { if (it.id == id) transform(it) else it }) }
+    }
+
+    /** Prepares one candidate through the existing material preparation helper and copies it into the project. */
+    private suspend fun stageEditorCandidate(directory: File, pending: EditorPendingAdd, candidate: EditorAddCandidate): TrailerSource {
+        setPendingAdd(directory, pending.id) { it.copy(phase = EditorAddPhase.PREPARING, progress = null, error = null) }
+        val material = when (candidate) {
+            is EditorAddCandidate.Remote -> MaterialItem(
+                id = pending.id, sourceIdentity = candidate.originKey, name = candidate.name, sourceType = MaterialSourceType.REMOTE_FILE,
+                isVideo = candidate.isVideo, uriString = candidate.item.path, connectionId = candidate.connection.id,
+                remotePath = candidate.item.path, fileSize = candidate.item.size, state = MaterialPreparationState.MISSING,
+            )
+            is EditorAddCandidate.PhoneHard -> MaterialItem(
+                id = pending.id, sourceIdentity = candidate.originKey, name = candidate.name, sourceType = MaterialSourceType.PHONE_HARD,
+                isVideo = candidate.isVideo, uriString = Uri.fromFile(candidate.item.file).toString(), localFilePath = candidate.item.file.absolutePath,
+            )
+            is EditorAddCandidate.LocalUri -> MaterialItem(
+                id = pending.id, sourceIdentity = candidate.originKey, name = candidate.name, sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                isVideo = candidate.isVideo, uriString = candidate.uri.toString(), captureTimeMillis = candidate.captureTimeMillis,
+            )
+            is EditorAddCandidate.WebFile -> MaterialItem(
+                id = pending.id, sourceIdentity = candidate.originKey, name = candidate.name, sourceType = MaterialSourceType.PHONE_HARD,
+                isVideo = candidate.isVideo, uriString = Uri.fromFile(candidate.file).toString(), localFilePath = candidate.file.absolutePath,
             )
         }
-        trailerJob = viewModelScope.launch {
-            val output = File(session.directory, "trailer-${UUID.randomUUID()}.mp4")
+        // A fresh in-memory candidate: prepared for this project only, never registered in the basket.
+        val prepared = prepareMaterialItems(listOf(material), onItemProgress = { _, fraction ->
+            setPendingAdd(directory, pending.id) { it.copy(phase = EditorAddPhase.DOWNLOADING, progress = fraction) }
+        }, registeredInBasket = false).single()
+        check(prepared.state == MaterialPreparationState.READY) { prepared.errorMessage ?: "재료를 준비하지 못했습니다." }
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+
+        val extension = candidate.name.substringAfterLast('.', if (candidate.isVideo) "mp4" else "jpg")
+            .takeIf { it.isNotBlank() && it.length <= 5 && it.all(Char::isLetterOrDigit) } ?: if (candidate.isVideo) "mp4" else "jpg"
+        val destination = File(directory, "source-add-${UUID.randomUUID()}.$extension")
+        val partial = File(directory, "${destination.name}.part")
+        val materialsRoot = File(application.filesDir, "materials_cache").canonicalFile
+        try {
+            withContext(Dispatchers.IO) {
+                val staged = prepared.localFilePath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+                // A copy the helper created for THIS add only (fresh id, not in the basket) is moved; anything else
+                // (PhoneHard files, basket copies, web downloads) is copied so the original is never moved or altered.
+                val ownTemporaryCopy = staged != null && runCatching { staged.canonicalFile.parentFile == materialsRoot }.getOrDefault(false) &&
+                    (staged.name.startsWith("remote_${pending.id}.") || staged.name.startsWith("mat_${pending.id}.")) &&
+                    DurableMaterialStore.getItems().none { it.localFilePath == staged.absolutePath }
+                when {
+                    staged != null && ownTemporaryCopy && staged.renameTo(destination) -> Unit
+                    staged != null -> staged.inputStream().buffered().use { input -> partial.outputStream().buffered().use { input.copyTo(it) } }
+                    else -> {
+                        val uri = Uri.parse(prepared.uriString)
+                        application.contentResolver.openInputStream(uri)?.buffered()?.use { input ->
+                            partial.outputStream().buffered().use { input.copyTo(it) }
+                        } ?: error("미디어를 열 수 없습니다: ${candidate.name}")
+                    }
+                }
+                if (partial.exists()) {
+                    check(partial.length() > 0L && partial.renameTo(destination)) { "재료를 프로젝트에 복사하지 못했습니다." }
+                }
+            }
+            check(destination.isFile && destination.length() > 0L) { "재료를 프로젝트에 복사하지 못했습니다." }
+
+            setPendingAdd(directory, pending.id) { it.copy(phase = EditorAddPhase.ANALYZING, progress = null) }
+            val isImage = !candidate.isVideo
+            val captureTime = (candidate as? EditorAddCandidate.LocalUri)?.captureTimeMillis
+                ?: (candidate as? EditorAddCandidate.Remote)?.item?.modifiedAt?.toEpochMilli()
+                ?: (candidate as? EditorAddCandidate.PhoneHard)?.item?.importedAt?.toEpochMilli() ?: 0L
+            val decoded = decodeStagedTrailerFile(destination, candidate.name, isImage, captureTime)
+                ?: error("지원되지 않거나 손상된 미디어입니다: ${candidate.name}")
+            val (metadata, thumbnail, capTime) = decoded
+            val live = _state.value.trailer?.takeIf { it.directory == directory } ?: throw CancellationException("편집이 닫혔습니다.")
+            val analysis = if (isImage || live.isMusicOverlayMode) {
+                AudioAnalysisResult(emptyList(), 0.0, listOf(0.0), ClipAudioAvailability.NoTrack, ClipHighlightSource.Fallback)
+            } else {
+                AudioAnalysisService.analyze(application, Uri.fromFile(destination), metadata.first, (metadata.first.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048))
+            }
+            val finalThumbnail = if (!isImage && !live.isMusicOverlayMode) improveVideoThumbnail(destination, metadata.first, analysis.peakTimeSeconds, thumbnail) else thumbnail
+            return TrailerSource(
+                id = -1, name = candidate.name, file = destination, duration = metadata.first,
+                width = metadata.second, height = metadata.third, analysis = analysis, thumbnail = finalThumbnail,
+                isImage = isImage, captureTimeMillis = capTime, originKey = candidate.originKey,
+            )
+        } catch (failure: Throwable) {
+            // Only this add's own partial/copied file inside the project directory is removed.
+            withContext(NonCancellable + Dispatchers.IO) {
+                partial.delete()
+                if (_state.value.trailer?.sources?.none { it.file == destination } != false) destination.delete()
+            }
+            throw failure
+        }
+    }
+
+    private suspend fun appendPreparedSource(directory: File, pendingId: String, staged: TrailerSource) {
+        val live = _state.value.trailer?.takeIf { it.directory == directory } ?: return
+        val newSource = staged.copy(id = (live.sources.maxOfOrNull { it.id } ?: -1) + 1)
+        val analysedSources = if (!live.isMusicOverlayMode && live.editor?.autoPlan == true && newSource.isImage) {
+            setPendingAdd(directory, pendingId) { it.copy(phase = EditorAddPhase.ANALYZING) }
+            analyzeTrailerPhotos(application, live.sources + newSource)
+        } else live.sources + newSource
+        val anchor = pendingAddAnchor
+        val changed = editProject { session ->
+            if (session.directory != directory || session.sources.any { it.id == newSource.id }) return@editProject null
+            val project = session.editor ?: return@editProject null
+            val withSources = session.copy(sources = analysedSources.filter { candidate -> candidate.id == newSource.id || session.sources.any { it.id == candidate.id } })
+            if (project.autoPlan && !session.isMusicOverlayMode) {
+                val defaults = recommendedTrailerDefaults(withSources.sources)
+                withSources.copy(
+                    clipLength = defaults.clipLength,
+                    total = defaults.total,
+                    photoClipLength = defaultPhotoClipLength(defaults.clipLength, withSources.hasVideos),
+                ).withRegeneratedPlan()
+            } else {
+                val scene = withSources.defaultSceneFor(newSource, project.nextKey)
+                val insertAt = anchor?.let { key -> project.scenes.indexOfFirst { it.key == key }.takeIf { it >= 0 }?.plus(1) } ?: project.scenes.size
+                withSources.copy(editor = project.copy(
+                    scenes = project.scenes.toMutableList().apply { add(insertAt, scene) },
+                    nextKey = project.nextKey + 1,
+                ))
+            }
+        }
+        if (changed) {
+            if (anchor != null) pendingAddAnchor = (_state.value.trailer?.editor?.scenes?.firstOrNull { it.sourceId == newSource.id }?.key) ?: anchor
+            updateTrailer(directory) { s -> s.copy(pendingAdds = s.pendingAdds.filterNot { it.id == pendingId }) }
+        } else {
+            setPendingAdd(directory, pendingId) { it.copy(phase = EditorAddPhase.FAILED, error = "편집 중인 작업이 있어 추가하지 못했습니다. 다시 시도해 주세요.") }
+        }
+    }
+
+    /**
+     * Exports a FIXED snapshot of the current project. Editing continues; the running composition is never mutated,
+     * and a later edit simply makes the result outdated (next export reflects it).
+     */
+    fun exportEditorProject() = exportEditorProjectInternal(skipUnavailableMusic = false)
+
+    private fun exportEditorProjectInternal(skipUnavailableMusic: Boolean) {
+        val session = _state.value.trailer ?: return
+        if (!session.prepared || session.busy || session.export?.running == true) return
+        val scenes = session.scenes
+        val directory = session.directory
+        if (scenes.isEmpty()) {
+            updateTrailer(directory) { it.copy(export = EditorExportState(false, it.revision, "", error = "내보낼 장면이 없습니다. 재료를 추가해 주세요.")) }
+            return
+        }
+        // A stored but unreadable music choice is never silently dropped from the soundtrack: the user resolves it
+        // (다시 확인 / 다른 음악) or explicitly chooses to export without it (trailer mode only).
+        if (session.musicTrack == null && session.unavailableMusic != null && (!skipUnavailableMusic || session.isMusicOverlayMode)) {
+            updateTrailer(directory) { it.copy(musicExportPrompt = true) }
+            return
+        }
+        if (session.isMusicOverlayMode && session.musicTrack == null) {
+            updateTrailer(directory) { it.copy(export = EditorExportState(false, it.revision, "", error = "뮤직비디오는 배경 음악을 먼저 선택해 주세요.")) }
+            return
+        }
+        val revision = session.revision
+        val format = session.format
+        val musicTrack = session.musicTrack
+        val musicPolicy = session.musicPolicy
+        val musicFitCount = session.musicFitCount
+        val autoDucking = session.autoDucking
+        val musicVolume = session.editor?.musicVolume ?: 1f
+        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, "장면을 준비하는 중…")) }
+        editorExportJob = viewModelScope.launch {
+            val self = coroutineContext[Job]
+            val output = File(directory, "trailer-${UUID.randomUUID()}.mp4")
             try {
                 TrailerExporter.export(
                     context = application,
@@ -4805,20 +5468,59 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     musicPolicy = musicPolicy,
                     musicFitCount = musicFitCount,
                     autoDucking = autoDucking,
-                    aspectSources = sources,
+                    aspectSources = scenes.map { it.source },
+                    musicVolume = musicVolume,
                 ) { status, progress ->
-                    updateTrailer(directory) { it.copy(status = status, progress = progress) }
+                    updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
                 }
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                updateTrailer(directory) { it.copy(output = output, busy = false, progress = null, saved = false) }
-                // Old outputs remain in this private session until close, so the player's decoder can release safely.
-            } catch (cancelled: CancellationException) { output.delete(); throw cancelled }
-            catch (failure: Exception) {
-                kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                output.delete()
-                updateTrailer(directory) { it.copy(busy = false, progress = null, error = failure.message ?: "다시 만들어 주세요.") }
+                val previous = _state.value.trailer?.takeIf { it.directory == directory }?.output
+                updateTrailer(directory) { it.copy(output = output, outputRevision = revision, export = null, saved = false) }
+                val live = _state.value.trailer?.takeIf { it.directory == directory }
+                val saved = live != null && withContext(Dispatchers.IO) { draftFromSession(live)?.let(TrailerDraftStore::saveDraft) == true }
+                // The superseded render of this same project is removed only after the new one is recorded.
+                if (saved && previous != null && previous != output && previous.parentFile == directory && previous.name.startsWith("trailer-")) {
+                    withContext(Dispatchers.IO) { previous.delete() }
+                }
+                updateTrailer(directory) { it.copy(saveState = if (saved) it.saveState else EditorSaveState.FAILED) }
+            } catch (cancelled: CancellationException) {
+                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                throw cancelled
+            } catch (failure: Exception) {
+                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                updateTrailer(directory) { it.copy(export = EditorExportState(false, revision, "", error = failure.message ?: "내보내지 못했습니다. 다시 시도해 주세요.")) }
+            } finally {
+                if (editorExportJob === self) editorExportJob = null
             }
         }
+    }
+
+    fun cancelEditorExport() {
+        val session = _state.value.trailer ?: return
+        if (session.export?.running != true) return
+        editorExportJob?.cancel()
+        updateTrailer(session.directory) { it.copy(export = null) }
+    }
+
+    fun dismissEditorExportError() {
+        val session = _state.value.trailer ?: return
+        updateTrailer(session.directory) { if (it.export?.running == true) it else it.copy(export = null) }
+    }
+
+    /** Keeps the open project alive (export/adds continue) while the rail opens another destination. */
+    fun minimizeEditor(destination: MainNavigationDestination) {
+        if (_state.value.trailer == null) return
+        _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { scheduleEditorAutosave(it.directory, immediate = true) }
+        _state.update { it.copy(trailerMinimized = true) }
+        selectMainDestination(destination)
+    }
+
+    fun restoreEditor() {
+        if (_state.value.trailer == null) return
+        val currentScreen = _state.value.screen
+        val resolvedScreen = if (currentScreen == Screen.WebBrowser) Screen.Dashboard else currentScreen
+        _state.update { it.copy(trailerMinimized = false, imagePreview = null, screen = resolvedScreen) }
+        editorRecheckMusic(silent = true)
     }
 
     private var trailerModeSwitchToken = 0L
@@ -4844,13 +5546,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val photoLength = if (toMusicVideo) 1.0 else defaultPhotoClipLength(length, hasVideos)
             val total = trailerDefaults?.total
                 ?: list.sumOf { if (it.isImage) photoLength else it.duration }
+            // The previous render stays as the (now outdated) output; the new mode starts from its own recommendation.
             return base.copy(
                 sources = list,
                 isMusicOverlayMode = toMusicVideo,
                 clipLength = length,
                 photoClipLength = photoLength,
                 total = total,
-                output = null,
                 saved = false,
                 error = null,
                 progress = null,
@@ -4858,7 +5560,21 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 awaitingInitialSettings = true,
                 highlightAnalyzed = base.highlightAnalyzed || !toMusicVideo,
                 status = if (toMusicVideo) "음악을 선택해 주세요." else "장면을 분석했습니다. 설정을 확인해 주세요.",
-            )
+            ).let { switched ->
+                switched.copy(editor = EditorProject.fromPlan(
+                    switched.autoPlanScenes(),
+                    autoPlan = true,
+                    musicVolume = base.editor?.musicVolume ?: 1f,
+                    firstKey = base.editor?.nextKey ?: 1L,
+                ))
+            }
+        }
+        val before = session.editorSnapshot()
+        fun commitModeSwitch() {
+            val history = editorHistory(directory)
+            history.record(before)
+            updateTrailer(directory) { it.copy(revision = it.revision + 1, canUndo = history.canUndo, canRedo = history.canRedo) }
+            scheduleEditorAutosave(directory)
         }
 
         if (toMusicVideo || session.highlightAnalyzed) {
@@ -4866,6 +5582,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val live = current.trailer?.takeIf { it.directory == directory && !it.busy } ?: return@update current
                 current.copy(trailer = modeSession(live, ordered))
             }
+            commitModeSwitch()
             return
         }
 
@@ -4891,6 +5608,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val live = current.trailer?.takeIf { it.directory == directory && it.busy && it.isMusicOverlayMode } ?: return@update current
                     current.copy(trailer = modeSession(live, prepared).copy(highlightAnalyzed = true))
                 }
+                commitModeSwitch()
                 trailerJob = null
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) {
@@ -4904,17 +5622,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun retryTrailer() {
         val session = _state.value.trailer ?: return
-        if (session.output != null) regenerateTrailer(
-            session.sources.map { it.id },
-            session.total,
-            session.clipLength,
-            session.photoClipLength,
-            session.format,
-            session.musicTrack,
-            session.musicPolicy,
-            session.musicFitCount,
-            session.autoDucking,
-        )
+        if (session.prepared && session.editor != null) exportEditorProject()
         else trailerRetry?.invoke()
     }
 
@@ -4939,6 +5647,77 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    /**
+     * Stores the current render as an immutable collection copy after title/poster confirmation. The editable project
+     * stays open and saved; the poster is the user-confirmed candidate (or the first frame when none was chosen).
+     */
+    fun completeTrailerToCollection(title: String, posterCandidate: File? = null) {
+        val session = _state.value.trailer ?: return
+        val output = session.output ?: return
+        val directory = session.directory
+        if (session.busy || session.export?.running == true || !output.exists() || output.length() <= 0L) return
+
+        updateTrailer(directory) { it.copy(busy = true, status = "컬렉션에 보관하는 중…", error = null) }
+        viewModelScope.launch {
+            val createdPosters = mutableListOf<File>()
+            try {
+                val cleanTitle = title.ifBlank { "완성된 영상" }
+                val saved = withContext(Dispatchers.IO) {
+                    val duration = readVideoDurationSeconds(output)
+                    var poster = posterCandidate?.takeIf { it.isFile && it.length() > 0L }
+                    if (poster == null) {
+                        val retriever = MediaMetadataRetriever()
+                        try {
+                            retriever.setDataSource(output.absolutePath)
+                            retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { frame ->
+                                val tempPoster = File(directory, "poster-auto-${UUID.randomUUID()}.jpg")
+                                tempPoster.outputStream().use { frame.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                                createdPosters += tempPoster
+                                poster = tempPoster
+                            }
+                        } catch (_: Exception) {
+                        } finally { runCatching { retriever.release() } }
+                    }
+                    DurableCollectionStore.addVideo(
+                        title = cleanTitle,
+                        exportedFile = output,
+                        durationSeconds = duration,
+                        posterFile = poster,
+                        sourceDraftId = session.draftId,
+                    )
+                }
+                refreshCollections()
+                updateTrailer(directory) { it.copy(busy = false) }
+                _state.value.trailer?.takeIf { it.directory == directory }?.let { scheduleEditorAutosave(directory, immediate = true) }
+                _state.update {
+                    it.copy(message = if (saved != null) "‘${saved.title}’을(를) 컬렉션에 추가했습니다. 편집 중인 프로젝트는 그대로 유지됩니다." else "컬렉션 저장에 실패했습니다. 저장 공간을 확인해 주세요.")
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                updateTrailer(directory) { it.copy(busy = false, error = failure.message ?: "컬렉션에 보관하지 못했습니다.") }
+            } finally {
+                // Temporary poster files of this action only (the store keeps its own copy).
+                withContext(NonCancellable + Dispatchers.IO) {
+                    createdPosters.forEach { it.delete() }
+                    posterCandidate?.takeIf { it.parentFile == directory && it.name.startsWith("poster-candidate-") }?.delete()
+                }
+            }
+        }
+    }
+
+    private fun readVideoDurationSeconds(file: File): Double {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+        } catch (_: Exception) {
+            0.0
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
     fun dismissTrailer() {
         suspendTrailerDraft(showingSettings = false)
     }
@@ -4946,8 +5725,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private fun closeTrailer(clearRetry: Boolean) {
         val session = _state.value.trailer
         val running = trailerJob
-        _state.update { it.copy(trailer = null) }
+        _state.update { it.copy(trailer = null, trailerMinimized = false) }
         trailerJob = null
+        stopEditorBackgroundWork(session)
         if (clearRetry) trailerRetry = null
         if (session != null) {
             val isManaged = TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)
@@ -4962,31 +5742,62 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    /** Cancels this project's export/add/autosave jobs; their own partial files are removed by those jobs. */
+    private fun stopEditorBackgroundWork(session: TrailerSession?) {
+        editorExportJob?.cancel(); editorExportJob = null
+        editorAddJob?.cancel(); editorAddJob = null
+        editorAutosaveJob?.cancel(); editorAutosaveJob = null
+        session?.pendingAdds?.forEach { pendingAddCandidates.remove(it.id) }
+        pendingAddAnchor = null
+        session?.let {
+            editorHistories.remove(it.directory.absolutePath)
+            editorFinderSelections.remove(it.directory.absolutePath)
+        }
+    }
+
+    /** Saves the CURRENT project from the session itself and closes the editor (nothing is discarded). */
     fun suspendTrailerDraft(
         showingSettings: Boolean = false,
-        sources: List<TrailerSource>? = null,
-        total: Double? = null,
-        length: Double? = null,
-        photoLength: Double? = null,
-        format: TrailerFormat? = null,
-        musicTrack: TrailerMusicTrack? = null,
-        musicPolicy: TrailerMusicPolicy? = null,
-        musicFitCount: Int? = null,
-        autoDucking: Boolean? = null,
-        orderMode: String? = null,
         wasCancelled: Boolean = false,
     ) {
         val session = _state.value.trailer ?: return
+        if (session.prepared) {
+            // Save BEFORE stopping anything, so a failed save can keep the project (and its running work) open.
+            val sessionWithId = if (session.draftId == null) session.copy(draftId = UUID.randomUUID().toString()) else session
+            val saved = sessionWithId.sources.isNotEmpty() &&
+                draftFromSession(sessionWithId, showingSettings)?.let(TrailerDraftStore::saveDraft) == true
+            if (!saved && !wasCancelled) {
+                // Never drop unsaved edits of a prepared project silently: keep the editor open with a visible failure.
+                // (An explicit "멈추고 닫기" closes without deleting anything; the project files stay on disk.)
+                updateTrailer(session.directory) {
+                    it.copy(draftId = sessionWithId.draftId, saveState = EditorSaveState.FAILED, saveError = "프로젝트를 저장하지 못해 닫지 않았습니다. 저장 공간을 확인해 주세요.")
+                }
+                _state.update { it.copy(trailerMinimized = false) }
+                return
+            }
+            trailerJob?.cancel()
+            trailerJob = null
+            stopEditorBackgroundWork(session)
+            _state.update {
+                it.copy(
+                    trailer = null,
+                    trailerMinimized = false,
+                    trailerDraftCount = TrailerDraftStore.draftCount(),
+                    message = if (!saved) "마지막 변경을 저장하지 못했습니다. 프로젝트 파일은 지우지 않았습니다." else it.message,
+                )
+            }
+            return
+        }
+
         val running = trailerJob
         trailerJob = null
         val wasRunning = running?.isActive == true
         if (wasRunning) running?.cancel()
-
-        val finalOutput = session.output?.takeIf { it.exists() && it.length() > 0 }
+        stopEditorBackgroundWork(session)
 
         // Staging/analysis never finished: there is no valid plan to keep, so only this
         // session's own partial directory is removed and no draft is stored.
-        if (!session.prepared) {
+        run {
             if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
                 if (wasRunning) running?.invokeOnCompletion { TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory) }
                 else TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory)
@@ -4995,64 +5806,82 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update {
                 it.copy(
                     trailer = null,
+                    trailerMinimized = false,
                     trailerDraftCount = TrailerDraftStore.draftCount(),
                     message = if (wasCancelled) cancelMsg else it.message,
                 )
             }
-            return
-        }
-
-        val draftSources = (sources ?: session.sources).ifEmpty { session.sources }
-
-        if (draftSources.isNotEmpty()) {
-            val draft = TrailerDraft(
-                id = session.draftId ?: UUID.randomUUID().toString(),
-                isMusicOverlayMode = session.isMusicOverlayMode,
-                directory = session.directory,
-                sources = draftSources,
-                total = total ?: session.total,
-                clipLength = length ?: session.clipLength,
-                photoClipLength = photoLength ?: session.photoClipLength,
-                format = format ?: session.format,
-                musicTrack = musicTrack ?: session.musicTrack,
-                musicPolicy = musicPolicy ?: session.musicPolicy,
-                musicFitCount = musicFitCount ?: session.musicFitCount,
-                autoDucking = autoDucking ?: session.autoDucking,
-                output = finalOutput,
-                showingSettings = showingSettings,
-                orderMode = orderMode ?: session.orderMode,
-                timestamp = System.currentTimeMillis(),
-            )
-            TrailerDraftStore.saveDraft(draft)
-        } else if (!TrailerDraftStore.isDirectoryManagedAsDraft(session.directory)) {
-            TrailerDraftStore.safeDeletePrivateTrailerDirectory(session.directory)
-        }
-
-        _state.update {
-            it.copy(
-                trailer = null,
-                trailerDraftCount = TrailerDraftStore.draftCount(),
-            )
         }
     }
 
-    fun resumeTrailerDraft(draft: TrailerDraft) {
-        if (_state.value.trailer != null) return
-        stopInlineAudio()
-        if (!draft.isValid()) {
-            TrailerDraftStore.removeDraft(draft)
+    /** True when [directory] is the open project's folder (migration and cleanup never touch it). */
+    private fun isTrailerDirectoryInUse(directory: File): Boolean {
+        val open = _state.value.trailer?.directory ?: return false
+        return runCatching { open.canonicalPath == directory.canonicalPath }.getOrDefault(true)
+    }
+
+    /**
+     * Background, startup-time move of legacy cache data into durable storage: interrupted earlier migration copies
+     * are cleaned, legacy cache drafts are copied+validated+committed, and collection records that point at
+     * temporary cache files get their own permanent copy. Every failure keeps the original record and files.
+     */
+    private fun migrateEphemeralProjectData() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { TrailerDraftStore.cleanupInterruptedMigrations() }
+            runCatching { TrailerDraftStore.migrateLegacyDrafts(::isTrailerDirectoryInUse) }
+            runCatching { DurableCollectionStore.ephemeralRecordsToPromote().forEach { DurableCollectionStore.promoteEphemeralRecord(it) } }
             _state.update {
                 it.copy(
-                    trailerDraftStaleNotice = "이전 편집 파일이 삭제되었거나 사용할 수 없어 복원할 수 없습니다. 새 편집을 시작해 주세요.",
                     trailerDraftCount = TrailerDraftStore.draftCount(),
+                    trailerDraftsVersion = it.trailerDraftsVersion + 1,
+                    trailerDraftPicker = it.trailerDraftPicker?.let { TrailerDraftStore.getAllDrafts() },
+                    collections = DurableCollectionStore.getItems(),
+                )
+            }
+        }
+    }
+
+    /** "다시 확인": re-reads availability and retries any pending legacy migration (nothing is deleted). */
+    fun recheckTrailerDrafts() {
+        migrateEphemeralProjectData()
+    }
+
+    fun resumeTrailerDraft(requested: TrailerDraft) {
+        // The list a user tapped may predate a migration: always open the latest stored record.
+        val draft = TrailerDraftStore.draft(requested.id) ?: requested
+        _state.value.trailer?.let { open ->
+            if (open.draftId == draft.id) {
+                restoreEditor()
+                return
+            }
+            if (open.export?.running == true || open.busy) {
+                _state.update { it.copy(message = "‘${open.displayTitle}’ 작업이 진행 중입니다. 끝나거나 취소한 뒤 다른 편집을 열어 주세요.", trailerDraftPicker = null) }
+                return
+            }
+            // Explicit open of another project: the current one is saved first, never discarded.
+            suspendTrailerDraft()
+            if (_state.value.trailer != null) return
+        }
+        stopInlineAudio()
+        if (!draft.isValid()) {
+            // Never delete anything here: the record and every surviving file stay, so the user can reconnect,
+            // retry later, or remove the project explicitly from 편집본.
+            val details = draft.unavailableDetails().take(6).joinToString("\n") { "· $it" }
+            _state.update {
+                it.copy(
+                    trailerDraftStaleNotice = "‘${draft.displayTitle}’을(를) 지금 열 수 없습니다.\n$details\n\n" +
+                        "편집 정보와 남아 있는 파일은 지우지 않았습니다. 파일이 있는 저장소를 다시 연결한 뒤 편집본에서 ‘다시 확인’을 누르거나, 필요 없으면 직접 삭제해 주세요.",
+                    trailerDraftCount = TrailerDraftStore.draftCount(),
+                    trailerDraftsVersion = it.trailerDraftsVersion + 1,
                     trailerDraftPicker = null,
                 )
             }
             return
         }
+        val musicAvailable = draft.musicTrack?.let(::isMusicFileReadable)
+        val availableOutput = draft.output?.takeIf { it.exists() && it.length() > 0 }
 
-        TrailerDraftStore.detachDraft(draft.id)
-
+        // The draft stays registered while open, so its durable directory is protected and autosave updates it in place.
         val restoredSession = TrailerSession(
             directory = draft.directory,
             sources = draft.sources,
@@ -5060,43 +5889,1194 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             clipLength = draft.clipLength,
             photoClipLength = draft.photoClipLength,
             format = draft.format,
-            output = draft.output?.takeIf { it.exists() && it.length() > 0 },
+            output = availableOutput,
             busy = false,
-            status = if (draft.output != null) "예고편을 불러왔습니다." else "편집을 이어갑니다.",
+            status = if (availableOutput != null) "예고편을 불러왔습니다." else "편집을 이어갑니다.",
             progress = null,
             error = null,
             saved = false,
             isMusicOverlayMode = draft.isMusicOverlayMode,
-            musicTrack = draft.musicTrack?.takeIf { it.file.exists() },
+            musicTrack = draft.musicTrack?.takeIf { musicAvailable == true },
+            // Kept, displayed as unavailable and saved back unchanged until the user reconnects, replaces or removes it.
+            unavailableMusic = draft.musicTrack?.takeIf { musicAvailable == false },
             musicPolicy = draft.musicPolicy,
             musicFitCount = draft.musicFitCount,
             autoDucking = draft.autoDucking,
-            awaitingInitialSettings = draft.showingSettings || draft.output == null,
+            awaitingInitialSettings = draft.showingSettings || availableOutput == null,
             prepared = true,
             draftId = draft.id,
             highlightAnalyzed = !draft.isMusicOverlayMode,
             orderMode = draft.orderMode,
-        )
+            title = draft.customTitle,
+            saveState = EditorSaveState.SAVED,
+            revision = draft.revision ?: 0L,
+            outputRevision = if (availableOutput != null) draft.outputRevision else null,
+        ).let { restored ->
+            // Older drafts had no explicit scenes: derive them once from their stored plan parameters.
+            restored.copy(
+                editor = draft.editor ?: EditorProject.fromPlan(restored.autoPlanScenes(), autoPlan = true),
+            )
+        }
+        editorHistories.remove(draft.directory.absolutePath)
 
         _state.update {
             it.copy(
                 trailer = restoredSession,
                 imagePreview = null,
+                trailerMinimized = false,
                 trailerDraftPicker = null,
                 trailerDraftCount = TrailerDraftStore.draftCount(),
+                message = if (musicAvailable == false) {
+                    "음악 ‘${draft.musicTrack?.name}’ 파일을 지금 찾을 수 없습니다. 음악 선택과 길이·볼륨·더킹 설정은 그대로 보관합니다. " +
+                        "소리 탭에서 ‘다시 확인’하거나 다른 음악을 고를 수 있으며, 해결하기 전에는 내보낼 때 확인을 요청합니다."
+                } else it.message,
+            )
+        }
+    }
+
+    fun duplicateTrailerDraft(draft: TrailerDraft) {
+        val duplicated = TrailerDraftStore.duplicateDraft(draft)
+        if (duplicated != null) {
+            val remaining = TrailerDraftStore.getAllDrafts()
+            _state.update {
+                it.copy(
+                    trailerDraftCount = remaining.size,
+                    trailerDraftPicker = remaining,
+                    message = "‘${draft.displayTitle}’ 사본을 만들었습니다."
+                )
+            }
+        } else {
+            _state.update { it.copy(message = "사본을 만들지 못했습니다. 재료 파일과 저장 공간을 확인해 주세요. 원래 편집본은 그대로입니다.") }
+        }
+    }
+
+    fun renameTrailerDraft(draft: TrailerDraft, newTitle: String) {
+        TrailerDraftStore.renameDraft(draft.id, newTitle)
+        val remaining = TrailerDraftStore.getAllDrafts()
+        _state.update {
+            it.copy(
+                trailerDraftPicker = remaining,
+                trailerDraftCount = remaining.size
             )
         }
     }
 
     fun discardTrailerDraft(draft: TrailerDraft) {
-        TrailerDraftStore.removeDraft(draft)
+        if (_state.value.trailer?.let { it.draftId == draft.id || it.directory.absolutePath == draft.directory.absolutePath } == true) {
+            _state.update { it.copy(message = "지금 열려 있는 편집은 삭제할 수 없습니다. 편집을 닫은 뒤 삭제해 주세요.") }
+            return
+        }
+        val removed = TrailerDraftStore.removeDraft(draft)
+        if (removed) {
+            editorFinderSelections.remove(draft.directory.absolutePath)
+        }
         val remaining = TrailerDraftStore.getAllDrafts()
         _state.update {
             it.copy(
                 trailerDraftCount = remaining.size,
+                trailerDraftsVersion = it.trailerDraftsVersion + 1,
                 trailerDraftPicker = remaining,
+                message = if (!removed) "편집본 정보를 저장하지 못해 삭제하지 않았습니다. 프로젝트 파일도 그대로입니다." else it.message,
             )
         }
+    }
+
+    fun selectMainDestination(destination: MainNavigationDestination) {
+        // 영상 with a kept-alive editor returns to that same project instead of switching projects.
+        if (destination == MainNavigationDestination.VIDEO && _state.value.trailer != null && _state.value.trailerMinimized) {
+            _state.update { it.copy(activeMainTab = MainNavigationDestination.VIDEO) }
+            restoreEditor()
+            return
+        }
+        _state.update {
+            it.copy(
+                activeMainTab = destination,
+                screen = when (destination) {
+                    MainNavigationDestination.FINDER -> Screen.Dashboard
+                    MainNavigationDestination.VIDEO -> when (it.activeVideoTab) {
+                        VideoNavigationDestination.CREATE -> Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)
+                        VideoNavigationDestination.MATERIALS -> Screen.MaterialBasket
+                        VideoNavigationDestination.DRAFTS -> Screen.VideoDrafts
+                        VideoNavigationDestination.COLLECTIONS -> Screen.VideoCollections
+                    }
+                    MainNavigationDestination.TOOLS -> Screen.Settings
+                }
+            )
+        }
+    }
+
+    fun selectVideoDestination(destination: VideoNavigationDestination) {
+        _state.update {
+            it.copy(
+                activeMainTab = MainNavigationDestination.VIDEO,
+                activeVideoTab = destination,
+                screen = when (destination) {
+                    VideoNavigationDestination.CREATE -> Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)
+                    VideoNavigationDestination.MATERIALS -> Screen.MaterialBasket
+                    VideoNavigationDestination.DRAFTS -> Screen.VideoDrafts
+                    VideoNavigationDestination.COLLECTIONS -> Screen.VideoCollections
+                }
+            )
+        }
+    }
+
+    fun refreshMaterials() {
+        val currentItems = DurableMaterialStore.getItems()
+        // Validate accessible state for items on refresh
+        var changed = false
+        val updated = currentItems.map { item ->
+            when (item.sourceType) {
+                MaterialSourceType.LOCAL_LIBRARY -> {
+                    // An app-owned copy keeps the item usable even when the original is no longer reachable.
+                    val hasOwnedCopy = ownedMaterialCopy(item.localFilePath, getMaterialsDirectory()) != null
+                    val uri = Uri.parse(item.uriString)
+                    val accessible = hasOwnedCopy || runCatching {
+                        application.contentResolver.openInputStream(uri)?.use { true } ?: false
+                    }.getOrDefault(false)
+                    // Only an access failure clears itself here; a failed copy/validation stays visible until retried.
+                    val accessFailure = item.errorMessage == null || item.errorMessage == LOCAL_MATERIAL_ACCESS_ERROR || item.errorMessage == LOCAL_MATERIAL_GRANT_ERROR
+                    if (accessible && accessFailure && item.state == MaterialPreparationState.MISSING) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
+                    } else if (!accessible && item.state == MaterialPreparationState.READY) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = LOCAL_MATERIAL_ACCESS_ERROR)
+                    } else {
+                        item
+                    }
+                }
+                MaterialSourceType.PHONE_HARD -> {
+                    val file = item.localFilePath?.let { File(it) }
+                    val accessible = file != null && file.exists() && file.length() > 0L
+                    if (accessible && item.state == MaterialPreparationState.MISSING) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
+                    } else if (!accessible && item.state == MaterialPreparationState.READY) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = "폰하드 파일이 삭제되었거나 누락되었습니다.")
+                    } else {
+                        item
+                    }
+                }
+                MaterialSourceType.REMOTE_FILE -> {
+                    val local = item.localFilePath?.let { File(it) }
+                    val hasLocal = local != null && local.exists() && local.length() > 0L
+                    if (hasLocal && item.state == MaterialPreparationState.MISSING) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
+                    } else if (!hasLocal && item.state == MaterialPreparationState.READY) {
+                        changed = true
+                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = "가져오기 필요")
+                    } else {
+                        item
+                    }
+                }
+            }
+        }
+        var saveFailed = false
+        if (changed) {
+            updated.forEachIndexed { index, item ->
+                if (item != currentItems[index] &&
+                    !DurableMaterialStore.updateState(item.id, item.state, item.downloadProgress, item.localFilePath, item.errorMessage)
+                ) saveFailed = true
+            }
+        }
+        _state.update {
+            it.copy(
+                materials = DurableMaterialStore.getItems(),
+                message = if (saveFailed) MATERIAL_SAVE_ERROR else it.message,
+            )
+        }
+    }
+
+    internal fun addLocalMediaToMaterialBasket(uris: List<Uri>, items: List<LocalMediaItem> = emptyList()) {
+        val candidates = uris.map { uri ->
+            val uriStr = uri.toString()
+            val meta = items.firstOrNull { it.uri.toString() == uriStr }
+            val name = meta?.displayName ?: queryName(uri) ?: uri.lastPathSegment ?: "미디어"
+            val isVideo = meta?.isVideo ?: (application.contentResolver.getType(uri)?.startsWith("video/") == true)
+            // Verify immediate read access
+            val accessible = runCatching {
+                application.contentResolver.openInputStream(uri)?.use { true } ?: false
+            }.getOrDefault(false)
+            val state = if (accessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING
+            val errorMsg = if (!accessible) LOCAL_MATERIAL_GRANT_ERROR else null
+            MaterialItem(
+                sourceIdentity = "local:$uriStr",
+                name = name,
+                sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                isVideo = isVideo,
+                uriString = uriStr,
+                durationMs = meta?.durationMs,
+                state = state,
+                errorMessage = errorMsg
+            )
+        }
+        val added = DurableMaterialStore.addItems(candidates)
+        refreshMaterials()
+        _state.update {
+            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 미디어입니다."))
+        }
+    }
+
+    /** [added] null = nothing could be saved (the basket is unchanged), never reported as success or duplicate. */
+    private fun materialAddMessage(added: Int?, duplicateMessage: String): String = when {
+        added == null -> DurableMaterialStore.loadProblem()?.takeIf { DurableMaterialStore.isPersistBlocked() }
+            ?.let { "재료함에 담지 못했습니다. $it" } ?: "재료함에 담지 못했습니다. ${MATERIAL_SAVE_ERROR}"
+        added > 0 -> "${added}개를 재료함에 담았습니다."
+        else -> duplicateMessage
+    }
+
+    fun addPhoneHardToMaterialBasket(phoneHardItems: List<InboxDisplayItem>) {
+        val candidates = phoneHardItems.map { item ->
+            val isVideo = item.asPreviewItem().isVideo
+            val fileAccessible = item.file.exists() && item.file.length() > 0L
+            val state = if (fileAccessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING
+            val errorMsg = if (!fileAccessible) "폰하드 파일을 찾을 수 없습니다." else null
+            MaterialItem(
+                sourceIdentity = "phonehard:${item.id}",
+                name = item.originalFilename,
+                sourceType = MaterialSourceType.PHONE_HARD,
+                isVideo = isVideo,
+                uriString = Uri.fromFile(item.file).toString(),
+                localFilePath = item.file.absolutePath,
+                state = state,
+                errorMessage = errorMsg
+            )
+        }
+        val added = DurableMaterialStore.addItems(candidates)
+        refreshMaterials()
+        _state.update {
+            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 항목입니다."))
+        }
+    }
+
+    fun addRemoteFilesToMaterialBasket(connection: RemoteConnection, remoteItems: List<RemoteFileItem>) {
+        val candidates = remoteItems.filter { !it.isDirectory && (it.isVideo || it.isImage) }.map { item ->
+            val identity = "remote:${connection.id}:${item.path}"
+            MaterialItem(
+                sourceIdentity = identity,
+                name = item.name,
+                sourceType = MaterialSourceType.REMOTE_FILE,
+                isVideo = item.isVideo,
+                uriString = item.path,
+                connectionId = connection.id,
+                remotePath = item.path,
+                fileSize = item.size,
+                state = MaterialPreparationState.MISSING, // Remote references initially '가져오기 필요'
+                errorMessage = "가져오기 필요"
+            )
+        }
+        val added = DurableMaterialStore.addItems(candidates)
+        refreshMaterials()
+        _state.update {
+            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 파일입니다."))
+        }
+    }
+
+    fun removeMaterialItem(id: String) {
+        val removed = !DurableMaterialStore.contains(id) || DurableMaterialStore.removeItem(id)
+        refreshMaterials()
+        if (!removed) _state.update { it.copy(message = "재료를 빼지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+    }
+
+    fun reorderMaterialItem(from: Int, to: Int) {
+        val moved = DurableMaterialStore.reorder(from, to)
+        refreshMaterials()
+        if (!moved) _state.update { it.copy(message = "순서를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+    }
+
+    fun retryPrepareMaterial(item: MaterialItem) {
+        viewModelScope.launch {
+            val result = prepareMaterialItems(listOf(item)).single()
+            if (result.state != MaterialPreparationState.READY) {
+                _state.update { it.copy(message = "‘${result.displayLabel}’ 준비 실패: ${result.errorMessage ?: "다시 시도해 주세요."}") }
+            }
+        }
+    }
+
+    fun setMaterialExcluded(id: String, excluded: Boolean) {
+        val targetState = if (excluded) MaterialPreparationState.EXCLUDED else MaterialPreparationState.MISSING
+        val saved = DurableMaterialStore.updateState(id, targetState)
+        refreshMaterials()
+        if (!saved) _state.update { it.copy(message = "재료 상태를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+    }
+
+    private fun getMaterialsDirectory(): File {
+        return File(application.filesDir, "materials_cache").also { it.mkdirs() }
+    }
+
+    /** [file] when it is a regular file directly inside this app's materials copy folder (symlinks resolved), else null. */
+    private fun ownedMaterialCopy(path: String?, stagingDir: File): File? {
+        val file = path?.takeIf { it.isNotBlank() }?.let(::File) ?: return null
+        val canonical = runCatching { file.canonicalFile }.getOrNull() ?: return null
+        val root = runCatching { stagingDir.canonicalFile }.getOrNull() ?: return null
+        return canonical.takeIf { it.parentFile == root && it.isFile && it.length() > 0L }
+    }
+
+    /** True when [file] is a non-empty readable photo (decodable size) or video (video track with a real length). */
+    private fun isReadableMediaFile(file: File, isVideo: Boolean): Boolean {
+        if (!file.isFile || !file.canRead() || file.length() <= 0L) return false
+        return if (isVideo) {
+            val reader = MediaMetadataRetriever()
+            try {
+                reader.setDataSource(file.absolutePath)
+                val durationMs = reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull() ?: 0.0
+                reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes" && durationMs.isFinite() && durationMs > 0.0
+            } catch (_: Exception) {
+                false
+            } finally {
+                runCatching { reader.release() }
+            }
+        } else {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            runCatching { BitmapFactory.decodeFile(file.absolutePath, bounds) }
+            if (bounds.outWidth > 0 && bounds.outHeight > 0) true
+            else runCatching { BitmapFactory.decodeFile(file.absolutePath)?.let { it.recycle(); true } ?: false }.getOrDefault(false)
+        }
+    }
+
+    /**
+     * Prepares materials for use. With [registeredInBasket] every item is a [DurableMaterialStore] record and is
+     * reported READY only when that state was actually saved. Without it the items are fresh in-memory editor
+     * candidates that are not (and must not be) put into the basket; their result is returned without the store.
+     */
+    suspend fun prepareMaterialItems(
+        itemsToPrepare: List<MaterialItem>,
+        onProgress: ((completed: Int, total: Int, currentName: String) -> Unit)? = null,
+        onItemProgress: ((itemId: String, fraction: Float?) -> Unit)? = null,
+        registeredInBasket: Boolean = true,
+    ): List<MaterialItem> = withContext(Dispatchers.IO) {
+        val stagingDir = getMaterialsDirectory()
+        val total = itemsToPrepare.size
+        // Records [prepared] for a basket item. A READY that could not be saved is not success: the copy this
+        // operation created ([ownedNewFile]) is removed again and the item is reported as a retryable failure.
+        fun commit(item: MaterialItem, prepared: MaterialItem, ownedNewFile: File? = null): MaterialItem {
+            if (!registeredInBasket) return prepared
+            if (DurableMaterialStore.updateState(item.id, prepared.state, prepared.downloadProgress, prepared.localFilePath, prepared.errorMessage)) return prepared
+            ownedNewFile?.delete()
+            val reason = when {
+                DurableMaterialStore.isPersistBlocked() -> "재료함 목록 파일 문제로 저장이 멈춰 있어 준비 결과를 기록하지 못했습니다. 앱을 다시 열어 주세요."
+                !DurableMaterialStore.contains(item.id) -> "재료함에서 빠진 항목이라 준비 결과를 기록하지 못했습니다."
+                else -> "준비 결과를 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
+            }
+            return if (prepared.state == MaterialPreparationState.READY) {
+                item.copy(state = MaterialPreparationState.MISSING, downloadProgress = null, errorMessage = reason)
+            } else {
+                prepared.copy(errorMessage = listOfNotNull(prepared.errorMessage, reason).joinToString(" "))
+            }
+        }
+        itemsToPrepare.mapIndexed { index, item ->
+            ensureActive()
+            onProgress?.invoke(index, total, item.name)
+
+            when (item.sourceType) {
+                MaterialSourceType.LOCAL_LIBRARY -> {
+                    val existingCopy = ownedMaterialCopy(item.localFilePath, stagingDir)?.takeIf { isReadableMediaFile(it, item.isVideo) }
+                    if (existingCopy != null) {
+                        // A valid app-owned copy stays usable even when the original is no longer reachable.
+                        commit(item, item.copy(state = MaterialPreparationState.READY, downloadProgress = null, errorMessage = null))
+                    } else {
+                        // Copy into a partial owned by THIS operation; it becomes the item's copy only after validation.
+                        val ext = item.name.substringAfterLast('.', "").takeIf { it.isNotBlank() && it.length <= 5 && it.all(Char::isLetterOrDigit) }
+                            ?: if (item.isVideo) "mp4" else "jpg"
+                        val finalFile = File(stagingDir, "mat_${item.id}.${UUID.randomUUID()}.$ext")
+                        val partial = File(stagingDir, "${finalFile.name}.part")
+                        var failure: String? = null
+                        try {
+                            val opened = runCatching { application.contentResolver.openInputStream(Uri.parse(item.uriString)) }.getOrNull()
+                            if (opened == null) {
+                                failure = LOCAL_MATERIAL_ACCESS_ERROR
+                            } else {
+                                opened.use { input ->
+                                    partial.outputStream().use { output ->
+                                        val buffer = ByteArray(64 * 1024)
+                                        while (true) {
+                                            ensureActive()
+                                            val read = input.read(buffer)
+                                            if (read < 0) break
+                                            output.write(buffer, 0, read)
+                                        }
+                                        output.flush()
+                                        output.fd.sync()
+                                    }
+                                }
+                                failure = when {
+                                    partial.length() <= 0L -> "복사된 미디어가 비어 있습니다. 다시 시도해 주세요."
+                                    !isReadableMediaFile(partial, item.isVideo) -> "지원되지 않거나 손상된 미디어입니다. 원본을 확인하거나 이 항목을 제외해 주세요."
+                                    !partial.renameTo(finalFile) -> "준비한 사본을 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
+                                    else -> null
+                                }
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            failure = "미디어를 복사하지 못했습니다: ${error.message ?: "알 수 없는 오류"}. 다시 시도해 주세요."
+                        } finally {
+                            if (partial.exists()) partial.delete()
+                        }
+                        if (failure == null) {
+                            commit(item, item.copy(state = MaterialPreparationState.READY, localFilePath = finalFile.absolutePath, downloadProgress = null, errorMessage = null), ownedNewFile = finalFile)
+                        } else {
+                            // The original and any existing copy stay as they were.
+                            commit(item, item.copy(state = MaterialPreparationState.MISSING, downloadProgress = null, errorMessage = failure))
+                        }
+                    }
+                }
+                MaterialSourceType.PHONE_HARD -> {
+                    val file = item.localFilePath?.let { File(it) }
+                    val accessible = file != null && file.exists() && file.length() > 0L
+                    if (!accessible) {
+                        commit(item, item.copy(state = MaterialPreparationState.MISSING, downloadProgress = null, errorMessage = "폰하드 파일이 삭제되었거나 누락되었습니다."))
+                    } else {
+                        commit(item, item.copy(state = MaterialPreparationState.READY, downloadProgress = null, errorMessage = null))
+                    }
+                }
+                MaterialSourceType.REMOTE_FILE -> {
+                    // Check if already downloaded
+                    val existingFile = item.localFilePath?.let { File(it) }
+                    if (existingFile != null && existingFile.exists() && existingFile.length() > 0L) {
+                        commit(item, item.copy(state = MaterialPreparationState.READY, downloadProgress = null, errorMessage = null))
+                    } else {
+                        // Download remote file using dedicated service
+                        val connectionId = item.connectionId ?: item.sourceIdentity.removePrefix("remote:").substringBefore(':')
+                        val remotePath = item.remotePath ?: item.sourceIdentity.removePrefix("remote:").substringAfter(':')
+                        val connection = _state.value.connections.firstOrNull { it.id == connectionId }
+
+                        if (connection == null) {
+                            val errorMsg = "원격 연결을 찾을 수 없습니다 (${connectionId})"
+                            commit(item, item.copy(state = MaterialPreparationState.MISSING, downloadProgress = null, errorMessage = errorMsg))
+                        } else {
+                            if (registeredInBasket) DurableMaterialStore.updateState(item.id, MaterialPreparationState.DOWNLOADING, progress = 0f, errorMessage = null)
+                            onItemProgress?.invoke(item.id, 0f)
+                            val ext = item.name.substringAfterLast('.', "").takeIf { it.isNotBlank() && it.length <= 5 && it.all(Char::isLetterOrDigit) }
+                                ?: if (item.isVideo) "mp4" else "jpg"
+                            // Names unique to THIS operation: only its own partial is ever deleted here.
+                            val targetFile = File(stagingDir, "remote_${item.id}.${UUID.randomUUID()}.$ext")
+                            val tempFile = File(stagingDir, "${targetFile.name}.part")
+
+                            var downloadSuccess = false
+                            var errorDesc: String? = null
+                            try {
+                                withDedicatedRemoteService(connection) { service ->
+                                    val remoteItem = RemoteFileItem(
+                                        id = item.id,
+                                        name = item.name,
+                                        path = remotePath,
+                                        isDirectory = false,
+                                        size = item.fileSize ?: 0L
+                                    )
+                                    service.download(remoteItem, tempFile) { transferred, totalBytes ->
+                                        val p = if (totalBytes > 0) transferred.toFloat() / totalBytes else 0.5f
+                                        if (registeredInBasket) DurableMaterialStore.updateState(item.id, MaterialPreparationState.DOWNLOADING, progress = p)
+                                        onItemProgress?.invoke(item.id, if (totalBytes > 0) p else null)
+                                    }
+                                }
+                                if (!tempFile.exists() || tempFile.length() <= 0L) {
+                                    errorDesc = "다운로드된 파일이 비어 있습니다."
+                                } else if (!isReadableMediaFile(tempFile, item.isVideo)) {
+                                    errorDesc = "지원되지 않거나 손상된 미디어입니다. 원본을 확인하거나 이 항목을 제외해 주세요."
+                                } else if (tempFile.renameTo(targetFile)) {
+                                    downloadSuccess = true
+                                } else {
+                                    errorDesc = "임시 파일 저장에 실패했습니다."
+                                }
+                            } catch (cancelled: CancellationException) {
+                                // Interrupted: the record goes back to retry-needed; only this operation's partial is removed.
+                                if (registeredInBasket) DurableMaterialStore.updateState(item.id, MaterialPreparationState.MISSING, errorMessage = "가져오기가 중단되었습니다. 다시 시도해 주세요.")
+                                throw cancelled
+                            } catch (e: Exception) {
+                                errorDesc = e.message ?: "다운로드 중 오류가 발생했습니다."
+                            } finally {
+                                if (tempFile.exists()) tempFile.delete()
+                            }
+
+                            if (downloadSuccess) {
+                                commit(item, item.copy(state = MaterialPreparationState.READY, localFilePath = targetFile.absolutePath, downloadProgress = null, errorMessage = null), ownedNewFile = targetFile)
+                            } else {
+                                commit(item, item.copy(state = MaterialPreparationState.MISSING, downloadProgress = null, errorMessage = errorDesc))
+                            }
+                        }
+                    }
+                }
+            }
+        }.also {
+            if (registeredInBasket) {
+                withContext(Dispatchers.Main) {
+                    refreshMaterials()
+                }
+            }
+        }
+    }
+
+    fun startTrailerFromMaterials(materialItems: List<MaterialItem>) {
+        val selected = materialItems.filter { it.state != MaterialPreparationState.EXCLUDED }
+        if (selected.isEmpty()) {
+            _state.update { it.copy(message = "영상 제작에 사용할 선택된 재료가 없습니다.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _state.update { it.copy(message = "재료를 준비하는 중입니다…") }
+            val prepared = prepareMaterialItems(selected, onProgress = { completed, total, currentName ->
+                _state.update { it.copy(message = "재료 준비 중 (${completed + 1}/$total): $currentName") }
+            })
+
+            val failed = prepared.filter { it.state != MaterialPreparationState.READY }
+            if (failed.isNotEmpty()) {
+                _state.update {
+                    it.copy(
+                        message = "${failed.size}개 재료의 준비가 완료되지 않았습니다. 누락 항목을 확인하거나 제외한 후 다시 시도해 주세요."
+                    )
+                }
+                return@launch
+            }
+
+            // All selected items are READY: create the ordered URI list and proceed
+            val uris = prepared.mapNotNull { item ->
+                when (item.sourceType) {
+                    MaterialSourceType.LOCAL_LIBRARY -> {
+                        item.localFilePath?.let { Uri.fromFile(File(it)) } ?: Uri.parse(item.uriString)
+                    }
+                    MaterialSourceType.PHONE_HARD -> {
+                        item.localFilePath?.let { Uri.fromFile(File(it)) } ?: Uri.parse(item.uriString)
+                    }
+                    MaterialSourceType.REMOTE_FILE -> {
+                        item.localFilePath?.let { Uri.fromFile(File(it)) }
+                    }
+                }
+            }
+
+            if (uris.size == prepared.size) {
+                startLocalMediaTrailer(uris)
+            } else {
+                _state.update { it.copy(message = "일부 재료의 로컬 경로를 확인할 수 없습니다.") }
+            }
+        }
+    }
+
+    fun refreshCollections() {
+        _state.update { it.copy(collections = DurableCollectionStore.getItems()) }
+    }
+
+    fun addExportedVideoToCollection(
+        title: String,
+        file: File,
+        durationSeconds: Double,
+        posterFile: File? = null,
+        sourceDraftId: String? = null
+    ): CollectionItem? {
+        val saved = DurableCollectionStore.addVideo(
+            title = title,
+            exportedFile = file,
+            durationSeconds = durationSeconds,
+            posterFile = posterFile,
+            sourceDraftId = sourceDraftId
+        )
+        refreshCollections()
+        if (saved != null) {
+            _state.update { it.copy(message = "‘${saved.title}’을(를) 컬렉션에 저장했습니다.") }
+        }
+        return saved
+    }
+
+    fun removeCollectionVideo(id: String) {
+        DurableCollectionStore.removeVideo(id)
+        refreshCollections()
+    }
+
+    fun toggleCollectionPin(id: String) {
+        DurableCollectionStore.togglePin(id)
+        refreshCollections()
+    }
+
+    fun moveCollectionItem(id: String, offset: Int) {
+        DurableCollectionStore.moveItem(id, offset)
+        refreshCollections()
+    }
+
+    fun renameCollectionVideo(id: String, newTitle: String) {
+        DurableCollectionStore.rename(id, newTitle)
+        refreshCollections()
+    }
+
+    /** Stores the user-confirmed 추천 썸네일 candidate; cancelling never reaches here, so the prior poster stays. */
+    fun confirmCollectionPoster(id: String, frame: Bitmap) {
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                val temp = File(application.cacheDir, "poster-confirm-${UUID.randomUUID()}.jpg")
+                try {
+                    temp.outputStream().use { frame.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                    DurableCollectionStore.updatePoster(id, temp)
+                } catch (_: Exception) {
+                    false
+                } finally {
+                    temp.delete()
+                }
+            }
+            refreshCollections()
+            if (!ok) _state.update { it.copy(message = "썸네일을 저장하지 못했습니다. 이전 썸네일은 그대로입니다.") }
+        }
+    }
+
+    private var compressionJob: Job? = null
+
+    suspend fun collectionVideoFacts(item: CollectionItem): VideoFileFacts? = withContext(Dispatchers.IO) {
+        collectionReadableFile(item)?.let(::readVideoFacts)
+    }
+
+    /**
+     * A local file to read the collection video from: the owned copy itself, or for a granted content:// reference a
+     * temporary working copy in cache (never recorded as the item's storage; the external original is only read).
+     * Must be called off the main thread. Null when the video cannot be read now.
+     */
+    private fun collectionReadableFile(item: CollectionItem): File? {
+        if (!item.isContentReference) return File(item.localFilePath).takeIf { it.isFile && it.length() > 0L }
+        if (!DurableCollectionStore.hasPersistedReadGrant(item.localFilePath)) return null
+        runCatching { UUID.fromString(item.id) }.getOrNull() ?: return null
+        val dir = File(application.cacheDir, "collection_reference_use").also { it.mkdirs() }
+        val target = File(dir, "${item.id}.mp4")
+        if (target.isFile && target.length() > 0L && item.fileSizeBytes > 0L && target.length() == item.fileSizeBytes) return target
+        val partial = File(dir, "${item.id}.mp4.part")
+        return runCatching {
+            application.contentResolver.openInputStream(Uri.parse(item.localFilePath))?.use { input ->
+                java.io.FileOutputStream(partial).use { output -> input.copyTo(output); output.fd.sync() }
+            } ?: error("외부 원본을 열 수 없습니다.")
+            check(partial.length() > 0L && partial.renameTo(target))
+            target
+        }.getOrElse {
+            partial.delete()
+            null
+        }
+    }
+
+    /**
+     * 용량 줄이기: snapshots the item and preset, renders into this operation's own partial file, validates it and
+     * commits only a smaller playable result. Any failure/cancel/interruption leaves the old video and record untouched.
+     */
+    fun startCollectionCompression(itemId: String, preset: CompressionPreset) {
+        if (_state.value.compression?.running == true) {
+            _state.update { it.copy(message = "다른 영상의 용량을 줄이는 중입니다. 끝난 뒤 다시 시도해 주세요.") }
+            return
+        }
+        val item = DurableCollectionStore.item(itemId) ?: return
+        val operationId = UUID.randomUUID().toString()
+        val output = DurableCollectionStore.compressionPartialFile(operationId) ?: return
+        _state.update {
+            it.copy(compression = CollectionCompressionState(itemId, operationId, item.title, preset, CompressionPhase.PREPARING, originalBytes = item.fileSizeBytes))
+        }
+        fun update(transform: (CollectionCompressionState) -> CollectionCompressionState) {
+            _state.update { current ->
+                val live = current.compression?.takeIf { it.operationId == operationId } ?: return@update current
+                current.copy(compression = transform(live))
+            }
+        }
+        compressionJob = viewModelScope.launch {
+            val self = coroutineContext[Job]
+            try {
+                val input = withContext(Dispatchers.IO) { collectionReadableFile(item) }
+                    ?: error("원본 영상을 읽을 수 없습니다. 파일이 이동되었거나 읽기 권한이 없습니다.")
+                val facts = withContext(Dispatchers.IO) { readVideoFacts(input) }
+                    ?: error("원본 영상을 읽을 수 없습니다. 파일이 이동되었거나 지원되지 않는 형식입니다.")
+                val (width, height) = compressionTargetSize(facts, preset)
+                update { it.copy(phase = CompressionPhase.RUNNING, progress = 0f, originalBytes = facts.sizeBytes) }
+                CollectionCompressor.compress(application, input, output, width, height, preset.videoBitrate) { fraction ->
+                    update { it.copy(progress = fraction) }
+                }
+                update { it.copy(phase = CompressionPhase.VALIDATING, progress = null) }
+                val problem = withContext(Dispatchers.IO) { validateCompressedOutput(output, facts, width, height) }
+                if (problem != null) error("$problem 원본은 그대로 유지했습니다.")
+                val resultBytes = output.length()
+                if (resultBytes >= facts.sizeBytes) {
+                    withContext(Dispatchers.IO) { if (DurableCollectionStore.isOwnedCompressionPartial(output)) output.delete() }
+                    update {
+                        it.copy(
+                            phase = CompressionPhase.NO_GAIN, resultBytes = resultBytes,
+                            message = "더 작은 결과를 만들지 못했습니다 (원본 ${formatBytes(facts.sizeBytes)} → 결과 ${formatBytes(resultBytes)}). 원본을 그대로 유지했습니다.",
+                        )
+                    }
+                    return@launch
+                }
+                update { it.copy(phase = CompressionPhase.COMMITTING, resultBytes = resultBytes) }
+                val result = withContext(Dispatchers.IO) {
+                    DurableCollectionStore.replaceWithCompressed(itemId, item.localFilePath, output, readVideoFacts(output)?.durationSeconds ?: facts.durationSeconds, preset.title)
+                }
+                when (result) {
+                    CollectionReplaceResult.REPLACED -> update {
+                        it.copy(phase = CompressionPhase.DONE, progress = 1f, message = "${formatBytes(facts.sizeBytes)} → ${formatBytes(resultBytes)}로 줄였습니다.")
+                    }
+                    CollectionReplaceResult.ITEM_CHANGED -> {
+                        withContext(Dispatchers.IO) { if (DurableCollectionStore.isOwnedCompressionPartial(output)) output.delete() }
+                        update { it.copy(phase = CompressionPhase.FAILED, message = "작업 중에 이 영상이 바뀌었거나 삭제되어 적용하지 않았습니다.") }
+                    }
+                    CollectionReplaceResult.FAILED -> {
+                        withContext(Dispatchers.IO) { if (DurableCollectionStore.isOwnedCompressionPartial(output)) output.delete() }
+                        update { it.copy(phase = CompressionPhase.FAILED, message = "압축본을 저장하지 못했습니다. 저장 공간을 확인해 주세요. 원본은 그대로입니다.") }
+                    }
+                }
+                refreshCollections()
+            } catch (cancelled: CancellationException) {
+                withContext(NonCancellable + Dispatchers.IO) { if (DurableCollectionStore.isOwnedCompressionPartial(output)) output.delete() }
+                update { it.copy(phase = CompressionPhase.CANCELLED, progress = null, message = "취소했습니다. 원본은 그대로입니다.") }
+                throw cancelled
+            } catch (failure: Exception) {
+                withContext(NonCancellable + Dispatchers.IO) { if (DurableCollectionStore.isOwnedCompressionPartial(output)) output.delete() }
+                val reason = when (failure) {
+                    is androidx.media3.transformer.ExportException -> "이 기기에서 이 영상 형식을 변환할 수 없습니다 (오류 ${failure.errorCode}). 원본은 그대로입니다."
+                    else -> failure.message ?: "용량을 줄이지 못했습니다. 원본은 그대로입니다."
+                }
+                update { it.copy(phase = CompressionPhase.FAILED, progress = null, message = reason) }
+            } finally {
+                if (compressionJob === self) compressionJob = null
+            }
+        }
+    }
+
+    fun cancelCollectionCompression() {
+        compressionJob?.cancel()
+    }
+
+    fun dismissCollectionCompression() {
+        if (_state.value.compression?.running == true) return
+        _state.update { it.copy(compression = null) }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var size = bytes.toDouble()
+        var index = -1
+        do { size /= 1024; index++ } while (size >= 1024 && index < units.lastIndex)
+        return "%.1f %s".format(size, units[index])
+    }
+
+    private val collectionUnavailableMessage = "영상을 읽을 수 없습니다. 메뉴의 ‘다시 연결’을 이용하거나, 필요 없으면 직접 삭제해 주세요. 컬렉션 정보는 그대로 보관합니다."
+
+    fun shareCollectionVideo(item: CollectionItem) {
+        viewModelScope.launch {
+            val file = withContext(Dispatchers.IO) { collectionReadableFile(item) }
+            if (file == null) {
+                _state.update { it.copy(message = collectionUnavailableMessage) }
+                return@launch
+            }
+            val sendIntent = NasFinderShareIntentFactory.create(application, listOf(file))
+            application.startActivity(
+                Intent.createChooser(sendIntent, "${item.title} 공유")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+    }
+
+    fun previewCollectionVideo(item: CollectionItem) {
+        viewModelScope.launch {
+            val file = withContext(Dispatchers.IO) { collectionReadableFile(item) }
+            if (file == null) {
+                _state.update { it.copy(message = collectionUnavailableMessage) }
+                return@launch
+            }
+            previewCollectionFile(item, file)
+        }
+    }
+
+    private fun previewCollectionFile(item: CollectionItem, file: File) {
+        stopInlineAudio()
+        val remote = RemoteFileItem(
+            id = item.id,
+            name = item.title + (if (item.title.endsWith(".mp4", ignoreCase = true)) "" else ".mp4"),
+            path = file.absolutePath,
+            isDirectory = false,
+            size = file.length(),
+            modifiedAt = java.time.Instant.ofEpochMilli(item.timestamp),
+            mimeType = "video/mp4"
+        )
+        prepareLocalPreview(listOf(remote), listOf(file), 0)
+    }
+
+    fun importVideoUriToCollection(uri: Uri, copyToStorage: Boolean = true) {
+        if (!copyToStorage) {
+            // A reference is only ever made through the confirmation dialog, which re-checks support and the grant.
+            stageCollectionImport(listOf(uri to null))
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = "영상을 가져오는 중…") }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "가져온 영상"
+                    val cleanTitle = name.substringBeforeLast('.')
+                    val tempDir = File(application.cacheDir, "collection_import").also { it.mkdirs() }
+                    val tempVideo = File(tempDir, "import-${UUID.randomUUID()}.mp4")
+                    try {
+                        application.contentResolver.openInputStream(uri)?.use { input ->
+                            tempVideo.outputStream().use { output -> input.copyTo(output) }
+                        } ?: error("영상을 읽을 수 없습니다.")
+                        if (tempVideo.length() <= 0L) error("빈 영상 파일입니다.")
+                    } catch (failure: Exception) {
+                        tempVideo.delete()
+                        throw failure
+                    }
+                    
+                    var durationSec = 0.0
+                    var posterFile: File? = null
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(tempVideo.absolutePath)
+                        durationSec = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+                        val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        if (frame != null) {
+                            val pFile = File(tempDir, "poster-${UUID.randomUUID()}.jpg")
+                            pFile.outputStream().use { frame.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                            posterFile = pFile
+                        }
+                    } catch (_: Exception) {}
+                    finally {
+                        runCatching { retriever.release() }
+                    }
+
+                    // The store keeps its own permanent copy; the temporary import staging files are this call's own.
+                    try {
+                        DurableCollectionStore.addVideo(
+                            title = cleanTitle,
+                            exportedFile = tempVideo,
+                            durationSeconds = durationSec,
+                            posterFile = posterFile,
+                            sourceUri = uri.toString()
+                        ) ?: error("컬렉션에 저장하지 못했습니다. 저장 공간을 확인해 주세요.")
+                    } finally {
+                        tempVideo.delete()
+                        posterFile?.delete()
+                    }
+                }
+            }
+            _state.update { it.copy(isBusy = false) }
+            result.onSuccess { item ->
+                refreshCollections()
+                _state.update { it.copy(message = "‘${item.title}’을(를) 컬렉션에 추가했습니다 (앱 보관).") }
+            }.onFailure { error ->
+                _state.update { it.copy(message = error.message ?: "영상을 가져오지 못했습니다.") }
+            }
+        }
+    }
+
+    /**
+     * Collection import entry for picked content: stages the items for the 사본/참조 confirmation dialog (copy is the
+     * default). [picked] pairs each uri with the flags its picker result actually returned, or null when the caller
+     * only has the uri (then a reference is offered only if a persisted read grant is already held).
+     */
+    fun stageCollectionImport(picked: List<Pair<Uri, Int?>>) {
+        if (picked.isEmpty()) return
+        if (_state.value.pendingCollectionImport?.working == true) {
+            _state.update { it.copy(message = "이전 컬렉션 추가가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.") }
+            return
+        }
+        viewModelScope.launch {
+            var skippedImages = 0
+            val entries = withContext(Dispatchers.IO) {
+                picked.distinctBy { it.first.toString() }.mapNotNull { (uri, flags) ->
+                    val mime = runCatching { application.contentResolver.getType(uri) }.getOrNull()
+                    if (mime?.startsWith("image/") == true) {
+                        skippedImages++
+                        return@mapNotNull null
+                    }
+                    val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "가져온 영상"
+                    val size = if (uri.scheme == "content") runCatching {
+                        application.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else 0L
+                        }
+                    }.getOrNull() ?: 0L else runCatching { uri.path?.let(::File)?.length() }.getOrNull() ?: 0L
+                    val persistableRead = if (flags != null && flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
+                        flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    } else 0
+                    val blocker = when {
+                        uri.scheme != "content" ->
+                            "앱 안의 임시 파일이나 기기 경로는 앱을 다시 열었을 때 계속 읽을 수 있다고 보장되지 않습니다."
+                        flags != null && persistableRead == 0 ->
+                            "이 영상을 제공한 앱이 재시작 뒤에도 유지되는 읽기 권한을 주지 않았습니다."
+                        flags == null && !DurableCollectionStore.hasPersistedReadGrant(uri.toString()) ->
+                            "이 항목은 지금만 읽을 수 있는 임시 권한으로 선택되었습니다."
+                        else -> null
+                    }
+                    PendingImportEntry(uri.toString(), name.substringBeforeLast('.').ifBlank { name }, size, persistableRead, blocker)
+                }
+            }
+            if (entries.isEmpty()) {
+                _state.update { it.copy(message = if (skippedImages > 0) "컬렉션에는 영상만 추가할 수 있습니다. 선택한 사진은 제외했습니다." else "추가할 영상을 읽지 못했습니다.") }
+                return@launch
+            }
+            _state.update {
+                it.copy(pendingCollectionImport = PendingCollectionImport(
+                    entries = entries,
+                    excludedNote = if (skippedImages > 0) "사진 ${skippedImages}개는 컬렉션 대상이 아니라 제외했습니다." else null,
+                ))
+            }
+        }
+    }
+
+    fun cancelCollectionImport() {
+        if (_state.value.pendingCollectionImport?.working == true) return
+        _state.update { it.copy(pendingCollectionImport = null) }
+    }
+
+    /**
+     * Confirmation of the staged import. Copy (default) stores app-owned copies. Reference keeps the external original
+     * without copying, and only for entries whose persisted read grant is verified after taking it as the picker allowed;
+     * any entry that cannot be verified is NOT recorded and stays pending with a retry / copy choice.
+     */
+    fun confirmCollectionImport(asReference: Boolean) {
+        val pending = _state.value.pendingCollectionImport ?: return
+        if (pending.working) return
+        if (!asReference) {
+            _state.update { it.copy(pendingCollectionImport = null) }
+            pending.entries.forEach { entry -> importVideoUriToCollection(Uri.parse(entry.uri), copyToStorage = true) }
+            return
+        }
+        if (!pending.referenceSupported) {
+            _state.update { it.copy(pendingCollectionImport = pending.copy(problem = "선택한 영상 중 원본 참조를 지원하지 않는 항목이 있습니다. 앱 안에 사본으로 보관해 주세요.")) }
+            return
+        }
+        _state.update { it.copy(pendingCollectionImport = pending.copy(working = true, problem = null)) }
+        viewModelScope.launch {
+            val added = mutableListOf<CollectionItem>()
+            val notGranted = mutableListOf<PendingImportEntry>()
+            val failed = mutableListOf<Pair<PendingImportEntry, String>>()
+            withContext(Dispatchers.IO) {
+                pending.entries.forEach { entry ->
+                    runCatching { addVerifiedContentReference(entry) }
+                        .onSuccess { item -> if (item != null) added += item else notGranted += entry }
+                        .onFailure { error -> failed += entry to (error.message ?: "컬렉션 정보를 저장하지 못했습니다.") }
+                }
+            }
+            if (added.isNotEmpty()) refreshCollections()
+            val remaining = notGranted + failed.map { it.first }
+            if (remaining.isEmpty()) {
+                _state.update {
+                    it.copy(
+                        pendingCollectionImport = null,
+                        message = if (added.size == 1) "‘${added.first().title}’을(를) 원본 참조로 추가했습니다. 원본을 옮기거나 지우면 다시 연결이 필요합니다."
+                        else "${added.size}개 영상을 원본 참조로 추가했습니다. 원본을 옮기거나 지우면 다시 연결이 필요합니다.",
+                    )
+                }
+            } else {
+                val problem = buildList {
+                    if (added.isNotEmpty()) add("${added.size}개는 원본 참조로 추가했습니다.")
+                    if (notGranted.isNotEmpty()) add("${notGranted.size}개는 재시작 뒤에도 유지되는 읽기 권한을 확인하지 못해 추가하지 않았습니다.")
+                    failed.firstOrNull()?.let { (_, reason) -> add("${failed.size}개는 저장하지 못했습니다: $reason") }
+                    add("다시 시도하거나 앱 안에 사본으로 보관할 수 있습니다.")
+                }.joinToString(" ")
+                _state.update { it.copy(pendingCollectionImport = pending.copy(entries = remaining, working = false, problem = problem)) }
+            }
+        }
+    }
+
+    /**
+     * Takes the persistable READ grant only when the picker returned it as persistable, then verifies the grant is
+     * actually held before recording. Returns null (nothing recorded) when it is not; throws only on store failure.
+     */
+    private fun addVerifiedContentReference(entry: PendingImportEntry): CollectionItem? {
+        val uri = Uri.parse(entry.uri)
+        if (uri.scheme != "content") return null
+        if (entry.persistableReadFlag != 0) {
+            runCatching { application.contentResolver.takePersistableUriPermission(uri, entry.persistableReadFlag) }
+        }
+        if (!DurableCollectionStore.hasPersistedReadGrant(entry.uri)) return null
+        val tempDir = File(application.cacheDir, "collection_import").also { it.mkdirs() }
+        var durationSec = 0.0
+        var hasVideoTrack = false
+        var posterFile: File? = null
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(application, uri)
+            durationSec = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+            hasVideoTrack = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
+            if (hasVideoTrack && durationSec.isFinite() && durationSec > 0.0) {
+                runCatching { retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) }.getOrNull()?.let { frame ->
+                    val pFile = File(tempDir, "poster-${UUID.randomUUID()}.jpg")
+                    runCatching { pFile.outputStream().use { frame.compress(Bitmap.CompressFormat.JPEG, 90, it) } }
+                        .onSuccess { posterFile = pFile }.onFailure { pFile.delete() }
+                }
+            }
+        } catch (_: Exception) {
+            hasVideoTrack = false
+        } finally {
+            runCatching { retriever.release() }
+        }
+        // Only a readable video track with a real length is recorded; anything else stays pending with retry / copy.
+        if (!hasVideoTrack || !durationSec.isFinite() || durationSec <= 0.0) {
+            posterFile?.delete()
+            error("영상 정보를 읽지 못했습니다(영상 트랙 또는 길이 확인 실패). 지원되지 않거나 손상된 영상일 수 있습니다. 다시 시도하거나 앱 안에 사본으로 보관해 보세요.")
+        }
+        return try {
+            DurableCollectionStore.addContentReference(entry.title, entry.uri, durationSec, entry.sizeBytes, posterFile)
+                ?: error("컬렉션 정보를 저장하지 못했습니다. 저장 공간을 확인해 주세요.")
+        } finally {
+            posterFile?.delete()
+        }
+    }
+
+    fun acceptCollectionCopyOffer() {
+        val offer = _state.value.collectionCopyOffer ?: return
+        _state.update { it.copy(collectionCopyOffer = null) }
+        offer.copy()
+    }
+
+    fun dismissCollectionCopyOffer() {
+        _state.update { it.copy(collectionCopyOffer = null) }
+    }
+
+    /**
+     * "다시 연결" for a record whose video cannot be read: re-reads its recorded origin (content/file URI, or the
+     * remote path on its saved connection) into a fresh owned copy. The record is never removed; on failure it stays
+     * as-is with an explanation.
+     */
+    fun relinkCollectionVideo(id: String) {
+        val item = DurableCollectionStore.item(id) ?: return
+        if (item.isValid) {
+            _state.update { it.copy(message = "이 영상은 지금 재생할 수 있습니다.") }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = null) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val origin = item.sourceUri
+                    val connection = item.connectionId?.let { cid -> _state.value.connections.firstOrNull { it.id == cid } }
+                    val tempDir = File(application.cacheDir, "collection_import").also { it.mkdirs() }
+                    val temp = File(tempDir, "relink-${UUID.randomUUID()}.mp4")
+                    try {
+                        when {
+                            origin != null && (origin.startsWith("content://") || origin.startsWith("file://")) -> {
+                                val opened = try {
+                                    application.contentResolver.openInputStream(Uri.parse(origin))
+                                } catch (_: SecurityException) {
+                                    error("원본을 읽을 권한이 더 이상 없습니다. 원본 영상을 다시 가져온 뒤 이 항목을 직접 삭제해 주세요.")
+                                } ?: error("원본을 열 수 없습니다. 원본이 이동되었거나 삭제되었을 수 있습니다.")
+                                opened.use { input -> temp.outputStream().use { output -> input.copyTo(output) } }
+                            }
+                            origin != null && connection != null -> withDedicatedRemoteService(connection) { service ->
+                                service.download(
+                                    RemoteFileItem(id = origin, name = origin.substringAfterLast('/'), path = origin, isDirectory = false, size = 0L),
+                                    temp,
+                                )
+                            }
+                            item.connectionId != null -> error("이 영상을 가져온 연결을 찾을 수 없습니다. 연결을 다시 추가한 뒤 시도해 주세요.")
+                            else -> error("원본 위치 정보가 없어 다시 연결할 수 없습니다. 원본 영상을 다시 가져온 뒤 이 항목을 직접 삭제해 주세요.")
+                        }
+                        check(temp.isFile && temp.length() > 0L) { "원본에서 영상을 읽지 못했습니다." }
+                        check(DurableCollectionStore.relinkWithCopy(item.id, item.localFilePath, temp)) { "컬렉션 정보를 저장하지 못했습니다. 저장 공간을 확인해 주세요." }
+                    } finally {
+                        temp.delete()
+                    }
+                }
+            }
+            refreshCollections()
+            _state.update {
+                it.copy(
+                    isBusy = false,
+                    message = result.fold(
+                        onSuccess = { "‘${item.title}’을(를) 다시 연결해 앱 안에 보관했습니다." },
+                        onFailure = { error -> (error.message ?: "다시 연결하지 못했습니다.") + " 컬렉션 정보는 그대로 보관합니다." },
+                    ),
+                )
+            }
+        }
+    }
+
+    fun importRemoteFilesToCollection(connection: RemoteConnection, remoteItems: List<RemoteFileItem>, copyToStorage: Boolean = true) {
+        val videos = remoteItems.filter { !it.isDirectory && it.isVideo }
+        if (videos.isEmpty()) {
+            _state.update { it.copy(message = "추가할 영상 파일이 선택되지 않았습니다.") }
+            return
+        }
+        if (!copyToStorage) {
+            // A NAS/cloud path is only playable through a live connection and a download; it is not a durable local
+            // reference, so it is never recorded as one. Explain and offer the app-owned copy instead.
+            _state.update {
+                it.copy(
+                    collectionCopyOffer = CollectionCopyOffer(
+                        message = "원격 저장소의 영상은 연결 상태에 따라 재생할 수 없게 되므로 외부 참조로 보관할 수 없습니다.\n\n" +
+                            "대신 앱 안에 사본을 보관할까요? 원격 원본은 바꾸거나 지우지 않으며, 가져온 위치 정보는 함께 기록됩니다.",
+                        copy = { importRemoteFilesToCollection(connection, remoteItems, copyToStorage = true) },
+                    ),
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, message = "${videos.size}개 영상을 가져오는 중…") }
+            var successCount = 0
+            withContext(Dispatchers.IO) {
+                videos.forEach { item ->
+                    runCatching {
+                        val tempDir = File(application.cacheDir, "collection_import").also { it.mkdirs() }
+                        val tempVideo = File(tempDir, "import-${UUID.randomUUID()}.mp4")
+                        try {
+                            withDedicatedRemoteService(connection) { dedicatedSvc ->
+                                dedicatedSvc.download(item, tempVideo)
+                            }
+                        } catch (failure: Exception) {
+                            tempVideo.delete()
+                            throw failure
+                        }
+                        if (tempVideo.length() > 0L) {
+                            var durationSec = 0.0
+                            var posterFile: File? = null
+                            val retriever = MediaMetadataRetriever()
+                            try {
+                                retriever.setDataSource(tempVideo.absolutePath)
+                                durationSec = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000.0) ?: 0.0
+                                val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                                if (frame != null) {
+                                    val pFile = File(tempDir, "poster-${UUID.randomUUID()}.jpg")
+                                    pFile.outputStream().use { frame.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                                    posterFile = pFile
+                                }
+                            } catch (_: Exception) {}
+                            finally { runCatching { retriever.release() } }
+
+                            val cleanTitle = item.name.substringBeforeLast('.')
+                            val saved = DurableCollectionStore.addVideo(
+                                title = cleanTitle,
+                                exportedFile = tempVideo,
+                                durationSeconds = durationSec,
+                                posterFile = posterFile,
+                                sourceUri = item.path,
+                                connectionId = connection.id
+                            )
+                            if (saved != null) successCount++
+                            posterFile?.delete()
+                        }
+                        // Only this call's own download staging file; the store already holds its own copy (or nothing).
+                        tempVideo.delete()
+                    }
+                }
+            }
+            _state.update { it.copy(isBusy = false) }
+            refreshCollections()
+            val failed = videos.size - successCount
+            _state.update {
+                it.copy(message = "${successCount}개 영상을 컬렉션에 추가했습니다 (앱 보관)." + if (failed > 0) " ${failed}개는 내려받거나 저장하지 못했습니다." else "")
+            }
+        }
+    }
+
+    fun createProjectFromCollectionVideo(item: CollectionItem) {
+        val live = DurableCollectionStore.item(item.id) ?: item
+        if (live.isContentReference) {
+            if (!live.isValid) {
+                _state.update { it.copy(message = "외부 원본을 읽을 권한이 없습니다. 메뉴의 ‘다시 연결’을 이용하거나 원본을 다시 가져와 주세요.") }
+                return
+            }
+            // The project stages its own copy from the granted reference; the external original is only read.
+            startLocalMediaTrailer(listOf(Uri.parse(live.localFilePath)))
+            return
+        }
+        val file = File(live.localFilePath)
+        if (!file.exists() || file.length() <= 0L) {
+            _state.update { it.copy(message = "영상 파일을 찾을 수 없습니다. 메뉴의 ‘다시 연결’을 이용하거나 직접 삭제해 주세요.") }
+            return
+        }
+        val uri = Uri.fromFile(file)
+        startLocalMediaTrailer(listOf(uri))
     }
 
     fun openPhoneHardLongTouch() {
@@ -6295,6 +8275,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     private companion object {
+        // Access-type material failures; only these clear by themselves when the original becomes readable again.
+        const val LOCAL_MATERIAL_ACCESS_ERROR = "미디어에 접근할 수 없습니다 (권한 필요)"
+        const val LOCAL_MATERIAL_GRANT_ERROR = "미디어 접근 권한이 확인되지 않았습니다."
+        const val MATERIAL_SAVE_ERROR = "재료함 정보를 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
         const val MAX_THUMBNAIL_UI_ATTEMPTS = 3
         const val KEY_SUPER_THUMBNAIL_CONNECTION = "selected_connection_id"
         const val KEY_SUPER_THUMBNAIL_PATH = "selected_path_v1"
