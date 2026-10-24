@@ -25,6 +25,8 @@ data class PhoneHardItem(
     val mimeType: String? = null,
     val file: File,
     val durationMillis: Long? = null,
+    // 실제 비공개 여부: 자기 플래그 또는 상위 폴더가 비공개(기본 false).
+    val isPrivate: Boolean = false,
 )
 
 /**
@@ -56,6 +58,8 @@ data class PhoneHardOperationResult(
     val failed: List<Pair<PhoneHardTarget, String>>,
     val pathMappings: List<PhoneHardPathMapping> = emptyList(),
     val removedPaths: List<String> = emptyList(),
+    // 복사된 항목의 원본 → 새 경로(이동 매핑과 구분한다: 복사 결과로 참조를 옮기면 안 된다).
+    val copiedPaths: List<PhoneHardPathMapping> = emptyList(),
 ) {
     val isSuccess: Boolean get() = failed.isEmpty()
 }

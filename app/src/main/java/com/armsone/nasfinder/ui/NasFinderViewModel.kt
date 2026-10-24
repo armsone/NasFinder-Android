@@ -12,6 +12,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
@@ -35,6 +36,7 @@ import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.model.sortedWith
 import com.armsone.nasfinder.data.DownloadCache
 import com.armsone.nasfinder.data.FavoriteItemResolver
+import com.armsone.nasfinder.data.PrivacyMode
 import com.armsone.nasfinder.data.RemoteThumbnailRepository
 import com.armsone.nasfinder.data.RemoteThumbnailCacheStatistics
 import com.armsone.nasfinder.data.RemoteThumbnailTrafficSnapshot
@@ -157,16 +159,35 @@ data class AppState(
     val pendingCollectionImport: PendingCollectionImport? = null,
     val trailerConflict: TrailerConflictConfirmation? = null,
     val inlineAudioPlayback: InlineAudioPlaybackState? = null,
-    val activeMainTab: MainNavigationDestination = MainNavigationDestination.FINDER,
+    val activeMainTab: MainNavigationDestination = MainNavigationDestination.HOME,
     val activeVideoTab: VideoNavigationDestination = VideoNavigationDestination.CREATE,
     val materials: List<MaterialItem> = emptyList(),
+    // 작업대: pockets (always contains the default 기존 재료 pocket), the pocket on screen and the shared item selection.
+    val pockets: List<MaterialPocket> = listOf(MaterialPocket(DEFAULT_POCKET_ID, DEFAULT_POCKET_NAME, 0L)),
+    val workbenchPocketId: String = DEFAULT_POCKET_ID,
+    val workbenchSelected: Set<String> = emptySet(),
+    val workbenchAdd: WorkbenchAddRequest? = null,
+    val workbenchRun: WorkbenchRunState? = null,
+    val workbenchReconnect: WorkbenchReconnect? = null,
+    // Set by 미디어 전송 on the 작업대; the transfer screen consumes it to open straight in 보내기.
+    val workbenchSendRequested: Boolean = false,
     val collections: List<CollectionItem> = emptyList(),
     // The open editor is kept alive (export/adds continue) while the user visits Finder/Tools from its rail.
     val trailerMinimized: Boolean = false,
     val compression: CollectionCompressionState? = null,
+    // Shares of photos/videos waiting for the user's exact two-way choice (이미지 선별 / 영상 만들기), oldest first.
+    // Each share is already copied into app-private storage (see PendingShareStaging), so it survives exit/permission expiry.
+    val pendingMediaShares: List<PendingMediaShare> = emptyList(),
+    // Shares the user dismissed with "나중에": still pending (never deleted), just not asked again this run.
+    val deferredShareIds: Set<String> = emptySet(),
+    // Shares being copied right now (the share arrived, copies are not finished yet).
+    val shareIntakeInProgress: Int = 0,
 )
 
 enum class MainNavigationDestination {
+    HOME,
+    // Independent top-level destination directly below 홈 (outside the Finder / Video / Tools groups).
+    WORKBENCH,
     FINDER,
     VIDEO,
     TOOLS
@@ -174,6 +195,7 @@ enum class MainNavigationDestination {
 
 enum class VideoNavigationDestination {
     CREATE,
+    // Compatibility alias: opens the 작업대. It is no longer a separate tab of the 영상 hub.
     MATERIALS,
     DRAFTS,
     COLLECTIONS
@@ -292,6 +314,8 @@ data class RemoteDownloadState(
     val action: RemoteFileAction,
     val completedBytes: Long = 0,
     val totalBytes: Long = 0,
+    // 시작할 때 고정한 출처. true이면 일반 모드 화면에는 파일 이름이 든 진행 표시를 내놓지 않는다(작업은 계속된다).
+    val originPrivate: Boolean = false,
 ) {
     val fraction: Float?
         get() = totalBytes.takeIf { it > 0 }
@@ -355,6 +379,64 @@ sealed interface HomeFavoriteTarget {
 
 /** Network browse launched from the 영상 만들기 PLUS menu; selected media returns to [returnScreen]'s basket. */
 data class MediaPickRequest(val returnScreen: Screen.LocalPhotoLibrary)
+/** References waiting for the user's destination-pocket choice. Nothing is read or copied from the originals. */
+data class WorkbenchAddRequest(
+    val candidates: List<MaterialItem>,
+    val note: String? = null,
+    // Runs after the references were saved, with the pocket they went to (e.g. to select them for a transfer).
+    val afterAdd: ((pocketId: String) -> Unit)? = null,
+)
+
+data class WorkbenchRunLeaf(
+    val item: MaterialItem,
+    val stored: Boolean,
+    val parentName: String? = null,
+    // Id of the saved reference this leaf came from (itself, or the folder it was found in).
+    val rootId: String = item.id,
+)
+data class WorkbenchRunIssue(val name: String, val reason: String)
+data class WorkbenchRunPlan(
+    val leaves: List<WorkbenchRunLeaf>,
+    val issues: List<WorkbenchRunIssue>,
+    // Informational lines (e.g. what a folder expanded to); shown with the issues, never blocking by themselves.
+    val notes: List<String> = emptyList(),
+)
+
+/** One readable input of a 전송 run. */
+internal class WorkbenchSendEntry(val leaf: WorkbenchRunLeaf, val media: WorkbenchTransferMedia)
+
+internal class WorkbenchSendMaterialization(
+    val entries: List<WorkbenchSendEntry>,
+    val failures: List<WorkbenchRunIssue>,
+    // Temporary workspace owned by this run (NAS downloads). The caller deletes exactly this folder when the run ends.
+    val runDirectory: File,
+)
+enum class WorkbenchRunKind { VIDEO, SEND }
+
+/** Items that could not be read while the inputs were being fetched: the run waits for the user's explicit choice. */
+data class WorkbenchPartial(
+    val failures: List<WorkbenchRunIssue>,
+    // How many inputs were fetched successfully (what the run would continue with).
+    val available: Int,
+    val decision: kotlinx.coroutines.CompletableDeferred<Boolean>,
+)
+
+/** One explicit 영상 제작 / 전송 run: scanning folders, then (when something is unsupported) waiting for the user's decision. */
+data class WorkbenchRunState(
+    val kind: WorkbenchRunKind,
+    val phase: String,
+    val current: Int = 0,
+    val total: Int = 0,
+    val name: String = "",
+    val awaiting: WorkbenchRunPlan? = null,
+    val partial: WorkbenchPartial? = null,
+    // 작업을 시작할 때 고정한 출처. true이면 일반 모드 화면에서는 이름·보고를 가리고(작업은 계속) 산출물도 비공개로 시작한다.
+    val originPrivate: Boolean = false,
+)
+
+/** A 다시 연결 replacement the user has to confirm before the reference is changed. */
+data class WorkbenchReconnect(val itemId: String, val oldName: String, val replacement: MaterialItem)
+
 data class MediaPickStaging(val current: Int, val total: Int, val name: String, val progress: Float? = null)
 data class MediaPickDelivery(val id: Long, val uris: List<String>, val failedCount: Int, val message: String)
 
@@ -369,6 +451,9 @@ sealed interface Screen {
     ) : Screen
     data object Inbox : Screen
     data object PhotoTransfer : Screen
+    data object PhotoSelection : Screen
+    /** Formal 즐겨찾기 destination of the wide-window Finder group (the same stored list and reordering as the shelves). */
+    data object Favorites : Screen
     data object GooglePhotos : Screen
     data object Settings : Screen
     data object ThumbnailCache : Screen
@@ -469,10 +554,25 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     )
     val state: StateFlow<AppState> = _state.asStateFlow()
     private var importedIntentSignature: String? = null
+    private var shareRestoreJob: Job? = null
+
+    /** The one active 사진 선별 batch; its staging copies are app-private and removed only on finish/cancel. */
+    internal val photoSelection = PhotoSelectionSession(application, viewModelScope) { batchId, photos, pocketId ->
+        addPhotoSelectionToMaterials(batchId, photos, pocketId)
+    }
 
     init {
+        // Shares that arrived before an exit/restart come back as pending (their copies are durable).
+        shareRestoreJob = viewModelScope.launch {
+            val restored = PendingShareStaging.loadAll(application)
+            _state.update { current ->
+                val known = current.pendingMediaShares.map { it.id }.toSet()
+                current.copy(pendingMediaShares = (restored.filter { it.id !in known } + current.pendingMediaShares).sortedBy { it.createdAt })
+            }
+        }
         refreshDropboxAccountLabels()
         DurableMaterialStore.initialize(application)
+        publishMaterials()
         DurableCollectionStore.initialize(application)
         TrailerDraftStore.configureTrailersRoot(application.cacheDir, application.filesDir)
         // A project folder is never deleted while a collection record still points inside it.
@@ -517,16 +617,40 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 )
             }
         }
-        _state.value.connections.firstOrNull { it.id == _state.value.preferredId }?.let { connection ->
-            openConnection(connection, connection.normalizedRootPath, fallbackToRoot = false)
-        }
     }
 
     fun show(screen: Screen) {
+        // Old route: the standalone 영상 재료 screen is the 작업대 now.
+        if (screen == Screen.MaterialBasket) {
+            selectMainDestination(MainNavigationDestination.WORKBENCH)
+            return
+        }
         stopInlineAudio()
         invalidateImagePreviewRequests()
-        if (screen == Screen.Dashboard && _state.value.screen != Screen.Dashboard) {
-            invalidateFavoriteThumbnails()
+        if (screen == Screen.Dashboard) {
+            if (_state.value.screen != Screen.Dashboard) {
+                invalidateFavoriteThumbnails()
+            }
+            val hasOpenEditor = _state.value.trailer != null
+            if (hasOpenEditor) {
+                _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { scheduleEditorAutosave(it.directory, immediate = true) }
+            }
+            if (_state.value.mediaPick != null) {
+                mediaPickJob?.cancel()
+                mediaPickJob = null
+            }
+            _state.update {
+                it.copy(
+                    screen = Screen.Dashboard,
+                    activeMainTab = MainNavigationDestination.HOME,
+                    trailerMinimized = if (hasOpenEditor) true else it.trailerMinimized,
+                    message = null,
+                    mediaPick = null,
+                    mediaPickStaging = null,
+                    browserSelectRequest = null,
+                )
+            }
+            return
         }
         if (screen !is Screen.Browser && _state.value.mediaPick != null) {
             mediaPickJob?.cancel(); mediaPickJob = null
@@ -721,7 +845,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun returnToDashboardAfterBackground() {
         stopInlineAudio()
         // System media pickers and editor interruptions must retain the shared selection.
-        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.trailer != null || _state.value.mediaPick != null) return
+        // 사진 선별 and 사진·영상 전송 launch full-screen pickers/scanners and own staged state, so they stay open too.
+        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.screen == Screen.PhotoSelection ||
+            _state.value.screen == Screen.PhotoTransfer || _state.value.trailer != null || _state.value.mediaPick != null ||
+            // 작업대도 시스템 파일·폴더 선택기를 연다. 다녀와도 고른 포켓과 선택을 유지한다.
+            (_state.value.screen == Screen.Dashboard && _state.value.activeMainTab == MainNavigationDestination.WORKBENCH)
+        ) return
         connectionOpenJob?.cancel()
         connectionOpenJob = null
         thumbnailGeneration++
@@ -730,11 +859,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update {
             it.copy(
                 screen = Screen.Dashboard,
+                activeMainTab = MainNavigationDestination.HOME,
                 isBusy = false,
             )
         }
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
+    fun showMessage(text: String) { _state.update { it.copy(message = text) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
     fun showInboxErrorMessage(message: String) { _state.update { it.copy(inboxErrorMessage = message) } }
 
@@ -804,7 +935,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             application.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.AUTHORIZING, message = null) }
         }.onFailure { error ->
-            _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google Photos 로그인을 시작하지 못했습니다. Google Drive client ID를 먼저 설정해 주세요.")) }
+            _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google 포토 로그인을 시작하지 못했습니다. Google Drive client ID를 먼저 설정해 주세요.")) }
         }
     }
 
@@ -812,14 +943,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         googlePhotosJob?.cancel()
         googlePhotosJob = viewModelScope.launch {
             googlePhotosAccount.disconnect()
-            _state.update { it.copy(googlePhotosConnected = false, googlePhotosPhase = GooglePhotosPhase.IDLE, googlePhotosImportedCount = 0, message = "Google Photos 연결을 해제했습니다.") }
+            _state.update { it.copy(googlePhotosConnected = false, googlePhotosPhase = GooglePhotosPhase.IDLE, googlePhotosImportedCount = 0, message = "Google 포토 연결을 해제했습니다.") }
         }
     }
 
     fun cancelGooglePhotosImport() {
         googlePhotosJob?.cancel()
         googlePhotosJob = null
-        _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.CANCELLED, message = "Google Photos 가져오기를 취소했습니다.") }
+        _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.CANCELLED, message = "Google 포토 가져오기를 취소했습니다.") }
     }
 
     fun retryGooglePhotosImport() = startGooglePhotosPicker()
@@ -833,13 +964,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val picker = googlePhotosAccount.pickerClient()
                 val session = picker.createSession()
                 sessionId = session.id
-                val pickerUri = session.pickerUri?.takeIf { URI(it).scheme == "https" } ?: error("Google Photos 선택 화면 주소가 올바르지 않습니다.")
+                val pickerUri = session.pickerUri?.takeIf { URI(it).scheme == "https" } ?: error("Google 포토 선택 화면 주소가 올바르지 않습니다.")
                 application.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(pickerUri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.WAITING_FOR_SELECTION) }
                 GooglePhotosPickerFlow(picker).awaitSelection(session) { googlePhotosJob?.isActive == true }
                 val items = picker.allMediaItems(session.id)
                 _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.IMPORTING) }
                 val downloader = GooglePhotosContentDownloader()
+                // 가져오기를 시작한 순간의 모드를 고정한다. 도중에 모드가 바뀌어도 폰하드 파일의 공개 범위는 그대로다.
+                val importPrivate = PrivacyMode.isActive
                 val coordinator = GooglePhotosImportCoordinator(
                     download = { item ->
                         val suffix = item.mediaFile?.filename?.substringAfterLast('.', "")?.takeIf { it.length in 1..10 && it.all(Char::isLetterOrDigit) }?.let { ".$it" }.orEmpty()
@@ -848,7 +981,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     },
                     importFile = { file, item ->
                         try {
-                            file.inputStream().use { input -> inboxStore.import(item.mediaFile?.filename ?: "Google Photos 파일", item.mediaFile?.mimeType, input) }
+                            file.inputStream().use { input -> inboxStore.import(item.mediaFile?.filename ?: "Google 포토 파일", item.mediaFile?.mimeType, input, isPrivate = importPrivate) }
                         } finally { file.delete() }
                     },
                 )
@@ -856,12 +989,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val failed = summary.outcomes.count { it is GooglePhotosImportOutcome.Failed || it is GooglePhotosImportOutcome.Skipped }
                 val files = inboxFiles()
                 _state.update { it.copy(screen = Screen.Inbox, inboxFiles = files, googlePhotosPhase = GooglePhotosPhase.FINISHED, googlePhotosImportedCount = summary.importedCount,
-                    message = if (failed == 0) "Google Photos에서 ${summary.importedCount}개를 폰하드로 가져왔습니다." else "${summary.importedCount}개를 가져왔고 ${failed}개는 가져오지 못했습니다.") }
+                    message = if (failed == 0) "Google 포토에서 ${summary.importedCount}개를 폰하드로 가져왔습니다." else "${summary.importedCount}개를 가져왔고 ${failed}개는 가져오지 못했습니다.") }
                 NasFinderAppWidgetProvider.updateAll(application)
             } catch (_: CancellationException) {
                 _state.update { it.copy(googlePhotosPhase = GooglePhotosPhase.CANCELLED) }
             } catch (error: Throwable) {
-                _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google Photos 가져오기를 완료하지 못했습니다. 다시 시도해 주세요.")) }
+                _state.update { it.copy(screen = Screen.GooglePhotos, googlePhotosPhase = GooglePhotosPhase.ERROR, message = safeGooglePhotosMessage(error, "Google 포토 가져오기를 완료하지 못했습니다. 다시 시도해 주세요.")) }
             } finally {
                 sessionId?.let { id -> withContext(NonCancellable) { runCatching { googlePhotosAccount.pickerClient().deleteSession(id) } } }
             }
@@ -870,14 +1003,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     private fun safeGooglePhotosMessage(error: Throwable, fallback: String): String = when (error) {
         is ActivityNotFoundException -> "브라우저를 열 수 없습니다. 브라우저 앱을 확인해 주세요."
-        is com.armsone.nasfinder.googlephotos.GooglePhotosOAuthException.ReauthorizationRequired -> "Google Photos에 다시 로그인해 주세요."
+        is com.armsone.nasfinder.googlephotos.GooglePhotosOAuthException.ReauthorizationRequired -> "Google 포토에 다시 로그인해 주세요."
         else -> fallback
     }
 
     fun refreshInbox() {
         runCatching { inboxFiles() }.fold(
             onSuccess = { files ->
-                _state.update { it.copy(inboxFiles = files, inboxErrorMessage = null) }
+                // 비공개 폴더 표시 파일이 손상되면 일반 모드 목록이 비므로, 이유와 복구 방법을 중립적으로 알린다(파일 이름은 담지 않는다).
+                val metadataNotice = "비공개 폴더 표시 파일을 읽을 수 없어 일반 모드에서는 폰하드 목록을 숨겼습니다. 프라이버시 모드에서 확인하거나 파일을 복구해 주세요."
+                    .takeIf { inboxStore.privateMetadataUnreadable && !PrivacyMode.isActive }
+                _state.update { it.copy(inboxFiles = files, inboxErrorMessage = metadataNotice) }
             },
             onFailure = { error ->
                 _state.update {
@@ -972,6 +1108,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         repository.save(remaining); repository.credentials.delete(connection.id)
         favoriteRepository.saveRemote(remainingFavorites)
+        favoriteRepository.removeFavoritesOf(connection.id)
         if (_state.value.preferredId == connection.id) repository.setPreferred(null)
         invalidateFavoriteThumbnails()
         _state.update {
@@ -1030,11 +1167,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (recordHistory) saveSuperThumbnailHistory(location)
         val sameConnection = _state.value.superThumbnailConnectionId == location.connectionId
         superThumbnailStartJob?.cancel()
-        superThumbnailPreferences.edit()
-            .putString(KEY_SUPER_THUMBNAIL_CONNECTION, location.connectionId)
-            .putString(KEY_SUPER_THUMBNAIL_PATH, location.path)
-            .putString(KEY_SUPER_THUMBNAIL_TITLE, location.title)
-            .apply()
+        // 시작할 때 저장된 선택을 복원하는 호출(recordHistory=false)은 아무것도 다시 쓰지 않는다:
+        // 일반 모드에서 숨겨진 연결의 저장된 선택이 대체 연결로 덮어써지지 않게 한다.
+        if (recordHistory) {
+            superThumbnailPreferences.edit()
+                .putString(KEY_SUPER_THUMBNAIL_CONNECTION, location.connectionId)
+                .putString(KEY_SUPER_THUMBNAIL_PATH, location.path)
+                .putString(KEY_SUPER_THUMBNAIL_TITLE, location.title)
+                .apply()
+        }
         _state.update {
             it.copy(
                 superThumbnailConnectionId = location.connectionId,
@@ -1296,7 +1437,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(superThumbnailHistory = entries) }
     }
 
+    /** 모드 때문에 지금 보이지 않는 연결(저장은 되어 있음)의 id. 표시용 목록을 통째로 저장하다 이 기록을 지우지 않게 한다. */
+    private fun hiddenConnectionIds(): Set<String> {
+        val visible = repository.load().mapTo(hashSetOf()) { it.id }
+        return repository.loadAll().map { it.id }.filter { it !in visible }.toSet()
+    }
+
     private fun persistSuperThumbnailHistory(entries: List<SuperThumbnailLocation>) {
+        val hidden = hiddenConnectionIds()
         val json = org.json.JSONArray().apply {
             entries.forEach { entry ->
                 put(
@@ -1305,6 +1453,24 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         .put("path", entry.path)
                         .put("title", entry.title)
                 )
+            }
+            // 숨겨진 연결의 기존 기록은 원래 값 그대로 이어 붙인다(표시 목록만 넘겼다고 영구히 사라지지 않게).
+            if (hidden.isNotEmpty()) {
+                val shown = entries.mapTo(hashSetOf()) { it.connectionId to it.path }
+                runCatching {
+                    val previous = org.json.JSONArray(superThumbnailPreferences.getString(KEY_SUPER_THUMBNAIL_HISTORY, null).orEmpty())
+                    for (index in 0 until previous.length()) {
+                        val value = previous.opt(index)
+                        val owner = when (value) {
+                            is org.json.JSONObject -> value.optString("connectionId")
+                            is String -> value
+                            else -> null
+                        }
+                        if (owner == null || owner !in hidden) continue
+                        if (value is org.json.JSONObject && (owner to value.optString("path")) in shown) continue
+                        put(value)
+                    }
+                }
             }
         }.toString()
         superThumbnailPreferences.edit().putString(KEY_SUPER_THUMBNAIL_HISTORY, json).apply()
@@ -1344,6 +1510,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     .put("path", location.path)
                     .put("title", location.title),
             )
+        }
+        // 숨겨진 연결의 작업 위치는 원래 값 그대로 이어 붙인다.
+        val hidden = hiddenConnectionIds()
+        if (hidden.isNotEmpty()) {
+            runCatching {
+                val previous = org.json.JSONObject(superThumbnailPreferences.getString(KEY_SUPER_THUMBNAIL_WORK_LOCATIONS, null).orEmpty())
+                previous.keys().forEach { connectionId ->
+                    if (connectionId in hidden && !json.has(connectionId)) json.put(connectionId, previous.get(connectionId))
+                }
+            }
         }
         superThumbnailPreferences.edit().putString(KEY_SUPER_THUMBNAIL_WORK_LOCATIONS, json.toString()).apply()
     }
@@ -1783,11 +1959,29 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         )
     }
 
+    /** The connection [resumeLastLocation] would reopen, or null when there is no saved last folder (same conditions, nothing new stored). */
+    fun lastLocationConnection(): RemoteConnection? {
+        val connectionId = repository.lastConnectionId() ?: return null
+        repository.lastPath(connectionId) ?: return null
+        return _state.value.connections.firstOrNull { it.id == connectionId }
+    }
+
     fun resumeLastLocation() {
-        val connectionId = repository.lastConnectionId() ?: return
-        val connection = _state.value.connections.firstOrNull { it.id == connectionId } ?: return
-        val path = repository.lastPath(connectionId) ?: return
-        openConnection(connection, path, fallbackToRoot = true)
+        // 일반 모드에서는 비공개 출처 편집 세션을 되살리지 않는다(내보내기·저장은 계속 돌고, 프라이버시 모드에서만 돌아올 수 있다).
+        val minimizedSession = _state.value.trailer?.takeIf { _state.value.trailerMinimized }
+        if (minimizedSession != null && PrivacyMode.isVisible(minimizedSession.originPrivate)) {
+            restoreEditor()
+            return
+        }
+        val connectionId = repository.lastConnectionId()
+        val connection = connectionId?.let { id -> _state.value.connections.firstOrNull { it.id == id } }
+        val path = connectionId?.let { repository.lastPath(it) }
+        if (connection != null && !path.isNullOrBlank()) {
+            openConnection(connection, path, fallbackToRoot = true)
+        } else {
+            selectMainDestination(MainNavigationDestination.FINDER)
+            _state.update { it.copy(message = "이전 위치를 열 수 없습니다. 파인더에서 연결을 선택해 주세요.") }
+        }
     }
 
     fun loadRemoteThumbnail(item: RemoteFileItem) {
@@ -2264,10 +2458,6 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return owner
     }
 
-    fun showMessage(message: String) {
-        _state.update { it.copy(message = message) }
-    }
-
     /** 선택: opens the fresh target's own folder (an explicit command, never the hold itself) with only that entry selected. */
     fun homeFavoriteSelect(token: Long) {
         val action = _state.value.homeFavoriteAction?.takeIf { it.token == token } ?: return
@@ -2698,7 +2888,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private suspend fun <T> withDedicatedRemoteService(
         connection: RemoteConnection,
         block: suspend (RemoteFileService) -> T,
-    ): T {
+    ): T = openDedicatedRemoteService(connection).use { ownService -> block(ownService) }
+
+    /** A service of its own for [connection]; the caller closes it. Fails with a readable reason when the login is unavailable. */
+    private suspend fun openDedicatedRemoteService(connection: RemoteConnection): RemoteFileService {
         check(_state.value.connections.any { it.id == connection.id }) {
             "연결 정보를 찾을 수 없습니다. 연결을 다시 연 뒤 시도해 주세요."
         }
@@ -2709,7 +2902,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         check(!needsStoredToken || !credential.isNullOrBlank()) {
             "${connection.name}의 저장된 로그인 정보를 읽을 수 없습니다. 다시 로그인한 뒤 시도해 주세요."
         }
-        return RemoteFileServiceFactory.create(connection, credential.orEmpty()).use { ownService -> block(ownService) }
+        return RemoteFileServiceFactory.create(connection, credential.orEmpty())
     }
 
     /** Reserves an entry name that is unique inside [parentPrefix]; folders and files share one namespace. */
@@ -2859,13 +3052,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(message = "선택한 저장 연결을 찾을 수 없습니다.") }
             return false
         }
+        // 가져오기를 시작하는 순간의 출처를 고정한다(복사가 끝나 저장할 때의 모드가 아니다).
+        val jobPrivate = PrivacyMode.isActive
         val imported = withContext(Dispatchers.IO) {
             runCatching {
                 val source = validateWebDownload(file)
                 val testItem = RemoteFileItem(filename, filename, filename, false, mimeType = mimeType)
                 val destinationSubdir = if (testItem.isAudio) SharedInboxStore.MUSIC_DIRECTORY_NAME else null
                 source.inputStream().buffered().use { input ->
-                    inboxStore.import(filename, mimeType, input, destinationSubdirectory = destinationSubdir)
+                    inboxStore.import(filename, mimeType, input, destinationSubdirectory = destinationSubdir, isPrivate = jobPrivate)
                 }
             }
         }
@@ -3218,6 +3413,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     filename = item.name,
                     action = action,
                     totalBytes = item.size.coerceAtLeast(0),
+                    originPrivate = PrivacyMode.capturedOrigin(PrivacyMode.isPrivateOrigin(activeConnection.id, item.path)),
                 ),
             )
         }
@@ -3638,8 +3834,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         screen = Screen.GooglePhotos,
                         googlePhotosConnected = succeeded && googlePhotosAccount.isConnected(),
                         googlePhotosPhase = if (succeeded) GooglePhotosPhase.IDLE else GooglePhotosPhase.ERROR,
-                        message = if (succeeded) "Google Photos 연결이 완료되었습니다. 사진 선택을 시작해 주세요."
-                        else "Google Photos 로그인이 취소되었거나 완료되지 않았습니다.",
+                        message = if (succeeded) "Google 포토 연결이 완료되었습니다. 사진 선택을 시작해 주세요."
+                        else "Google 포토 로그인이 취소되었거나 완료되지 않았습니다.",
                     )
                 }
                 return
@@ -3698,9 +3894,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(message = "가져올 파일 주소가 없습니다.") }
             return
         }
-        val signature = "${intent.action}:$uri"
+        val deliveryId = intent.getLongExtra(com.armsone.nasfinder.MainActivity.EXTRA_DELIVERY_ID, -1L)
+        val deliveryKey = if (deliveryId != -1L) "delivery:$deliveryId" else "filter:${intent.filterHashCode()}"
+        val signature = "$deliveryKey:${intent.action}:$uri"
         if (signature == importedIntentSignature) return
         importedIntentSignature = signature
+        val jobPrivate = PrivacyMode.isActive
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
@@ -3711,7 +3910,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         "NasFinder 내장 뷰어가 지원하지 않는 파일입니다."
                     }
                     application.contentResolver.openInputStream(uri)?.use { input ->
-                        inboxStore.import(name, mimeType, input)
+                        inboxStore.import(name, mimeType, input, isPrivate = jobPrivate)
                     } ?: error("파일을 열 수 없습니다.")
                 }
             }
@@ -3743,15 +3942,213 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun importSharedIntent(intent: Intent?) {
         val sharedIntent = intent ?: return
         if (sharedIntent.action !in setOf(Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE)) return
-        val signature = "${sharedIntent.action}:${sharedIntent.clipData}:${sharedIntent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)}"
+        // Explicit delivery ID or filter hash forms the key: a later delivery that reuses the same URI has a new delivery ID,
+        // while configuration changes or recompositions reusing the same delivery ID are skipped.
+        val deliveryId = sharedIntent.getLongExtra(com.armsone.nasfinder.MainActivity.EXTRA_DELIVERY_ID, -1L)
+        val deliveryKey = if (deliveryId != -1L) "delivery:$deliveryId" else "filter:${sharedIntent.filterHashCode()}"
+        val signature = "$deliveryKey:${sharedIntent.action}:${sharedIntent.clipData}:${sharedIntent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)}"
         if (signature == importedIntentSignature) return
         importedIntentSignature = signature
-        val uris = buildList {
-            sharedIntent.clipData?.let { clip -> for (index in 0 until minOf(clip.itemCount, 50)) clip.getItemAt(index).uri?.let(::add) }
+        // Photos/videos are never capped or silently dropped: every URI is kept for the user's two-way choice.
+        val allUris = buildList {
+            sharedIntent.clipData?.let { clip -> for (index in 0 until clip.itemCount) clip.getItemAt(index).uri?.let(::add) }
             if (isEmpty()) sharedIntent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(::add)
-        }.distinct().take(50)
-        if (uris.isEmpty()) return
-        importInboxUris(uris, successMessage = "받았습니다", partialMessage = "받았지만")
+        }.distinct()
+        if (allUris.isEmpty()) return
+        val images = mutableListOf<Uri>()
+        val videos = mutableListOf<Uri>()
+        val others = mutableListOf<Uri>()
+        allUris.forEach { uri ->
+            val type = runCatching { application.contentResolver.getType(uri) }.getOrNull()
+                ?: sharedIntent.type?.takeIf { allUris.size == 1 && !it.endsWith("/*") }
+            when {
+                type?.startsWith("image/") == true -> images += uri
+                type?.startsWith("video/") == true -> videos += uri
+                else -> others += uri
+            }
+        }
+        if (images.isNotEmpty() || videos.isNotEmpty()) {
+            // The grant on these URIs is temporary: copy this batch (only this batch) into app-private storage right
+            // now, keeping order, kind and the original URI, before the two-way choice is even shown.
+            val imageSet = images.toHashSet()
+            val videoSet = videos.toHashSet()
+            val ordered = allUris.filter { it in imageSet || it in videoSet }
+            val sources = ordered.map { uri -> ShareIntakeSource(uri, runCatching { application.contentResolver.getType(uri) }.getOrNull(), uri in videoSet) }
+            _state.update { it.copy(shareIntakeInProgress = it.shareIntakeInProgress + 1) }
+            viewModelScope.launch {
+                shareRestoreJob?.join()
+                // The same URI can carry new content, so a share is never judged "already pending" from URIs alone:
+                // it is always snapshotted first, and only an identical (URI, snapshot hash) delivery is folded away.
+                val result = runCatching { PendingShareStaging.intake(application, sources) }
+                val incoming = result.getOrNull()
+                val duplicateOf = incoming?.let { fresh ->
+                    _state.value.pendingMediaShares.firstOrNull { isSameShareRevision(it, fresh) }
+                }
+                if (incoming != null && duplicateOf != null) {
+                    // Redelivery of the same intent (e.g. after process recreation): the existing durable copy has identical bytes.
+                    withContext(Dispatchers.IO) { PendingShareStaging.delete(application, incoming.id) }
+                    _state.update { it.copy(shareIntakeInProgress = (it.shareIntakeInProgress - 1).coerceAtLeast(0)) }
+                    return@launch
+                }
+                _state.update { current ->
+                    val share = incoming
+                    current.copy(
+                        shareIntakeInProgress = (current.shareIntakeInProgress - 1).coerceAtLeast(0),
+                        pendingMediaShares = if (share != null) current.pendingMediaShares + share else current.pendingMediaShares,
+                        message = if (share == null) "공유받은 미디어를 보관하지 못했습니다. ${result.exceptionOrNull()?.message.orEmpty()} 보낸 앱에서 다시 공유해 주세요." else current.message,
+                    )
+                }
+            }
+        }
+        if (others.isNotEmpty()) {
+            importInboxUris(others.take(50), successMessage = "받았습니다", partialMessage = "받았지만")
+        }
+    }
+
+    /** The share the choice dialog is about: the oldest pending one the user has not postponed. */
+    private fun visibleShare(): PendingMediaShare? =
+        _state.value.pendingMediaShares.firstOrNull { it.id !in _state.value.deferredShareIds }
+
+    private fun hideShare(id: String) {
+        _state.update { it.copy(pendingMediaShares = it.pendingMediaShares.filterNot { share -> share.id == id }) }
+    }
+
+    /** Puts a share back after an unfinished action; its durable copies were never touched. */
+    private fun restoreShare(share: PendingMediaShare) {
+        _state.update { current ->
+            if (current.pendingMediaShares.any { it.id == share.id }) current
+            else current.copy(pendingMediaShares = (current.pendingMediaShares + share).sortedBy { it.createdAt })
+        }
+    }
+
+    /**
+     * 이미지 선별: this share's own copies become the photo-selection batch (videos are excluded and counted).
+     * The share's copies are released only after the batch is fully staged; cancel/failure puts the share back.
+     */
+    fun chooseShareImageSelection() {
+        val share = visibleShare() ?: return
+        if (share.images.isEmpty()) return
+        if (photoSelection.state.value.phase != PhotoSelectionPhase.IDLE) {
+            _state.update { it.copy(message = "진행 중인 사진 선별이 있습니다. 먼저 완료하거나 취소한 뒤 다시 선택해 주세요. 공유받은 항목은 그대로 대기 중입니다.") }
+            return
+        }
+        hideShare(share.id)
+        _state.update {
+            it.copy(activeMainTab = MainNavigationDestination.TOOLS, screen = Screen.PhotoSelection, message = null)
+        }
+        photoSelection.start(
+            sources = share.images.sortedBy { it.order }.map { PhotoSelectionSource(Uri.fromFile(it.file), it.name, it.originalUri) },
+            skippedVideos = share.videos.size,
+            extraIssues = share.failures.map { PhotoSelectionIssue(it.name, it.reason) },
+            onStaged = { viewModelScope.launch(Dispatchers.IO) { PendingShareStaging.delete(application, share.id) } },
+            onAbort = { restoreShare(share) },
+        )
+    }
+
+    /** 영상 만들기: appends to the 작업대 only (no auto draft/editor). The share is released only after every copy is prepared. */
+    fun chooseShareVideoMaking() {
+        val share = visibleShare() ?: return
+        val items = (share.images + share.videos).sortedBy { it.order }
+        if (items.isEmpty()) return
+        hideShare(share.id)
+        val sharePocket = _state.value.workbenchPocketId
+        viewModelScope.launch {
+            val candidates = items.map { item ->
+                MaterialItem(
+                    // Batch + item identity (not the reusable provider URI): a retry of this share dedupes, a new share
+                    // that reuses the same URI is kept. The original URI stays in the identity for reference.
+                    sourceIdentity = "share:${share.id}:${item.order}:${item.originalUri}",
+                    name = item.name,
+                    sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                    isVideo = item.isVideo,
+                    uriString = Uri.fromFile(item.file).toString(),
+                    state = MaterialPreparationState.READY,
+                    // This share is already an app-owned copy (the sender's grant is temporary): it goes to the pocket on screen.
+                    pocketId = sharePocket,
+                    origin = "SHARE",
+                )
+            }
+            val added = withContext(Dispatchers.IO) { DurableMaterialStore.addItems(candidates) }
+            if (added == null) {
+                restoreShare(share)
+                _state.update { it.copy(message = materialAddMessage(null, "")) }
+                return@launch
+            }
+            val identities = candidates.map { it.sourceIdentity }.toSet()
+            val fresh = DurableMaterialStore.itemsIn(sharePocket).filter { it.sourceIdentity in identities && it.localFilePath == null }
+            val prepared = if (fresh.isEmpty()) emptyList() else prepareMaterialItems(fresh)
+            val failed = prepared.count { it.state != MaterialPreparationState.READY }
+            refreshMaterials()
+            if (failed == 0) {
+                withContext(Dispatchers.IO) { PendingShareStaging.delete(application, share.id) }
+            } else {
+                restoreShare(share)
+            }
+            _state.update {
+                it.copy(
+                    activeMainTab = MainNavigationDestination.WORKBENCH,
+                    screen = Screen.Dashboard,
+                    message = (if (added == 0) "이미 작업대에 담겨 있는 항목입니다." else "${added}개를 작업대에 담았습니다. 자동으로 편집본을 만들지는 않았습니다.") +
+                        (if (failed > 0) " ${failed}개는 사본을 만들지 못해 ‘다시 준비’가 필요하며, 공유받은 항목은 대기 목록에 남아 있습니다." else "") +
+                        (if (share.failures.isNotEmpty()) " 공유 중 ${share.failures.size}개는 복사하지 못해 담지 못했습니다." else ""),
+                )
+            }
+        }
+    }
+
+    /** "나중에": keeps the share pending (nothing deleted); it is asked again after a restart or from 사진 선별. */
+    fun deferPendingMediaShare() {
+        val share = visibleShare() ?: return
+        _state.update { it.copy(deferredShareIds = it.deferredShareIds + share.id) }
+    }
+
+    /** Re-opens every postponed share, e.g. from the 사진 선별 pending list. */
+    fun reopenPendingMediaShares() {
+        _state.update { it.copy(deferredShareIds = emptySet()) }
+    }
+
+    /** Explicit cancel: removes only this share's own copies; other pending shares, batches and the inbox stay. */
+    fun cancelPendingMediaShare() {
+        val share = visibleShare() ?: return
+        hideShare(share.id)
+        viewModelScope.launch(Dispatchers.IO) { PendingShareStaging.delete(application, share.id) }
+    }
+
+    /** Explicit cancel of one named pending share (pending list). */
+    fun discardPendingMediaShare(id: String) {
+        hideShare(id)
+        viewModelScope.launch(Dispatchers.IO) { PendingShareStaging.delete(application, id) }
+    }
+
+    /** Adds the confirmed photo-selection results to the chosen pocket as app-owned copies; returns a user message. */
+    internal suspend fun addPhotoSelectionToMaterials(batchId: String, photos: List<StagedPhoto>, pocketId: String = _state.value.workbenchPocketId): Result<String> {
+        if (photos.isEmpty()) return Result.failure(IllegalStateException("추가할 사진이 없습니다."))
+        val candidates = photos.map { photo ->
+            MaterialItem(
+                sourceIdentity = "photo-select:$batchId:${photo.id}",
+                name = photo.displayName,
+                sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                isVideo = false,
+                uriString = Uri.fromFile(photo.file).toString(),
+                state = MaterialPreparationState.READY,
+                pocketId = pocketId,
+                origin = "PHOTO_SELECTION",
+            )
+        }
+        val added = withContext(Dispatchers.IO) { DurableMaterialStore.addItems(candidates) }
+            ?: return Result.failure(IllegalStateException(materialAddMessage(null, "")))
+        val identities = candidates.map { it.sourceIdentity }.toSet()
+        val fresh = DurableMaterialStore.itemsIn(pocketId).filter { it.sourceIdentity in identities && it.localFilePath == null }
+        val prepared = if (fresh.isEmpty()) emptyList() else prepareMaterialItems(fresh)
+        val failed = prepared.count { it.state != MaterialPreparationState.READY }
+        refreshMaterials()
+        return Result.success(
+            when {
+                failed > 0 -> "${added - failed}개를 작업대에 담았고 ${failed}개는 사본을 만들지 못했습니다. 작업대에서 다시 확인해 주세요."
+                added == 0 -> "이미 작업대에 담겨 있는 사진입니다."
+                else -> "${added}장을 작업대에 담았습니다. 자동으로 편집본을 만들지는 않았습니다."
+            },
+        )
     }
 
     fun importPickedFiles(uris: List<Uri>) {
@@ -3770,6 +4167,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         val selected = uris.distinct()
         if (selected.isEmpty() || localMediaCopyJob?.isActive == true) return
+        // 복사 묶음 전체가 같은 출처를 갖도록 시작할 때 한 번 고정한다(도중에 모드를 바꿔도 섞이지 않는다).
+        val jobPrivate = PrivacyMode.isActive
         localMediaCopyJob = viewModelScope.launch {
             val total = selected.size
             var importedCount = 0
@@ -3781,7 +4180,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         application.contentResolver.openInputStream(uri)?.use { input ->
                             // Resolve and validate the selected folder through the existing PhoneHard store.
                             inboxStore.listPhoneHardFolder(destinationSubdirectory)
-                            inboxStore.import(name, application.contentResolver.getType(uri), input, destinationSubdirectory = destinationSubdirectory)
+                            inboxStore.import(name, application.contentResolver.getType(uri), input, destinationSubdirectory = destinationSubdirectory, isPrivate = jobPrivate)
                         } ?: error("파일을 열 수 없습니다.")
                         importedCount++
                     }.onFailure { failedCount++ }
@@ -3808,6 +4207,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     private fun importInboxUris(uris: List<Uri>, successMessage: String, partialMessage: String) {
+        val jobPrivate = PrivacyMode.isActive
         viewModelScope.launch {
             val (count, failed, files) = withContext(Dispatchers.IO) {
                 var importedCount = 0
@@ -3816,7 +4216,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     runCatching {
                         val name = copyDisplayName(uri, index)
                         application.contentResolver.openInputStream(uri)?.use { input ->
-                            inboxStore.import(name, application.contentResolver.getType(uri), input)
+                            inboxStore.import(name, application.contentResolver.getType(uri), input, isPrivate = jobPrivate)
                         } ?: error("파일을 열 수 없습니다.")
                         importedCount++
                     }.onFailure { failedCount++ }
@@ -4174,6 +4574,28 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    /** Capture time of a content:// / file:// source in epoch millis (0 when unknown). */
+    private fun localCaptureTime(uri: Uri): Long =
+        runCatching {
+            val projection = arrayOf(
+                android.provider.MediaStore.MediaColumns.DATE_TAKEN,
+                android.provider.MediaStore.MediaColumns.DATE_ADDED,
+                android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
+            )
+            application.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val taken = cursor.getLong(0)
+                    if (taken > 0L) taken
+                    else {
+                        val added = cursor.getLong(1)
+                        if (added > 0L) added * 1000L
+                        else cursor.getLong(2) * 1000L
+                    }
+                } else 0L
+            } ?: 0L
+        }.getOrDefault(0L).takeIf { it > 0L }
+            ?: if (uri.scheme == "file") uri.path?.let { File(it).lastModified() } ?: 0L else 0L
+
     fun startLocalMediaTrailer(uris: List<Uri>) {
         if (uris.isEmpty()) return
         val activeUris = uris.distinct()
@@ -4181,27 +4603,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val names = activeUris.map { uri ->
             queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어"
         }
-        val captureTimes = activeUris.map { uri ->
-            runCatching {
-                val projection = arrayOf(
-                    android.provider.MediaStore.MediaColumns.DATE_TAKEN,
-                    android.provider.MediaStore.MediaColumns.DATE_ADDED,
-                    android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
-                )
-                application.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val taken = cursor.getLong(0)
-                        if (taken > 0L) taken
-                        else {
-                            val added = cursor.getLong(1)
-                            if (added > 0L) added * 1000L
-                            else cursor.getLong(2) * 1000L
-                        }
-                    } else 0L
-                } ?: 0L
-            }.getOrDefault(0L).takeIf { it > 0L }
-                ?: if (uri.scheme == "file") uri.path?.let { File(it).lastModified() } ?: 0L else 0L
-        }
+        val captureTimes = activeUris.map { uri -> localCaptureTime(uri) }
         prepareTrailer(names, captureTimes = captureTimes, motionSourceUris = activeUris, originKeys = activeUris.map { editorOriginLocal(it.toString()) }) { index, destination ->
             val uri = activeUris[index]
             kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
@@ -4304,7 +4706,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         sourceFile: File,
         originalFilename: String,
         mimeType: String?,
-    ): Result<TrailerMusicTrack> = withContext(Dispatchers.IO) {
+    ): Result<TrailerMusicTrack> {
+        val jobPrivate = PrivacyMode.isActive
+        return withContext(Dispatchers.IO) {
         runCatching {
             require(sourceFile.exists() && sourceFile.length() > 0L) { "가져올 음악 파일이 비어있습니다." }
             val retriever = android.media.MediaMetadataRetriever()
@@ -4322,6 +4726,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     mimeType = mimeType,
                     input = input,
                     destinationSubdirectory = SharedInboxStore.MUSIC_DIRECTORY_NAME,
+                    isPrivate = jobPrivate,
                 )
             }
             val destination = inboxStore.file(record)
@@ -4331,6 +4736,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 name = record.originalFilename,
                 durationSeconds = duration,
             )
+        }
         }
     }
 
@@ -4543,7 +4949,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private fun prepareTrailer(
         names: List<String>,
         captureTimes: List<Long> = emptyList(),
-        motionSourceUris: List<Uri> = emptyList(),
+        motionSourceUris: List<Uri?> = emptyList(),
         initialExcludedCount: Int = 0,
         isMusicOverlayMode: Boolean = false,
         initialMusicTrack: TrailerMusicTrack? = null,
@@ -4551,6 +4957,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         initialMusicFitCount: Int = 1,
         forceNew: Boolean = false,
         originKeys: List<String?> = emptyList(),
+        // 시작할 때 고정한 출처. null이면 지금 모드를 한 번 읽는다(명시한 false는 모드를 다시 읽지 않는 공개 출처다).
+        jobPrivate: Boolean? = null,
+        // Called after every source was staged and before the project is finished; false = the user declined, close the project.
+        beforeFinish: (suspend (staged: Int) -> Boolean)? = null,
         stage: suspend (Int, File) -> Unit,
     ) {
         if (_state.value.trailer?.busy == true) return
@@ -4584,6 +4994,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     musicPolicy = initialMusicPolicy,
                     musicFitCount = initialMusicFitCount,
                     highlightAnalyzed = !isMusicOverlayMode,
+                    originPrivate = (jobPrivate ?: PrivacyMode.isActive) || originKeys.any(PrivacyMode::isPrivateOriginKey),
                 ),
                 imagePreview = null,
                 trailerMinimized = false,
@@ -4662,6 +5073,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val err = if (totalSkipped > 0) "사용 가능한 사진이나 영상이 없습니다 (지원되지 않거나 손상된 ${totalSkipped}개 제외)."
                     else "사용 가능한 사진이나 영상이 없습니다."
                     updateTrailer(directory) { it.copy(busy = false, error = err, progress = null) }
+                    return@launch
+                }
+                if (beforeFinish != null && !beforeFinish(sources.size)) {
+                    // Declined: only this run's project folder is removed (closeTrailer); references and originals are untouched.
+                    closeTrailer(clearRetry = false)
+                    _state.update { it.copy(message = "취소했습니다. 읽지 못한 항목은 작업대에 그대로 남아 있고 ‘다시 연결’할 수 있습니다. 이번 실행의 임시 파일만 정리했습니다.") }
                     return@launch
                 }
                 finishTrailerPreparation(directory, sources.toList(), initialExcludedCount + undecodableCount, isMusicOverlayMode, initialMusicTrack, initialMusicPolicy, initialMusicFitCount)
@@ -4857,6 +5274,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var editorExportJob: Job? = null
     private var editorAddJob: Job? = null
     private val pendingAddCandidates = linkedMapOf<String, EditorAddCandidate>()
+    // 추가를 요청한 순간 고정한 출처(현재 모드 또는 후보의 비공개 출처). 추가가 끝날 때 프로젝트를 영구히 오염시킨다.
+    private val pendingAddPrivate = mutableMapOf<String, Boolean>()
 
     private fun editorHistory(directory: File): EditorHistory =
         editorHistories.getOrPut(directory.absolutePath) { EditorHistory() }
@@ -4890,6 +5309,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             editor = session.editor,
             revision = session.revision,
             outputRevision = if (validOutput != null) session.outputRevision else null,
+            isPrivate = session.originPrivate,
         )
     }
 
@@ -5241,6 +5661,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val pending = candidates.distinctBy { it.originKey }.map { candidate ->
             val id = UUID.randomUUID().toString()
             pendingAddCandidates[id] = candidate
+            pendingAddPrivate[id] = PrivacyMode.capturedOrigin(PrivacyMode.isPrivateOriginKey(candidate.originKey))
             EditorPendingAdd(id, candidate.originKey, candidate.name, candidate.isVideo)
         }
         if (pending.isEmpty()) return
@@ -5266,6 +5687,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val item = session.pendingAdds.firstOrNull { it.id == id } ?: return
         if (item.phase != EditorAddPhase.FAILED && item.phase != EditorAddPhase.QUEUED) return
         pendingAddCandidates.remove(id)
+        pendingAddPrivate.remove(id)
         updateTrailer(session.directory) { live -> live.copy(pendingAdds = live.pendingAdds.filterNot { it.id == id }) }
     }
 
@@ -5284,6 +5706,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val source = stageEditorCandidate(directory, next, candidate)
                     appendPreparedSource(directory, next.id, source)
                     pendingAddCandidates.remove(next.id)
+                    pendingAddPrivate.remove(next.id)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
@@ -5339,7 +5762,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 // (PhoneHard files, basket copies, web downloads) is copied so the original is never moved or altered.
                 val ownTemporaryCopy = staged != null && runCatching { staged.canonicalFile.parentFile == materialsRoot }.getOrDefault(false) &&
                     (staged.name.startsWith("remote_${pending.id}.") || staged.name.startsWith("mat_${pending.id}.")) &&
-                    DurableMaterialStore.getItems().none { it.localFilePath == staged.absolutePath }
+                    DurableMaterialStore.getAllItems().none { it.localFilePath == staged.absolutePath }
                 when {
                     staged != null && ownTemporaryCopy && staged.renameTo(destination) -> Unit
                     staged != null -> staged.inputStream().buffered().use { input -> partial.outputStream().buffered().use { input.copyTo(it) } }
@@ -5388,6 +5811,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     private suspend fun appendPreparedSource(directory: File, pendingId: String, staged: TrailerSource) {
         val live = _state.value.trailer?.takeIf { it.directory == directory } ?: return
+        // 비공개 출처 미디어가 한 번이라도 들어오면 프로젝트는 영구히 비공개 출처가 된다(공개로 되돌아가지 않는다).
+        val addPrivate = pendingAddPrivate[pendingId] == true || PrivacyMode.isPrivateOriginKey(staged.originKey)
         val newSource = staged.copy(id = (live.sources.maxOfOrNull { it.id } ?: -1) + 1)
         val analysedSources = if (!live.isMusicOverlayMode && live.editor?.autoPlan == true && newSource.isImage) {
             setPendingAdd(directory, pendingId) { it.copy(phase = EditorAddPhase.ANALYZING) }
@@ -5397,7 +5822,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val changed = editProject { session ->
             if (session.directory != directory || session.sources.any { it.id == newSource.id }) return@editProject null
             val project = session.editor ?: return@editProject null
-            val withSources = session.copy(sources = analysedSources.filter { candidate -> candidate.id == newSource.id || session.sources.any { it.id == candidate.id } })
+            val withSources = session.copy(
+                sources = analysedSources.filter { candidate -> candidate.id == newSource.id || session.sources.any { it.id == candidate.id } },
+                originPrivate = session.originPrivate || addPrivate,
+            )
             if (project.autoPlan && !session.isMusicOverlayMode) {
                 val defaults = recommendedTrailerDefaults(withSources.sources)
                 withSources.copy(
@@ -5516,7 +5944,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun restoreEditor() {
-        if (_state.value.trailer == null) return
+        val session = _state.value.trailer ?: return
+        if (!PrivacyMode.isVisible(session.originPrivate)) return
         val currentScreen = _state.value.screen
         val resolvedScreen = if (currentScreen == Screen.WebBrowser) Screen.Dashboard else currentScreen
         _state.update { it.copy(trailerMinimized = false, imagePreview = null, screen = resolvedScreen) }
@@ -5635,7 +6064,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         trailerJob = viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    output.inputStream().buffered().use { inboxStore.import("예고편-${System.currentTimeMillis()}.mp4", "video/mp4", it) }
+                    output.inputStream().buffered().use {
+                        inboxStore.import("예고편-${System.currentTimeMillis()}.mp4", "video/mp4", it, isPrivate = session.originPrivate)
+                    }
                 }
                 val files = inboxFiles()
                 _state.update { current ->
@@ -5684,6 +6115,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         durationSeconds = duration,
                         posterFile = poster,
                         sourceDraftId = session.draftId,
+                        isPrivate = session.originPrivate,
                     )
                 }
                 refreshCollections()
@@ -5747,7 +6179,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         editorExportJob?.cancel(); editorExportJob = null
         editorAddJob?.cancel(); editorAddJob = null
         editorAutosaveJob?.cancel(); editorAutosaveJob = null
-        session?.pendingAdds?.forEach { pendingAddCandidates.remove(it.id) }
+        session?.pendingAdds?.forEach { pendingAddCandidates.remove(it.id); pendingAddPrivate.remove(it.id) }
         pendingAddAnchor = null
         session?.let {
             editorHistories.remove(it.directory.absolutePath)
@@ -5902,6 +6334,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             musicPolicy = draft.musicPolicy,
             musicFitCount = draft.musicFitCount,
             autoDucking = draft.autoDucking,
+            originPrivate = draft.isPrivate,
             awaitingInitialSettings = draft.showingSettings || availableOutput == null,
             prepared = true,
             draftId = draft.id,
@@ -5982,224 +6415,1011 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun selectMainDestination(destination: MainNavigationDestination) {
-        // 영상 with a kept-alive editor returns to that same project instead of switching projects.
-        if (destination == MainNavigationDestination.VIDEO && _state.value.trailer != null && _state.value.trailerMinimized) {
-            _state.update { it.copy(activeMainTab = MainNavigationDestination.VIDEO) }
-            restoreEditor()
-            return
+        val hasOpenEditor = _state.value.trailer != null
+        if (destination == MainNavigationDestination.HOME && hasOpenEditor) {
+            _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { scheduleEditorAutosave(it.directory, immediate = true) }
         }
         _state.update {
             it.copy(
                 activeMainTab = destination,
-                screen = when (destination) {
-                    MainNavigationDestination.FINDER -> Screen.Dashboard
-                    MainNavigationDestination.VIDEO -> when (it.activeVideoTab) {
-                        VideoNavigationDestination.CREATE -> Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)
-                        VideoNavigationDestination.MATERIALS -> Screen.MaterialBasket
-                        VideoNavigationDestination.DRAFTS -> Screen.VideoDrafts
-                        VideoNavigationDestination.COLLECTIONS -> Screen.VideoCollections
-                    }
-                    MainNavigationDestination.TOOLS -> Screen.Settings
-                }
+                screen = Screen.Dashboard,
+                trailerMinimized = if (destination == MainNavigationDestination.HOME && hasOpenEditor) true else it.trailerMinimized,
             )
         }
     }
 
     fun selectVideoDestination(destination: VideoNavigationDestination) {
+        // The former 영상 재료 tab is the 작업대 now; the old destination keeps working as an alias.
+        if (destination == VideoNavigationDestination.MATERIALS) {
+            selectMainDestination(MainNavigationDestination.WORKBENCH)
+            return
+        }
         _state.update {
             it.copy(
                 activeMainTab = MainNavigationDestination.VIDEO,
                 activeVideoTab = destination,
-                screen = when (destination) {
-                    VideoNavigationDestination.CREATE -> Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)
-                    VideoNavigationDestination.MATERIALS -> Screen.MaterialBasket
-                    VideoNavigationDestination.DRAFTS -> Screen.VideoDrafts
-                    VideoNavigationDestination.COLLECTIONS -> Screen.VideoCollections
-                }
+                screen = Screen.Dashboard,
             )
         }
     }
 
+    /** Explicit 미디어 고르기 entry of the 영상 hub: the only way from the hub into the existing media picker / editor path. */
+    fun chooseMediaForVideo() = show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER))
+
+    // ---- 작업대 (workbench): pockets of REFERENCES ----------------------------------------------------------------
+    // Adding stores location / identity / permission / metadata only. Originals are read again only when the user
+    // explicitly starts 영상 제작 or 전송, into a workspace owned by that run. Removing a reference or a pocket never
+    // deletes an original, a legacy copy or a previous material cache.
+
+    private var materialCheckJob: Job? = null
+    private var workbenchRunJob: Job? = null
+
+    private fun publishMaterials() {
+        val all = DurableMaterialStore.getItems()
+        val pockets = DurableMaterialStore.pockets()
+        val ids = all.map { it.id }.toSet()
+        _state.update { current ->
+            current.copy(
+                materials = all,
+                pockets = pockets,
+                workbenchPocketId = current.workbenchPocketId.takeIf { id -> pockets.any { it.id == id } } ?: DEFAULT_POCKET_ID,
+                workbenchSelected = current.workbenchSelected.intersect(ids),
+            )
+        }
+    }
+
+    /** Publishes the saved references at once, then re-checks reachability off the main thread (never copies or downloads). */
     fun refreshMaterials() {
-        val currentItems = DurableMaterialStore.getItems()
-        // Validate accessible state for items on refresh
-        var changed = false
-        val updated = currentItems.map { item ->
-            when (item.sourceType) {
-                MaterialSourceType.LOCAL_LIBRARY -> {
-                    // An app-owned copy keeps the item usable even when the original is no longer reachable.
-                    val hasOwnedCopy = ownedMaterialCopy(item.localFilePath, getMaterialsDirectory()) != null
-                    val uri = Uri.parse(item.uriString)
-                    val accessible = hasOwnedCopy || runCatching {
-                        application.contentResolver.openInputStream(uri)?.use { true } ?: false
-                    }.getOrDefault(false)
-                    // Only an access failure clears itself here; a failed copy/validation stays visible until retried.
-                    val accessFailure = item.errorMessage == null || item.errorMessage == LOCAL_MATERIAL_ACCESS_ERROR || item.errorMessage == LOCAL_MATERIAL_GRANT_ERROR
-                    if (accessible && accessFailure && item.state == MaterialPreparationState.MISSING) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
-                    } else if (!accessible && item.state == MaterialPreparationState.READY) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = LOCAL_MATERIAL_ACCESS_ERROR)
-                    } else {
-                        item
-                    }
+        publishMaterials()
+        materialCheckJob?.cancel()
+        materialCheckJob = viewModelScope.launch {
+            val saveFailed = withContext(Dispatchers.IO) {
+                var failed = false
+                DurableMaterialStore.getItems().forEach { item ->
+                    ensureActive()
+                    val updated = verifyMaterialAccess(item) ?: return@forEach
+                    if (!DurableMaterialStore.updateState(updated.id, updated.state, updated.downloadProgress, updated.localFilePath, updated.errorMessage)) failed = true
                 }
-                MaterialSourceType.PHONE_HARD -> {
-                    val file = item.localFilePath?.let { File(it) }
-                    val accessible = file != null && file.exists() && file.length() > 0L
-                    if (accessible && item.state == MaterialPreparationState.MISSING) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
-                    } else if (!accessible && item.state == MaterialPreparationState.READY) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = "폰하드 파일이 삭제되었거나 누락되었습니다.")
-                    } else {
-                        item
-                    }
-                }
-                MaterialSourceType.REMOTE_FILE -> {
-                    val local = item.localFilePath?.let { File(it) }
-                    val hasLocal = local != null && local.exists() && local.length() > 0L
-                    if (hasLocal && item.state == MaterialPreparationState.MISSING) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.READY, errorMessage = null)
-                    } else if (!hasLocal && item.state == MaterialPreparationState.READY) {
-                        changed = true
-                        item.copy(state = MaterialPreparationState.MISSING, errorMessage = "가져오기 필요")
-                    } else {
-                        item
-                    }
-                }
+                failed
+            }
+            publishMaterials()
+            if (saveFailed) _state.update { it.copy(message = MATERIAL_SAVE_ERROR) }
+        }
+    }
+
+    /**
+     * Whether the provider still answers for this reference, judged ONLY from metadata (a display-name query or the tree
+     * document itself). It never opens a stream or an asset descriptor: for Google / cloud providers that can trigger a full
+     * download. The real readable check happens when the user starts 영상 제작 or 전송. A revoked / expired grant shows up as
+     * a SecurityException here and is reported as "reconnect needed", nothing is copied.
+     */
+    private fun localReferenceReadable(item: MaterialItem): Boolean = runCatching {
+        val uri = Uri.parse(item.uriString)
+        when {
+            uri.scheme == "file" -> File(uri.path.orEmpty()).let { if (item.isFolder) it.isDirectory else it.isFile }
+            item.isFolder -> {
+                val doc = DocumentsContract.buildDocumentUriUsingTree(uri, DocumentsContract.getTreeDocumentId(uri))
+                application.contentResolver.query(doc, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID), null, null, null)?.use { it.moveToFirst() } ?: false
+            }
+            else -> application.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { it.moveToFirst() } ?: false
+        }
+    }.getOrDefault(false)
+
+    /** The item with its corrected state, or null when nothing changes. Only reads the reference; never writes a file. */
+    private fun verifyMaterialAccess(item: MaterialItem): MaterialItem? {
+        if (item.state == MaterialPreparationState.EXCLUDED || item.state == MaterialPreparationState.DOWNLOADING) return null
+        val failure: String? = when (item.sourceType) {
+            MaterialSourceType.LOCAL_LIBRARY -> {
+                // An app-owned legacy copy keeps the item usable even when the original is no longer reachable.
+                val hasOwnedCopy = ownedMaterialCopy(item.localFilePath, getMaterialsDirectory()) != null
+                if (hasOwnedCopy || localReferenceReadable(item)) null
+                else if (item.grantPersisted == false) LOCAL_MATERIAL_GRANT_ERROR else LOCAL_MATERIAL_ACCESS_ERROR
+            }
+            MaterialSourceType.PHONE_HARD -> {
+                val available = if (item.isFolder) resolvePhoneHardDiskFile(item.remotePath.orEmpty()).isDirectory
+                else item.localFilePath?.let { File(it) }?.let { it.exists() && it.length() > 0L } == true
+                if (available) null else "폰하드 항목이 삭제되었거나 이동되었습니다."
+            }
+            // NAS / cloud references are checked when a run starts; no network access just for opening the list.
+            MaterialSourceType.REMOTE_FILE -> {
+                val hasLocal = item.localFilePath?.let { File(it) }?.let { it.exists() && it.length() > 0L } == true
+                return if (hasLocal && item.state == MaterialPreparationState.MISSING && item.errorMessage == WORKBENCH_REMOTE_NOT_FETCHED) {
+                    item.copy(state = MaterialPreparationState.READY, errorMessage = null)
+                } else null
             }
         }
-        var saveFailed = false
-        if (changed) {
-            updated.forEachIndexed { index, item ->
-                if (item != currentItems[index] &&
-                    !DurableMaterialStore.updateState(item.id, item.state, item.downloadProgress, item.localFilePath, item.errorMessage)
-                ) saveFailed = true
-            }
+        val accessFailureMessage = item.errorMessage == null || item.errorMessage == LOCAL_MATERIAL_ACCESS_ERROR ||
+            item.errorMessage == LOCAL_MATERIAL_GRANT_ERROR || item.errorMessage.startsWith("폰하드")
+        return when {
+            failure == null && item.state == MaterialPreparationState.MISSING && accessFailureMessage ->
+                item.copy(state = MaterialPreparationState.READY, errorMessage = null)
+            failure != null && item.state == MaterialPreparationState.READY ->
+                item.copy(state = MaterialPreparationState.MISSING, errorMessage = failure)
+            else -> null
         }
+    }
+
+    // pockets ----------------------------------------------------------------------------------------------------
+
+    fun selectWorkbenchPocket(id: String) {
+        if (DurableMaterialStore.pockets().any { it.id == id }) _state.update { it.copy(workbenchPocketId = id) }
+    }
+
+    fun renameWorkbenchPocket(id: String, name: String) {
+        val saved = DurableMaterialStore.renamePocket(id, name)
+        publishMaterials()
+        if (!saved) _state.update { it.copy(message = POCKET_SAVE_ERROR) }
+    }
+
+    /** Deletes the pocket and ONLY its references; originals, legacy copies and other pockets stay. */
+    fun deleteWorkbenchPocket(id: String) {
+        val saved = DurableMaterialStore.deletePocket(id)
+        publishMaterials()
         _state.update {
-            it.copy(
-                materials = DurableMaterialStore.getItems(),
-                message = if (saveFailed) MATERIAL_SAVE_ERROR else it.message,
+            it.copy(message = if (saved) "포켓을 삭제했습니다. 원본 파일과 다른 포켓의 항목은 그대로입니다." else POCKET_DELETE_ERROR)
+        }
+    }
+
+    /** Creates an (empty) pocket from the 작업대 screen. */
+    fun createWorkbenchPocket(name: String) {
+        val pocket = DurableMaterialStore.createPocket(name)
+        publishMaterials()
+        if (pocket == null) _state.update { it.copy(message = POCKET_SAVE_ERROR) }
+        else _state.update { it.copy(workbenchPocketId = pocket.id) }
+    }
+
+    /** Creates a pocket and returns its id, or null (with a visible message) when it could not be saved. */
+    fun createWorkbenchPocketNow(name: String): String? {
+        val pocket = DurableMaterialStore.createPocket(name)
+        publishMaterials()
+        if (pocket == null) _state.update { it.copy(message = POCKET_SAVE_ERROR) }
+        return pocket?.id
+    }
+
+    // adding references -------------------------------------------------------------------------------------------
+
+    fun setWorkbenchSelected(ids: Set<String>) { _state.update { it.copy(workbenchSelected = ids) } }
+
+    fun toggleWorkbenchSelected(id: String) {
+        _state.update { it.copy(workbenchSelected = if (id in it.workbenchSelected) it.workbenchSelected - id else it.workbenchSelected + id) }
+    }
+
+    private fun offerWorkbenchAdd(candidates: List<MaterialItem>, afterAdd: ((String) -> Unit)? = null, note: String? = null) {
+        if (candidates.isEmpty()) {
+            _state.update { it.copy(message = note ?: "작업대에 담을 항목이 없습니다.") }
+            return
+        }
+        _state.update { it.copy(workbenchAdd = WorkbenchAddRequest(candidates, note, afterAdd)) }
+    }
+
+    fun dismissWorkbenchAdd() { _state.update { it.copy(workbenchAdd = null) } }
+
+    /** Saves the pending references into [pocketId]. A failed save keeps the request open and every prior pocket unchanged. */
+    fun confirmWorkbenchAdd(pocketId: String) {
+        val request = _state.value.workbenchAdd ?: return
+        viewModelScope.launch {
+            val pocketName = DurableMaterialStore.pockets().firstOrNull { it.id == pocketId }?.name ?: DEFAULT_POCKET_NAME
+            val added = withContext(Dispatchers.IO) { DurableMaterialStore.addItems(request.candidates.map { it.copy(pocketId = pocketId) }) }
+            if (added == null) {
+                _state.update { it.copy(message = materialAddMessage(null, "")) }
+                return@launch
+            }
+            val identities = request.candidates.map { it.sourceIdentity }.toSet()
+            val wanted = DurableMaterialStore.itemsIn(pocketId).filter { it.sourceIdentity in identities }.map { it.id }
+            val skipped = request.candidates.size - added
+            publishMaterials()
+            _state.update {
+                it.copy(
+                    workbenchAdd = null,
+                    workbenchPocketId = pocketId,
+                    workbenchSelected = it.workbenchSelected + wanted,
+                    message = (if (added > 0) "${added}개를 ‘$pocketName’에 담았습니다. 원본은 복사하지 않았습니다." else "이미 ‘$pocketName’에 담겨 있는 항목입니다.") +
+                        (if (added > 0 && skipped > 0) " 이미 있던 ${skipped}개는 건너뛰었습니다." else "") +
+                        (request.note?.let { n -> " $n" } ?: ""),
+                )
+            }
+            request.afterAdd?.invoke(pocketId)
+        }
+    }
+
+    /** 새 포켓을 만들어 바로 담기: the pocket is created first; if that cannot be saved nothing is added. */
+    fun confirmWorkbenchAddToNewPocket(name: String) {
+        if (_state.value.workbenchAdd == null) return
+        val pocket = DurableMaterialStore.createPocket(name)
+        if (pocket == null) {
+            _state.update { it.copy(message = POCKET_SAVE_ERROR) }
+            return
+        }
+        publishMaterials()
+        confirmWorkbenchAdd(pocket.id)
+    }
+
+    private fun isDeviceMediaStoreUri(uri: Uri): Boolean =
+        uri.authority == MediaStore.AUTHORITY && !uri.path.orEmpty().startsWith("/picker")
+
+    /** One reference for a content:// / file:// source. Tries a persistable read grant only where the provider supports it. */
+    private fun buildLocalReference(uri: Uri, meta: LocalMediaItem?, origin: String?): MaterialItem {
+        val uriStr = uri.toString()
+        val name = meta?.displayName ?: queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "미디어"
+        val mime = if (uri.scheme == "content") runCatching { application.contentResolver.getType(uri) }.getOrNull() else null
+        val leaf = classifyWorkbenchLeaf(name, mime)
+        val isVideo = meta?.isVideo ?: (leaf == WorkbenchLeafKind.VIDEO)
+        val kind = if (meta != null || leaf != WorkbenchLeafKind.OTHER) MaterialEntryKind.MEDIA else MaterialEntryKind.FILE
+        var grant: Boolean? = null
+        if (uri.scheme == "content" && !isDeviceMediaStoreUri(uri)) {
+            grant = runCatching { application.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); true }.getOrDefault(false)
+        }
+        // Metadata only: opening the original here could download a cloud / Google Photos item. Real reads happen at a run.
+        val accessible = localReferenceReadable(
+            MaterialItem(sourceIdentity = "local:$uriStr", name = name, sourceType = MaterialSourceType.LOCAL_LIBRARY, isVideo = isVideo, uriString = uriStr),
+        )
+        return MaterialItem(
+            sourceIdentity = "local:$uriStr",
+            name = name,
+            sourceType = MaterialSourceType.LOCAL_LIBRARY,
+            isVideo = isVideo,
+            uriString = uriStr,
+            durationMs = meta?.durationMs,
+            state = if (accessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING,
+            errorMessage = if (accessible) null else LOCAL_MATERIAL_GRANT_ERROR,
+            entryKind = kind,
+            origin = origin ?: when {
+                isPickerUri(uri) -> "GOOGLE_PHOTOS"
+                uri.scheme == "file" -> "PHONE_HARD"
+                else -> "MY_MEDIA"
+            },
+            grantPersisted = grant,
+            mimeType = mime,
+        )
+    }
+
+    private fun isPickerUri(uri: Uri): Boolean =
+        uri.authority == MediaStore.AUTHORITY && uri.path.orEmpty().startsWith("/picker")
+
+    /** 작업대에 담기 for content:// / file:// sources (내 미디어, Google 포토, 파일, 달력, 폰하드 선택 등). */
+    internal fun requestWorkbenchAddLocal(
+        uris: List<Uri>,
+        items: List<LocalMediaItem> = emptyList(),
+        origin: String? = null,
+        afterAdd: ((String) -> Unit)? = null,
+    ) {
+        val distinct = uris.distinct()
+        if (distinct.isEmpty()) return
+        // NasFinder's own NAS download copies are temporary (cache): they are not references to the original.
+        val stagedRoot = File(application.cacheDir, "media_basket").path
+        val (temporary, referable) = distinct.partition { it.scheme == "file" && it.path.orEmpty().startsWith(stagedRoot) }
+        viewModelScope.launch {
+            val candidates = withContext(Dispatchers.IO) {
+                referable.map { uri -> buildLocalReference(uri, items.firstOrNull { it.uri.toString() == uri.toString() }, origin) }
+            }
+            offerWorkbenchAdd(
+                candidates,
+                afterAdd,
+                note = if (temporary.isNotEmpty()) "NAS에서 고른 항목 ${temporary.size}개는 임시 사본이라 담지 않았습니다. NAS 화면에서 ‘작업대에 담기’로 담아 주세요." else null,
             )
         }
     }
 
-    internal fun addLocalMediaToMaterialBasket(uris: List<Uri>, items: List<LocalMediaItem> = emptyList()) {
-        val candidates = uris.map { uri ->
-            val uriStr = uri.toString()
-            val meta = items.firstOrNull { it.uri.toString() == uriStr }
-            val name = meta?.displayName ?: queryName(uri) ?: uri.lastPathSegment ?: "미디어"
-            val isVideo = meta?.isVideo ?: (application.contentResolver.getType(uri)?.startsWith("video/") == true)
-            // Verify immediate read access
-            val accessible = runCatching {
-                application.contentResolver.openInputStream(uri)?.use { true } ?: false
-            }.getOrDefault(false)
-            val state = if (accessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING
-            val errorMsg = if (!accessible) LOCAL_MATERIAL_GRANT_ERROR else null
-            MaterialItem(
-                sourceIdentity = "local:$uriStr",
-                name = name,
-                sourceType = MaterialSourceType.LOCAL_LIBRARY,
-                isVideo = isVideo,
-                uriString = uriStr,
-                durationMs = meta?.durationMs,
-                state = state,
-                errorMessage = errorMsg
-            )
-        }
-        val added = DurableMaterialStore.addItems(candidates)
-        refreshMaterials()
-        _state.update {
-            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 미디어입니다."))
+    /** 폴더(문서 트리) 참조: nothing under the folder is read or expanded until a run starts. */
+    internal fun requestWorkbenchAddFolderTree(treeUri: Uri, afterAdd: ((String) -> Unit)? = null) {
+        viewModelScope.launch {
+            val candidate = withContext(Dispatchers.IO) {
+                val grant = runCatching { application.contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION); true }.getOrDefault(false)
+                val name = runCatching {
+                    val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+                    application.contentResolver.query(doc, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                }.getOrNull()?.takeIf { it.isNotBlank() } ?: "폴더"
+                val readable = localReferenceReadable(MaterialItem(sourceIdentity = "tree:$treeUri", name = name, sourceType = MaterialSourceType.LOCAL_LIBRARY, isVideo = false, uriString = treeUri.toString(), entryKind = MaterialEntryKind.FOLDER))
+                MaterialItem(
+                    sourceIdentity = "tree:$treeUri",
+                    name = name,
+                    sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                    isVideo = false,
+                    uriString = treeUri.toString(),
+                    state = if (readable) MaterialPreparationState.READY else MaterialPreparationState.MISSING,
+                    errorMessage = if (readable) null else LOCAL_MATERIAL_GRANT_ERROR,
+                    entryKind = MaterialEntryKind.FOLDER,
+                    origin = "FILES",
+                    grantPersisted = grant,
+                )
+            }
+            offerWorkbenchAdd(listOf(candidate), afterAdd)
         }
     }
 
-    /** [added] null = nothing could be saved (the basket is unchanged), never reported as success or duplicate. */
-    private fun materialAddMessage(added: Int?, duplicateMessage: String): String = when {
-        added == null -> DurableMaterialStore.loadProblem()?.takeIf { DurableMaterialStore.isPersistBlocked() }
-            ?.let { "재료함에 담지 못했습니다. $it" } ?: "재료함에 담지 못했습니다. ${MATERIAL_SAVE_ERROR}"
-        added > 0 -> "${added}개를 재료함에 담았습니다."
-        else -> duplicateMessage
-    }
+    /** 폰하드 files and folders (Finder selection). Files stay where they are. */
+    fun requestWorkbenchAddPhoneHard(files: List<InboxDisplayItem>, folderPaths: List<String> = emptyList()) =
+        offerWorkbenchAdd(phoneHardReferences(files, folderPaths))
 
-    fun addPhoneHardToMaterialBasket(phoneHardItems: List<InboxDisplayItem>) {
-        val candidates = phoneHardItems.map { item ->
-            val isVideo = item.asPreviewItem().isVideo
-            val fileAccessible = item.file.exists() && item.file.length() > 0L
-            val state = if (fileAccessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING
-            val errorMsg = if (!fileAccessible) "폰하드 파일을 찾을 수 없습니다." else null
+    private fun phoneHardReferences(files: List<InboxDisplayItem>, folderPaths: List<String> = emptyList()): List<MaterialItem> {
+        val fileRefs = files.map { item ->
+            val leaf = classifyWorkbenchLeaf(item.originalFilename, item.mimeType)
+            val accessible = item.file.exists() && item.file.length() > 0L
             MaterialItem(
                 sourceIdentity = "phonehard:${item.id}",
                 name = item.originalFilename,
                 sourceType = MaterialSourceType.PHONE_HARD,
-                isVideo = isVideo,
+                isVideo = leaf == WorkbenchLeafKind.VIDEO,
                 uriString = Uri.fromFile(item.file).toString(),
                 localFilePath = item.file.absolutePath,
-                state = state,
-                errorMessage = errorMsg
+                state = if (accessible) MaterialPreparationState.READY else MaterialPreparationState.MISSING,
+                errorMessage = if (accessible) null else "폰하드 파일을 찾을 수 없습니다.",
+                fileSize = item.byteCount,
+                entryKind = if (leaf == WorkbenchLeafKind.OTHER) MaterialEntryKind.FILE else MaterialEntryKind.MEDIA,
+                origin = "PHONE_HARD",
+                mimeType = item.mimeType,
             )
         }
-        val added = DurableMaterialStore.addItems(candidates)
-        refreshMaterials()
-        _state.update {
-            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 항목입니다."))
+        val folderRefs = folderPaths.map { relative ->
+            val dir = resolvePhoneHardDiskFile(relative)
+            MaterialItem(
+                sourceIdentity = "phonehard-folder:$relative",
+                name = relative.trim('/').substringAfterLast('/').ifBlank { "폰하드" },
+                sourceType = MaterialSourceType.PHONE_HARD,
+                isVideo = false,
+                uriString = Uri.fromFile(dir).toString(),
+                remotePath = relative,
+                state = if (dir.isDirectory) MaterialPreparationState.READY else MaterialPreparationState.MISSING,
+                errorMessage = if (dir.isDirectory) null else "폰하드 폴더를 찾을 수 없습니다.",
+                entryKind = MaterialEntryKind.FOLDER,
+                origin = "PHONE_HARD",
+            )
         }
+        return fileRefs + folderRefs
     }
 
-    fun addRemoteFilesToMaterialBasket(connection: RemoteConnection, remoteItems: List<RemoteFileItem>) {
-        val candidates = remoteItems.filter { !it.isDirectory && (it.isVideo || it.isImage) }.map { item ->
-            val identity = "remote:${connection.id}:${item.path}"
+    /** NAS / cloud files and folders. Nothing is downloaded or listed here. */
+    fun requestWorkbenchAddRemote(connection: RemoteConnection, remoteItems: List<RemoteFileItem>, origin: String = "NAS") =
+        offerWorkbenchAdd(remoteReferences(connection, remoteItems, origin))
+
+    private fun remoteReferences(connection: RemoteConnection, remoteItems: List<RemoteFileItem>, origin: String = "NAS"): List<MaterialItem> {
+        val candidates = remoteItems.map { item ->
+            val leaf = classifyWorkbenchLeaf(item.name, item.mimeType)
             MaterialItem(
-                sourceIdentity = identity,
+                sourceIdentity = "remote:${connection.id}:${item.path}",
                 name = item.name,
                 sourceType = MaterialSourceType.REMOTE_FILE,
-                isVideo = item.isVideo,
+                isVideo = !item.isDirectory && leaf == WorkbenchLeafKind.VIDEO,
                 uriString = item.path,
                 connectionId = connection.id,
                 remotePath = item.path,
-                fileSize = item.size,
-                state = MaterialPreparationState.MISSING, // Remote references initially '가져오기 필요'
-                errorMessage = "가져오기 필요"
+                fileSize = item.size.takeIf { !item.isDirectory && it > 0L },
+                captureTimeMillis = item.modifiedAt?.toEpochMilli() ?: 0L,
+                entryKind = when {
+                    item.isDirectory -> MaterialEntryKind.FOLDER
+                    leaf == WorkbenchLeafKind.OTHER -> MaterialEntryKind.FILE
+                    else -> MaterialEntryKind.MEDIA
+                },
+                origin = origin,
+                mimeType = item.mimeType,
             )
         }
-        val added = DurableMaterialStore.addItems(candidates)
-        refreshMaterials()
-        _state.update {
-            it.copy(message = materialAddMessage(added, "이미 재료함에 담겨 있는 파일입니다."))
+        return candidates
+    }
+
+    /** The 영상 편집 재료 찾기 panel: what was selected there can also go to a pocket (references only, web downloads excluded). */
+    internal fun requestWorkbenchAddEditorCandidates(candidates: List<EditorAddCandidate>) {
+        val remote = candidates.filterIsInstance<EditorAddCandidate.Remote>()
+        val phoneHard = candidates.filterIsInstance<EditorAddCandidate.PhoneHard>()
+        val local = candidates.filterIsInstance<EditorAddCandidate.LocalUri>()
+        val skippedWeb = candidates.count { it is EditorAddCandidate.WebFile }
+        viewModelScope.launch {
+            val references = withContext(Dispatchers.IO) {
+                remote.groupBy { it.connection.id }.values.flatMap { group -> remoteReferences(group.first().connection, group.map { it.item }) } +
+                    phoneHardReferences(phoneHard.map { it.item }) +
+                    local.map { buildLocalReference(it.uri, null, null) }
+            }
+            offerWorkbenchAdd(
+                references,
+                note = if (skippedWeb > 0) "웹 다운로드 ${skippedWeb}개는 임시 파일이라 담지 않았습니다." else null,
+            )
         }
     }
 
+    /** 즐겨찾기 files and folders: the favorite already records its connection and path, so this is metadata only. */
+    fun requestWorkbenchAddFavorites(favorites: List<RemoteFavorite>, origin: String = "FAVORITE") {
+        val candidates = favorites.map { favorite ->
+            val leaf = classifyWorkbenchLeaf(favorite.name, favorite.mimeType)
+            val kind = when {
+                favorite.isDirectory -> MaterialEntryKind.FOLDER
+                leaf == WorkbenchLeafKind.OTHER -> MaterialEntryKind.FILE
+                else -> MaterialEntryKind.MEDIA
+            }
+            if (favorite.connectionId == "phonehard") {
+                val file = resolvePhoneHardDiskFile(favorite.path)
+                val available = if (favorite.isDirectory) file.isDirectory else file.isFile && file.length() > 0L
+                MaterialItem(
+                    sourceIdentity = if (favorite.isDirectory) "phonehard-folder:${favorite.path}" else "phonehard-path:${favorite.path}",
+                    name = favorite.name,
+                    sourceType = MaterialSourceType.PHONE_HARD,
+                    isVideo = !favorite.isDirectory && leaf == WorkbenchLeafKind.VIDEO,
+                    uriString = Uri.fromFile(file).toString(),
+                    localFilePath = if (favorite.isDirectory) null else file.absolutePath,
+                    remotePath = favorite.path,
+                    state = if (available) MaterialPreparationState.READY else MaterialPreparationState.MISSING,
+                    errorMessage = if (available) null else "폰하드 항목을 찾을 수 없습니다.",
+                    fileSize = favorite.size,
+                    entryKind = kind,
+                    origin = origin,
+                    mimeType = favorite.mimeType,
+                )
+            } else {
+                MaterialItem(
+                    sourceIdentity = "remote:${favorite.connectionId}:${favorite.path}",
+                    name = favorite.name,
+                    sourceType = MaterialSourceType.REMOTE_FILE,
+                    isVideo = !favorite.isDirectory && leaf == WorkbenchLeafKind.VIDEO,
+                    uriString = favorite.path,
+                    connectionId = favorite.connectionId,
+                    remotePath = favorite.path,
+                    fileSize = favorite.size,
+                    captureTimeMillis = favorite.modifiedAt?.toEpochMilli() ?: 0L,
+                    entryKind = kind,
+                    origin = origin,
+                    mimeType = favorite.mimeType,
+                )
+            }
+        }
+        offerWorkbenchAdd(candidates)
+    }
+
+    /** PhoneHard files chosen by relative path (picker page): references to the files where they are. */
+    fun requestWorkbenchAddPhoneHardPaths(relativePaths: List<String>) = requestWorkbenchAddFavorites(
+        relativePaths.map { path ->
+            val file = resolvePhoneHardDiskFile(path)
+            RemoteFavorite(connectionId = "phonehard", path = path, name = path.trim('/').substringAfterLast('/'), isDirectory = file.isDirectory, size = file.takeIf { it.isFile }?.length())
+        },
+        origin = "PHONE_HARD",
+    )
+
+    // compatibility entry points (earlier call sites / deep links) ------------------------------------------------------
+
+    internal fun addLocalMediaToMaterialBasket(uris: List<Uri>, items: List<LocalMediaItem> = emptyList()) = requestWorkbenchAddLocal(uris, items)
+    fun addPhoneHardToMaterialBasket(phoneHardItems: List<InboxDisplayItem>) = requestWorkbenchAddPhoneHard(phoneHardItems)
+    fun addRemoteFilesToMaterialBasket(connection: RemoteConnection, remoteItems: List<RemoteFileItem>) = requestWorkbenchAddRemote(connection, remoteItems)
+
+    /** [added] null = nothing could be saved (the workbench is unchanged), never reported as success or duplicate. */
+    private fun materialAddMessage(added: Int?, duplicateMessage: String): String = when {
+        added == null -> DurableMaterialStore.loadProblem()?.takeIf { DurableMaterialStore.isPersistBlocked() }
+            ?.let { "작업대에 담지 못했습니다. $it" } ?: "작업대에 담지 못했습니다. ${MATERIAL_SAVE_ERROR}"
+        added > 0 -> "${added}개를 작업대에 담았습니다."
+        else -> duplicateMessage
+    }
+
+    // item actions ----------------------------------------------------------------------------------------------
+
+    /** Removes the REFERENCE only; the original and any copy it points at stay. */
     fun removeMaterialItem(id: String) {
         val removed = !DurableMaterialStore.contains(id) || DurableMaterialStore.removeItem(id)
-        refreshMaterials()
-        if (!removed) _state.update { it.copy(message = "재료를 빼지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+        publishMaterials()
+        if (!removed) _state.update { it.copy(message = "항목을 빼지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
     }
 
     fun reorderMaterialItem(from: Int, to: Int) {
         val moved = DurableMaterialStore.reorder(from, to)
-        refreshMaterials()
+        publishMaterials()
         if (!moved) _state.update { it.copy(message = "순서를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
     }
 
-    fun retryPrepareMaterial(item: MaterialItem) {
+    /** Moves an item inside ITS pocket; other pockets keep their own order. */
+    fun moveWorkbenchItem(pocketId: String, from: Int, to: Int) {
+        val moved = DurableMaterialStore.reorderInPocket(pocketId, from, to)
+        publishMaterials()
+        if (!moved) _state.update { it.copy(message = "순서를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+    }
+
+    /** 다시 확인: re-reads the reference state (no copy, no download). NAS items are simply set to be retried at the next run. */
+    fun recheckMaterial(item: MaterialItem) {
         viewModelScope.launch {
-            val result = prepareMaterialItems(listOf(item)).single()
-            if (result.state != MaterialPreparationState.READY) {
-                _state.update { it.copy(message = "‘${result.displayLabel}’ 준비 실패: ${result.errorMessage ?: "다시 시도해 주세요."}") }
+            val saved = withContext(Dispatchers.IO) {
+                val current = DurableMaterialStore.getItems().firstOrNull { it.id == item.id } ?: return@withContext true
+                if (current.sourceType == MaterialSourceType.REMOTE_FILE) {
+                    current.state != MaterialPreparationState.MISSING ||
+                        DurableMaterialStore.updateState(current.id, MaterialPreparationState.READY, errorMessage = null)
+                } else {
+                    val verified = verifyMaterialAccess(current.copy(state = MaterialPreparationState.READY, errorMessage = null))
+                    val target = verified ?: current.copy(state = MaterialPreparationState.READY, errorMessage = null)
+                    DurableMaterialStore.updateState(current.id, target.state, errorMessage = target.errorMessage)
+                }
             }
+            publishMaterials()
+            if (!saved) _state.update { it.copy(message = MATERIAL_SAVE_ERROR) }
         }
     }
 
     fun setMaterialExcluded(id: String, excluded: Boolean) {
-        val targetState = if (excluded) MaterialPreparationState.EXCLUDED else MaterialPreparationState.MISSING
+        val targetState = if (excluded) MaterialPreparationState.EXCLUDED else MaterialPreparationState.READY
         val saved = DurableMaterialStore.updateState(id, targetState)
-        refreshMaterials()
-        if (!saved) _state.update { it.copy(message = "재료 상태를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+        publishMaterials()
+        if (!saved) _state.update { it.copy(message = "항목 상태를 바꾸지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+        else refreshMaterials()
+    }
+
+    // 다시 연결 --------------------------------------------------------------------------------------------------
+
+    /**
+     * The user picked a replacement for a reference that is gone / expired. Unless it is the very same identity the
+     * change waits for an explicit confirmation; only this reference changes, never another pocket's.
+     */
+    internal fun reconnectLocalReference(item: MaterialItem, newUri: Uri) {
+        viewModelScope.launch {
+            val replacement = withContext(Dispatchers.IO) { buildLocalReference(newUri, null, item.origin) }
+            if (replacement.sourceIdentity == item.sourceIdentity) {
+                val saved = withContext(Dispatchers.IO) { DurableMaterialStore.replaceReference(item.id, replacement.copy(pocketId = item.pocketId)) }
+                publishMaterials()
+                _state.update { it.copy(message = if (saved) "‘${item.displayLabel}’ 연결을 다시 확인했습니다." else MATERIAL_SAVE_ERROR) }
+            } else {
+                _state.update { it.copy(workbenchReconnect = WorkbenchReconnect(item.id, item.displayLabel, replacement)) }
+            }
+        }
+    }
+
+    internal fun reconnectFolderReference(item: MaterialItem, treeUri: Uri) {
+        viewModelScope.launch {
+            val replacement = withContext(Dispatchers.IO) {
+                runCatching { application.contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                item.copy(sourceIdentity = "tree:$treeUri", uriString = treeUri.toString(), grantPersisted = true)
+            }
+            if (replacement.sourceIdentity == item.sourceIdentity) {
+                val saved = withContext(Dispatchers.IO) { DurableMaterialStore.replaceReference(item.id, replacement) }
+                publishMaterials()
+                _state.update { it.copy(message = if (saved) "‘${item.displayLabel}’ 폴더 연결을 다시 확인했습니다." else MATERIAL_SAVE_ERROR) }
+            } else {
+                _state.update { it.copy(workbenchReconnect = WorkbenchReconnect(item.id, item.displayLabel, replacement)) }
+            }
+        }
+    }
+
+    fun confirmWorkbenchReconnect() {
+        val pending = _state.value.workbenchReconnect ?: return
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) { DurableMaterialStore.replaceReference(pending.itemId, pending.replacement) }
+            publishMaterials()
+            _state.update {
+                it.copy(
+                    workbenchReconnect = null,
+                    message = if (saved) "‘${pending.oldName}’ 참조를 선택한 항목으로 바꿨습니다. 원본 파일은 건드리지 않았습니다."
+                    else "참조를 바꾸지 못했습니다. 같은 포켓에 이미 같은 항목이 있거나 저장에 실패했습니다. 기존 참조는 그대로입니다.",
+                )
+            }
+        }
+    }
+
+    fun dismissWorkbenchReconnect() { _state.update { it.copy(workbenchReconnect = null) } }
+
+    /** NAS reference: the connection is missing -> go to the Finder to restore it; otherwise open the folder that held the file. */
+    fun reconnectRemoteReference(item: MaterialItem) {
+        val connection = _state.value.connections.firstOrNull { it.id == item.connectionId }
+        if (connection == null) {
+            selectMainDestination(MainNavigationDestination.FINDER)
+            _state.update { it.copy(message = "‘${item.displayLabel}’의 NAS 연결을 찾을 수 없습니다. 연결을 다시 추가하거나 복구한 뒤 다시 시도해 주세요. 작업대 항목은 그대로 남아 있습니다.") }
+            return
+        }
+        val parent = item.remotePath.orEmpty().trimEnd('/').substringBeforeLast('/', connection.normalizedRootPath).ifBlank { connection.normalizedRootPath }
+        openConnection(connection, parent)
+        _state.update { it.copy(message = "항목이 옮겨졌거나 지워졌는지 확인한 뒤, 다시 담거나 작업대에서 항목을 직접 빼 주세요.") }
+    }
+
+    // explicit runs -------------------------------------------------------------------------------------------------
+
+    private fun runProgress(name: String, found: Int) {
+        _state.update { cur -> cur.workbenchRun?.let { run -> cur.copy(workbenchRun = run.copy(name = name, current = found)) } ?: cur }
+    }
+
+    /**
+     * Expands the CURRENT content of the selected references at run start: folders are listed now (recursively, in name
+     * order, cancellable), media leaves are kept, everything else is reported. Nothing is downloaded or copied here.
+     */
+    private suspend fun planWorkbenchRun(items: List<MaterialItem>, onScan: (String, Int) -> Unit): WorkbenchRunPlan {
+        val leaves = mutableListOf<WorkbenchRunLeaf>()
+        val issues = mutableListOf<WorkbenchRunIssue>()
+        val notes = mutableListOf<String>()
+        for (item in items) {
+            kotlin.coroutines.coroutineContext.ensureActive()
+            when {
+                item.state == MaterialPreparationState.EXCLUDED -> issues += WorkbenchRunIssue(item.displayLabel, "제외된 항목이라 쓰지 않습니다.")
+                item.entryKind == MaterialEntryKind.FILE -> issues += WorkbenchRunIssue(item.displayLabel, "미디어가 아닌 파일이라 지원하지 않습니다.")
+                item.entryKind == MaterialEntryKind.FOLDER -> expandWorkbenchFolder(item, leaves, issues, notes, onScan)
+                else -> leaves += WorkbenchRunLeaf(item, stored = true)
+            }
+        }
+        return WorkbenchRunPlan(leaves, issues, notes)
+    }
+
+    private suspend fun expandWorkbenchFolder(
+        folder: MaterialItem,
+        leaves: MutableList<WorkbenchRunLeaf>,
+        issues: MutableList<WorkbenchRunIssue>,
+        notes: MutableList<String>,
+        onScan: (String, Int) -> Unit,
+    ) {
+        val before = leaves.size
+        var skippedOther = 0
+        var unsafe = 0
+        val unsafeNames = mutableListOf<String>()
+        fun markUnsafe(name: String) { unsafe++; if (unsafeNames.size < 3) unsafeNames += name }
+        fun leafOf(parent: MaterialItem, name: String, mime: String?, build: (Boolean) -> MaterialItem) {
+            val kind = classifyWorkbenchLeaf(name, mime)
+            if (kind == WorkbenchLeafKind.OTHER) { skippedOther++; return }
+            leaves += WorkbenchRunLeaf(build(kind == WorkbenchLeafKind.VIDEO), stored = false, parentName = parent.displayLabel, rootId = parent.id)
+            onScan(parent.displayLabel, leaves.size - before)
+        }
+        try {
+            when (folder.sourceType) {
+                // SAF: children come only from buildChildDocumentsUriUsingTree(grantedTree, parentId), so the framework keeps every
+                // read inside the granted tree. Document ids are tracked so a provider that links folders can not loop.
+                MaterialSourceType.LOCAL_LIBRARY -> withContext(Dispatchers.IO) {
+                    val tree = Uri.parse(folder.uriString)
+                    val pending = ArrayDeque<Pair<String, Int>>().apply { add(DocumentsContract.getTreeDocumentId(tree) to 0) }
+                    val seenDirs = mutableSetOf<String>()
+                    val seenDocs = mutableSetOf<String>()
+                    while (pending.isNotEmpty()) {
+                        ensureActive()
+                        val (parentId, depth) = pending.removeFirst()
+                        if (!seenDirs.add(parentId)) continue
+                        if (depth > WORKBENCH_MAX_FOLDER_DEPTH) { markUnsafe(parentId.substringAfterLast('/')); continue }
+                        val children = mutableListOf<Array<String?>>()
+                        application.contentResolver.query(
+                            DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId),
+                            arrayOf(
+                                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                                DocumentsContract.Document.COLUMN_SIZE,
+                            ),
+                            null, null, null,
+                        )?.use { c ->
+                            while (c.moveToNext()) children += arrayOf(c.getString(0), c.getString(1), c.getString(2), if (c.isNull(3)) null else c.getLong(3).toString())
+                        } ?: throw java.io.IOException("폴더를 읽을 수 없습니다.")
+                        val ordered = children.sortedBy { it[1].orEmpty().lowercase() }
+                        // Files of this folder first (name order), then its sub-folders, so the result order is predictable.
+                        ordered.filter { it[2] != DocumentsContract.Document.MIME_TYPE_DIR }.forEach { child ->
+                            if (!seenDocs.add(child[0].orEmpty())) return@forEach
+                            val doc = DocumentsContract.buildDocumentUriUsingTree(tree, child[0].orEmpty())
+                            leafOf(folder, child[1].orEmpty(), child[2]) { video ->
+                                MaterialItem(
+                                    sourceIdentity = "tree-doc:$doc", name = child[1].orEmpty(), sourceType = MaterialSourceType.LOCAL_LIBRARY,
+                                    isVideo = video, uriString = doc.toString(), fileSize = child[3]?.toLongOrNull(), pocketId = folder.pocketId,
+                                    origin = folder.origin, mimeType = child[2],
+                                )
+                            }
+                        }
+                        ordered.filter { it[2] == DocumentsContract.Document.MIME_TYPE_DIR }.reversed().forEach { pending.addFirst(it[0].orEmpty() to depth + 1) }
+                    }
+                }
+                // PhoneHard: the owned-root resolution (canonical path inside the PhoneHard root) is applied to the referenced
+                // folder and to every entry; symbolic links and anything whose canonical path leaves the folder are not followed.
+                MaterialSourceType.PHONE_HARD -> withContext(Dispatchers.IO) {
+                    val canonicalRoot = resolvePhoneHardDiskFile(folder.remotePath.orEmpty()).canonicalFile
+                    val rootPrefix = canonicalRoot.path + File.separator
+                    fun inside(file: File): Boolean = file.canonicalFile.let { it == canonicalRoot || it.path.startsWith(rootPrefix) }
+                    if (!canonicalRoot.isDirectory) throw java.io.IOException("폰하드 폴더를 찾을 수 없습니다.")
+                    val pending = ArrayDeque<Pair<String, Int>>().apply { add(folder.remotePath.orEmpty() to 0) }
+                    val seenDirs = mutableSetOf<String>()
+                    while (pending.isNotEmpty()) {
+                        ensureActive()
+                        val (relative, depth) = pending.removeFirst()
+                        val dir = resolvePhoneHardDiskFile(relative)
+                        if (!inside(dir) || !seenDirs.add(dir.canonicalPath)) continue
+                        if (depth > WORKBENCH_MAX_FOLDER_DEPTH) { markUnsafe(dir.name); continue }
+                        val entries = inboxStore.listPhoneHardFolder(relative.ifBlank { null }).sortedBy { it.name.lowercase() }
+                        val safe = entries.filter { entry ->
+                            val ok = !java.nio.file.Files.isSymbolicLink(entry.file.toPath()) && inside(entry.file)
+                            if (!ok) markUnsafe(entry.name)
+                            ok
+                        }
+                        safe.filter { it.kind != com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY }.forEach { entry ->
+                            leafOf(folder, entry.name, entry.mimeType) { video ->
+                                MaterialItem(
+                                    sourceIdentity = "phonehard-path:${entry.relativePath}", name = entry.name, sourceType = MaterialSourceType.PHONE_HARD,
+                                    isVideo = video, uriString = Uri.fromFile(entry.file).toString(), localFilePath = entry.file.absolutePath,
+                                    fileSize = entry.byteCount, pocketId = folder.pocketId, origin = folder.origin, mimeType = entry.mimeType,
+                                )
+                            }
+                        }
+                        safe.filter { it.kind == com.armsone.nasfinder.data.PhoneHardEntryKind.DIRECTORY }.reversed().forEach { pending.addFirst(it.relativePath to depth + 1) }
+                    }
+                }
+                // NAS / cloud: every listed path is normalized (dot / repeated separators) and must stay inside the referenced
+                // folder; a path that leaves it is skipped and reported. The backend gives no symlink flag, so loops are bounded
+                // by the visited set and the depth limit and reported instead of trusted.
+                MaterialSourceType.REMOTE_FILE -> {
+                    val connection = _state.value.connections.firstOrNull { it.id == folder.connectionId }
+                        ?: throw IllegalStateException("NAS 연결을 찾을 수 없습니다.")
+                    val root = normalizeWorkbenchRemotePath(folder.remotePath.orEmpty())
+                        ?: throw IllegalStateException("폴더 경로가 올바르지 않습니다.")
+                    withDedicatedRemoteService(connection) { svc ->
+                        val pending = ArrayDeque<Triple<String, String, Int>>().apply { add(Triple(folder.remotePath.orEmpty(), root, 0)) }
+                        val seen = mutableSetOf<String>()
+                        while (pending.isNotEmpty()) {
+                            kotlin.coroutines.coroutineContext.ensureActive()
+                            val (listPath, normalized, depth) = pending.removeFirst()
+                            if (!seen.add(normalized)) continue
+                            if (depth > WORKBENCH_MAX_FOLDER_DEPTH) { markUnsafe(normalized.substringAfterLast('/')); continue }
+                            val entries = svc.list(listPath)
+                                .filter { it.name.isNotBlank() && it.name != "." && it.name != ".." && !it.name.startsWith('.') }
+                                .sortedBy { it.name.lowercase() }
+                            val safe = entries.mapNotNull { entry ->
+                                val childNormalized = normalizeWorkbenchRemotePath(entry.path)
+                                if (childNormalized == null || !isInsideWorkbenchRoot(root, childNormalized)) { markUnsafe(entry.name); null }
+                                else if (childNormalized == normalized) null
+                                else entry to childNormalized
+                            }
+                            safe.filter { !it.first.isDirectory }.forEach { (entry, _) ->
+                                leafOf(folder, entry.name, entry.mimeType) { video ->
+                                    MaterialItem(
+                                        sourceIdentity = "remote:${connection.id}:${entry.path}", name = entry.name, sourceType = MaterialSourceType.REMOTE_FILE,
+                                        isVideo = video, uriString = entry.path, connectionId = connection.id, remotePath = entry.path,
+                                        fileSize = entry.size.takeIf { it > 0L }, captureTimeMillis = entry.modifiedAt?.toEpochMilli() ?: 0L,
+                                        pocketId = folder.pocketId, origin = folder.origin, mimeType = entry.mimeType,
+                                    )
+                                }
+                            }
+                            safe.filter { it.first.isDirectory }.reversed().forEach { (entry, childNormalized) -> pending.addFirst(Triple(entry.path, childNormalized, depth + 1)) }
+                        }
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val reason = error.message ?: "폴더를 읽지 못했습니다."
+            // The reference stays; it is marked so the user sees 다시 연결.
+            withContext(Dispatchers.IO) { DurableMaterialStore.updateState(folder.id, MaterialPreparationState.MISSING, errorMessage = reason) }
+            issues += WorkbenchRunIssue(folder.displayLabel, "폴더를 읽지 못했습니다: $reason")
+            return
+        }
+        val found = leaves.size - before
+        if (found == 0) issues += WorkbenchRunIssue(folder.displayLabel, "폴더 안에 지금 사용할 수 있는 미디어가 없습니다.")
+        else notes += "폴더 ‘${folder.displayLabel}’: 미디어 ${found}개"
+        // Skipped content is an explicit decision point (listed in the confirmation), not a completion note.
+        if (skippedOther > 0) issues += WorkbenchRunIssue(folder.displayLabel, "미디어가 아닌 파일 ${skippedOther}개는 대상이 아니라 건너뜁니다.")
+        if (unsafe > 0) issues += WorkbenchRunIssue(folder.displayLabel, "안전하지 않거나 범위를 벗어난 경로 ${unsafe}개(${unsafeNames.joinToString()})는 따라가지 않았습니다. 심볼릭 링크·폴더 밖 경로·너무 깊은 하위 폴더입니다.")
+        if (folder.state == MaterialPreparationState.MISSING && !folder.errorMessage.isNullOrBlank()) {
+            withContext(Dispatchers.IO) { DurableMaterialStore.updateState(folder.id, MaterialPreparationState.READY, errorMessage = null) }
+        }
+    }
+
+    private fun planSummary(plan: WorkbenchRunPlan): String =
+        (plan.issues.map { "${it.name}: ${it.reason}" } + plan.notes).joinToString(" / ")
+
+    /** Reads the whole plan, then asks once when something is unsupported; never silently drops an item. */
+    fun startWorkbenchVideo(items: List<MaterialItem>, inheritedPrivate: Boolean = false) {
+        if (_state.value.workbenchRun != null) return
+        val snapshot = items.toList()
+        if (snapshot.isEmpty()) {
+            _state.update { it.copy(message = "영상 제작에 사용할 항목을 먼저 선택해 주세요.") }
+            return
+        }
+        // 첫 번째 중단점 전에 출처를 한 번 고정한다: 지금 모드 또는 입력(항목·포켓·연결·경로) 중 하나라도 비공개이면 비공개.
+        val jobPrivate = inheritedPrivate || PrivacyMode.capturedOrigin(snapshot.any(DurableMaterialStore::isEffectivelyPrivate))
+        trailerRetry = {
+            // 다시 시도할 때는 숨겨진 항목도 조용히 빠지지 않도록 전체 항목에서 찾고, 처음 고정한 출처를 이어받는다.
+            val fresh = snapshot.mapNotNull { old -> DurableMaterialStore.getAllItems().firstOrNull { it.id == old.id } }
+            startWorkbenchVideo(fresh, inheritedPrivate = jobPrivate)
+        }
+        workbenchRunJob = viewModelScope.launch {
+            _state.update { it.copy(workbenchRun = WorkbenchRunState(WorkbenchRunKind.VIDEO, "항목을 확인하는 중…", originPrivate = jobPrivate)) }
+            val plan = try {
+                planWorkbenchRun(snapshot) { name, found -> runProgress(name, found) }
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(workbenchRun = null, message = "취소했습니다. 작업대 항목은 그대로 남아 있습니다.") }
+                throw cancelled
+            }
+            if (plan.issues.isNotEmpty()) {
+                _state.update { cur -> cur.workbenchRun?.let { run -> cur.copy(workbenchRun = run.copy(phase = "사용할 수 없는 항목이 있습니다.", awaiting = plan)) } ?: cur }
+            } else {
+                proceedWorkbenchVideo(plan, jobPrivate)
+            }
+        }
+    }
+
+    /** 미디어 전송 from the 작업대: the pocket and its selection are kept; the transfer screen still waits for the QR and an explicit 보내기. */
+    fun openWorkbenchSend(pocketId: String) {
+        _state.update { it.copy(workbenchPocketId = pocketId, workbenchSendRequested = true) }
+        show(Screen.PhotoTransfer)
+    }
+
+    fun consumeWorkbenchSendRequest() { _state.update { it.copy(workbenchSendRequested = false) } }
+
+    fun confirmWorkbenchRun() {
+        val run = _state.value.workbenchRun ?: return
+        // Fetch failures: the user chose to continue with the inputs that were read.
+        run.partial?.let { it.decision.complete(true); return }
+        val plan = run.awaiting ?: return
+        if (run.kind == WorkbenchRunKind.VIDEO) proceedWorkbenchVideo(plan, run.originPrivate)
+        else _state.update { it.copy(workbenchRun = null) }
+    }
+
+    /** Cancels scanning or declines the unsupported-items prompt. References and selection stay as they were. */
+    fun cancelWorkbenchRun() {
+        // Fetch failures: declining ends the run (the waiting run removes only its own temporary workspace).
+        _state.value.workbenchRun?.partial?.let { it.decision.complete(false); return }
+        workbenchRunJob?.cancel()
+        workbenchRunJob = null
+        _state.update { it.copy(workbenchRun = null, message = "취소했습니다. 작업대 항목은 그대로 남아 있습니다.") }
+    }
+
+    /** Suspends the run until the user decides whether to continue with fewer inputs. Never continues on its own. */
+    private suspend fun askWorkbenchPartial(kind: WorkbenchRunKind, failures: List<WorkbenchRunIssue>, available: Int, originPrivate: Boolean): Boolean {
+        val decision = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        _state.update { it.copy(workbenchRun = WorkbenchRunState(kind, "일부 항목을 읽지 못했습니다.", partial = WorkbenchPartial(failures, available, decision), originPrivate = originPrivate)) }
+        return try {
+            decision.await()
+        } finally {
+            _state.update { it.copy(workbenchRun = null) }
+        }
+    }
+
+    private fun workbenchCaptureTime(item: MaterialItem): Long {
+        if (item.captureTimeMillis > 0L) return item.captureTimeMillis
+        return when (item.sourceType) {
+            MaterialSourceType.LOCAL_LIBRARY -> localCaptureTime(Uri.parse(item.uriString))
+            MaterialSourceType.PHONE_HARD -> item.localFilePath?.let { File(it).lastModified() } ?: 0L
+            MaterialSourceType.REMOTE_FILE -> 0L
+        }
+    }
+
+    private fun proceedWorkbenchVideo(plan: WorkbenchRunPlan, jobPrivate: Boolean) {
+        _state.update { it.copy(workbenchRun = null) }
+        if (plan.leaves.isEmpty()) {
+            _state.update { it.copy(message = "영상 제작에 쓸 수 있는 미디어가 없습니다. " + planSummary(plan)) }
+            return
+        }
+        val leaves = plan.leaves
+        val services = mutableMapOf<String, RemoteFileService>()
+        val failures = mutableListOf<WorkbenchRunIssue>()
+        var stateSaveFailed = false
+        val motionUris: MutableList<Uri?> = leaves.map { leaf ->
+            leaf.item.takeIf { it.sourceType == MaterialSourceType.LOCAL_LIBRARY && !it.isVideo }?.let { Uri.parse(it.uriString) }
+        }.toMutableList()
+        prepareTrailer(
+            names = leaves.map { it.item.displayLabel },
+            captureTimes = leaves.map { workbenchCaptureTime(it.item) },
+            motionSourceUris = motionUris,
+            originKeys = leaves.map { leaf ->
+                val item = leaf.item
+                when (item.sourceType) {
+                    MaterialSourceType.LOCAL_LIBRARY -> editorOriginLocal(item.uriString)
+                    MaterialSourceType.REMOTE_FILE -> editorOriginRemote(item.connectionId.orEmpty(), item.remotePath.orEmpty())
+                    MaterialSourceType.PHONE_HARD -> item.sourceIdentity.takeIf { it.startsWith("phonehard:") }?.let { editorOriginPhoneHard(it.removePrefix("phonehard:")) }
+                }
+            },
+            // Fetch / permission errors never turn into a quietly smaller project: the user decides first.
+            beforeFinish = { staged -> failures.isEmpty() || askWorkbenchPartial(WorkbenchRunKind.VIDEO, failures.toList(), staged, jobPrivate) },
+            jobPrivate = jobPrivate,
+        ) { index, destination ->
+            val leaf = leaves[index]
+            try {
+                stageWorkbenchLeaf(leaf.item, destination, services)
+                if (leaf.stored && leaf.item.state != MaterialPreparationState.READY) {
+                    if (!withContext(Dispatchers.IO) { DurableMaterialStore.updateState(leaf.item.id, MaterialPreparationState.READY, errorMessage = null) }) stateSaveFailed = true
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                val reason = error.message ?: "읽을 수 없습니다."
+                runCatching { destination.delete() }
+                motionUris[index] = null
+                failures += WorkbenchRunIssue(leaf.item.displayLabel, reason)
+                if (leaf.stored && !withContext(Dispatchers.IO) { DurableMaterialStore.updateState(leaf.item.id, MaterialPreparationState.MISSING, errorMessage = reason) }) stateSaveFailed = true
+            }
+        }
+        trailerJob?.invokeOnCompletion {
+            services.values.forEach { runCatching { it.close() } }
+            viewModelScope.launch {
+                publishMaterials()
+                val notice = (failures.map { "${it.name}: ${it.reason}" } + plan.notes + listOfNotNull(MATERIAL_SAVE_ERROR.takeIf { stateSaveFailed })).joinToString(" / ")
+                if (notice.isNotBlank()) _state.update { cur -> cur.copy(message = (if (failures.isNotEmpty()) "읽지 못한 항목이 있습니다. 작업대에는 그대로 남아 ‘다시 연결’할 수 있습니다. " else "") + notice) }
+            }
+        }
+    }
+
+    /** Copies / downloads ONE reference into [destination] inside the run's own project folder. Never touches the original. */
+    private suspend fun stageWorkbenchLeaf(item: MaterialItem, destination: File, services: MutableMap<String, RemoteFileService>) {
+        val legacyCopy = item.localFilePath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+        when {
+            legacyCopy != null -> withContext(Dispatchers.IO) { legacyCopy.copyTo(destination, overwrite = true) }
+            item.sourceType == MaterialSourceType.LOCAL_LIBRARY -> kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                application.contentResolver.openInputStream(Uri.parse(item.uriString))?.use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted) throw CancellationException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: error("원본을 열 수 없습니다. ‘다시 연결’이 필요할 수 있습니다.")
+            }
+            item.sourceType == MaterialSourceType.PHONE_HARD -> error("폰하드 파일을 찾을 수 없습니다.")
+            else -> {
+                val connection = _state.value.connections.firstOrNull { it.id == item.connectionId }
+                    ?: error("NAS 연결을 찾을 수 없습니다 (${item.connectionId.orEmpty()}).")
+                val service = services.getOrPut(connection.id) { openDedicatedRemoteService(connection) }
+                service.download(
+                    RemoteFileItem(id = item.id, name = item.name, path = item.remotePath.orEmpty(), isDirectory = false, size = item.fileSize ?: 0L),
+                    destination,
+                )
+                val expected = item.fileSize ?: 0L
+                check(destination.length() > 0 && (expected <= 0 || destination.length() == expected)) { "파일을 끝까지 받지 못했습니다." }
+            }
+        }
+        check(destination.length() > 0) { "파일을 끝까지 읽지 못했습니다." }
+    }
+
+    /** Plans (folder expansion, unsupported report) for a 전송 run; the caller shows [WorkbenchRunPlan.issues] before sending. */
+    internal suspend fun planWorkbenchSend(items: List<MaterialItem>, onScan: (String, Int) -> Unit): WorkbenchRunPlan = planWorkbenchRun(items, onScan)
+
+    internal suspend fun materializeWorkbenchForSend(
+        leaves: List<WorkbenchRunLeaf>,
+        onProgress: (index: Int, total: Int, name: String) -> Unit,
+    ): WorkbenchSendMaterialization {
+        val runDirectory = File(application.cacheDir, "workbench_send/${UUID.randomUUID()}")
+        val services = mutableMapOf<String, RemoteFileService>()
+        val entries = mutableListOf<WorkbenchSendEntry>()
+        val failures = mutableListOf<WorkbenchRunIssue>()
+        try {
+            withContext(Dispatchers.IO) { runDirectory.mkdirs() }
+            leaves.forEachIndexed { index, leaf ->
+                kotlin.coroutines.coroutineContext.ensureActive()
+                val item = leaf.item
+                onProgress(index, leaves.size, item.displayLabel)
+                try {
+                    val legacyCopy = item.localFilePath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+                    val source: Uri = when {
+                        legacyCopy != null -> Uri.fromFile(legacyCopy)
+                        item.sourceType == MaterialSourceType.LOCAL_LIBRARY -> Uri.parse(item.uriString)
+                        item.sourceType == MaterialSourceType.PHONE_HARD -> error("폰하드 파일을 찾을 수 없습니다.")
+                        else -> {
+                            val safeName = item.name.substringAfterLast('/').replace(Regex("[\\\\:*?\"<>|]"), "_").ifBlank { "media" }
+                            val target = File(File(runDirectory, index.toString()).also { it.mkdirs() }, safeName)
+                            stageWorkbenchLeaf(item, target, services)
+                            Uri.fromFile(target)
+                        }
+                    }
+                    val media = withContext(Dispatchers.IO) { describeTransferMedia(application, source, item.name, item.mimeType) }
+                        ?: error("읽을 수 없거나 미디어가 아닙니다.")
+                    entries += WorkbenchSendEntry(leaf, media)
+                    if (leaf.stored && item.state == MaterialPreparationState.MISSING) {
+                        withContext(Dispatchers.IO) { DurableMaterialStore.updateState(item.id, MaterialPreparationState.READY, errorMessage = null) }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    val reason = error.message ?: "읽을 수 없습니다."
+                    failures += WorkbenchRunIssue(item.displayLabel, reason)
+                    if (leaf.stored) withContext(Dispatchers.IO) { DurableMaterialStore.updateState(item.id, MaterialPreparationState.MISSING, errorMessage = reason) }
+                }
+            }
+        } catch (error: Throwable) {
+            withContext(NonCancellable + Dispatchers.IO) { deleteOwnedSendRunDirectory(runDirectory) }
+            throw error
+        } finally {
+            services.values.forEach { runCatching { it.close() } }
+            withContext(NonCancellable) { publishMaterials() }
+        }
+        return WorkbenchSendMaterialization(entries, failures, runDirectory)
+    }
+
+    /** Removes exactly the temporary workspace of one finished / failed / cancelled 전송 run. */
+    internal fun finishWorkbenchSend(runDirectory: File?) {
+        if (runDirectory == null) return
+        viewModelScope.launch(Dispatchers.IO + NonCancellable) { deleteOwnedSendRunDirectory(runDirectory) }
+    }
+
+    /**
+     * Recursive delete that only ever touches one run workspace: an immediate child of cacheDir/workbench_send whose name is a
+     * run UUID, resolved canonically and not a symbolic link. Anything else is left alone.
+     */
+    private fun deleteOwnedSendRunDirectory(runDirectory: File) {
+        runCatching {
+            val root = File(application.cacheDir, "workbench_send").canonicalFile
+            val target = runDirectory.canonicalFile
+            val ownedName = runCatching { UUID.fromString(target.name) }.isSuccess
+            if (target.parentFile == root && ownedName && !java.nio.file.Files.isSymbolicLink(runDirectory.toPath())) target.deleteRecursively()
+        }
     }
 
     private fun getMaterialsDirectory(): File {
@@ -6256,8 +7476,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (DurableMaterialStore.updateState(item.id, prepared.state, prepared.downloadProgress, prepared.localFilePath, prepared.errorMessage)) return prepared
             ownedNewFile?.delete()
             val reason = when {
-                DurableMaterialStore.isPersistBlocked() -> "재료함 목록 파일 문제로 저장이 멈춰 있어 준비 결과를 기록하지 못했습니다. 앱을 다시 열어 주세요."
-                !DurableMaterialStore.contains(item.id) -> "재료함에서 빠진 항목이라 준비 결과를 기록하지 못했습니다."
+                DurableMaterialStore.isPersistBlocked() -> "작업대 목록 파일 문제로 저장이 멈춰 있어 준비 결과를 기록하지 못했습니다. 앱을 다시 열어 주세요."
+                !DurableMaterialStore.contains(item.id) -> "작업대에서 빠진 항목이라 준비 결과를 기록하지 못했습니다."
                 else -> "준비 결과를 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
             }
             return if (prepared.state == MaterialPreparationState.READY) {
@@ -6409,50 +7629,146 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    fun startTrailerFromMaterials(materialItems: List<MaterialItem>) {
-        val selected = materialItems.filter { it.state != MaterialPreparationState.EXCLUDED }
-        if (selected.isEmpty()) {
-            _state.update { it.copy(message = "영상 제작에 사용할 선택된 재료가 없습니다.") }
+    // ---- 프라이버시 모드 -----------------------------------------------------------------------------------------------
+    // 추가형 가시성: 일반 모드 = 공개만, 프라이버시 모드 = 공개 + 비공개. 메모리에만 있고 앱을 새로 열면 항상 일반 모드다.
+
+    fun togglePrivacyMode() = setPrivacyMode(!PrivacyMode.isActive)
+
+    fun setPrivacyMode(active: Boolean) {
+        if (PrivacyMode.isActive == active) return
+        PrivacyMode.setActive(active)
+        reloadForPrivacyMode()
+    }
+
+    /** 프라이버시 모드에서 로고를 한 번 누르면: 모드를 끄고 홈으로 간다(머리글 글자는 NasFinder로 돌아온다). */
+    fun exitPrivacyToHome() = setPrivacyMode(false)
+
+    /**
+     * 모드가 바뀌면 보이는 목록을 다시 읽고 화면·시트·선택을 비운다. 진행 중인 편집·내보내기·다운로드는 취소하거나 지우지 않는다
+     * (편집기는 접어 두기만 한다). 이미 시작한 작업의 공개 범위는 시작 시점에 고정되어 바뀌지 않는다.
+     */
+    private fun reloadForPrivacyMode() {
+        stopInlineAudio()
+        val files = runCatching { inboxFiles() }.getOrDefault(emptyList())
+        val visibleConnections = repository.load()
+        val visibleConnectionIds = visibleConnections.mapTo(hashSetOf()) { it.id }
+        val history = loadSuperThumbnailHistory()
+        val workLocations = loadSuperThumbnailWorkLocations()
+        _state.update { current ->
+            // 슈퍼썸네일의 선택 위치·작업 위치·보고서가 이제 보이지 않는 연결을 가리키면 화면에 남지 않게 비운다(저장된 기록은 그대로).
+            val selectionHidden = current.superThumbnailConnectionId != null && current.superThumbnailConnectionId !in visibleConnectionIds
+            val workHidden = current.superThumbnailWorkLocation?.let { it.connectionId !in visibleConnectionIds } == true
+            val reportHidden = current.superThumbnailReportLocationId?.let { id ->
+                (current.superThumbnailHistory + listOfNotNull(current.superThumbnailWorkLocation)).firstOrNull { it.id == id }
+                    ?.let { it.connectionId !in visibleConnectionIds } ?: selectionHidden
+            } == true
+            current.copy(
+                connections = visibleConnections,
+                superThumbnailHistory = history,
+                superThumbnailWorkLocations = workLocations,
+                superThumbnailConnectionId = if (selectionHidden) null else current.superThumbnailConnectionId,
+                superThumbnailPath = if (selectionHidden) null else current.superThumbnailPath,
+                superThumbnailTitle = if (selectionHidden) null else current.superThumbnailTitle,
+                superThumbnailWork = if (selectionHidden) null else current.superThumbnailWork,
+                superThumbnailWorkLocation = if (workHidden) null else current.superThumbnailWorkLocation,
+                superThumbnailSessionReport = if (reportHidden || selectionHidden) null else current.superThumbnailSessionReport,
+                superThumbnailReportLocationId = if (reportHidden || selectionHidden) null else current.superThumbnailReportLocationId,
+                preferredId = repository.preferredId(),
+                remoteFavorites = favoriteRepository.remoteFavorites(),
+                browserFavorites = favoriteRepository.browserFavorites(),
+                inboxFiles = files,
+                inboxErrorMessage = null,
+                collections = DurableCollectionStore.getItems(),
+                trailerDraftCount = TrailerDraftStore.draftCount(),
+                trailerDraftPicker = null,
+                screen = Screen.Dashboard,
+                activeMainTab = MainNavigationDestination.HOME,
+                imagePreview = null,
+                homeFavoriteAction = null,
+                browserSelectRequest = null,
+                initialInboxSubpath = null,
+                pendingTransfer = null,
+                pendingInboxUpload = null,
+                pendingLocalUpload = null,
+                workbenchAdd = null,
+                workbenchSelected = emptySet(),
+                workbenchReconnect = null,
+                pendingCollectionImport = null,
+                collectionCopyOffer = null,
+                trailerMinimized = current.trailer != null || current.trailerMinimized,
+                message = null,
+            )
+        }
+        publishMaterials()
+    }
+
+    // 명시적인 공개/비공개 전환. 일반 모드에서 비공개로 바꾸면 그 기록이 열려 있던 화면·선택을 즉시 닫는다.
+    private val hidesOnPrivate: (Boolean) -> Boolean get() = { isPrivate -> isPrivate && !PrivacyMode.isActive }
+
+    fun setConnectionPrivate(connection: RemoteConnection, isPrivate: Boolean) {
+        repository.setPrivate(connection.id, isPrivate)
+        val hiding = hidesOnPrivate(isPrivate)
+        _state.update { current ->
+            val viewingIt = hiding && (current.screen as? Screen.Browser)?.connection?.id == connection.id
+            current.copy(
+                connections = repository.load(),
+                preferredId = repository.preferredId(),
+                remoteFavorites = favoriteRepository.remoteFavorites(),
+                screen = if (viewingIt) Screen.Dashboard else current.screen,
+                homeFavoriteAction = if (hiding) null else current.homeFavoriteAction,
+            )
+        }
+    }
+
+    fun setRemoteFavoritePrivate(favoriteId: String, isPrivate: Boolean) {
+        val list = favoriteRepository.setRemotePrivate(favoriteId, isPrivate)
+        _state.update { it.copy(remoteFavorites = list, homeFavoriteAction = if (hidesOnPrivate(isPrivate)) null else it.homeFavoriteAction) }
+    }
+
+    fun setBrowserFavoritePrivate(favoriteId: String, isPrivate: Boolean) {
+        _state.update { it.copy(browserFavorites = favoriteRepository.setBrowserPrivate(favoriteId, isPrivate)) }
+    }
+
+    fun setPocketPrivate(pocketId: String, isPrivate: Boolean) {
+        if (!DurableMaterialStore.setPocketPrivate(pocketId, isPrivate)) {
+            _state.update { it.copy(message = MATERIAL_SAVE_ERROR) }
             return
         }
+        publishMaterials()
+    }
 
-        viewModelScope.launch {
-            _state.update { it.copy(message = "재료를 준비하는 중입니다…") }
-            val prepared = prepareMaterialItems(selected, onProgress = { completed, total, currentName ->
-                _state.update { it.copy(message = "재료 준비 중 (${completed + 1}/$total): $currentName") }
-            })
-
-            val failed = prepared.filter { it.state != MaterialPreparationState.READY }
-            if (failed.isNotEmpty()) {
-                _state.update {
-                    it.copy(
-                        message = "${failed.size}개 재료의 준비가 완료되지 않았습니다. 누락 항목을 확인하거나 제외한 후 다시 시도해 주세요."
-                    )
-                }
-                return@launch
-            }
-
-            // All selected items are READY: create the ordered URI list and proceed
-            val uris = prepared.mapNotNull { item ->
-                when (item.sourceType) {
-                    MaterialSourceType.LOCAL_LIBRARY -> {
-                        item.localFilePath?.let { Uri.fromFile(File(it)) } ?: Uri.parse(item.uriString)
-                    }
-                    MaterialSourceType.PHONE_HARD -> {
-                        item.localFilePath?.let { Uri.fromFile(File(it)) } ?: Uri.parse(item.uriString)
-                    }
-                    MaterialSourceType.REMOTE_FILE -> {
-                        item.localFilePath?.let { Uri.fromFile(File(it)) }
-                    }
-                }
-            }
-
-            if (uris.size == prepared.size) {
-                startLocalMediaTrailer(uris)
-            } else {
-                _state.update { it.copy(message = "일부 재료의 로컬 경로를 확인할 수 없습니다.") }
-            }
+    fun setMaterialPrivate(itemId: String, isPrivate: Boolean) {
+        if (!DurableMaterialStore.setItemPrivate(itemId, isPrivate)) {
+            _state.update { it.copy(message = MATERIAL_SAVE_ERROR) }
+            return
         }
+        publishMaterials()
+    }
+
+    fun setCollectionPrivate(itemId: String, isPrivate: Boolean) {
+        DurableCollectionStore.setPrivate(itemId, isPrivate)
+        refreshCollections()
+    }
+
+    fun setDraftPrivate(draftId: String, isPrivate: Boolean) {
+        TrailerDraftStore.setDraftPrivate(draftId, isPrivate)
+        _state.update {
+            it.copy(
+                trailerDraftCount = TrailerDraftStore.draftCount(),
+                trailerDraftsVersion = it.trailerDraftsVersion + 1,
+                trailerDraftPicker = it.trailerDraftPicker?.let { TrailerDraftStore.getAllDrafts() },
+            )
+        }
+    }
+
+    fun setPhoneHardPrivate(relativePath: String, isDirectory: Boolean, isPrivate: Boolean) {
+        if (!inboxStore.setPrivate(relativePath, isDirectory, isPrivate)) {
+            _state.update { it.copy(message = "공개 범위를 바꾸지 못했습니다.") }
+            return
+        }
+        val hiding = hidesOnPrivate(isPrivate)
+        refreshInbox()
+        if (hiding) _state.update { it.copy(initialInboxSubpath = null) }
     }
 
     fun refreshCollections() {
@@ -6563,7 +7879,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val operationId = UUID.randomUUID().toString()
         val output = DurableCollectionStore.compressionPartialFile(operationId) ?: return
         _state.update {
-            it.copy(compression = CollectionCompressionState(itemId, operationId, item.title, preset, CompressionPhase.PREPARING, originalBytes = item.fileSizeBytes))
+            it.copy(compression = CollectionCompressionState(itemId, operationId, item.title, preset, CompressionPhase.PREPARING, originalBytes = item.fileSizeBytes, originPrivate = item.isPrivate || PrivacyMode.isActive))
         }
         fun update(transform: (CollectionCompressionState) -> CollectionCompressionState) {
             _state.update { current ->
@@ -6698,6 +8014,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             stageCollectionImport(listOf(uri to null))
             return
         }
+        val jobPrivate = PrivacyMode.isActive
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, message = "영상을 가져오는 중…") }
             val result = withContext(Dispatchers.IO) {
@@ -6740,7 +8057,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             exportedFile = tempVideo,
                             durationSeconds = durationSec,
                             posterFile = posterFile,
-                            sourceUri = uri.toString()
+                            sourceUri = uri.toString(),
+                            isPrivate = jobPrivate,
                         ) ?: error("컬렉션에 저장하지 못했습니다. 저장 공간을 확인해 주세요.")
                     } finally {
                         tempVideo.delete()
@@ -6835,13 +8153,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             return
         }
         _state.update { it.copy(pendingCollectionImport = pending.copy(working = true, problem = null)) }
+        val jobPrivate = PrivacyMode.isActive
         viewModelScope.launch {
             val added = mutableListOf<CollectionItem>()
             val notGranted = mutableListOf<PendingImportEntry>()
             val failed = mutableListOf<Pair<PendingImportEntry, String>>()
             withContext(Dispatchers.IO) {
                 pending.entries.forEach { entry ->
-                    runCatching { addVerifiedContentReference(entry) }
+                    runCatching { addVerifiedContentReference(entry, jobPrivate) }
                         .onSuccess { item -> if (item != null) added += item else notGranted += entry }
                         .onFailure { error -> failed += entry to (error.message ?: "컬렉션 정보를 저장하지 못했습니다.") }
                 }
@@ -6872,7 +8191,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * Takes the persistable READ grant only when the picker returned it as persistable, then verifies the grant is
      * actually held before recording. Returns null (nothing recorded) when it is not; throws only on store failure.
      */
-    private fun addVerifiedContentReference(entry: PendingImportEntry): CollectionItem? {
+    private fun addVerifiedContentReference(entry: PendingImportEntry, jobPrivate: Boolean): CollectionItem? {
         val uri = Uri.parse(entry.uri)
         if (uri.scheme != "content") return null
         if (entry.persistableReadFlag != 0) {
@@ -6906,7 +8225,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             error("영상 정보를 읽지 못했습니다(영상 트랙 또는 길이 확인 실패). 지원되지 않거나 손상된 영상일 수 있습니다. 다시 시도하거나 앱 안에 사본으로 보관해 보세요.")
         }
         return try {
-            DurableCollectionStore.addContentReference(entry.title, entry.uri, durationSec, entry.sizeBytes, posterFile)
+            DurableCollectionStore.addContentReference(entry.title, entry.uri, durationSec, entry.sizeBytes, posterFile, isPrivate = jobPrivate)
                 ?: error("컬렉션 정보를 저장하지 못했습니다. 저장 공간을 확인해 주세요.")
         } finally {
             posterFile?.delete()
@@ -7001,6 +8320,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }
             return
         }
+        val jobPrivate = PrivacyMode.capturedOrigin(connection.isPrivate || PrivacyMode.isPrivateConnection(connection.id))
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, message = "${videos.size}개 영상을 가져오는 중…") }
             var successCount = 0
@@ -7040,7 +8360,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                 durationSeconds = durationSec,
                                 posterFile = posterFile,
                                 sourceUri = item.path,
-                                connectionId = connection.id
+                                connectionId = connection.id,
+                                isPrivate = jobPrivate,
                             )
                             if (saved != null) successCount++
                             posterFile?.delete()
@@ -7433,10 +8754,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ) {
         if (items.isEmpty()) return
         networkDownloadJob?.cancel()
+        // 시작하는 순간의 출처를 고정한다(프라이버시 모드, 비공개 연결, 비공개 경로의 항목).
+        val progressPrivate = PrivacyMode.capturedOrigin(
+            connection.isPrivate || PrivacyMode.isPrivateConnection(connection.id) ||
+                items.any { PrivacyMode.isPrivateOrigin(connection.id, it.path) },
+        )
         _state.update {
             it.copy(
                 isDownloadingNetwork = true,
                 networkDownloadProgress = NetworkDownloadProgress(
+                    originPrivate = progressPrivate,
                     currentFileName = "",
                     completedFiles = 0,
                     totalFiles = items.size,
@@ -7458,9 +8785,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             service = ownService,
                             items = items,
                             destination = destination,
-                        ) { progress ->
-                            if (ownJob?.isActive == true) _state.update { it.copy(networkDownloadProgress = progress) }
-                        }
+                            onProgress = { progress ->
+                                if (ownJob?.isActive == true) _state.update { it.copy(networkDownloadProgress = progress.copy(originPrivate = progressPrivate)) }
+                            },
+                            // 시작 순간에 고정한 값을 그대로 쓴다(코디네이터가 현재 모드를 다시 읽지 않는다).
+                            originPrivate = progressPrivate,
+                        )
                     }
                 }.getOrElse { e ->
                     if (e is CancellationException) {
@@ -7478,11 +8808,18 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     // A newer download owns the progress fields once it has replaced this job.
                     if (networkDownloadJob === ownJob) {
                         networkDownloadJob = null
+                        // 비공개로 시작한 작업의 결과가 일반 모드에서 끝나면 이름·경로·오류 세부를 전역 메시지에 싣지 않는다.
+                        // 결과(성공/실패/취소/건너뜀)는 그대로 알리고, 작업은 취소·삭제하지 않는다.
+                        val maskPrivate = progressPrivate && !PrivacyMode.isActive
                         val msg = when (val finished = result) {
-                            is NetworkDownloadResult.Success -> finished.message
-                            is NetworkDownloadResult.Failure -> finished.message
-                            is NetworkDownloadResult.Cancelled -> finished.message
-                            is NetworkDownloadResult.Skipped -> finished.reason
+                            is NetworkDownloadResult.Success ->
+                                if (maskPrivate) "비공개 다운로드를 완료했습니다. 프라이버시 모드에서 확인해 주세요." else finished.message
+                            is NetworkDownloadResult.Failure ->
+                                if (maskPrivate) "비공개 다운로드에 실패했습니다. 프라이버시 모드에서 다시 확인해 주세요." else finished.message
+                            is NetworkDownloadResult.Cancelled ->
+                                if (maskPrivate) "비공개 다운로드가 취소되었습니다." else finished.message
+                            is NetworkDownloadResult.Skipped ->
+                                if (maskPrivate) "비공개 다운로드에서 처리하지 않은 항목이 있습니다. 프라이버시 모드에서 확인해 주세요." else finished.reason
                         }
                         _state.update {
                             it.copy(
@@ -7678,9 +9015,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         treeUri: Uri,
         onResult: (NetworkDownloadResult) -> Unit,
     ) {
+        // 요청 순간의 보기 범위를 고정해 코디네이터의 개수 산정·복사 전체에 같은 값을 쓴다.
+        val privateVisible = PrivacyMode.isActive
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                networkDownloadCoordinator.exportPhoneHardTargetsToExternalTree(targets, treeUri)
+                networkDownloadCoordinator.exportPhoneHardTargetsToExternalTree(targets, treeUri, privateVisible = privateVisible)
             }.getOrElse { e ->
                 if (e is CancellationException) NetworkDownloadResult.Cancelled(0, 0L)
                 else NetworkDownloadResult.Failure(e.message ?: "외부 저장소 내보내기 실패", e)
@@ -7736,6 +9075,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             else shareInboxFiles(fileIds)
             return
         }
+        // 요청 순간의 보기 범위를 고정한다: 비동기 압축 중 모드가 바뀌어도 포함 범위가 중간에 달라지지 않는다.
+        val privateVisible = PrivacyMode.isActive
         viewModelScope.launch(Dispatchers.IO) {
             val sharesDir = File(application.cacheDir, "shares").apply { mkdirs() }
             val uniqueZipName = "phonehard_share_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.zip"
@@ -7812,6 +9153,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                             if (!isInsidePhoneHard(canonical)) {
                                 throw java.io.IOException("폰하드 밖을 가리키는 항목은 공유할 수 없습니다: ${child.name}")
                             }
+                            // 일반 모드에서 폴더를 통째로 공유할 때 보이지 않는 비공개 하위 항목은 함께 나가지 않는다.
+                            if (!privateVisible && PrivacyMode.isPhoneHardAbsolutePathPrivate(canonical.path)) continue
                             when {
                                 canonical.isDirectory ->
                                     addFolder(canonical, reserveZipEntryName(usedNames, prefix, child.name) + "/", depth + 1, nextAncestors)
@@ -7870,6 +9213,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             cancelLocalThumbnailGeneration()
             return
         }
+        // 요청 순간의 보기 범위를 고정한다(생성 도중 모드가 바뀌어도 대상 범위가 달라지지 않는다).
+        val privateVisible = PrivacyMode.isActive
         _state.update { it.copy(isLocalThumbnailRunning = true) }
         // Started lazily so the job is registered before its own cleanup can compare against it.
         val job = viewModelScope.launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.LAZY) {
@@ -7881,6 +9226,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
                 val mediaFiles = if (target.isDirectory) {
                     targetFile.walkTopDown()
+                        // 일반 모드에서는 보이지 않는 비공개 하위 파일의 썸네일을 만들지 않는다.
+                        .filter { privateVisible || !PrivacyMode.isPhoneHardAbsolutePathPrivate(it.path) }
                         .filter { it.isFile && (isPhoneHardImage(it.name) || isPhoneHardVideo(it.name) || it.name.endsWith(".pdf", ignoreCase = true)) }
                         .toList()
                 } else {
@@ -8278,7 +9625,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         // Access-type material failures; only these clear by themselves when the original becomes readable again.
         const val LOCAL_MATERIAL_ACCESS_ERROR = "미디어에 접근할 수 없습니다 (권한 필요)"
         const val LOCAL_MATERIAL_GRANT_ERROR = "미디어 접근 권한이 확인되지 않았습니다."
-        const val MATERIAL_SAVE_ERROR = "재료함 정보를 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
+        const val MATERIAL_SAVE_ERROR = "작업대 정보를 저장하지 못했습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
+        const val POCKET_DELETE_ERROR = "포켓을 삭제하지 못했습니다. 저장에 실패해도 참조는 지워지지 않으며, 일부 항목이 ‘기존 재료’ 포켓에 표시될 수 있습니다. 원본 파일은 그대로입니다."
+        const val POCKET_SAVE_ERROR = "포켓 정보를 저장하지 못했습니다. 기존 포켓과 항목은 그대로입니다. 저장 공간을 확인한 뒤 다시 시도해 주세요."
         const val MAX_THUMBNAIL_UI_ATTEMPTS = 3
         const val KEY_SUPER_THUMBNAIL_CONNECTION = "selected_connection_id"
         const val KEY_SUPER_THUMBNAIL_PATH = "selected_path_v1"

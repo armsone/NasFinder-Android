@@ -73,6 +73,8 @@ data class CollectionCompressionState(
     val message: String? = null,
     val originalBytes: Long = 0L,
     val resultBytes: Long? = null,
+    // 시작할 때 고정한 출처. true이면 일반 모드 화면에는 제목을 내놓지 않는다(작업은 계속된다).
+    val originPrivate: Boolean = false,
 ) {
     val running: Boolean get() = phase == CompressionPhase.PREPARING || phase == CompressionPhase.RUNNING ||
         phase == CompressionPhase.VALIDATING || phase == CompressionPhase.COMMITTING

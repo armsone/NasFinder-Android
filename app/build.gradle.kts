@@ -11,10 +11,10 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 421971
-        versionName = "2.21.2"
-        buildConfigField("String", "BUILD_NUMBER", "\"202610210051\"")
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        versionCode = 427007
+        versionName = "2.28.0"
+        buildConfigField("String", "BUILD_NUMBER", "\"202610222350\"")
+        testInstrumentationRunner = "com.armsone.nasfinder.smoke.PhoneSmokeInstrumentation"
         vectorDrawables.useSupportLibrary = true
     }
 
@@ -70,6 +70,7 @@ dependencies {
     implementation("com.github.mwiede:jsch:2.28.3")
     implementation("com.hierynomus:smbj:0.14.0")
     implementation(project(":hanai-onnx"))
+    implementation(project(":hanai-core"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.2")
 
     testImplementation("junit:junit:4.13.2")

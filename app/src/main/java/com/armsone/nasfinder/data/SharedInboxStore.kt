@@ -10,6 +10,8 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.time.Instant
 import java.util.UUID
 
@@ -20,6 +22,8 @@ data class SharedInboxRecord(
     val mimeType: String?,
     val byteCount: Long,
     val importedAt: Instant,
+    // 비공개 파일 레코드(기본 false). 매니페스트에는 true일 때만 기록해 예전 레코드를 새로 쓰지 않는다.
+    val isPrivate: Boolean = false,
 )
 
 data class PhoneHardImportResult(
@@ -38,7 +42,11 @@ class SharedInboxStore private constructor(
 ) {
     val rootDirectory: File = phoneHardRoot(filesDirectory)
     private val manifestFile: File
+    private val privateFoldersFile: File
     @Volatile private var snapshot: List<SharedInboxRecord> = emptyList()
+    // 비공개 폴더의 루트 기준 상대 경로 집합(폴더는 매니페스트에 없으므로 별도의 작은 내부 파일에 둔다). 하위 전체가 숨는다.
+    @Volatile private var privateFolders: Set<String> = emptySet()
+    @Volatile private var privateFoldersUnreadable = false
 
     constructor(context: Context) : this(context.filesDir, Hooks.DEFAULT)
     constructor(filesDirectory: File) : this(filesDirectory, Hooks.DEFAULT)
@@ -53,10 +61,14 @@ class SharedInboxStore private constructor(
             "폰하드 저장소가 안전한 폴더가 아닙니다."
         }
         manifestFile = File(rootDirectory, MANIFEST_NAME)
+        privateFoldersFile = File(rootDirectory, PRIVATE_FOLDERS_NAME)
+        PrivacyMode.setPhoneHardRootPath(rootDirectory.canonicalPath)
+        privateFolders = readPrivateFolders()
         val musicDir = File(rootDirectory, MUSIC_DIRECTORY_NAME)
         if (!musicDir.exists()) musicDir.mkdirs()
         if (!manifestFile.exists()) atomicWrite(manifestFile, encodeManifest(emptyList()))
         synchronized(PROCESS_LOCK) { snapshot = readManifest() }
+        publishPrivacyScope(snapshot)
     }
 
     val musicDirectory: File
@@ -64,8 +76,118 @@ class SharedInboxStore private constructor(
             if (!it.exists()) it.mkdirs()
         }
 
+    /** 비공개를 포함한 전체 레코드(삭제·이동·정리용). 화면 목록에는 [records]를 쓴다. */
+    fun allRecords(): List<SharedInboxRecord> = synchronized(PROCESS_LOCK) {
+        readManifest().also { snapshot = it; publishPrivacyScope(it) }
+    }
+
+    /** 지금 모드에서 보이는 레코드: 일반 모드는 공개만(자기 플래그·상위 폴더 모두 공개), 프라이버시 모드는 전체. */
     fun records(): List<SharedInboxRecord> = synchronized(PROCESS_LOCK) {
-        readManifest().also { snapshot = it }
+        val all = readManifest().also { snapshot = it; publishPrivacyScope(it) }
+        // 비공개 폴더 표시를 읽을 수 없으면 무엇이 비공개인지 알 수 없으므로 일반 모드에서는 아무것도 보여 주지 않는다(전체 기록은 allRecords).
+        if (PrivacyMode.isActive) all else if (privateFoldersUnreadable) emptyList() else {
+            val index = privateIndex(all)
+            all.filterNot { index.isPrivate(it.storedFilename) }
+        }
+    }
+
+    /** 비공개 폴더 표시 파일을 읽을 수 없는 상태인지(일반 모드 목록은 이 동안 비워지고, 손상 파일과 백업은 그대로 보존된다). */
+    val privateMetadataUnreadable: Boolean get() = privateFoldersUnreadable
+
+    /** 한 번 만들어 두고 O(1)로 조회하는 비공개 판정 도구(레코드 수에 대해 제곱으로 느려지지 않게 한다). */
+    private class PrivateIndex(private val files: Set<String>, private val folders: Set<String>) {
+        /** 레코드 자기 플래그, 자신이 비공개 폴더, 또는 상위 폴더가 비공개면 true. */
+        fun isPrivate(storedFilename: String): Boolean {
+            val path = storedFilename.trim('/')
+            if (storedFilename in files || path in files) return true
+            if (folders.isEmpty()) return false
+            var end = path.length
+            while (true) {
+                if (path.substring(0, end) in folders) return true
+                end = path.lastIndexOf('/', end - 1)
+                if (end <= 0) return false
+            }
+        }
+    }
+
+    private fun privateIndex(records: List<SharedInboxRecord>): PrivateIndex =
+        PrivateIndex(records.filter { it.isPrivate }.mapTo(hashSetOf()) { it.storedFilename }, privateFolders)
+
+    private fun publishPrivacyScope(records: List<SharedInboxRecord>) {
+        val files = records.filter { it.isPrivate }.mapTo(hashSetOf()) { it.storedFilename }
+        val index = PrivateIndex(files, privateFolders)
+        val ids = records.filter { index.isPrivate(it.storedFilename) }.mapTo(hashSetOf()) { it.id.toString() }
+        PrivacyMode.setPhoneHardScope(files, privateFolders, ids)
+    }
+
+    /**
+     * 비공개 폴더 표시 파일을 읽는다. 파일이 없으면 빈 집합이지만, 있는데 읽거나 해석하지 못하면 모든 폰하드를 비공개로
+     * 취급(fail-closed)하고 손상된 파일은 덮어쓰지 않도록 백업만 남긴다.
+     */
+    private fun readPrivateFolders(): Set<String> {
+        // 없는 경우만 "비공개 폴더 없음"이다. 폴더 등 파일이 아닌 항목이 있거나 읽지 못하면 읽을 수 없음으로 본다.
+        if (!privateFoldersFile.exists() && !Files.isSymbolicLink(privateFoldersFile.toPath())) {
+            privateFoldersUnreadable = false
+            PrivacyMode.setPhoneHardScopeUnreadable(false)
+            return emptySet()
+        }
+        val parsed = runCatching {
+            require(privateFoldersFile.isFile) { "비공개 폴더 표시가 파일이 아닙니다." }
+            val list = JsonReader(privateFoldersFile.readText(StandardCharsets.UTF_8)).readValue() as? List<*>
+                ?: throw IllegalStateException("비공개 폴더 표시 형식이 올바르지 않습니다.")
+            // 모든 원소가 비어 있지 않은 문자열이어야 한다. 다른 형식이 섞인 목록을 조용히 비어 있는(공개) 것으로 해석하지 않는다.
+            list.map { element ->
+                (element as? String)?.trim('/')?.takeIf { it.isNotEmpty() }
+                    ?: throw IllegalStateException("비공개 폴더 표시 항목이 올바르지 않습니다.")
+            }.toSet()
+        }.getOrNull()
+        if (parsed == null) {
+            privateFoldersUnreadable = true
+            PrivacyMode.setPhoneHardScopeUnreadable(true)
+            runCatching {
+                val backup = File(rootDirectory, "$PRIVATE_FOLDERS_NAME.unreadable")
+                if (!backup.exists() && privateFoldersFile.isFile) privateFoldersFile.copyTo(backup, overwrite = false)
+            }
+            return privateFolders
+        }
+        privateFoldersUnreadable = false
+        PrivacyMode.setPhoneHardScopeUnreadable(false)
+        return parsed
+    }
+
+    private fun writePrivateFolders(folders: Set<String>) {
+        check(!privateFoldersUnreadable) { "비공개 폴더 표시 파일을 읽을 수 없어 변경하지 않았습니다." }
+        if (folders == privateFolders && privateFoldersFile.isFile == folders.isNotEmpty()) return
+        val bytes = buildString {
+            append('[')
+            folders.sorted().forEachIndexed { index, folder ->
+                if (index > 0) append(',')
+                appendJson(folder)
+            }
+            append(']')
+        }.toByteArray(StandardCharsets.UTF_8)
+        atomicWrite(privateFoldersFile, bytes)
+        privateFolders = folders
+    }
+
+    /** 명시적인 공개/비공개 전환(파일 레코드 또는 폴더). id·위치·순서는 그대로 두고 플래그만 바꾼다. */
+    fun setPrivate(relativePath: String, isDirectory: Boolean, isPrivate: Boolean): Boolean = synchronized(PROCESS_LOCK) {
+        val path = relativePath.trim('/')
+        if (path.isEmpty()) return@synchronized false
+        runCatching {
+            if (isDirectory) {
+                writePrivateFolders(if (isPrivate) privateFolders + path else privateFolders - path)
+            } else {
+                val current = readManifest()
+                val updated = current.map { if (it.storedFilename == path) it.copy(isPrivate = isPrivate) else it }
+                if (updated != current) hooks.commitManifest(manifestFile, encodeManifest(updated))
+                snapshot = updated
+                // 실패한 마무리가 남긴 이 파일 자신의 임시 경로 표시만 걷는다(상위·형제·하위 표시는 그대로).
+                if (!isPrivate && path in privateFolders) writePrivateFolders(privateFolders - path)
+            }
+            publishPrivacyScope(readManifest())
+            true
+        }.getOrDefault(false)
     }
 
     fun file(record: SharedInboxRecord): File = synchronized(PROCESS_LOCK) {
@@ -86,6 +208,8 @@ class SharedInboxStore private constructor(
         id: UUID = UUID.randomUUID(),
         importedAt: Instant = Instant.now(),
         destinationSubdirectory: String? = null,
+        // null = 지금 모드. 오래 걸리는 작업은 시작할 때 잡아 둔 출처를 명시해 넘긴다(모드가 바뀌어도 바뀌지 않는다).
+        isPrivate: Boolean? = null,
     ): SharedInboxRecord = synchronized(PROCESS_LOCK) {
         val current = readManifest()
         val original = safeBasename(originalFilename)
@@ -100,7 +224,11 @@ class SharedInboxStore private constructor(
         require(!destination.exists()) { "폰하드 파일 payload가 이미 있습니다." }
         val temporary = File(rootDirectory, ".import-$id.tmp")
         var payloadCommitted = false
+        val recordPrivate = isPrivate ?: PrivacyMode.isActive
+        // 비공개 파일은 최종 이름이 생기기 전에 비공개로 등록해, 매니페스트 분류가 끝나기 전에 웹하드 등에 보이지 않게 한다.
+        val pending = if (recordPrivate) listOf(stored) else emptyList()
         try {
+            PrivacyMode.withPendingPrivate(pending) {
             val bytes = FileOutputStream(temporary).use { output ->
                 val copied = input.copyTo(output)
                 output.fd.sync()
@@ -108,11 +236,13 @@ class SharedInboxStore private constructor(
             }
             moveWithoutReplacing(temporary, destination)
             payloadCommitted = true
-            val record = SharedInboxRecord(id, original, stored, safeMime, bytes, importedAt)
+            val record = SharedInboxRecord(id, original, stored, safeMime, bytes, importedAt, recordPrivate)
             val updated = current + record
             hooks.commitManifest(manifestFile, encodeManifest(updated))
             snapshot = updated
+            publishPrivacyScope(updated)
             record
+            }
         } catch (error: Throwable) {
             temporary.delete()
             if (payloadCommitted) destination.delete()
@@ -132,7 +262,9 @@ class SharedInboxStore private constructor(
         desiredName: String,
         destinationSubdirectory: String? = null,
         mimeType: String? = null,
+        isPrivate: Boolean? = null,
     ): PhoneHardImportResult = synchronized(PROCESS_LOCK) {
+        val importPrivate = isPrivate ?: PrivacyMode.isActive
         require(stagedEntry.exists()) { "스테이징 소스가 존재하지 않습니다: ${stagedEntry.path}" }
         val destDir = resolveDirectory(destinationSubdirectory)
         if (!destDir.exists() && !destDir.mkdirs()) {
@@ -152,8 +284,12 @@ class SharedInboxStore private constructor(
         val rootCanonical = rootDirectory.canonicalFile
         val createdFiles = mutableListOf<File>()
         val newRecords = mutableListOf<SharedInboxRecord>()
+        val previousPrivateFolders = privateFolders
+        val targetRelEarly = targetEntry.relativeTo(rootCanonical).invariantSeparatorsPath
 
         try {
+          // 비공개 가져오기는 첫 파일이 최종 위치에 생기기 전에 그 경로(폴더면 하위 전체)를 비공개로 등록한다.
+          PrivacyMode.withPendingPrivate(if (importPrivate) listOf(targetRelEarly) else emptyList()) {
             if (stagedEntry.isDirectory) {
                 if (!targetEntry.mkdirs()) throw IllegalStateException("대상 폴더를 생성하지 못했습니다: ${targetEntry.path}")
                 createdFiles.add(targetEntry)
@@ -186,6 +322,7 @@ class SharedInboxStore private constructor(
                             mimeType = childSafeMime,
                             byteCount = destChild.length(),
                             importedAt = Instant.now(),
+                            isPrivate = importPrivate,
                         )
                         validateRecord(record)
                         newRecords.add(record)
@@ -207,6 +344,7 @@ class SharedInboxStore private constructor(
                     mimeType = safeMime,
                     byteCount = targetEntry.length(),
                     importedAt = Instant.now(),
+                    isPrivate = importPrivate,
                 )
                 validateRecord(record)
                 newRecords.add(record)
@@ -221,17 +359,25 @@ class SharedInboxStore private constructor(
             require(newRecords.none { it.storedFilename in existingStored }) { "매니페스트에 이미 존재하는 저장 경로입니다." }
 
             val updatedManifest = currentManifest + newRecords
+            val targetRel = targetRelEarly
+            // 폴더를 통째로 가져오면 하위가 비공개로 시작하도록 폴더 자체를 비공개 폴더로 기록한다(빈 하위 폴더 포함).
+            // 비공개 표시를 먼저 확정한 뒤 매니페스트를 기록한다(표시 쓰기가 실패하면 아무것도 확정되지 않는다).
+            if (importPrivate && stagedEntry.isDirectory) writePrivateFolders(privateFolders + targetRel)
             hooks.commitManifest(manifestFile, encodeManifest(updatedManifest))
             snapshot = updatedManifest
-            val targetRel = targetEntry.relativeTo(rootCanonical).invariantSeparatorsPath
+            publishPrivacyScope(updatedManifest)
             PhoneHardImportResult(targetEntry, targetRel, newRecords)
+          }
         } catch (error: Throwable) {
             for (created in createdFiles.reversed()) {
                 runCatching {
                     if (created.isDirectory) created.deleteRecursively() else created.delete()
                 }
             }
+            // 확정하지 못한 비공개 폴더 표시는 되돌린다(표시 쓰기 자체가 실패한 경우는 되돌릴 것이 없다).
+            if (privateFolders != previousPrivateFolders) runCatching { writePrivateFolders(previousPrivateFolders) }
             snapshot = runCatching { readManifest() }.getOrElse { currentManifest }
+            runCatching { publishPrivacyScope(snapshot) }
             throw error
         }
     }
@@ -262,12 +408,14 @@ class SharedInboxStore private constructor(
     fun listPhoneHardFolder(relativeSubdirectory: String? = null): List<PhoneHardItem> = synchronized(PROCESS_LOCK) {
         val targetDir = resolveDirectory(relativeSubdirectory)
         require(targetDir.exists() && targetDir.isDirectory) { "폴더가 존재하지 않습니다." }
+        check(PrivacyMode.isActive || !privateFoldersUnreadable) { PRIVATE_METADATA_UNREADABLE_MESSAGE }
 
-        val records = readManifest().also { snapshot = it }
+        val records = readManifest().also { snapshot = it; publishPrivacyScope(it) }
         val recordByStored = records.associateBy { it.storedFilename }
 
         val rootCanonical = rootDirectory.canonicalFile
         val items = mutableListOf<PhoneHardItem>()
+        val index = privateIndex(records)
 
         val children = targetDir.listFiles() ?: emptyArray()
         for (child in children) {
@@ -276,6 +424,9 @@ class SharedInboxStore private constructor(
             if (Files.isSymbolicLink(child.toPath())) continue
 
             val relPath = child.canonicalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+            val itemPrivate = index.isPrivate(relPath)
+            // 일반 모드에서는 비공개 파일·폴더를 목록에서 뺀다(디스크의 파일은 그대로다).
+            if (itemPrivate && !PrivacyMode.isActive) continue
             if (child.isDirectory) {
                 items.add(
                     PhoneHardItem(
@@ -287,6 +438,7 @@ class SharedInboxStore private constructor(
                         modifiedAt = Instant.ofEpochMilli(child.lastModified()),
                         mimeType = null,
                         file = child,
+                        isPrivate = itemPrivate,
                     )
                 )
             } else if (child.isFile) {
@@ -301,6 +453,7 @@ class SharedInboxStore private constructor(
                         modifiedAt = rec?.importedAt ?: Instant.ofEpochMilli(child.lastModified()),
                         mimeType = rec?.mimeType,
                         file = child,
+                        isPrivate = itemPrivate,
                     )
                 )
             }
@@ -314,7 +467,7 @@ class SharedInboxStore private constructor(
     /**
      * Creates a new directory inside [parentSubdirectory].
      */
-    fun createFolder(folderName: String, parentSubdirectory: String? = null): File = synchronized(PROCESS_LOCK) {
+    fun createFolder(folderName: String, parentSubdirectory: String? = null, isPrivate: Boolean? = null): File = synchronized(PROCESS_LOCK) {
         val parent = resolveDirectory(parentSubdirectory)
         val safeName = safeBasename(folderName)
         require(safeName.isNotBlank() && safeName != "." && safeName != "..") { "올바르지 않은 폴더명입니다." }
@@ -325,7 +478,21 @@ class SharedInboxStore private constructor(
         val newDir = File(parent, safeName).canonicalFile
         validateContainment(newDir)
         require(!newDir.exists()) { "이미 같은 이름의 파일 또는 폴더가 존재합니다." }
-        if (!newDir.mkdirs()) throw IllegalStateException("폴더를 생성하지 못했습니다.")
+        val folderPrivate = isPrivate ?: PrivacyMode.isActive
+        val rel = newDir.relativeTo(rootDirectory.canonicalFile).invariantSeparatorsPath
+        PrivacyMode.withPendingPrivate(if (folderPrivate) listOf(rel) else emptyList()) {
+            if (!newDir.mkdirs()) throw IllegalStateException("폴더를 생성하지 못했습니다.")
+            if (folderPrivate) {
+                try {
+                    writePrivateFolders(privateFolders + rel)
+                    publishPrivacyScope(readManifest())
+                } catch (error: Throwable) {
+                    // 비공개 표시를 저장하지 못했으면 공개 폴더로 남기지 않고 방금 만든 빈 폴더를 없앤 뒤 실패를 알린다.
+                    runCatching { newDir.delete() }
+                    throw error
+                }
+            }
+        }
         newDir
     }
 
@@ -336,7 +503,12 @@ class SharedInboxStore private constructor(
     fun moveTargets(
         targets: List<PhoneHardTarget>,
         destinationSubdirectory: String? = null,
-    ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) {
+    ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) { moveTargetsImpl(targets, destinationSubdirectory) }
+
+    private fun moveTargetsImpl(
+        targets: List<PhoneHardTarget>,
+        destinationSubdirectory: String? = null,
+    ): PhoneHardOperationResult {
         val destDir = resolveDirectory(destinationSubdirectory)
         val rootCanonical = rootDirectory.canonicalFile
         val destRelative = if (destDir == rootCanonical) "" else destDir.relativeTo(rootCanonical).invariantSeparatorsPath
@@ -352,6 +524,7 @@ class SharedInboxStore private constructor(
             var fileMoved = false
             var movedFile: File? = null
             var originalFile: File? = null
+            var foldersBefore: Set<String>? = null
             try {
                 val targetFile = resolveExistingEntry(target.relativePath)
                 originalFile = targetFile
@@ -376,15 +549,26 @@ class SharedInboxStore private constructor(
                 val finalFile = File(destDir, finalName).canonicalFile
                 validateContainment(finalFile)
 
+                val newRel = finalFile.relativeTo(rootCanonical).invariantSeparatorsPath
+
+                // 비공개 분류를 먼저 디스크에 확정한다. 확정하지 못하면 아무것도 옮기지 않고 이 항목만 실패 처리한다.
+                val plan = planRelocation(currentManifest, targetRel, newRel, movingDirectory, copy = false)
+                val previousFolders = privateFolders
+                try {
+                    commitInterimFolders(plan, currentManifest)
+                } catch (e: Exception) {
+                    failed.add(target to "비공개 표시를 먼저 저장하지 못해 이동하지 않았습니다: ${e.message}")
+                    continue
+                }
+                foldersBefore = previousFolders
+
                 // Perform filesystem move
                 moveWithoutReplacing(targetFile, finalFile)
                 fileMoved = true
                 movedFile = finalFile
 
-                val newRel = finalFile.relativeTo(rootCanonical).invariantSeparatorsPath
-
                 // Build candidate manifest without mutating currentManifest yet
-                val candidateManifest = if (movingDirectory) {
+                val candidateManifest = (if (movingDirectory) {
                     currentManifest.map { record ->
                         if (record.storedFilename == targetRel) {
                             record.copy(storedFilename = newRel)
@@ -403,11 +587,12 @@ class SharedInboxStore private constructor(
                             record
                         }
                     }
-                }
+                }).withDestinationMarked(plan, newRel)
 
                 hooks.commitManifest(manifestFile, encodeManifest(candidateManifest))
                 currentManifest = candidateManifest
                 snapshot = currentManifest
+                finalizeFolders(plan)
                 succeeded.add(target)
                 pathMappings.add(PhoneHardPathMapping(targetRel, newRel, movingDirectory))
             } catch (e: Exception) {
@@ -416,16 +601,19 @@ class SharedInboxStore private constructor(
                         moveWithoutReplacing(movedFile, originalFile)
                     }
                     if (rollbackResult.isFailure) {
+                        // 항목이 도착 위치에 남아 있으므로 먼저 확정한 비공개 표시도 그대로 둔다(공개로 남지 않는다).
                         failed.add(target to "이동 후 매니페스트 저장에 실패했으며 원래 위치 복구도 실패했습니다: ${e.message}")
                     } else {
+                        foldersBefore?.let(::restoreFolders)
                         failed.add(target to "이동 후 매니페스트 저장에 실패하여 원래 위치로 복구했습니다: ${e.message}")
                     }
                 } else {
+                    foldersBefore?.let(::restoreFolders)
                     failed.add(target to (e.message ?: "이동에 실패했습니다."))
                 }
             }
         }
-        PhoneHardOperationResult(succeeded, failed, pathMappings = pathMappings)
+        return PhoneHardOperationResult(succeeded, failed, pathMappings = pathMappings)
     }
 
     /**
@@ -434,6 +622,11 @@ class SharedInboxStore private constructor(
      * restores the original name when the manifest cannot be committed, serializes with PROCESS_LOCK.
      */
     fun renamePhoneHardTarget(
+        relativePath: String,
+        newName: String,
+    ): PhoneHardOperationResult = renamePhoneHardTargetImpl(relativePath, newName)
+
+    private fun renamePhoneHardTargetImpl(
         relativePath: String,
         newName: String,
     ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) {
@@ -478,6 +671,7 @@ class SharedInboxStore private constructor(
                 "이미 같은 이름의 파일 또는 폴더가 존재합니다."
             }
 
+            val plan = planRelocation(currentManifest, sourceRel, destRel, renamingDirectory, copy = false)
             val candidateManifest = currentManifest.map { record ->
                 if (record.storedFilename == sourceRel) {
                     record.copy(storedFilename = destRel, originalFilename = name)
@@ -487,14 +681,31 @@ class SharedInboxStore private constructor(
                 } else {
                     record
                 }
-            }
+            }.withDestinationMarked(plan, destRel)
             candidateManifest.forEach(::validateRecord)
 
-            moveWithoutReplacing(source, destination)
+            // 비공개 분류를 먼저 디스크에 확정한다. 확정하지 못하면 이름을 바꾸지 않는다.
+            val foldersBefore = privateFolders
+            try {
+                commitInterimFolders(plan, currentManifest)
+            } catch (e: Exception) {
+                return@synchronized PhoneHardOperationResult(
+                    emptyList(),
+                    listOf(target to "비공개 표시를 먼저 저장하지 못해 이름을 바꾸지 않았습니다: ${e.message}"),
+                )
+            }
+
+            try {
+                moveWithoutReplacing(source, destination)
+            } catch (e: Exception) {
+                restoreFolders(foldersBefore)
+                throw e
+            }
             try {
                 hooks.commitManifest(manifestFile, encodeManifest(candidateManifest))
             } catch (e: Exception) {
                 if (runCatching { moveWithoutReplacing(destination, source) }.isSuccess) {
+                    restoreFolders(foldersBefore)
                     return@synchronized PhoneHardOperationResult(
                         emptyList(),
                         listOf(target to "이름 변경 후 매니페스트 저장에 실패하여 원래 이름으로 복구했습니다: ${e.message}"),
@@ -509,6 +720,7 @@ class SharedInboxStore private constructor(
                 }
             }
             snapshot = candidateManifest
+            finalizeFolders(plan)
             PhoneHardOperationResult(
                 listOf(target),
                 emptyList(),
@@ -526,7 +738,12 @@ class SharedInboxStore private constructor(
     fun copyTargets(
         targets: List<PhoneHardTarget>,
         destinationSubdirectory: String? = null,
-    ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) {
+    ): PhoneHardOperationResult = synchronized(PROCESS_LOCK) { copyTargetsImpl(targets, destinationSubdirectory) }
+
+    private fun copyTargetsImpl(
+        targets: List<PhoneHardTarget>,
+        destinationSubdirectory: String? = null,
+    ): PhoneHardOperationResult {
         val destDir = resolveDirectory(destinationSubdirectory)
         val rootCanonical = rootDirectory.canonicalFile
         val destRelative = if (destDir == rootCanonical) "" else destDir.relativeTo(rootCanonical).invariantSeparatorsPath
@@ -534,11 +751,13 @@ class SharedInboxStore private constructor(
         val deduped = deduplicateTargets(targets)
         val succeeded = mutableListOf<PhoneHardTarget>()
         val failed = mutableListOf<Pair<PhoneHardTarget, String>>()
+        val copied = mutableListOf<PhoneHardPathMapping>()
 
         var currentManifest = readManifest()
 
         for (target in deduped) {
-            val newlyCreatedFiles = mutableListOf<File>()
+            val owned = mutableListOf<Pair<File, Any?>>()
+            var foldersBefore: Set<String>? = null
             try {
                 val targetFile = resolveExistingEntry(target.relativePath)
                 val targetRel = targetFile.relativeTo(rootCanonical).invariantSeparatorsPath
@@ -555,11 +774,25 @@ class SharedInboxStore private constructor(
                 validateContainment(finalFile)
 
                 val newRecordsToAdd = mutableListOf<SharedInboxRecord>()
+                val plan = planRelocation(
+                    currentManifest, targetRel, finalFile.relativeTo(rootCanonical).invariantSeparatorsPath,
+                    target.isDirectory, copy = true,
+                )
+                // 복사본의 비공개 분류를 첫 파일이 생기기 전에 디스크에 확정한다. 확정하지 못하면 아무것도 복사하지 않는다.
+                val previousFolders = privateFolders
+                try {
+                    commitInterimFolders(plan, currentManifest)
+                } catch (e: Exception) {
+                    failed.add(target to "비공개 표시를 먼저 저장하지 못해 복사하지 않았습니다: ${e.message}")
+                    continue
+                }
+                foldersBefore = previousFolders
+                // 도착 경로는 원자적으로 새로 만든 것만 이 작업의 것으로 기록한다(이미 있던 경로는 합치거나 지우지 않는다).
+                createMissingParents(destDir, owned)
 
                 if (target.isDirectory) {
                     val finalRel = finalFile.relativeTo(rootCanonical).invariantSeparatorsPath
-                    finalFile.mkdirs()
-                    newlyCreatedFiles.add(finalFile)
+                    createOwnedDirectory(finalFile, owned)
 
                     // Deep copy all descendants
                     targetFile.walkTopDown().forEach { sourceChild ->
@@ -569,12 +802,11 @@ class SharedInboxStore private constructor(
                         val destChild = File(finalFile, subPath).canonicalFile
                         validateContainment(destChild)
                         if (sourceChild.isDirectory) {
-                            destChild.mkdirs()
-                            newlyCreatedFiles.add(destChild)
+                            destChild.parentFile?.let { createMissingParents(it, owned) }
+                            createOwnedDirectory(destChild, owned)
                         } else if (sourceChild.isFile) {
-                            destChild.parentFile?.mkdirs()
-                            sourceChild.copyTo(destChild, overwrite = false)
-                            newlyCreatedFiles.add(destChild)
+                            destChild.parentFile?.let { createMissingParents(it, owned) }
+                            copyFileExclusive(sourceChild, destChild, owned)
 
                             val destChildRel = destChild.relativeTo(rootCanonical).invariantSeparatorsPath
                             val oldSourceRel = sourceChild.relativeTo(rootCanonical).invariantSeparatorsPath
@@ -588,13 +820,13 @@ class SharedInboxStore private constructor(
                                     mimeType = existingRec?.mimeType,
                                     byteCount = destChild.length(),
                                     importedAt = Instant.now(),
+                                    isPrivate = existingRec?.isPrivate == true,
                                 )
                             )
                         }
                     }
                 } else {
-                    targetFile.copyTo(finalFile, overwrite = false)
-                    newlyCreatedFiles.add(finalFile)
+                    copyFileExclusive(targetFile, finalFile, owned)
 
                     val finalRel = finalFile.relativeTo(rootCanonical).invariantSeparatorsPath
                     val existingRec = currentManifest.firstOrNull { it.storedFilename == targetRel }
@@ -607,24 +839,37 @@ class SharedInboxStore private constructor(
                             mimeType = existingRec?.mimeType,
                             byteCount = finalFile.length(),
                             importedAt = Instant.now(),
+                            isPrivate = existingRec?.isPrivate == true,
                         )
                     )
                 }
 
-                val candidateManifest = currentManifest + newRecordsToAdd
+                val candidateManifest = (currentManifest + newRecordsToAdd)
+                    .withDestinationMarked(plan, finalFile.relativeTo(rootCanonical).invariantSeparatorsPath)
                 hooks.commitManifest(manifestFile, encodeManifest(candidateManifest))
                 currentManifest = candidateManifest
                 snapshot = currentManifest
+                finalizeFolders(plan)
                 succeeded.add(target)
+                copied.add(PhoneHardPathMapping(targetRel, finalFile.relativeTo(rootCanonical).invariantSeparatorsPath, target.isDirectory))
             } catch (e: Exception) {
-                // Rollback newly created files; currentManifest remains untouched
-                for (created in newlyCreatedFiles.reversed()) {
-                    runCatching { created.delete() }
+                // 이 작업이 실제로 만든 경로만 역순으로 하나씩 지우고(재귀 삭제 없음, 남이 넣은 항목은 남는다),
+                // 모두 사라진 것이 확인될 때만 이전 비공개 표시로 되돌린다. 남으면 먼저 확정한 보호 표시를 유지한다(원본은 건드리지 않는다).
+                val cleanedUp = removeOwnedPaths(owned)
+                var reason = if (e is java.nio.file.FileAlreadyExistsException) {
+                    "같은 이름의 항목이 이미 있어 복사하지 않았습니다."
+                } else {
+                    e.message ?: "복사에 실패했습니다."
                 }
-                failed.add(target to (e.message ?: "복사에 실패했습니다."))
+                if (cleanedUp) {
+                    foldersBefore?.let(::restoreFolders)
+                } else {
+                    reason += " (복사 중이던 항목을 완전히 지우지 못해 비공개 표시를 유지했습니다.)"
+                }
+                failed.add(target to reason)
             }
         }
-        PhoneHardOperationResult(succeeded, failed)
+        return PhoneHardOperationResult(succeeded, failed, copiedPaths = copied)
     }
 
     /**
@@ -632,6 +877,16 @@ class SharedInboxStore private constructor(
      * Deduplicates ancestors, removes from manifest and filesystem.
      */
     fun deleteTargets(targets: List<PhoneHardTarget>): PhoneHardOperationResult = synchronized(PROCESS_LOCK) {
+        val result = deleteTargetsImpl(targets)
+        // 지운 폴더의 비공개 표시도 함께 정리한다(남기면 같은 이름의 새 폴더가 조용히 숨겨진다).
+        val remaining = privateFolders.filterNot { folder ->
+            result.removedPaths.any { removed -> folder == removed || folder.startsWith("$removed/") }
+        }.toSet()
+        runCatching { writePrivateFolders(remaining); publishPrivacyScope(readManifest()) }
+        result
+    }
+
+    private fun deleteTargetsImpl(targets: List<PhoneHardTarget>): PhoneHardOperationResult {
         val deduped = deduplicateTargets(targets)
         val rootCanonical = rootDirectory.canonicalFile
 
@@ -646,7 +901,22 @@ class SharedInboxStore private constructor(
                 val targetFile = resolveExistingEntry(target.relativePath)
                 val targetRel = targetFile.relativeTo(rootCanonical).invariantSeparatorsPath
 
+                if (!PrivacyMode.isActive && privateFoldersUnreadable) {
+                    failed.add(target to PRIVATE_METADATA_UNREADABLE_MESSAGE)
+                    continue
+                }
                 if (target.isDirectory) {
+                    // 일반 모드에서 폴더를 지우면 보이지 않는 비공개 하위 항목까지 함께 지워진다 → 그런 폴더는 지우지 않는다.
+                    if (!PrivacyMode.isActive) {
+                        val hiddenIndex = privateIndex(currentManifest)
+                        val hasHidden = currentManifest.any {
+                            it.storedFilename.startsWith("$targetRel/") && hiddenIndex.isPrivate(it.storedFilename)
+                        } || privateFolders.any { it.startsWith("$targetRel/") }
+                        if (hasHidden) {
+                            failed.add(target to "폴더 안에 이 모드에서 보이지 않는 항목이 있어 삭제하지 않았습니다.")
+                            continue
+                        }
+                    }
                     val deleted = targetFile.deleteRecursively()
                     if (!deleted && targetFile.exists()) {
                         throw IllegalStateException("폴더를 완전히 삭제하지 못했습니다.")
@@ -672,7 +942,123 @@ class SharedInboxStore private constructor(
                 failed.add(target to (e.message ?: "삭제에 실패했습니다."))
             }
         }
-        PhoneHardOperationResult(succeeded, failed, removedPaths = removedPaths)
+        return PhoneHardOperationResult(succeeded, failed, removedPaths = removedPaths)
+    }
+
+    /**
+     * 이동·이름 변경·복사 한 건의 비공개 분류 계획. 분류는 공개 노출 전에 디스크에 확정한다.
+     * [interim]은 파일 시스템을 바꾸기 전에 먼저 쓰는 상위 집합(기존 표시 + 도착 쪽 표시 + 비공개 파일 레코드가 새 경로에서
+     * 레코드 커밋 전에도 가려지도록 한 임시 경로), [finalFolders]는 완료 뒤 남기는 표시, [markFile]은 도착 파일 자신에 플래그가 필요한지.
+     * 비공개 하위가 든 공개 상위 폴더는 비공개 폴더 표시와 레코드 플래그가 새 경로로 따라갈 뿐 상위를 비공개로 만들지 않는다.
+     */
+    private class RelocationPlan(val interim: Set<String>, val finalFolders: Set<String>, val markFile: Boolean)
+
+    private fun coveredBy(path: String, folders: Set<String>): Boolean {
+        var end = path.length
+        while (end > 0) {
+            if (path.substring(0, end) in folders) return true
+            end = path.lastIndexOf('/', end - 1)
+        }
+        return false
+    }
+
+    private fun planRelocation(
+        before: List<SharedInboxRecord>,
+        src: String,
+        dst: String,
+        isDirectory: Boolean,
+        copy: Boolean,
+    ): RelocationPlan {
+        val folders = privateFolders
+        val flagged = before.filter { it.isPrivate }.mapTo(hashSetOf()) { it.storedFilename }
+        // 표시를 읽을 수 없으면 무엇이 비공개인지 모르므로 비공개로 보고(→ 아래 표시 쓰기가 거부되어 아무것도 바뀌지 않는다).
+        val selfPrivate = privateFoldersUnreadable || src in flagged || coveredBy(src, folders)
+        fun inSource(path: String) = path == src || path.startsWith("$src/")
+        val carried = folders.filter(::inSource).map { dst + it.removePrefix(src) }
+        var finalFolders = (if (copy) folders else folders.filterNot(::inSource).toSet()) + carried
+        var markFile = false
+        val parent = dst.substringBeforeLast('/', "")
+        if (selfPrivate && !(parent.isNotEmpty() && coveredBy(parent, finalFolders))) {
+            if (isDirectory) finalFolders = finalFolders + dst else markFile = true
+        }
+        val temporary = hashSetOf<String>()
+        flagged.filter(::inSource).forEach { temporary += dst + it.removePrefix(src) }
+        if (markFile) temporary += dst
+        temporary.removeAll { coveredBy(it, finalFolders) }
+        return RelocationPlan(folders + finalFolders + temporary, finalFolders, markFile)
+    }
+
+    private fun List<SharedInboxRecord>.withDestinationMarked(plan: RelocationPlan, destination: String): List<SharedInboxRecord> =
+        if (!plan.markFile) this else map { if (it.storedFilename == destination) it.copy(isPrivate = true) else it }
+
+    /** 파일 시스템을 바꾸기 전에 비공개 표시 상위 집합을 디스크에 확정하고 공개 범위에 반영한다. 실패하면 예외(아직 아무것도 바뀌지 않음). */
+    private fun commitInterimFolders(plan: RelocationPlan, records: List<SharedInboxRecord>) {
+        writePrivateFolders(plan.interim)
+        publishPrivacyScope(records)
+    }
+
+    /** 완료 뒤 임시 표시를 걷어 낸다. 쓰기에 실패해도 상위 집합이 남을 뿐이라 비공개로 안전하다(공개로 풀리지 않는다). */
+    private fun finalizeFolders(plan: RelocationPlan) {
+        runCatching { writePrivateFolders(plan.finalFolders) }
+        runCatching { publishPrivacyScope(readManifest()) }
+    }
+
+    /** 파일 시스템을 원래대로 되돌린 뒤에만 쓴다. 되돌리지 못하면 상위 집합을 그대로 둔다. */
+    private fun restoreFolders(previous: Set<String>) {
+        runCatching { writePrivateFolders(previous) }
+        runCatching { publishPrivacyScope(readManifest()) }
+    }
+
+    /** 이 작업이 방금 만든 경로를 만든 순간의 파일 식별자와 함께 기록한다. 정리할 때 같은 항목인지 대조한다. */
+    private fun recordOwned(path: File, owned: MutableList<Pair<File, Any?>>) {
+        val key = runCatching {
+            Files.readAttributes(path.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS).fileKey()
+        }.getOrNull()
+        owned.add(path to key)
+    }
+
+    /** [dir]을 원자적으로 새로 만든다. 같은 경로가 이미 있으면 합치지 않고 실패한다. */
+    private fun createOwnedDirectory(dir: File, owned: MutableList<Pair<File, Any?>>) {
+        Files.createDirectory(dir.toPath())
+        recordOwned(dir, owned)
+    }
+
+    /** 없는 상위 폴더만 새로 만들어 기록한다. 이미 있던 폴더는 남의 것으로 두고 정리 대상에 넣지 않는다. */
+    private fun createMissingParents(dir: File, owned: MutableList<Pair<File, Any?>>) {
+        if (Files.isDirectory(dir.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+        dir.parentFile?.let { createMissingParents(it, owned) }
+        try {
+            createOwnedDirectory(dir, owned)
+        } catch (e: java.nio.file.FileAlreadyExistsException) {
+            if (!Files.isDirectory(dir.toPath(), LinkOption.NOFOLLOW_LINKS)) throw e
+        }
+    }
+
+    /** [dest]를 배타적으로 새로 만들어 쓴다. 파일이 생긴 즉시 기록해 쓰다 실패한 부분 복사본도 정리 대상이 된다. */
+    private fun copyFileExclusive(source: File, dest: File, owned: MutableList<Pair<File, Any?>>) {
+        Files.newInputStream(source.toPath()).use { input ->
+            Files.newOutputStream(dest.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).use { output ->
+                recordOwned(dest, owned)
+                input.copyTo(output)
+            }
+        }
+    }
+
+    /** 만든 역순으로 하나씩만 지운다(재귀 삭제 없음). 비어 있지 않거나 다른 항목으로 바뀐 경로는 남기고 false를 돌려준다. */
+    private fun removeOwnedPaths(owned: List<Pair<File, Any?>>): Boolean {
+        var allRemoved = true
+        for ((path, key) in owned.asReversed()) {
+            val removed = runCatching {
+                val p = path.toPath()
+                if (Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
+                    val current = Files.readAttributes(p, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS).fileKey()
+                    if (key == null || current == key) Files.delete(p)
+                }
+                !Files.exists(p, LinkOption.NOFOLLOW_LINKS)
+            }.getOrDefault(false)
+            if (!removed) allRemoved = false
+        }
+        return allRemoved
     }
 
     private fun resolveDirectory(relativeSubdirectory: String?): File {
@@ -790,6 +1176,7 @@ class SharedInboxStore private constructor(
                 mimeType = item["mimeType"] as? String,
                 byteCount = item["byteCount"].asLong(),
                 importedAt = Instant.parse(importedAt),
+                isPrivate = (item["isPrivate"] as? Number)?.toLong() == 1L,
             ).also(::validateRecord)
         }
         require(records.map { it.id }.distinct().size == records.size) { "중복된 폰하드 파일 UUID입니다." }
@@ -903,8 +1290,11 @@ class SharedInboxStore private constructor(
         const val DIRECTORY_NAME = "SharedInbox"
         const val MUSIC_DIRECTORY_NAME = "Music"
         private const val MANIFEST_NAME = ".nasfinder-manifest.json"
+        private const val PRIVATE_FOLDERS_NAME = ".nasfinder-private-folders.json"
         internal const val LEGACY_MANIFEST_NAME = "manifest.json"
         private const val MANIFEST_VERSION = 1
+        private const val PRIVATE_METADATA_UNREADABLE_MESSAGE =
+            "비공개 폴더 표시 파일을 읽을 수 없어 일반 모드에서는 폰하드 목록을 숨겼습니다. 프라이버시 모드에서 확인하거나 파일(.nasfinder-private-folders.json과 .unreadable 백업)을 복구해 주세요."
         private val PROCESS_LOCK = Any()
 
         internal fun phoneHardRoot(filesDirectory: File): File = File(filesDirectory, DIRECTORY_NAME)
@@ -942,6 +1332,8 @@ private fun encodeManifest(records: List<SharedInboxRecord>): ByteArray = buildS
         if (record.mimeType == null) append("null") else appendJson(record.mimeType)
         append(",\"byteCount\":").append(record.byteCount).append(',')
         append("\"importedAt\":").appendJson(record.importedAt.toString())
+        // true일 때만 쓴다(예전 레코드를 새 키로 다시 쓰지 않는다). 이 JSON 읽기 도구는 true/false 리터럴이 없어 1을 쓴다.
+        if (record.isPrivate) append(",\"isPrivate\":1")
         append('}')
     }
     append("]}")

@@ -57,7 +57,7 @@ class GooglePhotosAccountController(context: Context) {
         val dedicated = app.getSharedPreferences("google.photos.oauth.v1", Context.MODE_PRIVATE)
             .getString("clientId", null)?.trim()?.takeIf(String::isNotBlank)
         val drive = com.armsone.nasfinder.data.OAuthClientConfigurationStore(app).clientId(CloudOAuthProvider.GOOGLE_DRIVE)
-        val clientId = dedicated ?: drive ?: throw IllegalStateException("Google Photos에 사용할 Google client ID가 없습니다.")
+        val clientId = dedicated ?: drive ?: throw IllegalStateException("Google 포토에 사용할 Google client ID가 없습니다.")
         return GooglePhotosOAuthConfiguration(clientId, redirectUriOverride = REDIRECT_URI)
     }
 

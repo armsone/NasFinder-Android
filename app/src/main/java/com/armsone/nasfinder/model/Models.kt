@@ -35,6 +35,8 @@ data class RemoteConnection(
     val usesTls: Boolean = kind.supportsTls,
     val trustedHostKey: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
+    /** 비공개 연결(기본 false, 예전 데이터와 같다). 일반 모드의 목록·선택지·문서 공급자에서만 숨긴다. */
+    val isPrivate: Boolean = false,
 ) {
     val normalizedRootPath: String
         get() {

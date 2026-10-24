@@ -28,15 +28,27 @@ import com.armsone.nasfinder.update.AppUpdateDialog
 import com.armsone.nasfinder.update.AppUpdateState
 import com.armsone.nasfinder.update.GitHubAppUpdateService
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : ComponentActivity() {
     private val incomingIntent = mutableStateOf<Intent?>(null)
+    private var intentConsumed = false
     private val appUpdateService by lazy { GitHubAppUpdateService(this, installedVersionCode()) }
     private var pendingUpdateInstallFile: File? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        incomingIntent.value = intent
+        // 소비 플래그는 같은 프로세스의 구성 변경에서만 신뢰한다. 프로세스가 새로 만들어졌다면 미완료 intake를 다시 평가한다.
+        intentConsumed = savedInstanceState != null &&
+            savedInstanceState.getLong(KEY_PROCESS_SESSION, 0L) == processSession &&
+            savedInstanceState.getBoolean(KEY_INTENT_CONSUMED, false)
+        val currentIntent = intent
+        if (currentIntent != null && !intentConsumed) {
+            if (!currentIntent.hasExtra(EXTRA_DELIVERY_ID)) {
+                currentIntent.putExtra(EXTRA_DELIVERY_ID, nextDeliveryId())
+            }
+            incomingIntent.value = currentIntent
+        }
         NasFinderShortcuts.installDynamic(this)
         enableEdgeToEdge()
         setContent {
@@ -86,12 +98,17 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 LaunchedEffect(incomingIntent.value) {
-                    val entry = incomingIntent.value
-                    when (ExternalEntryRouteParser.parse(entry?.action, entry?.dataString)) {
-                        ExternalEntryRoute.Inbox -> model.show(Screen.Inbox)
-                        ExternalEntryRoute.WebHard -> model.show(Screen.Inbox)
-                        ExternalEntryRoute.WebBrowser -> model.show(Screen.WebBrowser)
-                        ExternalEntryRoute.PassThrough, ExternalEntryRoute.Rejected -> model.handleEntryIntent(entry)
+                    val entry = incomingIntent.value ?: return@LaunchedEffect
+                    try {
+                        when (ExternalEntryRouteParser.parse(entry.action, entry.dataString)) {
+                            ExternalEntryRoute.Inbox -> model.show(Screen.Inbox)
+                            ExternalEntryRoute.WebHard -> model.show(Screen.Inbox)
+                            ExternalEntryRoute.WebBrowser -> model.show(Screen.WebBrowser)
+                            ExternalEntryRoute.PassThrough, ExternalEntryRoute.Rejected -> model.handleEntryIntent(entry)
+                        }
+                    } finally {
+                        intentConsumed = true
+                        incomingIntent.value = null
                     }
                 }
             }
@@ -102,6 +119,9 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        intentConsumed = false
+        val deliveryId = nextDeliveryId()
+        intent.putExtra(EXTRA_DELIVERY_ID, deliveryId)
         incomingIntent.value = intent
     }
 
@@ -153,12 +173,24 @@ class MainActivity : ComponentActivity() {
 
     private fun showToast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_INTENT_CONSUMED, intentConsumed)
+        outState.putLong(KEY_PROCESS_SESSION, processSession)
+    }
+
     override fun onDestroy() {
         appUpdateService.close()
         super.onDestroy()
     }
 
-    private companion object {
-        const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+    companion object {
+        const val EXTRA_DELIVERY_ID = "com.armsone.nasfinder.extra.DELIVERY_ID"
+        private const val KEY_INTENT_CONSUMED = "com.armsone.nasfinder.state.INTENT_CONSUMED"
+        private const val KEY_PROCESS_SESSION = "com.armsone.nasfinder.state.PROCESS_SESSION"
+        private val processSession: Long = System.nanoTime() xor System.currentTimeMillis()
+        private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+        private val deliverySequence = AtomicLong(System.currentTimeMillis())
+        private fun nextDeliveryId(): Long = deliverySequence.incrementAndGet()
     }
 }

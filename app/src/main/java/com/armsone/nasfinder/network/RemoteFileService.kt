@@ -4,6 +4,8 @@ import com.armsone.nasfinder.model.ConnectionKind
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
@@ -312,16 +314,32 @@ class SynologyFileService(
             pollTask("SYNO.FileStation.CopyMove", "3", taskId)
         }
 
-    private fun pollTask(api: String, version: String, taskId: String) {
+    private suspend fun pollTask(
+        api: String,
+        version: String,
+        taskId: String,
+        timeoutMillis: Long = 180_000L,
+    ) {
+        val startTime = System.currentTimeMillis()
         while (true) {
+            currentCoroutineContext().ensureActive()
+            if (System.currentTimeMillis() - startTime > timeoutMillis) {
+                throw RemoteServiceException.Server("Synology 작업 상태 확인 시간이 초과되었습니다. 서버에서 작업이 계속 진행 중일 수 있습니다.")
+            }
             val status = apiJson(
                 api = api,
                 version = version,
                 method = "status",
                 parameters = mapOf("taskid" to JSONObject.quote(taskId)),
             ).getJSONObject("data")
+            val errorCode = status.optInt("error_code", 0).takeIf { it > 0 }
+                ?: status.optJSONArray("errors")?.optJSONObject(0)?.optInt("code", 0)?.takeIf { it > 0 }
+            val hasErrors = (status.optJSONArray("errors")?.length() ?: 0) > 0
+            if (status.optBoolean("has_fail") || status.optBoolean("failed") || hasErrors || errorCode != null) {
+                throw RemoteServiceException.Server("Synology 작업 실패${errorCode?.let { " ($it)" } ?: ""}")
+            }
             if (status.optBoolean("finished")) return
-            Thread.sleep(250)
+            delay(250)
         }
     }
 

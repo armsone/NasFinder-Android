@@ -209,7 +209,7 @@ internal fun LocalPhotoLibraryGrid(
                     }
                 }
             }
-            if (ordered.isEmpty() && !loading) Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) { Text("표시할 사진·영상이 없습니다."); TextButton(onClick = onLaunchPicker) { Text("사진·영상 선택") } }
+            if (ordered.isEmpty() && !loading) Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) { Text("표시할 미디어가 없습니다."); TextButton(onClick = onLaunchPicker) { Text("미디어 선택") } }
             if (scrollButtonsVisible) Column(Modifier.align(Alignment.CenterEnd).background(MaterialTheme.colorScheme.surface.copy(alpha = .9f), RoundedCornerShape(12.dp))) {
                 IconButton(onClick = { scope.launch { grid.animateScrollToItem(0) } }, enabled = grid.canScrollBackward) { Icon(Icons.Default.ArrowUpward, "맨 위로") }
                 IconButton(onClick = { scope.launch { if (entries.isNotEmpty()) grid.animateScrollToItem(entries.lastIndex) } }, enabled = grid.canScrollForward) { Icon(Icons.Default.ArrowDownward, "맨 아래로") }
@@ -245,7 +245,7 @@ internal fun LocalPhotoLibraryGrid(
                     listOf(1, 3, 5, 8).forEach { count -> DropdownMenuItem(text = { Text("${if (columns == count) "✓ " else ""}${count}열") }, onClick = { columns = count; filterMenu = false }) }
                     HorizontalDivider()
                     DropdownMenuItem(text = { Text("표시한 항목 모두 선택") }, onClick = { onSetSelection(ordered.map { it.uri.toString() }, true); filterMenu = false }, enabled = ordered.isNotEmpty())
-                    if (onLoadMore != null) DropdownMenuItem(text = { Text("이전 사진·영상 더 보기") }, onClick = { onLoadMore(); filterMenu = false }, enabled = !loading)
+                    if (onLoadMore != null) DropdownMenuItem(text = { Text("이전 미디어 더 보기") }, onClick = { onLoadMore(); filterMenu = false }, enabled = !loading)
                 }
             }
             CompactGridPill("전날", enabled = !copying && !loading) {

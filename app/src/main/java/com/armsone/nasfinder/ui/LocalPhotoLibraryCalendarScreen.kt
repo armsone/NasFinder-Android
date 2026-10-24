@@ -212,7 +212,7 @@ internal fun LocalPhotoLibraryCalendarScreen(
     Column(modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 2.dp)) {
         if (permissionState != CalendarMediaPermissionState.FULL_ACCESS) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(if (permissionState == CalendarMediaPermissionState.DENIED) "사진·영상 접근 권한이 필요합니다." else "허용한 사진·영상만 표시합니다.", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
+                Text(if (permissionState == CalendarMediaPermissionState.DENIED) "미디어 접근 권한이 필요합니다." else "허용한 미디어만 표시합니다.", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
                 if (permissionState == CalendarMediaPermissionState.DENIED) androidx.compose.material3.TextButton(onClick = ::requestPermission) { Text("권한 허용") }
             }
         }
@@ -278,7 +278,7 @@ internal fun LocalPhotoLibraryCalendarScreen(
                     CalendarMediaThumbnailCell(context, item, selected, false, onTap = { if (onPreviewItems != null) onPreviewItems(selectedAssets.map { it.uri }, item.uri) else onPreview(item.uri) }, onToggleSelected = { toggleAsset(item.uri.toString()) })
                 }
             }
-            if (visibleAssets.isEmpty() && !selectionLoading) Text(if (indexLoading) "사진·영상 날짜를 불러오는 중" else "자료가 있는 날짜를 선택하세요", Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (visibleAssets.isEmpty() && !selectionLoading) Text(if (indexLoading) "미디어 날짜를 불러오는 중" else "자료가 있는 날짜를 선택하세요", Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (scrollButtonsVisible) Column(Modifier.align(Alignment.CenterEnd).background(MaterialTheme.colorScheme.surface.copy(alpha = .9f), RoundedCornerShape(12.dp))) {
                 IconButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, enabled = gridState.canScrollBackward) { Icon(Icons.Default.ArrowUpward, "맨 위로") }
                 IconButton(onClick = { scope.launch { if (visibleAssets.isNotEmpty()) gridState.animateScrollToItem(visibleAssets.lastIndex) } }, enabled = gridState.canScrollForward) { Icon(Icons.Default.ArrowDownward, "맨 아래로") }

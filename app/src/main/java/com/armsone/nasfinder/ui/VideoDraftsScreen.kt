@@ -24,12 +24,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun VideoDraftsScreen(
     state: AppState,
     model: NasFinderViewModel,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    // 영상 hub embeds this screen under its own title / tab bar: no own title, back arrow or system insets.
+    embedded: Boolean = false
 ) {
     val drafts = remember(state.trailerDraftCount, state.trailerDraftsVersion) { TrailerDraftStore.getAllDrafts() }
     val metadataProblem = remember(state.trailerDraftsVersion) { TrailerDraftStore.metadataProblem() }
@@ -37,64 +39,38 @@ internal fun VideoDraftsScreen(
     var draftToRename by remember { mutableStateOf<TrailerDraft?>(null) }
     var renameTitle by remember { mutableStateOf("") }
 
-    BackHandler { onBack() }
+    BackHandler(enabled = !embedded) { onBack() }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("편집본", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
-                        Text(
-                            "진행 중인 프로젝트 (${drafts.size}개)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "뒤로")
-                    }
-                },
+            PorcelainTopBar(
+                title = if (embedded) "편집본 ${drafts.size}개" else "편집본",
+                subtitle = if (embedded) null else "진행 중인 프로젝트 (${drafts.size}개)",
+                onBack = if (embedded) null else onBack,
+                windowInsets = if (embedded) WindowInsets(0) else TopAppBarDefaults.windowInsets,
                 actions = {
-                    TextButton(onClick = { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)) }) {
+                    TextButton(onClick = { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.TRAILER)) }, modifier = Modifier.heightIn(min = 48.dp)) {
                         Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("새 프로젝트")
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
-        }
+        },
+        contentWindowInsets = if (embedded) WindowInsets(0) else ScaffoldDefaults.contentWindowInsets
     ) { padding ->
         if (drafts.isEmpty()) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Icon(Icons.Default.MovieFilter, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(if (metadataProblem != null) "편집본 목록을 읽지 못했습니다" else "보관된 편집본이 없습니다", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            EmptyState(
+                icon = Icons.Default.MovieFilter,
+                title = if (metadataProblem != null) "편집본 목록을 읽지 못했습니다" else "보관된 편집본이 없습니다",
+                description = "새 영상을 제작하거나 편집을 일시 정지하면 여기에 안전하게 영구 저장됩니다.",
+                modifier = Modifier.fillMaxSize().padding(padding),
+                action = metadataProblem?.let { problem ->
                     // An unreadable list is reported as such, never as an intentionally empty library.
-                    metadataProblem?.let { problem ->
-                        Text(problem, fontSize = 13.sp, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
-                    }
-                    Text(
-                        "새 영상을 제작하거나 편집을 일시 정지하면 여기에 안전하게 영구 저장됩니다.",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-                }
-            }
+                    { Text(problem, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
+                },
+            )
         } else {
             LazyColumn(
                 Modifier
@@ -200,33 +176,38 @@ internal fun VideoDraftsScreen(
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                             Spacer(Modifier.height(4.dp))
 
-                            Row(
+                            FlowRow(
                                 Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.End,
-                                verticalAlignment = Alignment.CenterVertically
+                                verticalArrangement = Arrangement.spacedBy(0.dp)
                             ) {
-                                TextButton(onClick = { model.resumeTrailerDraft(draft) }) {
+                                TextButton(onClick = { model.resumeTrailerDraft(draft) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
                                     Icon(Icons.Default.PlayArrow, null, Modifier.size(16.dp))
                                     Spacer(Modifier.width(4.dp))
-                                    Text("이어서 편집")
+                                    Text("이어서 편집", maxLines = 1, softWrap = false)
                                 }
-                                TextButton(onClick = { model.duplicateTrailerDraft(draft) }) {
+                                TextButton(onClick = { model.duplicateTrailerDraft(draft) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
                                     Icon(Icons.Default.ContentCopy, null, Modifier.size(16.dp))
                                     Spacer(Modifier.width(4.dp))
-                                    Text("복제")
+                                    Text("복제", maxLines = 1, softWrap = false)
                                 }
                                 TextButton(onClick = {
                                     draftToRename = draft
                                     renameTitle = draft.displayTitle
-                                }) {
+                                }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
                                     Icon(Icons.Default.Edit, null, Modifier.size(16.dp))
                                     Spacer(Modifier.width(4.dp))
-                                    Text("이름 변경")
+                                    Text("이름 변경", maxLines = 1, softWrap = false)
                                 }
-                                TextButton(onClick = { draftToDelete = draft }) {
+                                TextButton(onClick = { model.setDraftPrivate(draft.id, !draft.isPrivate) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
+                                    Icon(if (draft.isPrivate) Icons.Default.Visibility else Icons.Default.VisibilityOff, null, Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (draft.isPrivate) "공개로" else "비공개로", maxLines = 1, softWrap = false)
+                                }
+                                TextButton(onClick = { draftToDelete = draft }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
                                     Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
                                     Spacer(Modifier.width(4.dp))
-                                    Text("삭제", color = MaterialTheme.colorScheme.error)
+                                    Text("삭제", color = MaterialTheme.colorScheme.error, maxLines = 1, softWrap = false)
                                 }
                             }
                         }
@@ -267,7 +248,7 @@ internal fun VideoDraftsScreen(
             AlertDialog(
                 onDismissRequest = { draftToDelete = null },
                 title = { Text("이 편집본을 지울까요?") },
-                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 사진과 영상, 컬렉션에 보관된 영상은 지워지지 않습니다.") },
+                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어, 컬렉션에 보관된 영상은 지워지지 않습니다.") },
                 confirmButton = {
                     TextButton(onClick = {
                         model.discardTrailerDraft(draft)

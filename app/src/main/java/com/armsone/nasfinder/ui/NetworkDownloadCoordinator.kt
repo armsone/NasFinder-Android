@@ -8,6 +8,7 @@ import android.webkit.MimeTypeMap
 import com.armsone.nasfinder.data.PhoneHardImportResult
 import com.armsone.nasfinder.data.PhoneHardItem
 import com.armsone.nasfinder.data.PhoneHardTarget
+import com.armsone.nasfinder.data.PrivacyMode
 import com.armsone.nasfinder.data.SharedInboxStore
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.network.RemoteFileService
@@ -50,6 +51,8 @@ data class NetworkDownloadProgress(
     val currentFileTotalBytes: Long,
     val totalBytesDownloaded: Long,
     val totalBytesExpected: Long,
+    // 작업을 시작할 때 고정한 출처. true이면 일반 모드 화면에는 파일 이름이 든 진행 대화상자를 내놓지 않는다.
+    val originPrivate: Boolean = false,
 ) {
     val fileProgressFraction: Float
         get() = if (totalFiles > 0) (completedFiles.toFloat() / totalFiles).coerceIn(0f, 1f) else 0f
@@ -142,6 +145,8 @@ interface NetworkDownloadCoordinator {
         items: List<RemoteFileItem>,
         destination: NetworkDownloadDestination,
         onProgress: (NetworkDownloadProgress) -> Unit = {},
+        // 호출자가 시작 순간에 고정한 출처(모드 + 입력). null은 "지정 안 함"이라 그때의 모드를 쓰고, 명시한 false는 그대로 공개로 고정된다.
+        originPrivate: Boolean? = null,
     ): NetworkDownloadResult
 
     /**
@@ -152,7 +157,8 @@ interface NetworkDownloadCoordinator {
         items: List<RemoteFileItem>,
         subdirectory: String? = null,
         onProgress: (NetworkDownloadProgress) -> Unit = {},
-    ): NetworkDownloadResult = download(service, items, NetworkDownloadDestination.PhoneHard(subdirectory), onProgress)
+        originPrivate: Boolean? = null,
+    ): NetworkDownloadResult = download(service, items, NetworkDownloadDestination.PhoneHard(subdirectory), onProgress, originPrivate)
 
     /**
      * Convenience function to download to an external SAF tree Uri.
@@ -173,6 +179,8 @@ interface NetworkDownloadCoordinator {
         targets: List<PhoneHardTarget>,
         treeUri: Uri,
         onProgress: (NetworkDownloadProgress) -> Unit = {},
+        // 요청 순간의 보기 범위(프라이버시 모드 여부). 재귀 개수 산정과 복사 전체에 같은 값을 쓴다. null이면 호출 시점의 모드.
+        privateVisible: Boolean? = null,
     ): NetworkDownloadResult = NetworkDownloadResult.Skipped("로컬 내보내기가 지원되지 않는 코디네이터입니다.")
 
     companion object {
@@ -202,7 +210,10 @@ class DefaultNetworkDownloadCoordinator(
         items: List<RemoteFileItem>,
         destination: NetworkDownloadDestination,
         onProgress: (NetworkDownloadProgress) -> Unit,
+        originPrivate: Boolean?,
     ): NetworkDownloadResult = withContext(Dispatchers.IO) {
+        // 호출자가 고정해 넘긴 값을 그대로 쓴다(명시한 false도 유지). 지정하지 않은 경우에만 지금 모드를 쓴다.
+        val jobPrivate = originPrivate ?: PrivacyMode.isActive
         if (items.isEmpty()) {
             return@withContext NetworkDownloadResult.Skipped("다운로드할 대상 항목이 선택되지 않았습니다.")
         }
@@ -423,6 +434,7 @@ class DefaultNetworkDownloadCoordinator(
                             desiredName = plan.sanitizedName,
                             destinationSubdirectory = destination.subdirectory,
                             mimeType = if (plan.isDirectory) null else plan.originalItem.mimeType,
+                            isPrivate = jobPrivate,
                         )
                         savedTargetPaths.add(importResult.targetFile.absolutePath)
                         committedDestinationFiles += importResult.records.size
@@ -518,7 +530,9 @@ class DefaultNetworkDownloadCoordinator(
         targets: List<PhoneHardTarget>,
         treeUri: Uri,
         onProgress: (NetworkDownloadProgress) -> Unit,
+        privateVisible: Boolean?,
     ): NetworkDownloadResult = withContext(Dispatchers.IO) {
+        val scopeVisible = privateVisible ?: PrivacyMode.isActive
         if (targets.isEmpty()) {
             return@withContext NetworkDownloadResult.Skipped("내보낼 대상 항목이 선택되지 않았습니다.")
         }
@@ -630,8 +644,8 @@ class DefaultNetworkDownloadCoordinator(
             if (plan.isDirectory) {
                 file.walkTopDown()
                     .maxDepth(MAX_REMOTE_DIRECTORY_DEPTH)
-                    .onEnter { dir -> !Files.isSymbolicLink(dir.toPath()) }
-                    .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) }
+                    .onEnter { dir -> !Files.isSymbolicLink(dir.toPath()) && !hiddenFromExport(dir, file, scopeVisible) }
+                    .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) && !hiddenFromExport(it, file, scopeVisible) }
                     .forEach { f ->
                         totalFilesExpected++
                         totalBytesExpected += f.length()
@@ -674,6 +688,7 @@ class DefaultNetworkDownloadCoordinator(
                     stagedEntry = plan.resolvedFile,
                     displayName = plan.displayName,
                     mimeType = plan.mimeType,
+                    skipChild = { child -> hiddenFromExport(child, plan.resolvedFile, scopeVisible) },
                     onBytesCopied = { fileName, fileBytesCopied, fileTotal, delta ->
                         streamBytesTransferred += delta
                         onProgress(
@@ -753,6 +768,13 @@ class DefaultNetworkDownloadCoordinator(
         }
     }
 
+    /**
+     * 일반 모드에서 폴더를 통째로 내보낼 때 보이지 않는 비공개 하위 항목은 함께 나가지 않는다.
+     * 사용자가 직접 고른 항목([root] 자신)과 프라이버시 모드의 내보내기는 막지 않는다.
+     */
+    private fun hiddenFromExport(file: File, root: File, privateVisible: Boolean): Boolean =
+        file != root && !privateVisible && PrivacyMode.isPhoneHardAbsolutePathPrivate(file.absolutePath)
+
     private suspend fun saveStagedEntryToTreeUri(
         contentResolver: ContentResolver,
         treeUri: Uri,
@@ -762,6 +784,7 @@ class DefaultNetworkDownloadCoordinator(
         mimeType: String?,
         depth: Int = 0,
         ancestorCanonicalPaths: Set<String> = emptySet(),
+        skipChild: ((File) -> Boolean)? = null,
         onBytesCopied: ((fileName: String, fileBytesCopied: Long, fileTotalBytes: Long, bytesDelta: Long) -> Unit)? = null,
         onFileCommitted: (Long) -> Unit,
     ): Uri = withContext(Dispatchers.IO) {
@@ -804,6 +827,7 @@ class DefaultNetworkDownloadCoordinator(
                 for (child in children) {
                     coroutineContext.ensureActive()
                     if (Files.isSymbolicLink(child.toPath())) continue
+                    if (skipChild?.invoke(child) == true) continue
                     saveStagedEntryToTreeUri(
                         contentResolver = contentResolver,
                         treeUri = treeUri,
@@ -813,6 +837,7 @@ class DefaultNetworkDownloadCoordinator(
                         mimeType = null,
                         depth = depth + 1,
                         ancestorCanonicalPaths = nextAncestors,
+                        skipChild = skipChild,
                         onBytesCopied = onBytesCopied,
                         onFileCommitted = { bytes ->
                             anyChildCommitted = true

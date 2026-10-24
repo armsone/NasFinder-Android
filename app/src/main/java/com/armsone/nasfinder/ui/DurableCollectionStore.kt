@@ -1,6 +1,7 @@
 package com.armsone.nasfinder.ui
 
 import android.content.Context
+import com.armsone.nasfinder.data.PrivacyMode
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -28,6 +29,8 @@ data class CollectionItem(
     val promotedFromEphemeral: Boolean = false,
     // Not persisted: whether a content:// reference still holds its persisted read grant (filled in by the store).
     val referenceGranted: Boolean = false,
+    // 비공개 영상(기본 false, 예전 데이터와 같다). 포스터·복사본 파일은 이 레코드에 종속이라 따로 표시하지 않는다.
+    val isPrivate: Boolean = false,
 ) {
     /** A content:// reference kept only because a persistable read grant was actually obtained. */
     val isContentReference: Boolean get() = isReference && localFilePath.startsWith("content://")
@@ -90,7 +93,24 @@ object DurableCollectionStore {
     @Synchronized
     fun getItems(): List<CollectionItem> {
         val granted = persistedReadGrants()
-        return items.map { if (it.isContentReference) it.copy(referenceGranted = it.localFilePath in granted) else it }
+        return items.filter { PrivacyMode.isVisible(it.isPrivate) }
+            .map { if (it.isContentReference) it.copy(referenceGranted = it.localFilePath in granted) else it }
+    }
+
+    /** 비공개를 포함한 전체 컬렉션(정리·소유권 계산용). 화면 목록에는 쓰지 않는다. */
+    @Synchronized
+    fun getAllItems(): List<CollectionItem> = items.toList()
+
+    /** 명시적인 공개/비공개 전환. 파일·순서는 그대로 두고 플래그만 바꾼다. */
+    @Synchronized
+    fun setPrivate(id: String, isPrivate: Boolean): Boolean {
+        val index = items.indexOfFirst { it.id == id }
+        if (index < 0) return false
+        val previous = items[index]
+        if (previous.isPrivate == isPrivate) return true
+        items[index] = previous.copy(isPrivate = isPrivate)
+        if (!persistToDisk()) { items[index] = previous; return false }
+        return true
     }
 
     @Synchronized
@@ -157,10 +177,16 @@ object DurableCollectionStore {
         posterFile: File? = null,
         sourceDraftId: String? = null,
         sourceUri: String? = null,
-        connectionId: String? = null
+        connectionId: String? = null,
+        // null = 지정 안 함(지금 모드를 따른다). 호출자가 작업 시작 때 고정한 값은 명시하며, 명시한 false는 공개 출처로 고정된 값이다.
+        isPrivate: Boolean? = null,
     ): CollectionItem? {
         val dir = storeDir ?: return null
         if (!exportedFile.exists() || exportedFile.length() <= 0L) return null
+        // 시작 시점의 출처: 호출자가 고정한 값(없으면 지금 모드), 비공개 편집본에서 만든 영상, 비공개 연결 출처.
+        val privateOrigin = (isPrivate ?: PrivacyMode.isActive) ||
+            (sourceDraftId != null && TrailerDraftStore.isDraftPrivate(sourceDraftId)) ||
+            PrivacyMode.isPrivateConnection(connectionId)
 
         val id = UUID.randomUUID().toString()
         val createdFiles = mutableListOf<File>()
@@ -185,6 +211,7 @@ object DurableCollectionStore {
             connectionId = connectionId,
             sourceDraftId = sourceDraftId,
             fileSizeBytes = destVideo.length(),
+            isPrivate = privateOrigin,
         )
         if (!insertAndPersist(item)) {
             createdFiles.forEach { it.delete() }
@@ -205,6 +232,7 @@ object DurableCollectionStore {
         durationSeconds: Double,
         sizeBytes: Long,
         posterFile: File? = null,
+        isPrivate: Boolean? = null,
     ): CollectionItem? {
         val dir = storeDir ?: return null
         require(durationSeconds.isFinite() && durationSeconds > 0.0) { "영상 길이를 확인하지 못해 참조로 추가하지 않았습니다. 다시 시도하거나 앱 안에 사본으로 보관해 주세요." }
@@ -222,6 +250,7 @@ object DurableCollectionStore {
             sourceUri = uri,
             fileSizeBytes = sizeBytes.coerceAtLeast(0L),
             referenceGranted = true,
+            isPrivate = isPrivate ?: PrivacyMode.isActive,
         )
         if (!insertAndPersist(item)) {
             destPoster?.delete()
@@ -351,10 +380,11 @@ object DurableCollectionStore {
         val from = items.indexOfFirst { it.id == id }
         if (from < 0) return
         val currentItem = items[from]
+        // 보이는 항목끼리만 이웃으로 센다(숨겨진 항목과 자리를 바꿔 아무 일도 없는 것처럼 보이지 않게).
         val targetIndices = if (currentItem.isPinned) {
-            items.indices.filter { items[it].isPinned }
+            items.indices.filter { items[it].isPinned && PrivacyMode.isVisible(items[it].isPrivate) }
         } else {
-            items.indices.filter { !items[it].isPinned }
+            items.indices.filter { !items[it].isPinned && PrivacyMode.isVisible(items[it].isPrivate) }
         }
         val posInGroup = targetIndices.indexOf(from)
         if (posInGroup < 0) return
@@ -493,6 +523,7 @@ object DurableCollectionStore {
                     item.compressedPreset?.let { put("compressedPreset", it) }
                     put("compressedFromReference", item.compressedFromReference)
                     put("promotedFromEphemeral", item.promotedFromEphemeral)
+                    if (item.isPrivate) put("isPrivate", true)
                 }
                 array.put(obj)
             }
@@ -605,6 +636,7 @@ object DurableCollectionStore {
                         compressedPreset = obj.optString("compressedPreset").takeIf { it.isNotBlank() },
                         compressedFromReference = obj.optBoolean("compressedFromReference", false),
                         promotedFromEphemeral = obj.optBoolean("promotedFromEphemeral", false),
+                        isPrivate = obj.optBoolean("isPrivate", false),
                     )
                 )
             }

@@ -7,6 +7,8 @@
             <data android:scheme="content" />
             <data android:mimeType="*/*" />
         </intent>
+        <!-- 사진·영상 전송의 "Google 포토": the installed Google Photos app's own picker (no OAuth scope, no server). -->
+        <package android:name="com.google.android.apps.photos" />
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />

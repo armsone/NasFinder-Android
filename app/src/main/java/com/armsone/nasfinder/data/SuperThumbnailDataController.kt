@@ -186,7 +186,8 @@ class SuperThumbnailDataController(context: Context) {
 
     private fun requireConnection(connectionId: String): RemoteConnection {
         require(connectionId.isNotBlank()) { "연결 ID가 필요합니다." }
-        return connections.load().firstOrNull { it.id == connectionId }
+        // 존재 확인은 표시 목록이 아니라 저장된 전체 연결 기준이다.
+        return connections.loadAll().firstOrNull { it.id == connectionId }
             ?: throw IllegalArgumentException("저장된 연결을 찾을 수 없습니다.")
     }
 

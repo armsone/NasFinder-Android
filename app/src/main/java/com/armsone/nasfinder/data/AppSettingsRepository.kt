@@ -94,7 +94,16 @@ class AppSettingsRepository(context: Context) {
         preferences.edit().putString(KEY_SCREEN_AWAKE, mode.name).apply()
     }
 
+    /** Saved drag order of one sidebar group (ids only); empty = the default order. Groups never share ids. */
+    fun menuOrder(group: String): List<String> =
+        preferences.getString(KEY_MENU_ORDER_PREFIX + group, null)?.split('\n')?.filter { it.isNotBlank() }.orEmpty()
+
+    fun setMenuOrder(group: String, ids: List<String>) {
+        preferences.edit().putString(KEY_MENU_ORDER_PREFIX + group, ids.joinToString("\n")).apply()
+    }
+
     private companion object {
+        const val KEY_MENU_ORDER_PREFIX = "menu_order."
         const val KEY_THEME = "theme"
         const val KEY_ICON_PACK = "interface_icon_pack"
         const val KEY_PORCELAIN_ACTIVATED = "porcelain_theme_2_17_0_activated"

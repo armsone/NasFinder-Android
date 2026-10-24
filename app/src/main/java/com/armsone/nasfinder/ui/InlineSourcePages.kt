@@ -218,12 +218,12 @@ internal fun DeviceFolderBrowserPage(
         when {
             list == null || (folderId != null && media == null) -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
             (folderId == null && folderError) || (folderId != null && mediaError) -> Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                Text("기기 사진·영상 목록을 불러오지 못했습니다. 담은 항목은 그대로 유지됩니다.", textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
+                Text("기기 미디어 목록을 불러오지 못했습니다. 담은 항목은 그대로 유지됩니다.", textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
                 Button(onClick = { retry++ }, modifier = Modifier.padding(top = 12.dp)) { Text("다시 시도") }
                 OutlinedButton(onClick = onLaunchDocumentPicker, enabled = enabled, modifier = Modifier.padding(top = 8.dp)) { Text("다른 저장소에서 가져오기") }
             }
             folderId == null && list.isEmpty() -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                Text("표시할 사진·영상 폴더가 없습니다. 사진 접근 권한을 확인하거나 '다른 저장소에서 가져오기'를 사용하세요.", textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
+                Text("표시할 미디어 폴더가 없습니다. 사진 접근 권한을 확인하거나 '다른 저장소에서 가져오기'를 사용하세요.", textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
             }
             folderId == null -> LazyVerticalGrid(GridCells.Adaptive(110.dp), Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(list, key = { it.id }) { folder ->
@@ -238,7 +238,7 @@ internal fun DeviceFolderBrowserPage(
             }
             else -> {
                 val folderMedia = media.orEmpty()
-                if (folderMedia.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("이 폴더에 사진·영상이 없습니다.", style = MaterialTheme.typography.bodySmall) }
+                if (folderMedia.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("이 폴더에 미디어가 없습니다.", style = MaterialTheme.typography.bodySmall) }
                 else LazyVerticalGrid(GridCells.Adaptive(96.dp), Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(folderMedia, key = { it.uri.toString() }) { entry ->
                         val raw = entry.uri.toString()

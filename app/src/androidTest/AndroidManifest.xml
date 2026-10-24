@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Platform android.app.Instrumentation only (no androidx.test dependency); drives the app through UiAutomation. -->
+    <instrumentation
+        android:name="com.armsone.nasfinder.smoke.PhoneSmokeInstrumentation"
+        android:label="NasFinder phone smoke"
+        android:targetPackage="com.armsone.nasfinder" />
+</manifest>

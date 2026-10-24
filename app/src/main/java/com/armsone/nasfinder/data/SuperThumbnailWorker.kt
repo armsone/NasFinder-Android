@@ -145,7 +145,8 @@ class SuperThumbnailWorker(
         // Eligibility wait (not a file failure): retry later without touching the network or the retry-by-error budget.
         if (requiresWifi && !SuperThumbnailNetworkPolicy.isWifi(applicationContext)) return Result.retry()
         val repository = ConnectionRepository(applicationContext)
-        val connection = repository.load().firstOrNull { it.id == connectionId }
+        // 백그라운드 작업은 표시 모드가 아니라 저장된 전체 연결로 찾는다(모드를 꺼도 비공개 연결 작업이 실패하지 않는다).
+        val connection = repository.loadAll().firstOrNull { it.id == connectionId }
             ?: return Result.failure(failureData())
         val requestedRoot = inputData.getString(KEY_ROOT_PATH) ?: connection.normalizedRootPath
         val budget = SuperThumbnailBudget()

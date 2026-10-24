@@ -56,14 +56,17 @@ data class ThemePalette(
     val pressed: Color,
     val onAccent: Color,
     val solidAction: Color = accent,
+    /** Caution text/icon colour (always paired with a symbol and words, never colour alone); readable on `surface`. */
+    val warn: Color = Color(0xFF8A5A00),
 )
 
 private fun palette(
     isDark: Boolean, background: Long, surface: Long, elevated: Long, border: Long, text: Long, secondary: Long,
     accent: Long, selected: Long, danger: Long, pressed: Long, onAccent: Long, solidAction: Long = accent,
+    warn: Long = if (isDark) 0xFFE5B85C else 0xFF8A5A00,
 ) = ThemePalette(
     isDark, Color(background), Color(surface), Color(elevated), Color(border), Color(text), Color(secondary),
-    Color(accent), Color(selected), Color(danger), Color(pressed), Color(onAccent), Color(solidAction),
+    Color(accent), Color(selected), Color(danger), Color(pressed), Color(onAccent), Color(solidAction), Color(warn),
 )
 
 private val LightPalette = palette(

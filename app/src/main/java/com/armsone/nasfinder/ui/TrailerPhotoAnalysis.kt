@@ -293,6 +293,21 @@ private fun similarityCloseness(fingerprint: IntArray, aspectRatio: Double, othe
     return closeness.coerceIn(0.0, 1.0)
 }
 
+/**
+ * Photo selection reuses these exact HanYang measurements and duplicate gates (no change to trailer analysis):
+ * sharpness/exposure in 0..1, a 16×16 luminance fingerprint, and the closeness test between two photos.
+ */
+internal class PhotoSelectionMetrics(val sharpness: Double, val exposure: Double, val fingerprint: IntArray)
+internal fun measurePhotoSelectionBitmap(bitmap: Bitmap): PhotoSelectionMetrics {
+    val (sharpness, exposure, _) = photoQualityComponents(bitmap)
+    return PhotoSelectionMetrics(sharpness, exposure, grayscaleFingerprint(bitmap))
+}
+/** Closeness 0..1 when the pair passes every duplicate gate, otherwise null (not similar at all). */
+internal fun photoSelectionCloseness(first: PhotoSelectionMetrics, firstAspect: Double, second: PhotoSelectionMetrics, secondAspect: Double): Double? =
+    similarityCloseness(first.fingerprint, firstAspect, second.fingerprint, secondAspect)
+internal const val PHOTO_SELECTION_DINO_DISTANCE_GATE = DINO_DISTANCE_GATE
+internal fun photoSelectionCosineDistance(first: FloatArray, second: FloatArray): Double = 1.0 - cosineDot(first, second)
+
 /** Same local HanYang quality/fingerprint used by motion representation selection. */
 internal data class TrailerMotionMeasurement(val quality: Double, val sharpness: Double, val exposure: Double, val fingerprint: IntArray)
 internal fun measureTrailerMotionBitmap(bitmap: Bitmap): TrailerMotionMeasurement {

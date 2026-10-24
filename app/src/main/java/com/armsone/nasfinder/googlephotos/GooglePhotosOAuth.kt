@@ -81,11 +81,11 @@ data class GooglePhotosCredential(
 }
 
 sealed class GooglePhotosOAuthException(message: String) : Exception(message) {
-    data object InvalidCallback : GooglePhotosOAuthException("Google Photos 인증 응답이 올바르지 않습니다.")
-    data object StateMismatch : GooglePhotosOAuthException("Google Photos 인증 상태가 일치하지 않습니다.")
-    data object AuthorizationDenied : GooglePhotosOAuthException("Google Photos 인증이 취소되었습니다.")
-    data object ReauthorizationRequired : GooglePhotosOAuthException("Google Photos에 다시 로그인해 주세요.")
-    data class RequestFailed(val statusCode: Int?) : GooglePhotosOAuthException("Google Photos 인증 요청이 실패했습니다.")
+    data object InvalidCallback : GooglePhotosOAuthException("Google 포토 인증 응답이 올바르지 않습니다.")
+    data object StateMismatch : GooglePhotosOAuthException("Google 포토 인증 상태가 일치하지 않습니다.")
+    data object AuthorizationDenied : GooglePhotosOAuthException("Google 포토 인증이 취소되었습니다.")
+    data object ReauthorizationRequired : GooglePhotosOAuthException("Google 포토에 다시 로그인해 주세요.")
+    data class RequestFailed(val statusCode: Int?) : GooglePhotosOAuthException("Google 포토 인증 요청이 실패했습니다.")
 }
 
 class GooglePhotosCredentialStore(context: Context) {

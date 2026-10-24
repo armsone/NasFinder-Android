@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -191,8 +192,8 @@ internal fun LocalPhotoLibraryScreen(
             recentItems = LocalPhotoLibraryCalendarRepository.loadRecentMedia(context, recentLimit, libraryQuery)
             photoDateCounts = LocalPhotoLibraryCalendarRepository.loadMediaDateCounts(context, libraryQuery)
         } catch (error: kotlinx.coroutines.CancellationException) { throw error }
-        catch (_: SecurityException) { recentItems = emptyList(); libraryError = "사진·영상 접근 권한을 확인해 주세요." }
-        catch (_: Exception) { recentItems = emptyList(); libraryError = "사진·영상 목록을 불러오지 못했습니다. 더 보기에서 새로고침해 주세요." }
+        catch (_: SecurityException) { recentItems = emptyList(); libraryError = "미디어 접근 권한을 확인해 주세요." }
+        catch (_: Exception) { recentItems = emptyList(); libraryError = "미디어 목록을 불러오지 못했습니다. 더 보기에서 새로고침해 주세요." }
         finally { recentLoading = false }
     }
 
@@ -300,7 +301,8 @@ internal fun LocalPhotoLibraryScreen(
 
     // File addition: OpenMultipleDocuments file picker
     val documentPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments(),
+        // Asks for a persistable read grant so a later 작업대에 담기 can keep the reference after a restart.
+        PersistableOpenDocuments(multiple = true),
     ) { uris ->
         // An empty result means cancel; preserve previous selections
         if (uris.isNotEmpty()) {
@@ -359,21 +361,13 @@ internal fun LocalPhotoLibraryScreen(
     Scaffold(
         topBar = {
             Column(Modifier.fillMaxWidth()) {
-                CenterAlignedTopAppBar(
-                    title = {
-                        Text(
-                            when (initialIntent) {
-                                LocalMediaEditIntent.TRAILER -> "영상 만들기"
-                                LocalMediaEditIntent.MUSIC -> "뮤직비디오"
-                                LocalMediaEditIntent.NONE -> if (googlePhotosSource) "Google 포토" else "내 사진·영상"
-                            },
-                        )
+                PorcelainTopBar(
+                    title = when (initialIntent) {
+                        LocalMediaEditIntent.TRAILER -> "영상 만들기"
+                        LocalMediaEditIntent.MUSIC -> "뮤직비디오"
+                        LocalMediaEditIntent.NONE -> if (googlePhotosSource) "Google 포토" else "내 미디어"
                     },
-                    navigationIcon = {
-                        IconButton(onClick = handleBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
-                        }
-                    },
+                    onBack = handleBack,
                     actions = {
                         if (initialIntent == LocalMediaEditIntent.NONE) {
                             androidx.compose.material3.TextButton(onClick = { documentPicker.launch(arrayOf("image/*", "video/*")) }, enabled = !copying) { Text("파일에서 추가") }
@@ -384,40 +378,43 @@ internal fun LocalPhotoLibraryScreen(
                                 androidx.compose.material3.DropdownMenuItem(text = { Text("사진 접근 권한") }, onClick = { showLibraryMenu = false; requestMediaPermission() })
                                 if (!googlePhotosSource) {
                                     androidx.compose.material3.DropdownMenuItem(text = { Text("새로고침") }, onClick = { showLibraryMenu = false; libraryRevision++ })
-                                    if (recentItems.size >= recentLimit) androidx.compose.material3.DropdownMenuItem(text = { Text("이전 사진·영상 더 보기") }, onClick = { showLibraryMenu = false; recentLimit += 180 }, enabled = !recentLoading)
+                                    if (recentItems.size >= recentLimit) androidx.compose.material3.DropdownMenuItem(text = { Text("이전 미디어 더 보기") }, onClick = { showLibraryMenu = false; recentLimit += 180 }, enabled = !recentLoading)
                                 }
                             }
                         }
                     },
-                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(),
                 )
                 if (com.armsone.nasfinder.ui.theme.usesUnifiedLayout(com.armsone.nasfinder.ui.theme.LocalNasFinderTheme.current)) {
-                    // Approved 03-photos: compact photo-first filter pills (min 36, corner 8) over the same existing pages.
-                    Row(
-                        Modifier.fillMaxWidth().horizontalScroll(androidx.compose.foundation.rememberScrollState())
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        pages.forEachIndexed { index, (key, title) ->
-                            val active = pagerState.currentPage == index
-                            Box(
-                                Modifier.heightIn(min = 36.dp).widthIn(min = 64.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (active) com.armsone.nasfinder.ui.theme.themePalette().selected else MaterialTheme.colorScheme.surfaceVariant)
-                                    .selectable(selected = active, role = androidx.compose.ui.semantics.Role.Tab, onClick = { goToPage(key) })
-                                    .padding(horizontal = 14.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text(
-                                    if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title,
-                                    maxLines = 1,
-                                    fontSize = 13.sp,
-                                    lineHeight = 18.sp,
-                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
+                    // Source tabs share the underline grammar of the 영상 hub and the iOS source tab bar: label, 3dp accent capsule, 48 touch height.
+                    Box(Modifier.fillMaxWidth()) {
+                        Row(
+                            Modifier.fillMaxWidth().horizontalScroll(androidx.compose.foundation.rememberScrollState())
+                                .padding(horizontal = 8.dp).selectableGroup(),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            pages.forEachIndexed { index, (key, title) ->
+                                val active = pagerState.currentPage == index
+                                Box(
+                                    Modifier.heightIn(min = 48.dp)
+                                        .selectable(selected = active, role = androidx.compose.ui.semantics.Role.Tab, onClick = { goToPage(key) })
+                                        .padding(horizontal = 12.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        if (googlePhotosSource) { if (key == "calendar") "기기 달력" else "선택한 사진" } else title,
+                                        maxLines = 1,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (active) com.armsone.nasfinder.ui.theme.themePalette().accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    if (active) Box(
+                                        Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(3.dp).clip(CircleShape)
+                                            .background(com.armsone.nasfinder.ui.theme.themePalette().accent),
+                                    )
+                                }
                             }
                         }
+                        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(.5.dp).background(MaterialTheme.colorScheme.outlineVariant))
                     }
                 } else androidx.compose.material3.ScrollableTabRow(
                     selectedTabIndex = pagerState.currentPage.coerceIn(0, pages.lastIndex),
@@ -473,17 +470,17 @@ internal fun LocalPhotoLibraryScreen(
                                 if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
                             }
                         }
-                        LocalMediaActionButton("재료함 담기", actionsEnabled, Modifier, isSecondary = true) {
+                        LocalMediaActionButton("작업대에 담기", actionsEnabled, Modifier, isSecondary = true) {
                             val uris = selectedUris()
                             if (uris.isNotEmpty()) {
-                                model.addLocalMediaToMaterialBasket(uris, deviceItems)
+                                model.requestWorkbenchAddLocal(uris, deviceItems)
                             }
                         }
                         LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier, isSecondary = true) {
                             // Opens the 사본/참조 confirmation; the selection itself is kept either way.
                             model.stageCollectionImport(selectedUris().map { it to null })
                         }
-                        LocalMediaActionButton("영상 편집", actionsEnabled, Modifier, isSecondary = false) {
+                        LocalMediaActionButton("영상 만들기", actionsEnabled, Modifier, isSecondary = false) {
                             // Unified entry starts as a trailer; the editor switches modes inline.
                             // An explicit music route keeps its original music-video start.
                             if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
@@ -519,7 +516,7 @@ internal fun LocalPhotoLibraryScreen(
                         if (!googlePhotosSource) {
                             if (permissionState != CalendarMediaPermissionState.FULL_ACCESS) {
                                 Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text(if (permissionState == CalendarMediaPermissionState.DENIED) "사진·영상 접근 권한이 필요합니다." else "허용한 사진·영상만 표시합니다.", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
+                                    Text(if (permissionState == CalendarMediaPermissionState.DENIED) "미디어 접근 권한이 필요합니다." else "허용한 미디어만 표시합니다.", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
                                     if (permissionState == CalendarMediaPermissionState.DENIED) androidx.compose.material3.TextButton(onClick = { requestMediaPermission() }) { Text("권한 허용") }
                                 }
                             }
@@ -562,7 +559,7 @@ internal fun LocalPhotoLibraryScreen(
                                     jumpItems = (jumpItems + loaded).distinctBy { canonicalKeyFor(it.uri.toString()) }
                                     completion(loaded)
                                 } catch (error: kotlinx.coroutines.CancellationException) { throw error }
-                                catch (_: Exception) { libraryError = "해당 날짜의 사진·영상을 불러오지 못했습니다."; completion(emptyList()) }
+                                catch (_: Exception) { libraryError = "해당 날짜의 미디어를 불러오지 못했습니다."; completion(emptyList()) }
                             }
                         },
                         onPreview = { sequence, item ->
@@ -667,14 +664,14 @@ internal fun LocalPhotoLibraryScreen(
                         val actionsEnabled = !loading && !copying && selected.isNotEmpty()
                         fun selectedUris() = selected.map(Uri::parse)
                         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            LocalMediaActionButton("영상 편집", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = false) {
+                            LocalMediaActionButton("영상 만들기", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = false) {
                                 if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
                                 else onCreateTrailer(selectedUris())
                             }
-                            LocalMediaActionButton("재료함 담기", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
+                            LocalMediaActionButton("작업대에 담기", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
                                 val uris = selectedUris()
                                 if (uris.isNotEmpty()) {
-                                    model.addLocalMediaToMaterialBasket(uris, deviceItems)
+                                    model.requestWorkbenchAddLocal(uris, deviceItems)
                                 }
                             }
                             LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
@@ -1167,7 +1164,7 @@ private fun MediaSourcePageContent(
                         }
                         MediaSourcePage.Favorites -> {
                             if (state.remoteFavorites.isEmpty()) {
-                                Text("즐겨찾기가 없습니다. 파일 목록에서 사진·영상이나 폴더를 즐겨찾기에 추가하면 여기에 나타납니다.", Modifier.padding(24.dp))
+                                Text("즐겨찾기가 없습니다. 파일 목록에서 미디어나 폴더를 즐겨찾기에 추가하면 여기에 나타납니다.", Modifier.padding(24.dp))
                             } else {
                                 val lockedConnection = state.remoteFavorites.firstOrNull { it.id in chosenFavorites && it.connectionId != "phonehard" }?.connectionId
                                 when (viewMode) {
@@ -1203,7 +1200,7 @@ private fun MediaSourcePageContent(
                                                 }
                                                 SourceRow(
                                                     title = favorite.name,
-                                                    subtitle = if (!usable && !favorite.isDirectory && !isMedia) "사진·영상 아님" else metaList.joinToString(" · "),
+                                                    subtitle = if (!usable && !favorite.isDirectory && !isMedia) "미디어 아님" else metaList.joinToString(" · "),
                                                     bitmap = state.favoriteThumbnails[favorite.id],
                                                     cacheIdentity = "favorite:${favorite.connectionId}:${favorite.remoteItemId ?: favorite.path}:${favorite.path}:${favorite.size}:${favorite.modifiedAt}:${favorite.thumbnailUrl}",
                                                     isFolder = favorite.isDirectory,
@@ -1246,7 +1243,7 @@ private fun MediaSourcePageContent(
                                                 val usable = (favorite.isDirectory || isMedia) && (phoneHard || connection != null) &&
                                                     (favorite.isDirectory || phoneHard || lockedConnection == null || lockedConnection == favorite.connectionId)
                                                 val subtitleText = when {
-                                                    !favorite.isDirectory && !isMedia -> "사진·영상 아님"
+                                                    !favorite.isDirectory && !isMedia -> "미디어 아님"
                                                     !phoneHard && connection == null -> "연결 없음"
                                                     !usable -> "다른 연결과 함께 담을 수 없음"
                                                     phoneHard -> "폰하드"
@@ -1315,7 +1312,7 @@ private fun MediaSourcePageContent(
                                     }
                                 }
                                 entries == null -> CircularProgressIndicator(Modifier.align(Alignment.Center))
-                                entries.isEmpty() -> Text("이 폴더에 사진·영상이나 하위 폴더가 없습니다.", Modifier.padding(24.dp))
+                                entries.isEmpty() -> Text("이 폴더에 미디어나 하위 폴더가 없습니다.", Modifier.padding(24.dp))
                                 viewMode == MediaSourceViewMode.DETAILS -> {
                                     LazyColumn(
                                         modifier = Modifier.fillMaxSize(),
@@ -1439,6 +1436,18 @@ private fun MediaSourcePageContent(
                     enabled = selectedCount > 0,
                     modifier = Modifier.weight(1f),
                 ) { Text("선택 해제") }
+                // Reference only: no download, no copy. Keeps the choice so it can still go to the picker basket.
+                OutlinedButton(
+                    onClick = {
+                        if (page is MediaSourcePage.PhoneHard) {
+                            model.requestWorkbenchAddPhoneHardPaths(chosenPhoneHard.toList())
+                        } else {
+                            model.requestWorkbenchAddFavorites(state.remoteFavorites.filter { it.id in chosenFavorites })
+                        }
+                    },
+                    enabled = selectedCount > 0,
+                    modifier = Modifier.weight(1.4f),
+                ) { Text("작업대에 담기") }
                 Button(
                     enabled = selectedCount > 0,
                     modifier = Modifier.weight(2f),

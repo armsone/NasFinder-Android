@@ -6,11 +6,11 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
-import android.provider.OpenableColumns
-import android.provider.MediaStore
 import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,11 +25,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -61,12 +64,14 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,12 +95,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -106,27 +108,6 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import java.util.UUID
 import kotlin.math.roundToInt
 
-private enum class SelectedMediaKind(
-    val title: String,
-    val icon: ImageVector,
-    val wireName: String,
-) {
-    MOTION_PHOTO("Motion Photo", Icons.Default.LiveTv, "motionPhoto"),
-    PHOTO("사진", Icons.Default.Photo, "photo"),
-    VIDEO("영상", Icons.Default.VideoFile, "video"),
-    UNKNOWN("알 수 없음", Icons.AutoMirrored.Filled.HelpOutline, "unknown"),
-}
-
-private data class SelectedMedia(
-    val uri: Uri,
-    val kind: SelectedMediaKind,
-    val displayName: String,
-    val mimeType: String,
-    val byteLength: Long,
-    val thumbnail: Bitmap?,
-    val durationMs: Long?,
-)
-
 private enum class PhotoPairingRole {
     NONE,
     SEND,
@@ -135,10 +116,12 @@ private enum class PhotoPairingRole {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PhotoTransferScreen(onBack: () -> Unit) {
+internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val receiver = remember { PhotoPairingReceiver() }
+    // The receive-ready listener/QR lives in a ViewModel so rotation or window resize does not drop it.
+    val receiveController: PhotoTransferReceiveController = viewModel()
+    val receiveUi by receiveController.ui.collectAsState()
     var senderSession by remember { mutableStateOf<PhotoTransferSenderSession?>(null) }
     val scanner = remember {
         val options = GmsBarcodeScannerOptions.Builder()
@@ -147,73 +130,98 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
             .build()
         GmsBarcodeScanning.getClient(context, options)
     }
-    var selectedUriStrings by rememberSaveable { mutableStateOf(emptyList<String>()) }
-    var selectionGeneration by rememberSaveable { mutableStateOf(0L) }
-    var selectedMedia by remember { mutableStateOf(emptyList<SelectedMedia>()) }
-    var selectionLoading by remember { mutableStateOf(false) }
+    // 보낼 항목은 작업대 포켓의 참조입니다. 고르기만 하면 원본은 복사하지 않고, 보내기를 누른 실행에서만 읽습니다.
+    val pocketItems = remember(state.materials, state.workbenchPocketId, state.pockets) {
+        state.materials.filter { item -> (if (state.pockets.any { it.id == item.pocketId }) item.pocketId else DEFAULT_POCKET_ID) == state.workbenchPocketId }
+    }
+    val selectedItems = pocketItems.filter { it.id in state.workbenchSelected && it.state != MaterialPreparationState.EXCLUDED }
+    var sendJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    // Unsupported items found when a send starts: the user decides before anything is sent (never silently dropped).
+    var issuePrompt by remember { mutableStateOf<Pair<WorkbenchRunPlan, kotlinx.coroutines.CompletableDeferred<Boolean>>?>(null) }
+    // Fetch / permission failures found AFTER the run started: sending fewer items needs the user's explicit choice.
+    var fetchPrompt by remember { mutableStateOf<Triple<List<WorkbenchRunIssue>, Int, kotlinx.coroutines.CompletableDeferred<Boolean>>?>(null) }
+    var runIssues by remember { mutableStateOf(emptyList<WorkbenchRunIssue>()) }
+    var sentEntries by remember { mutableStateOf(emptyMap<String, WorkbenchSendEntry>()) }
+    // Stable per selection (wire contract §2.1): reconnects and retries of the same selection reuse it, so a
+    // receiver that already committed an item recognises it instead of saving a duplicate.
+    // rememberSaveable alone does not survive a full process restart, so the id (with receiver and prepared items)
+    // is also journaled per selection: the same selection resumes the same transfer, never a duplicate.
+    val senderJournal = remember { PhotoTransferSenderJournal(context) }
+    var transferId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
+    var sendReport by remember { mutableStateOf<PhotoTransferSendReport?>(null) }
+    var sourceInfos by remember { mutableStateOf(emptyMap<String, PhotoTransferSourceInfo>()) }
+    var sendNames by remember { mutableStateOf(emptyMap<String, String>()) }
+    var deleteOriginals by remember { mutableStateOf(false) }
+    var deleteStatus by remember { mutableStateOf<String?>(null) }
+    var deleteWorking by remember { mutableStateOf(false) }
+    var deleteConfirmation by remember { mutableStateOf(false) }
+    var verifiedDeleteIds by remember { mutableStateOf(emptyList<String>()) }
     var pairingRole by rememberSaveable { mutableStateOf(PhotoPairingRole.NONE) }
     var pairingStatus by rememberSaveable { mutableStateOf("보내기 또는 받기를 선택하세요.") }
-    var pairingQr by remember { mutableStateOf<Bitmap?>(null) }
     var transferInProgress by remember { mutableStateOf(false) }
-    var receivedResults by remember { mutableStateOf(emptyList<SavedPhotoTransferResult>()) }
-    var receiverStarting by remember { mutableStateOf(false) }
-    var receiverConnected by remember { mutableStateOf(false) }
-    var receiverUiGeneration by remember { mutableStateOf(0L) }
-    var pairingAddress by remember { mutableStateOf<String?>(null) }
-    var receiverPeerTitle by remember { mutableStateOf<String?>(null) }
-    var receiverFinished by remember { mutableStateOf(false) }
-    var receiverError by remember { mutableStateOf<String?>(null) }
     var senderConnecting by remember { mutableStateOf(false) }
     var senderPeerTitle by remember { mutableStateOf<String?>(null) }
     var sentItemCount by remember { mutableStateOf<Int?>(null) }
     var senderError by remember { mutableStateOf<String?>(null) }
     var senderUiGeneration by remember { mutableStateOf(0L) }
-    var showPairingModal by remember { mutableStateOf(false) }
+    var showSenderModal by remember { mutableStateOf(false) }
     var showDismissConfirmation by remember { mutableStateOf(false) }
-    val receiverStartJob = remember { mutableStateOf<Job?>(null) }
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(maxItems = 100),
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            selectionLoading = true
-            selectionGeneration += 1L
-            selectedUriStrings = uris.map(Uri::toString)
-            selectedMedia = uris.map { uri ->
-                SelectedMedia(uri, SelectedMediaKind.UNKNOWN, "", "application/octet-stream", -1L, null, null)
-            }
+    val receiverStarting = receiveUi.starting
+    val receiverConnected = receiveUi.connected
+    val receiverFinished = receiveUi.finished
+    // A new pick/removal means the previous send report no longer describes the selection.
+    val onPendingChanged: () -> Unit = {
+        sendReport = null
+        sourceInfos = emptyMap()
+        deleteOriginals = false
+        deleteStatus = null
+        runIssues = emptyList()
+    }
+    // 미디어 / Google 포토 / 파일 (+ 폴더 inside 파일): every pick becomes references in a pocket the user chooses.
+    val pickers = rememberWorkbenchPickers(model, afterAdd = { onPendingChanged() })
+    var filesOrFolder by remember { mutableStateOf(false) }
+    val deleteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        val ids = verifiedDeleteIds
+        verifiedDeleteIds = emptyList()
+        deleteWorking = false
+        val infos = sourceInfos
+        val gone = ids.count { id ->
+            (infos[id] as? PhotoTransferSourceInfo.Deletable)?.let { PhotoTransferSourceDelete.isGone(context, it.snapshot.mediaUri) } == true
+        }
+        deleteStatus = when {
+            gone == ids.size && ids.isNotEmpty() -> "원본 ${gone}개를 삭제했습니다."
+            gone > 0 -> "원본 ${gone}/${ids.size}개만 삭제되었습니다. 나머지는 그대로 남아 있습니다."
+            result.resultCode == android.app.Activity.RESULT_OK -> "삭제 결과를 확인하지 못했습니다. 원본이 남아 있을 수 있습니다."
+            else -> "삭제하지 않았습니다. 원본은 그대로 남아 있습니다."
         }
     }
 
-    LaunchedEffect(selectedUriStrings, selectionGeneration) {
-        selectionLoading = selectedUriStrings.isNotEmpty()
-        if (selectedUriStrings.isNotEmpty()) {
-            val uris = selectedUriStrings.map(Uri::parse)
-            if (selectedMedia.size != uris.size) {
-                selectedMedia = uris.map { uri ->
-                    SelectedMedia(uri, SelectedMediaKind.UNKNOWN, "", "application/octet-stream", -1L, null, null)
-                }
-            }
-            val semaphore = Semaphore(4)
-            coroutineScope {
-                uris.mapIndexed { index, uri ->
-                    launch {
-                        val loaded = semaphore.withPermit { loadSelectedMedia(context, uri) }
-                        selectedMedia = selectedMedia.toMutableList().also { current ->
-                            if (index in current.indices) current[index] = loaded
-                        }
-                    }
-                }.joinAll()
-            }
-        } else {
-            selectedMedia = emptyList()
+    // One transfer id per selection. Not recomputed while sending or while a send report is still relevant,
+    // so a partly confirmed send is resumed under the same id.
+    val selectionKey = selectedItems.joinToString("|") { it.sourceIdentity }
+    LaunchedEffect(selectionKey, transferInProgress, sendReport != null) {
+        if (transferInProgress || sendReport != null) return@LaunchedEffect
+        transferId = if (selectedItems.isEmpty()) UUID.randomUUID().toString() else {
+            runCatching { senderJournal.resolve(selectedItems.map { it.sourceIdentity }) }
+                .getOrElse { UUID.randomUUID().toString() }
         }
-        selectionLoading = false
+    }
+    // 미디어 전송 pressed on the 작업대: open straight in 보내기 (the QR / explicit send are still the user's).
+    LaunchedEffect(state.workbenchSendRequested) {
+        if (state.workbenchSendRequested) {
+            pairingRole = PhotoPairingRole.SEND
+            pairingStatus = "항목을 확인하고 QR을 스캔하세요."
+            model.consumeWorkbenchSendRequest()
+        }
     }
 
-    DisposableEffect(Unit) {
+    // Leaving the screen for real (not a rotation/resize) releases the receive listener; configuration changes keep it.
+    val hostActivity = remember(context) { context.findTransferHostActivity() }
+    DisposableEffect(receiveController) {
         onDispose {
-            receiverStartJob.value?.cancel()
-            receiver.close()
+            if (hostActivity?.isChangingConfigurations != true) receiveController.release()
         }
     }
 
@@ -223,101 +231,18 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
     }
 
     val startReceiving: () -> Unit = {
-        showPairingModal = true
+        showSenderModal = false
         senderUiGeneration += 1L
-        receiverUiGeneration += 1L
-        val uiGeneration = receiverUiGeneration
-        receiverStartJob.value?.cancel()
-        receiver.close()
         senderSession?.close()
         senderSession = null
         pairingRole = PhotoPairingRole.RECEIVE
-        pairingQr = null
-        pairingAddress = null
-        receivedResults = emptyList()
-        receiverFinished = false
-        receiverError = null
-        receiverPeerTitle = null
-        receiverConnected = false
-        receiverStarting = true
-        pairingStatus = "새 연결 정보를 준비하고 있습니다."
-        receiverStartJob.value = scope.launch {
-            val result = receiver.start(
-                context = context,
-                onConnected = { peer ->
-                    scope.launch connectionUpdate@{
-                        if (receiverUiGeneration != uiGeneration) return@connectionUpdate
-                        receiverStarting = false
-                        receiverConnected = true
-                        receiverPeerTitle = peer.displayName
-                        pairingQr = null
-                        pairingStatus = "${peer.displayName}와 연결되었습니다. 파일을 기다리고 있습니다."
-                    }
-                },
-                onProgress = { progress ->
-                    scope.launch {
-                        if (receiverUiGeneration == uiGeneration) {
-                            pairingStatus = receiveProgressText(progress)
-                        }
-                    }
-                },
-                onComplete = { results ->
-                    scope.launch completionUpdate@{
-                        if (receiverUiGeneration != uiGeneration) return@completionUpdate
-                        receiverStarting = false
-                        receiverConnected = false
-                        receiverFinished = true
-                        receivedResults = results
-                        pairingStatus = "${results.size}개 파일을 받았습니다."
-                    }
-                },
-                onFailure = { reason ->
-                    scope.launch failureUpdate@{
-                        if (receiverUiGeneration != uiGeneration) return@failureUpdate
-                        receiverStarting = false
-                        receiverConnected = false
-                        pairingQr = null
-                        receiverError = reason
-                        pairingStatus = reason
-                    }
-                },
-            )
-            if (!isActive || receiverUiGeneration != uiGeneration) return@launch
-            when (result) {
-                is PhotoPairingStartResult.Ready -> {
-                    val readyQr = pairingQrBitmap(result.payload.encode())
-                    if (!isActive || receiverUiGeneration != uiGeneration || receiverConnected) {
-                        return@launch
-                    }
-                    receiverStarting = false
-                    pairingQr = readyQr
-                    pairingAddress = "${result.payload.host}:${result.payload.port}"
-                    pairingStatus = "보내는 기기에서 QR 코드를 스캔하세요."
-                }
-                PhotoPairingStartResult.NoLocalNetwork -> {
-                    receiverStarting = false
-                    receiverError = "같은 Wi-Fi에 연결한 뒤 다시 시도하세요."
-                    pairingStatus = checkNotNull(receiverError)
-                }
-                is PhotoPairingStartResult.Failed -> {
-                    receiverStarting = false
-                    receiverError = result.reason
-                    pairingStatus = result.reason
-                }
-            }
-        }
+        receiveController.start()
     }
 
     val selectSendRole: () -> Unit = {
-        showPairingModal = false
+        showSenderModal = false
         senderUiGeneration += 1L
-        receiverUiGeneration += 1L
-        receiverStartJob.value?.cancel()
-        receiver.close()
-        receiverStarting = false
-        receiverConnected = false
-        pairingQr = null
-        pairingAddress = null
+        receiveController.stop()
         senderSession?.close()
         senderSession = null
         senderConnecting = false
@@ -329,7 +254,7 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
     }
 
     val scanReceiverQr: () -> Unit = {
-        showPairingModal = true
+        showSenderModal = true
         senderUiGeneration += 1L
         val scanGeneration = senderUiGeneration
         senderSession?.close()
@@ -345,11 +270,11 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                 val payload = barcode.rawValue?.let(PhotoPairingPayload::decode)
                 if (payload == null) {
                     senderConnecting = false
-                    senderError = "NasFinder 사진 전송 QR 코드가 아니거나 형식이 올바르지 않습니다."
+                    senderError = "NasFinder 미디어 전송 QR 코드가 아니거나 형식이 올바르지 않습니다."
                     pairingStatus = checkNotNull(senderError)
                 } else {
                     scope.launch connectionAttempt@{
-                        val connection = connectToPhotoPair(payload)
+                        val connection = connectToPhotoPair(context, payload)
                         if (senderUiGeneration != scanGeneration) {
                             connection.getOrNull()?.close()
                             return@connectionAttempt
@@ -362,11 +287,15 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                                 senderError = null
                                 senderPeerTitle = session.peerPlatform.displayName
                                 sentItemCount = null
-                                pairingStatus = "${session.peerPlatform.displayName} 기기와 연결되었습니다."
+                                pairingStatus = "${session.peerPlatform.displayName} 기기와 연결되었습니다." +
+                                    if (session.legacyTokenExposed) {
+                                        " 이전 방식으로 연결되어 이 QR은 노출되었으므로 원본 삭제를 사용할 수 없습니다. " +
+                                            "삭제하려면 받는 기기에서 새 QR을 만들어 다시 스캔하세요."
+                                    } else ""
                             },
                             onFailure = {
                                 senderConnecting = false
-                                senderError = it.message ?: "연결하지 못했습니다."
+                                senderError = it.userMessage("연결하지 못했습니다. 두 기기가 같은 Wi-Fi에 있는지 확인한 뒤 다시 시도해 주세요.")
                                 pairingStatus = checkNotNull(senderError)
                             },
                         )
@@ -376,74 +305,201 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
             .addOnFailureListener {
                 if (senderUiGeneration != scanGeneration) return@addOnFailureListener
                 senderConnecting = false
-                senderError = it.message ?: "QR 코드를 읽지 못했습니다."
+                senderError = it.userMessage("QR 코드를 읽지 못했습니다. 받는 기기의 QR을 다시 비춰 주세요.")
                 pairingStatus = checkNotNull(senderError)
             }
             .addOnCanceledListener {
                 if (senderUiGeneration != scanGeneration) return@addOnCanceledListener
                 senderConnecting = false
-                showPairingModal = false
+                showSenderModal = false
                 pairingStatus = "QR 스캔이 취소되었습니다."
             }
     }
 
     val sendSelected: () -> Unit = sendSelected@{
-        if (transferInProgress || selectionLoading) return@sendSelected
-        val session = senderSession
-        if (session != null) {
-            transferInProgress = true
-            val outgoing = selectedMedia.mapNotNull { item ->
-                if (item.byteLength < 0L) null else {
+        if (transferInProgress) return@sendSelected
+        val session = senderSession ?: return@sendSelected
+        // The explicit SEND acts on exactly the selection the user reviewed, as it is right now.
+        val snapshot = selectedItems.toList()
+        if (snapshot.isEmpty()) {
+            pairingStatus = "보낼 항목이 없습니다."
+            return@sendSelected
+        }
+        transferInProgress = true
+        val currentTransferId = transferId
+        senderError = null
+        sendReport = null
+        deleteOriginals = false
+        deleteStatus = null
+        runIssues = emptyList()
+        sendJob = scope.launch {
+            // Temporary workspace owned by THIS run (NAS downloads only). Removed in finally, whatever the outcome.
+            var runDirectory: java.io.File? = null
+            try {
+                // 1. Folders are listed now (their CURRENT media), unsupported items are reported before anything is sent.
+                pairingStatus = "항목을 확인하는 중…"
+                val plan = model.planWorkbenchSend(snapshot) { name, found -> pairingStatus = "$name · 미디어 ${found}개 확인" }
+                if (plan.issues.isNotEmpty()) {
+                    runIssues = plan.issues
+                    val decision = kotlinx.coroutines.CompletableDeferred<Boolean>()
+                    issuePrompt = plan to decision
+                    val proceed = try { decision.await() } finally { issuePrompt = null }
+                    if (!proceed) {
+                        pairingStatus = "보내기를 취소했습니다. 작업대 항목은 그대로 남아 있습니다."
+                        return@launch
+                    }
+                }
+                if (plan.leaves.isEmpty()) {
+                    pairingStatus = "보낼 수 있는 미디어가 없습니다."
+                    senderError = pairingStatus
+                    return@launch
+                }
+                // 2. Read the inputs: local references stream from where they are, NAS items are downloaded into the run workspace.
+                val materialized = model.materializeWorkbenchForSend(plan.leaves) { index, total, name ->
+                    pairingStatus = "준비 중 ${index + 1}/$total · $name"
+                }
+                runDirectory = materialized.runDirectory
+                runIssues = plan.issues + materialized.failures
+                val entries = materialized.entries
+                if (materialized.failures.isNotEmpty()) {
+                    // Never turn a failed fetch into a quietly smaller send: ask, and clean this run's workspace on cancel.
+                    val decision = kotlinx.coroutines.CompletableDeferred<Boolean>()
+                    fetchPrompt = Triple(materialized.failures, entries.size, decision)
+                    val proceed = try { decision.await() } finally { fetchPrompt = null }
+                    if (!proceed) {
+                        pairingStatus = "보내기를 취소했습니다. 읽지 못한 항목은 작업대에 그대로 남아 있고 ‘다시 연결’할 수 있습니다."
+                        return@launch
+                    }
+                }
+                if (entries.isEmpty()) {
+                    senderError = "읽을 수 있는 항목이 없어 보내지 않았습니다. 작업대에서 ‘다시 연결’할 수 있습니다."
+                    pairingStatus = checkNotNull(senderError)
+                    return@launch
+                }
+                val outgoing = entries.map { entry ->
                     PhotoTransferOutgoingItem(
-                        uri = item.uri,
-                        id = UUID.randomUUID().toString(),
-                        name = item.displayName,
-                        mimeType = item.mimeType,
-                        mediaKind = item.kind.wireName,
-                        byteLength = item.byteLength,
+                        uri = entry.media.uri,
+                        // Stable per transfer + reference identity (not the temporary file name), so retries reuse the same ids.
+                        id = stableTransferItemId(currentTransferId, Uri.parse("workbench:${entry.leaf.item.sourceIdentity}")),
+                        name = entry.media.name,
+                        mimeType = entry.media.mimeType,
+                        mediaKind = entry.media.mediaKind,
+                        byteLength = entry.media.byteLength,
                     )
                 }
-            }
-            if (outgoing.size != selectedMedia.size) {
-                pairingStatus = "크기를 확인할 수 없는 파일이 있어 전송할 수 없습니다."
+                sentEntries = entries.indices.associate { outgoing[it].id to entries[it] }
+                // Snapshot every original before the first byte leaves, so a later delete can prove "unchanged".
+                val infos = withContext(Dispatchers.IO) {
+                    outgoing.indices.associate { index ->
+                        val item = entries[index].leaf.item
+                        outgoing[index].id to runCatching {
+                            if (item.sourceType != MaterialSourceType.LOCAL_LIBRARY || item.localFilePath != null || item.uriString.isBlank()) {
+                                PhotoTransferSourceInfo.NotDeletable("작업대 참조나 NAS·폰하드 항목은 원본 삭제 대상에서 제외했습니다.")
+                            } else {
+                                PhotoTransferSourceDelete.inspect(context, Uri.parse(item.uriString), outgoing[index].byteLength)
+                            }
+                        }.getOrElse { PhotoTransferSourceInfo.NotDeletable("원본에 더 이상 접근할 수 없어 삭제 대상에서 제외했습니다.") }
+                    }
+                }
+                sourceInfos = infos
+                sendNames = outgoing.associate { it.id to it.name }
+                val expectedReceiver = senderJournal.load(currentTransferId)?.receiverId
+                runCatching {
+                    senderJournal.recordPrepared(
+                        currentTransferId,
+                        outgoing.mapIndexed { index, it -> SenderPreparedItem(it.id, "workbench:${entries[index].leaf.item.sourceIdentity}", it.name, it.byteLength) },
+                    )
+                }
+                session.send(context, outgoing, currentTransferId, expectedReceiverId = expectedReceiver) { progress ->
+                    scope.launch { pairingStatus = sendProgressText(progress) }
+                }.fold(
+                    onSuccess = { report ->
+                        sendReport = report
+                        report.receiverId?.let { id -> runCatching { senderJournal.recordReceiver(currentTransferId, id) } }
+                        val verifiedIds = report.outcomes.values.filter { it.committed && it.inputsVerified }.map { it.itemId }.toSet()
+                        val allVerified = report.receiptProtocol && verifiedIds.size == outgoing.size
+                        runCatching { senderJournal.recordOutcome(currentTransferId, verifiedIds, allVerified) }
+                        val confirmed = verifiedIds.size
+                        val mismatched = report.outcomes.values.count { it.committed && !it.inputsVerified }
+                        sentItemCount = if (report.receiptProtocol) confirmed else report.sentCount
+                        pairingStatus = sendCompletionText(report.receiptProtocol, report.sentCount, confirmed, mismatched, outgoing.size) +
+                            outputFailureNote(failedOutputItemIds(report).size)
+                        // The pocket keeps every reference after success: only the user removes references.
+                    },
+                    onFailure = {
+                        if (it is kotlinx.coroutines.CancellationException) throw it
+                        senderError = it.userMessage("파일을 보내지 못했습니다. 두 기기가 같은 Wi-Fi에 있는지 확인한 뒤 다시 시도해 주세요.") + if (session.receiptProtocol) {
+                            " 작업대 항목은 그대로 남아 있습니다. 다시 연결해 보내면 이미 저장된 항목은 건너뛰고 이어서 확인합니다."
+                        } else " 작업대 항목은 그대로 남아 있습니다."
+                        pairingStatus = checkNotNull(senderError)
+                    },
+                )
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                pairingStatus = "보내기를 취소했습니다. 작업대 항목은 그대로 남아 있습니다."
+                throw cancelled
+            } catch (error: Exception) {
+                senderError = error.userMessage("보내기를 준비하지 못했습니다.") + " 작업대 항목은 그대로 남아 있습니다."
+                pairingStatus = checkNotNull(senderError)
+            } finally {
+                model.finishWorkbenchSend(runDirectory)
                 transferInProgress = false
-            } else {
-                senderError = null
-                scope.launch {
-                    session.send(context, outgoing) { progress ->
-                        scope.launch { pairingStatus = sendProgressText(progress) }
-                    }.fold(
-                        onSuccess = { count ->
-                            sentItemCount = count
-                            pairingStatus = "${count}개 보내기 완료"
-                        },
-                        onFailure = {
-                            senderError = it.message ?: "파일을 보내지 못했습니다."
-                            pairingStatus = checkNotNull(senderError)
-                        },
-                    )
-                    transferInProgress = false
-                    session.close()
-                    senderSession = null
-                }
+                session.close()
+                senderSession = null
             }
         }
     }
 
     val stopAndDismissPairing: () -> Unit = {
         showDismissConfirmation = false
-        showPairingModal = false
-        receiverUiGeneration += 1L
+        showSenderModal = false
         senderUiGeneration += 1L
-        receiverStartJob.value?.cancel()
-        receiver.close()
+        receiveController.stop()
+        sendJob?.cancel()
+        sendJob = null
         senderSession?.close()
         senderSession = null
-        receiverStarting = false
-        receiverConnected = false
         senderConnecting = false
         transferInProgress = false
         if (pairingRole == PhotoPairingRole.RECEIVE) pairingRole = PhotoPairingRole.NONE
+    }
+    val runOriginalDelete: () -> Unit = runDelete@{
+        val report = sendReport ?: return@runDelete
+        if (deleteWorking) return@runDelete
+        deleteWorking = true
+        deleteStatus = null
+        scope.launch {
+            val infos = sourceInfos
+            val verified = mutableListOf<String>()
+            var changed = 0
+            withContext(Dispatchers.IO) {
+                report.outcomes.values.filter { it.committed && it.inputsVerified }.forEach { outcome ->
+                    val info = infos[outcome.itemId] as? PhotoTransferSourceInfo.Deletable ?: return@forEach
+                    val sha = report.originHashes[outcome.itemId] ?: return@forEach
+                    if (PhotoTransferSourceDelete.verifyUnchanged(context, info.snapshot, sha) == null) {
+                        verified += outcome.itemId
+                    } else {
+                        changed += 1
+                    }
+                }
+            }
+            if (verified.isEmpty()) {
+                deleteWorking = false
+                deleteStatus = if (changed > 0) "보낸 뒤 바뀐 원본 ${changed}개는 삭제하지 않았습니다." else "삭제할 수 있는 원본이 없습니다."
+                return@launch
+            }
+            val sender = PhotoTransferSourceDelete.createDeleteRequest(
+                context,
+                verified.map { (infos.getValue(it) as PhotoTransferSourceInfo.Deletable).snapshot.mediaUri },
+            )
+            if (sender == null) {
+                deleteWorking = false
+                deleteStatus = "삭제 요청을 만들 수 없습니다. 원본은 그대로 남아 있습니다."
+                return@launch
+            }
+            verifiedDeleteIds = verified
+            deleteStatus = if (changed > 0) "바뀐 원본 ${changed}개는 제외하고 삭제 동의를 요청합니다." else null
+            deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        }
     }
     val pairingDismissNeedsConfirmation =
         (pairingRole == PhotoPairingRole.RECEIVE && receiverConnected && !receiverFinished) ||
@@ -455,37 +511,18 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                modifier = Modifier.height(44.dp),
-                title = {
-                    Text(
-                        "Live Photos & Motion Photos",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontSize = 17.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-            )
+            PorcelainTopBar(title = "미디어 전송", onBack = onBack)
         },
     ) { padding ->
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .padding(padding)
                 .fillMaxSize(),
             contentAlignment = Alignment.TopCenter,
         ) {
+            // 미디어 전송 uses the whole content pane on every window size (no centered column cap).
             LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth(),
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -500,6 +537,7 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                         PhotoTransferActionRow(
                             title = "받기",
                             icon = Icons.Default.QrCode,
+                            design = PackGlyph.RECEIVE,
                             onClick = startReceiving,
                             enabled = !transferInProgress && !receiverStarting && !receiverConnected,
                             accessibilityHint = "수신을 시작하고 QR 코드를 표시합니다.",
@@ -510,67 +548,94 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                 if (pairingRole == PhotoPairingRole.SEND) {
                     item {
                         PhotoTransferSection(
-                            title = "1 미디어 선택",
+                            title = "1 미디어 고르기",
                             headerIcon = Icons.Default.CheckCircle,
-                            footer = if (selectedMedia.isEmpty()) {
-                                "사진, 영상, Motion Photo를 한 번에 여러 개 선택할 수 있습니다."
-                            } else {
-                                "선택한 항목은 QR 연결 후 한 번에 보낼 수 있습니다."
-                            },
+                            footer = "고른 항목은 작업대 포켓에 위치·권한 정보만 담깁니다. 원본은 복사하거나 내려받지 않고 ‘보내기’를 누른 순간에만 읽습니다. " +
+                                "출처를 바꾸거나 선택을 취소해도 포켓과 선택은 그대로이고, 여러 출처에서 계속 담을 수 있습니다.",
                         ) {
                             PhotoTransferActionRow(
-                                title = if (selectedMedia.isEmpty()) "사진 보관함에서 선택" else "다시 선택",
+                                title = "미디어",
+                                subtitle = "Android 사진 선택기 · 기기에 클라우드 사진이 연결되어 있으면 함께 보일 수 있음",
                                 icon = Icons.Default.AddPhotoAlternate,
-                                onClick = {
-                                    picker.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo),
-                                    )
-                                },
+                                onClick = pickers.pickMedia,
+                                enabled = !transferInProgress,
                             )
-                            if (selectionLoading) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                ) {
-                                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                                    Text("미리보기 준비 중…", style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
+                            PhotoTransferActionRow(
+                                title = "Google 포토",
+                                subtitle = if (pickers.googlePhotosAvailable) "Google 포토 앱의 선택 화면 · 로그인이나 업로드 없이 고른 항목만 담음"
+                                else "Google 포토 앱이 설치되어 있지 않아 사용할 수 없음",
+                                icon = Icons.Default.Photo,
+                                onClick = pickers.pickGooglePhotos,
+                                enabled = pickers.googlePhotosAvailable && !transferInProgress,
+                                accessibilityHint = "Google 포토 앱에서 미디어를 고릅니다.",
+                            )
+                            PhotoTransferActionRow(
+                                title = "파일",
+                                subtitle = "파일 선택기 · 파일이나 폴더를 담음 · 이 방식으로 고른 기기 저장소 원본만 보낸 뒤 삭제를 고를 수 있음",
+                                icon = Icons.Default.Collections,
+                                onClick = { filesOrFolder = true },
+                                enabled = !transferInProgress,
+                                accessibilityHint = "파일 또는 폴더를 고릅니다. 폴더는 보내기를 누를 때 안의 미디어만 확인합니다.",
+                            )
                         }
                     }
 
-                    if (selectedMedia.isNotEmpty()) {
+                    item {
+                        PocketSendHeader(
+                            state = state,
+                            selectedCount = selectedItems.size,
+                            enabled = !transferInProgress,
+                            onSelectPocket = { onPendingChanged(); model.selectWorkbenchPocket(it) },
+                            onSelectAll = {
+                                onPendingChanged()
+                                val ids = pocketItems.filter { it.state != MaterialPreparationState.EXCLUDED }.map { it.id }
+                                val all = ids.isNotEmpty() && ids.all { it in state.workbenchSelected }
+                                model.setWorkbenchSelected(if (all) state.workbenchSelected - ids.toSet() else state.workbenchSelected + ids)
+                            },
+                            onCreatePocket = { model.createWorkbenchPocket(it) },
+                        )
+                    }
+                    if (pocketItems.isEmpty()) {
                         item {
-                            PhotoTransferSection(
-                                title = "2 선택 검토 · ${selectedMedia.size}개",
-                                headerIcon = Icons.Default.Collections,
-                            ) {
-                                AdaptiveSelectedMediaGrid(
-                                    items = selectedMedia,
-                                    onRemove = { index ->
-                                        selectionLoading = true
-                                        selectedUriStrings = selectedUriStrings.filterIndexed { itemIndex, _ ->
-                                            itemIndex != index
-                                        }
-                                    },
-                                )
-                            }
+                            Text(
+                                "이 포켓은 비어 있습니다. 위에서 출처를 골라 담거나 다른 포켓을 선택하세요.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 12.dp),
+                            )
+                        }
+                    }
+                    items(pocketItems, key = { "pocket-item-${it.id}" }) { item ->
+                        WorkbenchItemRow(
+                            item = item,
+                            selected = item.id in state.workbenchSelected,
+                            onToggle = { if (!transferInProgress) { onPendingChanged(); model.toggleWorkbenchSelected(item.id) } },
+                            onRemove = if (transferInProgress) null else ({ onPendingChanged(); model.removeMaterialItem(item.id) }),
+                        )
+                    }
+                    if (runIssues.isNotEmpty()) {
+                        item {
+                            Text(
+                                "보내지 못한 항목 ${runIssues.size}개 (작업대에는 그대로 남아 있고 ‘다시 연결’할 수 있습니다)\n" +
+                                    runIssues.joinToString("\n") { "• ${it.name}: ${it.reason}" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(horizontal = 12.dp),
+                            )
                         }
                     }
 
                     item {
                         PhotoTransferSection(
-                            title = "3 다른 폰 연결",
+                            title = "2 다른 폰 연결 후 보내기",
                             headerIcon = Icons.Default.Wifi,
-                            footer = "두 기기가 같은 Wi-Fi에 있어야 합니다.",
+                            footer = "두 기기가 같은 Wi-Fi에 있어야 합니다. 연결한 뒤 ‘보내기’를 눌러야 전송이 시작됩니다.",
                         ) {
                             PhotoTransferActionRow(
                                 title = "QR 스캔해서 연결",
                                 icon = Icons.Default.QrCodeScanner,
                                 onClick = scanReceiverQr,
-                                enabled = selectedMedia.isNotEmpty() && !selectionLoading &&
-                                    !senderConnecting && !transferInProgress,
+                                enabled = selectedItems.isNotEmpty() && !senderConnecting && !transferInProgress,
                                 accessibilityHint = "받는 기기에 표시된 QR 코드를 스캔해 연결합니다.",
                             )
                         }
@@ -581,23 +646,53 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
         }
     }
 
-    if (showPairingModal) {
+    if (filesOrFolder) FilesOrFolderDialog(pickers) { filesOrFolder = false }
+
+    fetchPrompt?.let { (failures, available, decision) ->
+        WorkbenchPartialDialog(failures, available, "보내기", onContinue = { decision.complete(true) }, onCancel = { decision.complete(false) })
+    }
+
+    issuePrompt?.let { (plan, decision) ->
+        AlertDialog(
+            onDismissRequest = { decision.complete(false) },
+            title = { Text("보낼 수 없는 항목이 있습니다", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 320.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        if (plan.leaves.isEmpty()) "보낼 수 있는 미디어가 없습니다." else "아래 항목은 제외하고 미디어 ${plan.leaves.size}개를 보낼 수 있습니다. 작업대 항목은 그대로 남습니다.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    plan.issues.forEach { Text("• ${it.name}: ${it.reason}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error) }
+                    plan.notes.forEach { Text("• $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                }
+            },
+            confirmButton = { TextButton(onClick = { decision.complete(true) }) { Text(if (plan.leaves.isEmpty()) "확인" else "제외하고 보내기") } },
+            dismissButton = { TextButton(onClick = { decision.complete(false) }) { Text("취소") } },
+        )
+    }
+
+    val pairingModalVisible = if (pairingRole == PhotoPairingRole.RECEIVE) receiveUi.modalOpen else showSenderModal
+    if (pairingModalVisible) {
         PhotoTransferPairingModal(
             role = pairingRole,
             onDismissRequest = requestPairingDismiss,
         ) {
             if (pairingRole == PhotoPairingRole.RECEIVE) {
                 ReceiverTransferState(
-                    starting = receiverStarting,
-                    connected = receiverConnected,
-                    finished = receiverFinished,
-                    error = receiverError,
-                    peerTitle = receiverPeerTitle,
-                    qr = pairingQr,
-                    address = pairingAddress,
-                    status = pairingStatus,
-                    results = receivedResults,
-                    canRegenerate = pairingQr != null && !receiverStarting && !receiverConnected,
+                    starting = receiveUi.starting,
+                    connected = receiveUi.connected,
+                    finished = receiveUi.finished,
+                    error = receiveUi.error,
+                    peerTitle = receiveUi.peerTitle,
+                    qr = receiveUi.qr,
+                    address = receiveUi.address,
+                    status = receiveUi.status,
+                    results = receiveUi.results,
+                    partialNote = receiveUi.partialNote,
+                    canRegenerate = receiveUi.qr != null && !receiveUi.starting && !receiveUi.connected,
                     onRegenerate = startReceiving,
                     onRetry = startReceiving,
                 )
@@ -609,13 +704,77 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                     error = senderError,
                     transferInProgress = transferInProgress,
                     status = pairingStatus,
-                    selectedCount = selectedMedia.size,
-                    canSend = senderSession != null && selectedMedia.isNotEmpty() && !selectionLoading,
+                    selectedCount = selectedItems.size,
+                    canSend = senderSession != null && selectedItems.isNotEmpty(),
                     onSend = sendSelected,
                     onRetry = scanReceiverQr,
+                    notice = if (senderSession?.legacyTokenExposed == true) {
+                        "이전 방식으로 연결되어 이 QR은 노출되었으므로 원본 삭제를 사용할 수 없습니다. " +
+                            "삭제하려면 받는 기기에서 새 QR을 만든 뒤 다시 스캔하세요."
+                    } else null,
+                    afterSend = {
+                        sendReport?.let { report ->
+                            val failedIds = failedOutputItemIds(report)
+                            if (failedIds.isNotEmpty()) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(outputFailureNote(failedIds.size).trim(), style = MaterialTheme.typography.bodySmall)
+                                    OutlinedButton(
+                                        onClick = {
+                                            // Explicit user choice after the explanation: the not-yet-confirmed items go under a NEW
+                                            // transfer id. Nothing is removed from the pocket and originals are never touched; the
+                                            // selection just narrows to the references that were not confirmed.
+                                            val verifiedIds = report.outcomes.values.filter { it.committed && it.inputsVerified }.map { it.itemId }.toSet()
+                                            val retainedEntries = sentEntries.filterKeys { it !in verifiedIds }.values
+                                            val retainedRoots = retainedEntries.map { it.leaf.rootId }.toSet()
+                                            if (retainedRoots.isNotEmpty()) {
+                                                val retainedIdentities = selectedItems.filter { it.id in retainedRoots }.map { it.sourceIdentity }
+                                                model.setWorkbenchSelected(retainedRoots)
+                                                transferId = runCatching { senderJournal.startNew(retainedIdentities) }
+                                                    .getOrElse { UUID.randomUUID().toString() }
+                                                onPendingChanged()
+                                                sentItemCount = null
+                                                pairingStatus = "새로 보내기 준비: ${retainedRoots.size}개 항목을 새 전송으로 보냅니다. 받는 기기에서 새 QR을 만들어 다시 연결하세요."
+                                            }
+                                        },
+                                        enabled = !transferInProgress,
+                                    ) { Text("새로 보내기 (${failedIds.size}개 포함)") }
+                                }
+                            }
+                            SenderOriginalDeleteSection(
+                                report = report,
+                                infos = sourceInfos,
+                                names = sendNames,
+                                enabled = deleteOriginals,
+                                onEnabledChange = { deleteOriginals = it },
+                                status = deleteStatus,
+                                working = deleteWorking,
+                                onRequestDelete = { deleteConfirmation = true },
+                            )
+                        }
+                    },
                 )
             }
         }
+    }
+
+    if (deleteConfirmation) {
+        AlertDialog(
+            onDismissRequest = { deleteConfirmation = false },
+            title = { Text("보낸 원본을 삭제할까요?") },
+            text = {
+                Text(
+                    "상대 기기가 저장을 확인했고, 보낸 뒤 바뀌지 않은 원본만 삭제 대상입니다. " +
+                        "Android가 삭제 동의 화면을 한 번 더 보여 주며, 거절하면 아무것도 지워지지 않습니다.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { deleteConfirmation = false; runOriginalDelete() }) { Text("확인하고 계속") }
+            },
+            dismissButton = { TextButton(onClick = { deleteConfirmation = false }) { Text("취소") } },
+        )
     }
 
     if (showDismissConfirmation) {
@@ -627,7 +786,7 @@ fun PhotoTransferScreen(onBack: () -> Unit) {
                     if (pairingRole == PhotoPairingRole.RECEIVE) {
                         "연결된 기기에서 받고 있는 항목은 완료되지 않습니다."
                     } else {
-                        "현재 연결 또는 파일 전송이 완료되지 않습니다."
+                        "현재 연결 또는 파일 전송이 완료되지 않습니다. 작업대 항목은 그대로 남습니다."
                     },
                 )
             },
@@ -747,43 +906,31 @@ private fun PhotoTransferActionRow(
     onClick: () -> Unit,
     enabled: Boolean = true,
     accessibilityHint: String? = null,
+    subtitle: String? = null,
+    design: PackGlyph? = null,
 ) {
     Column {
         TextButton(
             onClick = onClick,
             enabled = enabled,
-            modifier = Modifier.fillMaxWidth().height(44.dp).semantics {
-                contentDescription = listOfNotNull(title, accessibilityHint).joinToString(". ")
+            modifier = Modifier.fillMaxWidth().heightIn(min = if (subtitle == null) 44.dp else 60.dp).semantics {
+                contentDescription = listOfNotNull(title, subtitle, accessibilityHint).joinToString(". ")
             },
         ) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp), design = design)
             Spacer(Modifier.width(10.dp))
-            Text(title, fontSize = 15.sp)
-            Spacer(Modifier.weight(1f))
-        }
-        HorizontalDivider(modifier = Modifier.padding(start = 44.dp), color = MaterialTheme.colorScheme.outlineVariant)
-    }
-}
-
-@Composable
-private fun AdaptiveSelectedMediaGrid(items: List<SelectedMedia>, onRemove: (Int) -> Unit) {
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        val columnCount = ((maxWidth.value + 10f) / 114f).toInt().coerceIn(1, 6)
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items.withIndex().chunked(columnCount).forEach { rowItems ->
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    rowItems.forEach { indexed ->
-                        SelectedMediaReviewCard(
-                            item = indexed.value,
-                            index = indexed.index,
-                            onRemove = { onRemove(indexed.index) },
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                    repeat(columnCount - rowItems.size) { Spacer(Modifier.weight(1f)) }
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 15.sp)
+                subtitle?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }
+        HorizontalDivider(modifier = Modifier.padding(start = 44.dp), color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
@@ -817,6 +964,7 @@ private fun ReceiverTransferState(
     address: String?,
     status: String,
     results: List<SavedPhotoTransferResult>,
+    partialNote: String?,
     canRegenerate: Boolean,
     onRegenerate: () -> Unit,
     onRetry: () -> Unit,
@@ -831,7 +979,7 @@ private fun ReceiverTransferState(
                     Icon(
                         Icons.Default.Warning,
                         contentDescription = null,
-                        tint = Color(0xffff9800),
+                        tint = com.armsone.nasfinder.ui.theme.themePalette().warn,
                         modifier = Modifier.size(40.dp),
                     )
                     Text(error, style = MaterialTheme.typography.bodyMedium)
@@ -844,7 +992,7 @@ private fun ReceiverTransferState(
                 qr != null -> {
                     Image(
                         bitmap = qr.asImageBitmap(),
-                        contentDescription = "사진 전송 페어링 QR 코드",
+                        contentDescription = "미디어 전송 페어링 QR 코드",
                         modifier = Modifier.size(280.dp),
                     )
                     Text("보내는 기기에서 이 QR 코드를 스캔하세요.", style = MaterialTheme.typography.bodyMedium)
@@ -873,17 +1021,18 @@ private fun ReceiverTransferState(
                     Icon(
                         Icons.Default.CheckCircle,
                         contentDescription = null,
-                        tint = Color(0xff34a853),
+                        tint = com.armsone.nasfinder.ui.theme.themePalette().accent,
                         modifier = Modifier.size(48.dp),
                     )
                     Text("${peerTitle ?: "상대"} 기기와 연결되었습니다.", fontWeight = FontWeight.Medium)
                     if (finished) {
                         Text(
-                            "${results.size}개 받기 완료",
+                            if (partialNote == null) "${results.size}개 받기 완료" else "${results.size}개 저장됨 · 일부만 받음",
                             fontSize = 15.sp,
-                            color = Color(0xff34a853),
+                            color = if (partialNote == null) MaterialTheme.colorScheme.onSurface else com.armsone.nasfinder.ui.theme.themePalette().warn,
                             fontWeight = FontWeight.SemiBold,
                         )
+                        partialNote?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
                         if (results.isNotEmpty()) AdaptiveReceivedResultsGrid(results)
                     } else {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -907,6 +1056,8 @@ private fun SenderTransferState(
     canSend: Boolean,
     onSend: () -> Unit,
     onRetry: () -> Unit,
+    notice: String? = null,
+    afterSend: @Composable () -> Unit = {},
 ) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
@@ -922,7 +1073,7 @@ private fun SenderTransferState(
                     Icon(
                         Icons.Default.Warning,
                         contentDescription = null,
-                        tint = Color(0xffff9800),
+                        tint = com.armsone.nasfinder.ui.theme.themePalette().warn,
                         modifier = Modifier.size(40.dp),
                     )
                     Text(error, style = MaterialTheme.typography.bodyMedium)
@@ -932,23 +1083,31 @@ private fun SenderTransferState(
                     Icon(
                         Icons.Default.CheckCircle,
                         contentDescription = null,
-                        tint = Color(0xff34a853),
+                        tint = com.armsone.nasfinder.ui.theme.themePalette().accent,
                         modifier = Modifier.size(48.dp),
                     )
                     Text("$peerTitle 기기와 연결되었습니다.", fontWeight = FontWeight.Medium)
                     when {
-                        sentItemCount != null -> Text(
-                            "${sentItemCount}개 보내기 완료",
-                            fontSize = 15.sp,
-                            color = Color(0xff34a853),
-                            fontWeight = FontWeight.SemiBold,
-                        )
+                        sentItemCount != null -> {
+                            Text(
+                                "${sentItemCount}개 보내기 완료",
+                                fontSize = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            afterSend()
+                        }
                         transferInProgress -> {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                             Text(status, style = MaterialTheme.typography.labelSmall)
                         }
-                        else -> Button(onClick = onSend, enabled = canSend) {
-                            Text("4 보내기 · ${selectedCount}개")
+                        else -> {
+                            notice?.let {
+                                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Button(onClick = onSend, enabled = canSend) {
+                                Text("4 보내기 · ${selectedCount}개")
+                            }
                         }
                     }
                 }
@@ -956,6 +1115,93 @@ private fun SenderTransferState(
         }
     }
 }
+
+/**
+ * Optional cleanup after a send: default OFF, only items the receiver durably confirmed with matching input hashes
+ * and whose exact MediaStore original is unchanged are offered; every other item is listed with its reason.
+ */
+@Composable
+private fun SenderOriginalDeleteSection(
+    report: PhotoTransferSendReport,
+    infos: Map<String, PhotoTransferSourceInfo>,
+    names: Map<String, String>,
+    enabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    status: String?,
+    working: Boolean,
+    onRequestDelete: () -> Unit,
+) {
+    val excluded = mutableListOf<Pair<String, String>>()
+    var eligible = 0
+    report.outcomes.values.forEach { outcome ->
+        val name = names[outcome.itemId] ?: "항목"
+        val info = infos[outcome.itemId]
+        val reason = when {
+            report.legacyTokenExposed ->
+                "이전 방식으로 연결되어 이 QR의 비밀 값이 노출되었습니다. 받는 기기에서 새 QR을 만들어 다시 연결해야 삭제할 수 있습니다."
+            !report.receiptProtocol -> "상대 앱이 항목별 저장 확인을 지원하지 않습니다."
+            !outcome.committed -> "상대 기기의 저장 확인을 받지 못했습니다."
+            !outcome.inputsVerified -> "저장 확인 해시가 보낸 내용과 일치하지 않습니다."
+            info is PhotoTransferSourceInfo.NotDeletable -> info.reason
+            info == null -> "원본 정보를 확인하지 못했습니다."
+            else -> null
+        }
+        if (reason == null) eligible += 1 else excluded += name to reason
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("보낸 원본 삭제", fontWeight = FontWeight.Medium)
+                Text(
+                    "기본은 삭제하지 않음 · 삭제 가능 ${eligible}개 · 제외 ${excluded.size}개",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(checked = enabled && eligible > 0, onCheckedChange = onEnabledChange, enabled = eligible > 0 && !working)
+        }
+        if (enabled && eligible > 0) {
+            Button(onClick = onRequestDelete, enabled = !working) {
+                Text(if (working) "확인 중…" else "원본 ${eligible}개 삭제…")
+            }
+        }
+        Text(
+            PhotoTransferSourceDelete.SUPPORTED_SOURCE_NOTE + " 받는 기기의 저장 확인을 받은 항목만 삭제할 수 있습니다. " +
+                "소중한 원본은 받는 기기에서 직접 확인한 뒤 삭제하세요.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (excluded.isNotEmpty()) {
+            Text("삭제에서 제외된 항목", style = MaterialTheme.typography.labelMedium)
+            excluded.take(6).forEach { (name, reason) ->
+                Text(
+                    "· $name — $reason",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (excluded.size > 6) {
+                Text(
+                    "외 ${excluded.size - 6}개",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+internal const val LEGACY_RECEIVE_NOTE =
+    "보내는 기기가 이전 방식으로 연결해 이 QR의 비밀 값이 노출되었습니다. 원본 삭제를 쓰려면 새 QR 코드를 만들어 다시 연결하세요."
+
+/** Same selection + same transfer id → same item id on every retry (never a fresh random id per attempt). */
+internal fun stableTransferItemId(transferId: String, uri: Uri): String =
+    UUID.nameUUIDFromBytes("$transferId|$uri".toByteArray(Charsets.UTF_8)).toString()
 
 @Composable
 private fun SavedPhotoTransferCard(result: SavedPhotoTransferResult, modifier: Modifier = Modifier) {
@@ -1025,61 +1271,6 @@ private fun loadSavedPhotoTransferThumbnail(context: Context, result: SavedPhoto
 }.getOrNull()
 
 @Composable
-private fun SelectedMediaReviewCard(
-    item: SelectedMedia,
-    index: Int,
-    onRemove: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Box(
-        modifier = modifier
-            .height(112.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .semantics { contentDescription = "항목 ${index + 1}, ${item.kind.title}" },
-        contentAlignment = Alignment.Center,
-    ) {
-        item.thumbnail?.let { thumbnail ->
-            SkinAwareThumbnailImage(
-                bitmap = thumbnail,
-                cacheIdentity = "photo-transfer-selected:${item.uri}:${item.byteLength}:${item.mimeType}",
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } ?: Icon(
-            item.kind.icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(34.dp),
-        )
-        if (item.kind == SelectedMediaKind.VIDEO) {
-            Icon(
-                Icons.Default.PlayCircle,
-                contentDescription = null,
-                tint = Color.White,
-                modifier = Modifier.size(34.dp),
-            )
-        }
-        MediaKindBadge(
-            text = listOfNotNull(item.kind.title, formatDuration(item.durationMs)).joinToString(" "),
-            modifier = Modifier.align(Alignment.BottomStart).padding(6.dp),
-        )
-        IconButton(
-            onClick = onRemove,
-            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(36.dp),
-        ) {
-            Icon(
-                Icons.Default.Close,
-                contentDescription = "항목 ${index + 1} 삭제",
-                tint = Color.White,
-                modifier = Modifier.size(24.dp).background(Color.Black.copy(alpha = .65f), CircleShape),
-            )
-        }
-    }
-}
-
-@Composable
 private fun MediaKindBadge(text: String, modifier: Modifier = Modifier) {
     Text(
         text,
@@ -1092,84 +1283,6 @@ private fun MediaKindBadge(text: String, modifier: Modifier = Modifier) {
             .padding(horizontal = 7.dp, vertical = 4.dp),
     )
 }
-
-private suspend fun loadSelectedMedia(context: Context, uri: Uri): SelectedMedia =
-    withContext(Dispatchers.IO) {
-        val mimeType = context.contentResolver.getType(uri)
-        val kind = when {
-            mimeType?.startsWith("video/") == true -> SelectedMediaKind.VIDEO
-            mimeType?.startsWith("image/") == true -> {
-                if (isMotionPhoto(context, uri)) {
-                    SelectedMediaKind.MOTION_PHOTO
-                } else {
-                    SelectedMediaKind.PHOTO
-                }
-            }
-            else -> SelectedMediaKind.UNKNOWN
-        }
-        var displayName: String? = null
-        var byteLength = -1L
-        runCatching {
-            context.contentResolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (nameColumn >= 0 && !cursor.isNull(nameColumn)) displayName = cursor.getString(nameColumn)
-                    if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) byteLength = cursor.getLong(sizeColumn)
-                }
-            }
-        }
-        if (byteLength < 0L) {
-            byteLength = runCatching {
-                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
-            }.getOrNull() ?: -1L
-        }
-        SelectedMedia(
-            uri = uri,
-            kind = kind,
-            displayName = displayName?.takeIf(String::isNotBlank) ?: "media-${uri.toString().hashCode()}",
-            mimeType = mimeType ?: if (kind == SelectedMediaKind.VIDEO) "video/mp4" else "image/jpeg",
-            byteLength = byteLength,
-            thumbnail = loadMediaThumbnail(context, uri, kind),
-            durationMs = if (kind == SelectedMediaKind.VIDEO) loadVideoDuration(context, uri) else null,
-        )
-    }
-
-private fun loadMediaThumbnail(context: Context, uri: Uri, kind: SelectedMediaKind): Bitmap? = runCatching {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        context.contentResolver.loadThumbnail(uri, Size(320, 240), null)
-    } else if (kind == SelectedMediaKind.VIDEO) {
-        MediaMetadataRetriever().run {
-            try {
-                setDataSource(context, uri)
-                getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-            } finally {
-                release()
-            }
-        }
-    } else {
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            BitmapFactory.decodeStream(input, null, BitmapFactory.Options().apply { inSampleSize = 4 })
-        }
-    }
-}.getOrNull()
-
-private fun loadVideoDuration(context: Context, uri: Uri): Long? = runCatching {
-    MediaMetadataRetriever().run {
-        try {
-            setDataSource(context, uri)
-            extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
-        } finally {
-            release()
-        }
-    }
-}.getOrNull()
 
 private fun formatDuration(durationMs: Long?): String? = durationMs?.let {
     val seconds = (it / 1_000.0).roundToInt().coerceAtLeast(0)
@@ -1185,7 +1298,7 @@ private fun sendProgressText(progress: PhotoTransferProgress): String {
     return "${progress.fileName} · $percent% · ${progress.completedFiles}/${progress.totalFiles ?: 0}개"
 }
 
-private fun receiveProgressText(progress: PhotoTransferProgress): String {
+internal fun receiveProgressText(progress: PhotoTransferProgress): String {
     val percent = if (progress.totalBytes > 0L) {
         (progress.transferredBytes * 100L / progress.totalBytes).coerceIn(0L, 100L)
     } else {
@@ -1194,37 +1307,63 @@ private fun receiveProgressText(progress: PhotoTransferProgress): String {
     return "${progress.fileName} · $percent% · ${progress.completedFiles}개 저장"
 }
 
-private fun isMotionPhoto(context: Context, uri: Uri): Boolean {
-    val mediaStoreFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) runCatching {
-        context.contentResolver.query(
-            uri,
-            arrayOf(MediaStore.Files.FileColumns.SPECIAL_FORMAT),
-            null,
-            null,
-            null,
-        )?.use { cursor ->
-            val column = cursor.getColumnIndex(MediaStore.Files.FileColumns.SPECIAL_FORMAT)
-            cursor.moveToFirst() && column >= 0 &&
-                cursor.getInt(column) == MediaStore.Files.FileColumns.SPECIAL_FORMAT_MOTION_PHOTO
-        } ?: false
-    }.getOrDefault(false) else false
-    if (mediaStoreFlag) return true
+// Tablets use the available content width; only extremely wide windows keep a centered column.
 
-    return runCatching {
-        val length = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: return false
-        if (length !in 1..512L * 1024 * 1024) return false
-        val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
-            val output = java.io.ByteArrayOutputStream(length.toInt())
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var remaining = length
-            while (remaining > 0) {
-                val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                if (count <= 0) return false
-                output.write(buffer, 0, count)
-                remaining -= count
-            }
-            output.toByteArray()
-        } ?: return false
-        MotionPhotoCodec.parse(bytes) != null
-    }.getOrDefault(false)
+private tailrec fun Context.findTransferHostActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is android.content.ContextWrapper -> baseContext.findTransferHostActivity()
+    else -> null
+}
+
+private const val GOOGLE_PHOTOS_PACKAGE = "com.google.android.apps.photos"
+
+internal fun isGooglePhotosInstalled(context: Context): Boolean = runCatching {
+    @Suppress("DEPRECATION")
+    context.packageManager.getPackageInfo(GOOGLE_PHOTOS_PACKAGE, 0)
+    true
+}.getOrDefault(false)
+
+/**
+ * Opens the Google Photos app's own picker (ACTION_GET_CONTENT pinned to its package). It returns content URIs with a
+ * temporary read grant for just the chosen items; no Google sign-in, API scope or upload is involved on our side.
+ * The result is read as any other picked URI. This is not the system Files chooser.
+ */
+internal class GooglePhotosAppPickContract : ActivityResultContract<Unit, List<Uri>>() {
+    override fun createIntent(context: Context, input: Unit): android.content.Intent =
+        android.content.Intent(android.content.Intent.ACTION_GET_CONTENT)
+            .setType("*/*")
+            .putExtra(android.content.Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+            .putExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, true)
+            .addCategory(android.content.Intent.CATEGORY_OPENABLE)
+            .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .setPackage(GOOGLE_PHOTOS_PACKAGE)
+
+    override fun parseResult(resultCode: Int, intent: android.content.Intent?): List<Uri> {
+        if (resultCode != android.app.Activity.RESULT_OK || intent == null) return emptyList()
+        val clip = intent.clipData
+        val fromClip = if (clip != null) (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri } else emptyList()
+        return fromClip.ifEmpty { listOfNotNull(intent.data) }
+    }
+}
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1L shl 30 -> "%.1fGB".format(bytes / (1L shl 30).toDouble())
+    bytes >= 1L shl 20 -> "%.1fMB".format(bytes / (1L shl 20).toDouble())
+    bytes >= 1L shl 10 -> "${bytes shr 10}KB"
+    else -> "${bytes}B"
+}
+
+/** Items the receiver reported failed because its earlier received output is missing/modified/unverifiable. */
+internal fun failedOutputItemIds(report: PhotoTransferSendReport): Set<String> =
+    report.outcomes.values.filter { !it.committed && it.reason in ReceivedOutputCheck.OUTPUT_REASONS }.map { it.itemId }.toSet()
+
+internal fun outputFailureNote(count: Int): String =
+    if (count == 0) "" else " 받는 기기에 이전에 저장된 ${count}개의 사본이 없어졌거나 바뀌었거나 확인되지 않아 실패로 보고되었습니다. 자동으로 다시 저장하지 않았고 받은 기기의 파일은 그대로입니다. 원본은 삭제 대상에서 제외됩니다. 다시 받으려면 '새로 보내기'를 선택하세요."
+
+/** Completion counts only items whose stored content matches what was sent; a differing stored copy is reported separately. */
+internal fun sendCompletionText(receiptProtocol: Boolean, sentCount: Int, confirmed: Int, mismatched: Int, total: Int): String = when {
+    !receiptProtocol -> "${sentCount}개 보내기 완료"
+    confirmed == total -> "${confirmed}개 보내기 완료"
+    mismatched > 0 -> "${confirmed}/${total}개만 저장이 확인되었습니다. ${mismatched}개는 받은 기기에 저장된 내용이 보낸 내용과 다릅니다. 원본을 지우지 마세요."
+    else -> "${confirmed}/${total}개만 저장이 확인되었습니다."
 }

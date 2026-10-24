@@ -10,7 +10,7 @@ class GooglePhotosIntegrationContractTest {
         val app = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderApp.kt").readText()
         val viewModel = sourceFile("app/src/main/java/com/armsone/nasfinder/ui/NasFinderViewModel.kt").readText()
         val callback = sourceFile("app/src/main/java/com/armsone/nasfinder/platform/OAuthCallbackActivity.kt").readText()
-        assertTrue(app.contains("Google Photos에서 가져오기"))
+        assertTrue(app.contains("Google 포토에서 가져오기"))
         assertTrue(app.contains("모바일 데이터"))
         assertTrue(app.contains("NasFinder 서버로 보내지 않습니다"))
         assertTrue(viewModel.contains("GooglePhotosPickerFlow(picker).awaitSelection"))

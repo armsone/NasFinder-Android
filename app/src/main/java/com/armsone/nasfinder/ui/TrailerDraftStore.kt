@@ -1,5 +1,6 @@
 package com.armsone.nasfinder.ui
 
+import com.armsone.nasfinder.data.PrivacyMode
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -30,6 +31,9 @@ data class TrailerDraft(
     val migrationIssue: String? = null,
     val revision: Long? = null,
     val outputRevision: Long? = null,
+    // 비공개 편집본(기본 false, 예전 데이터와 같다). 비공개 입력이 한 번 들어오면 풀리지 않는 오염 플래그이며
+    // 출력(폰하드 파일)·컬렉션 영상으로 이어진다. 공개로 되돌리는 것은 사용자의 명시적 전환뿐이다.
+    val isPrivate: Boolean = false,
 ) {
     val displayTitle: String get() {
         if (!customTitle.isNullOrBlank()) return customTitle
@@ -115,7 +119,9 @@ object TrailerDraftStore {
         val previous = drafts.toMap()
         val existing = drafts.values.firstOrNull { it.id == draft.id || sameDirectory(it.directory, draft.directory) }
         if (existing != null) drafts.remove(existing.id)
-        drafts[draft.id] = draft.copy(migrationIssue = null)
+        // 오염은 저장 중에도 풀리지 않는다. 프라이버시 모드에서 새로 생긴 편집본은 비공개로 시작한다.
+        val tainted = draft.isPrivate || existing?.isPrivate == true || (existing == null && PrivacyMode.isActive)
+        drafts[draft.id] = draft.copy(migrationIssue = null, isPrivate = tainted)
         if (!persistDraftsToDisk()) {
             drafts.clear()
             drafts.putAll(previous)
@@ -134,21 +140,39 @@ object TrailerDraftStore {
         return target
     }
 
+    /** 지금 모드에서 보이는 편집본. */
     @Synchronized
     fun getAllDrafts(): List<TrailerDraft> {
-        return drafts.values.sortedByDescending { it.timestamp }
+        return drafts.values.filter { PrivacyMode.isVisible(it.isPrivate) }.sortedByDescending { it.timestamp }
     }
 
+    /** 비공개를 포함한 전체 편집본(정리·소유권 계산용). 화면 목록에는 쓰지 않는다. */
     @Synchronized
-    fun draft(id: String): TrailerDraft? = drafts[id]
+    fun getEveryDraft(): List<TrailerDraft> = drafts.values.toList()
+
+    @Synchronized
+    fun draft(id: String): TrailerDraft? = drafts[id]?.takeIf { PrivacyMode.isVisible(it.isPrivate) }
+
+    @Synchronized
+    fun isDraftPrivate(id: String): Boolean = drafts[id]?.isPrivate == true
+
+    /** 명시적인 공개/비공개 전환. 편집본 내용은 그대로 두고 플래그만 바꾼다. */
+    @Synchronized
+    fun setDraftPrivate(id: String, isPrivate: Boolean): Boolean {
+        val existing = drafts[id] ?: return false
+        if (existing.isPrivate == isPrivate) return true
+        drafts[id] = existing.copy(isPrivate = isPrivate)
+        if (!persistDraftsToDisk()) { drafts[id] = existing; return false }
+        return true
+    }
 
     @Synchronized
     fun draftCount(): Int {
-        return drafts.size
+        return drafts.values.count { PrivacyMode.isVisible(it.isPrivate) }
     }
 
     @Synchronized
-    fun hasAnyDraft(): Boolean = drafts.isNotEmpty()
+    fun hasAnyDraft(): Boolean = drafts.values.any { PrivacyMode.isVisible(it.isPrivate) }
 
     /**
      * Explicit user removal: the record goes first (atomically); only then its own app directory is deleted, and only
@@ -447,6 +471,7 @@ object TrailerDraftStore {
         put("orderMode", draft.orderMode ?: "추가순")
         put("timestamp", draft.timestamp)
         put("customTitle", draft.customTitle ?: "")
+        if (draft.isPrivate) put("isPrivate", true)
         draft.revision?.let { put("revision", it) }
         draft.outputRevision?.let { put("outputRevision", it) }
         draft.musicTrack?.let { track ->
@@ -667,6 +692,7 @@ object TrailerDraftStore {
             editor = editor,
             revision = if (obj.has("revision")) obj.optLong("revision") else null,
             outputRevision = if (obj.has("outputRevision")) obj.optLong("outputRevision") else null,
+            isPrivate = obj.optBoolean("isPrivate", false),
         )
     }
 }

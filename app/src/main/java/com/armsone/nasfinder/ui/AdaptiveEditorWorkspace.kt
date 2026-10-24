@@ -406,7 +406,7 @@ private fun EditorRail(
             PackIcon(PackGlyph.SETTINGS, null, Modifier.size(24.dp))
         }
         Spacer(Modifier.weight(1f))
-        RailButton(expanded, label = "파인더 홈 (편집 유지)", selected = false, onClick = onFinderHome) {
+        RailButton(expanded, label = "파인더 (편집 유지)", selected = false, onClick = onFinderHome) {
             PackIcon(PackGlyph.NAS, null, Modifier.size(24.dp))
         }
     }
@@ -1262,7 +1262,7 @@ private fun PlanSection(session: TrailerSession, model: NasFinderViewModel) {
     }
 }
 
-private enum class FinderSource(val title: String) { PHONEHARD("폰하드"), PHOTOS("내 사진·영상"), NETWORK("NAS·클라우드"), WEB("웹 다운로드") }
+private enum class FinderSource(val title: String) { PHONEHARD("폰하드"), PHOTOS("내 미디어"), NETWORK("NAS·클라우드"), WEB("웹 다운로드") }
 
 /**
  * Finder for the CURRENT project: real browsing/selection of PhoneHard, device photos (MediaStore list + system
@@ -1328,6 +1328,12 @@ private fun EditorFinderPanel(
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (selection.isNotEmpty()) TextButton(onClick = { selection.clear() }) { Text("선택 해제") }
+                // References only; the selection stays so it can still be added to this project.
+                OutlinedButton(
+                    onClick = { model.requestWorkbenchAddEditorCandidates(selection.values.toList()) },
+                    enabled = selection.isNotEmpty(),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("작업대에 담기") }
                 Button(
                     onClick = {
                         model.editorAddCandidates(selection.values.toList(), afterKey = selectedSceneKey)
@@ -1508,7 +1514,7 @@ private fun PhotosFinder(
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            error = "사진·영상 목록을 불러오지 못했습니다."
+            error = "미디어 목록을 불러오지 못했습니다."
         } finally {
             loading = false
         }
@@ -1613,7 +1619,7 @@ private fun NetworkFinder(
                 Text(error!!, color = MaterialTheme.colorScheme.error)
                 Button(onClick = { reload++ }) { Text("다시 시도") }
             }
-            entries.isEmpty() -> FinderEmpty("이 폴더에 사진·영상이나 하위 폴더가 없습니다.")
+            entries.isEmpty() -> FinderEmpty("이 폴더에 미디어나 하위 폴더가 없습니다.")
             else -> LazyVerticalGrid(GridCells.Adaptive(96.dp), contentPadding = PaddingValues(12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(entries, key = { it.path }) { entry ->
                     if (entry.isDirectory) {
@@ -1663,7 +1669,7 @@ private fun WebFinder(
                 }
             }
         } else {
-            Text("지금 받은 사진·영상 다운로드가 없습니다.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("지금 받은 미디어 다운로드가 없습니다.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         OutlinedButton(onClick = { model.show(Screen.WebBrowser) }) {
             PackIcon(PackGlyph.BROWSER, null, Modifier.size(18.dp))

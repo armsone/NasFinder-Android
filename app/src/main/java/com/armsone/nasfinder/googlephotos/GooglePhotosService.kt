@@ -70,9 +70,9 @@ data class GooglePhotosPickingSession(val id: String, val pickerUri: String?, va
 data class GooglePhotosMediaPage(val items: List<GooglePhotosMediaItem>, val nextPageToken: String?)
 
 sealed class GooglePhotosPickerException(message: String) : Exception(message) {
-    data object InvalidResponse : GooglePhotosPickerException("Google Photos 응답을 해석하지 못했습니다.")
-    data object InvalidContentUrl : GooglePhotosPickerException("Google Photos 콘텐츠 주소가 올바르지 않습니다.")
-    data class Http(val statusCode: Int) : GooglePhotosPickerException("Google Photos 요청이 실패했습니다. (HTTP $statusCode)")
+    data object InvalidResponse : GooglePhotosPickerException("Google 포토 응답을 해석하지 못했습니다.")
+    data object InvalidContentUrl : GooglePhotosPickerException("Google 포토 콘텐츠 주소가 올바르지 않습니다.")
+    data class Http(val statusCode: Int) : GooglePhotosPickerException("Google 포토 요청이 실패했습니다. (HTTP $statusCode)")
 }
 
 class GooglePhotosPickerClient(
@@ -124,7 +124,7 @@ class GooglePhotosContentDownloader(private val client: OkHttpClient = OkHttpCli
         client.newCall(builder.build()).execute().use { response ->
             if (!response.isSuccessful) throw GooglePhotosPickerException.Http(response.code)
             destination.parentFile?.mkdirs(); val partial = File(destination.parentFile, destination.name + ".partial")
-            try { response.body.byteStream().use { input -> partial.outputStream().use(input::copyTo) }; if (!partial.renameTo(destination)) throw java.io.IOException("Unable to finalize Google Photos download") }
+            try { response.body.byteStream().use { input -> partial.outputStream().use(input::copyTo) }; if (!partial.renameTo(destination)) throw java.io.IOException("Unable to finalize Google 포토 download") }
             catch (error: Throwable) { partial.delete(); throw error }
         }; destination
     }

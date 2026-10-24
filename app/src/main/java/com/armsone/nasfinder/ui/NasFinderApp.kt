@@ -7,6 +7,8 @@
 
 package com.armsone.nasfinder.ui
 
+import com.armsone.nasfinder.ui.theme.LocalInterfaceIconPack
+
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
@@ -145,6 +147,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -154,6 +157,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.armsone.nasfinder.model.*
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import com.armsone.nasfinder.data.SuperThumbnailWorkStatus
 import com.armsone.nasfinder.data.SuperThumbnailVaultTiming
 import com.armsone.nasfinder.data.ScreenAwakeMode
@@ -173,6 +177,7 @@ import com.armsone.nasfinder.ui.theme.BrowserOrange
 import com.armsone.nasfinder.ui.theme.paletteFor
 import com.armsone.nasfinder.ui.theme.themePalette
 import com.armsone.nasfinder.ui.theme.ThemeVectors
+import com.armsone.nasfinder.ui.theme.LocalThemePalette
 import com.armsone.nasfinder.ui.theme.fileMetaColor
 import com.armsone.nasfinder.ui.theme.thumbnailBorderColor
 import com.armsone.nasfinder.ui.theme.thumbnailSurfaceColor
@@ -221,6 +226,7 @@ fun NasFinderApp(
     onCheckForUpdates: () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
+    val privacyEpoch by com.armsone.nasfinder.data.PrivacyMode.epoch.collectAsStateWithLifecycle()
     var showBusyOverlay by remember { mutableStateOf(false) }
     LaunchedEffect(state.isBusy) {
         if (state.isBusy) {
@@ -296,6 +302,8 @@ fun NasFinderApp(
                     },
                 ),
         ) {
+            // 프라이버시 모드가 바뀌면 화면 트리를 새로 만든다: 열린 대화상자·시트·선택·탐색 상태가 비워져 숨겨진 내용이 남지 않는다.
+            androidx.compose.runtime.key(privacyEpoch) {
             when (val screen = state.screen) {
                 Screen.Dashboard -> DashboardScreen(state, model)
                 is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
@@ -303,10 +311,47 @@ fun NasFinderApp(
                     BrowserScreen(screen, state, model, onCoverFlowFullscreen = { browserCoverFlowFullscreen = it })
                 }
                 Screen.Inbox, Screen.WebHard -> PorcelainWideHost(state, model, phoneHardSelected = true) { InboxScreen(state, model) }
-                Screen.PhotoTransfer -> PhotoTransferScreen(
-                    onBack = { model.show(Screen.Dashboard) },
-                )
+                // Wide windows keep the persistent navigation beside the content; the transfer content uses the right pane width only.
+                Screen.PhotoTransfer -> PorcelainWideHost(state, model) {
+                    PhotoTransferScreen(
+                        state = state,
+                        model = model,
+                        onBack = { model.show(Screen.Dashboard) },
+                    )
+                }
+                Screen.Favorites -> {
+                    var pendingFavoriteRemoval by remember { mutableStateOf<RemoteFavorite?>(null) }
+                    PorcelainWideHost(state, model, favoritesSelected = true) {
+                        PorcelainFavoritesDestination(
+                            state, model,
+                            onRemoveFavorite = { pendingFavoriteRemoval = it },
+                            onBack = { model.selectMainDestination(MainNavigationDestination.FINDER) },
+                        )
+                    }
+                    pendingFavoriteRemoval?.let { favorite ->
+                        FavoriteRemovalDialog(favorite, onDismiss = { pendingFavoriteRemoval = null }) {
+                            pendingFavoriteRemoval = null
+                            model.removeFavorite(favorite)
+                        }
+                    }
+                    HomeFavoriteActionHost(state, model)
+                }
+                Screen.PhotoSelection -> PorcelainWideHost(state, model) {
+                    PhotoSelectionScreen(
+                        session = model.photoSelection,
+                        onBack = { model.show(Screen.Dashboard) },
+                        onShowMessage = model::showMessage,
+                        pendingShares = state.pendingMediaShares,
+                        onOpenPendingShares = model::reopenPendingMediaShares,
+                        onDiscardPendingShare = model::discardPendingMediaShare,
+                        pockets = state.pockets,
+                        pocketCount = { id -> state.materials.count { item -> (if (state.pockets.any { it.id == item.pocketId }) item.pocketId else DEFAULT_POCKET_ID) == id } },
+                        activePocketId = state.workbenchPocketId,
+                        onCreatePocket = model::createWorkbenchPocketNow,
+                    )
+                }
                 Screen.GooglePhotos, is Screen.LocalPhotoLibrary -> mediaLibraryStateHolder.SaveableStateProvider("media-library") {
+                    PorcelainWideHost(state, model) {
                     LocalPhotoLibraryScreen(
                     model = model,
                     initialIntent = (screen as? Screen.LocalPhotoLibrary)?.initialIntent ?: LocalMediaEditIntent.NONE,
@@ -317,14 +362,17 @@ fun NasFinderApp(
                     onMusicOverlay = { model.startLocalMusicOverlay(it, null) },
                     onCopyToPhoneHard = model::copyLocalMediaToInbox,
                     )
+                    }
                 }
-                Screen.Settings -> SettingsScreen(state, model, automaticUpdateDownloadEnabled, onAutomaticUpdateDownloadChanged, onCheckForUpdates)
-                Screen.ThumbnailCache -> ThumbnailCacheScreen(state, model)
-                Screen.SuperThumbnail -> SuperThumbnailScreen(state, model)
-                Screen.SuperThumbnailFolderPicker -> SuperThumbnailFolderPickerScreen(state, model)
-                Screen.SuperThumbnailProgress -> SuperThumbnailProgressScreen(state, model)
-                Screen.SuperThumbnailReport -> SuperThumbnailReportScreen(state, model)
-                Screen.WebBrowser -> WebBrowserScreen(
+                Screen.Settings -> PorcelainWideHost(state, model) {
+                    SettingsScreen(state, model, automaticUpdateDownloadEnabled, onAutomaticUpdateDownloadChanged, onCheckForUpdates)
+                }
+                Screen.ThumbnailCache -> PorcelainWideHost(state, model) { ThumbnailCacheScreen(state, model) }
+                Screen.SuperThumbnail -> PorcelainWideHost(state, model) { SuperThumbnailScreen(state, model) }
+                Screen.SuperThumbnailFolderPicker -> PorcelainWideHost(state, model) { SuperThumbnailFolderPickerScreen(state, model) }
+                Screen.SuperThumbnailProgress -> PorcelainWideHost(state, model) { SuperThumbnailProgressScreen(state, model) }
+                Screen.SuperThumbnailReport -> PorcelainWideHost(state, model) { SuperThumbnailReportScreen(state, model) }
+                Screen.WebBrowser -> PorcelainWideHost(state, model) { WebBrowserScreen(
                     sessionController = webBrowserSession,
                     initialUrl = state.browserFavorites.firstOrNull { it.isHomepage }?.url
                         ?: state.browserFavorites.firstOrNull()?.url
@@ -342,12 +390,20 @@ fun NasFinderApp(
                     onSaveDownloadedFile = model::importWebDownloadToInbox,
                     onSendDownloadedFile = model::importWebDownloadToNas,
                     onDiscardDownloadedFile = model::discardWebDownload,
-                )
-                Screen.MaterialBasket -> MaterialBasketScreen(state, model, onBack = { model.show(Screen.Dashboard) })
-                Screen.VideoDrafts -> VideoDraftsScreen(state, model, onBack = { model.show(Screen.Dashboard) })
-                Screen.VideoCollections -> VideoCollectionsScreen(state, model, onBack = { model.show(Screen.Dashboard) })
+                ) }
+                Screen.MaterialBasket -> PorcelainWideHost(state, model) { WorkbenchScreen(state, model, embedded = false, onBack = { model.show(Screen.Dashboard) }) }
+                Screen.VideoDrafts -> PorcelainWideHost(state, model) { VideoDraftsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
+                Screen.VideoCollections -> PorcelainWideHost(state, model) { VideoCollectionsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
             }
-            state.trailer?.let { session ->
+            }
+
+            // 작업대에 담기 / 영상 제작 확인 / 다시 연결 확인: one host for every source screen.
+            WorkbenchAddDialog(state, model)
+            WorkbenchRunDialog(state, model)
+            WorkbenchReconnectDialog(state, model)
+            // 일반 모드에서는 비공개 출처 편집 세션의 화면도 '편집으로 돌아가기' 알약(제목 노출)도 만들지 않는다.
+            // 세션은 그대로 살아 있어 내보내기·자동 저장은 계속되고, 프라이버시 모드로 돌아오면 다시 나타난다.
+            state.trailer?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }?.let { session ->
                 if (!state.trailerMinimized && state.screen != Screen.WebBrowser) {
                     VideoTrailerScreen(session, model, browsingForMusic = false)
                 } else {
@@ -386,7 +442,7 @@ fun NasFinderApp(
                     onPlaybackFailure = model::fallbackPreviewToExternal,
                 )
             }
-            state.networkDownloadProgress?.let { progress ->
+            state.networkDownloadProgress?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }?.let { progress ->
                 NetworkDownloadProgressDialog(
                     progress = progress,
                     onCancel = model::cancelNetworkDownload,
@@ -399,7 +455,7 @@ fun NasFinderApp(
                     trackColor = Color.Transparent,
                 )
             }
-            state.download?.let { download ->
+            state.download?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }?.let { download ->
                 if (download.action == RemoteFileAction.PREVIEW) {
                     PreviewLoadProgressStrip(download, Modifier.align(Alignment.BottomCenter))
                 } else {
@@ -409,6 +465,24 @@ fun NasFinderApp(
         }
         state.message?.let { message ->
             AlertDialog(onDismissRequest = model::dismissMessage, confirmButton = { TextButton(onClick = model::dismissMessage) { Text("확인") } }, title = { Text("알림") }, text = { Text(message) })
+        }
+        if (state.shareIntakeInProgress > 0) {
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text("공유받은 파일 보관 중") },
+                text = { Text("공유받은 미디어를 이 앱 안에 안전하게 복사하고 있습니다. 끝나면 선택지가 나타납니다.") },
+                confirmButton = {},
+            )
+        }
+        state.pendingMediaShares.firstOrNull { it.id !in state.deferredShareIds }?.let { share ->
+            MediaShareChoiceDialog(
+                share = share,
+                waitingCount = state.pendingMediaShares.size,
+                onImageSelection = model::chooseShareImageSelection,
+                onMakeVideo = model::chooseShareVideoMaking,
+                onLater = model::deferPendingMediaShare,
+                onCancel = model::cancelPendingMediaShare,
+            )
         }
         state.trailerDraftPicker?.let { drafts ->
             TrailerDraftManager(drafts, model)
@@ -1423,6 +1497,21 @@ private fun MediaPreviewContent(
                             }
                         }
 
+                        override fun onTracksChanged(tracks: Tracks) {
+                            // Evidence from the container itself: a video track exists but this device cannot decode any of
+                            // them while audio is playable. Sound without a picture is a failure, not a success.
+                            if (preview.kind != BuiltInPreviewKind.VIDEO) return
+                            val videoGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                            val audioPlayable = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSupported }
+                            if (videoGroups.isNotEmpty() && videoGroups.none { it.isSupported } && audioPlayable) {
+                                pause()
+                                isBuffering = false
+                                bufferedFraction = null
+                                playing = false
+                                playbackError = "이 기기에서는 이 영상의 화면을 표시할 수 없어 소리만 재생될 수 있습니다. 다른 플레이어로 열어 보세요."
+                            }
+                        }
+
                         override fun onPlayerError(error: PlaybackException) {
                             isBuffering = false
                             bufferedFraction = null
@@ -1497,6 +1586,18 @@ private fun MediaPreviewContent(
                 }
             }
         }
+        // A video this viewer cannot show is routed to the system's own player chooser right away when the file is already
+        // on this device (a remote stream is never downloaded without the user pressing the button below). Closing the
+        // chooser returns here, where 닫기 / 다시 시도 stay available. Runtime decoder support is not assumed.
+        var autoRoutedToChooser by remember(mediaSourceKey) { mutableStateOf(false) }
+        LaunchedEffect(playbackError) {
+            if (playbackError != null && !autoRoutedToChooser && preview.kind == BuiltInPreviewKind.VIDEO &&
+                preview.remoteStream == null && onPlaybackFailure != null
+            ) {
+                autoRoutedToChooser = true
+                onPlaybackFailure()
+            }
+        }
         playbackError?.let { errorMessage ->
             Surface(
                 modifier = Modifier
@@ -1540,21 +1641,21 @@ private fun MediaPreviewContent(
                         ) {
                             Text("닫기")
                         }
-                        if (onPlaybackFailure != null) OutlinedButton(
-                            onClick = onPlaybackFailure,
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = .90f)),
-                        ) {
-                            Text("외부 앱으로 열기")
-                        }
-                        Button(
+                        OutlinedButton(
                             onClick = {
                                 playbackError = null
                                 isBuffering = true
                                 retryTrigger++
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = .90f)),
                         ) {
                             Text("다시 시도")
+                        }
+                        if (onPlaybackFailure != null) Button(
+                            onClick = onPlaybackFailure,
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        ) {
+                            Text("다른 플레이어로 열기")
                         }
                     }
                 }
@@ -1690,7 +1791,7 @@ private fun TrailerDraftManager(drafts: List<TrailerDraft>, model: NasFinderView
                 IconButton(onClick = model::dismissTrailerDraftPicker, modifier = Modifier.align(Alignment.CenterStart)) {
                     Icon(Icons.Default.ArrowBack, contentDescription = "닫기")
                 }
-                Text("보관한 편집", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("편집본", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
             }
             if (drafts.isEmpty()) {
                 Column(
@@ -1700,7 +1801,7 @@ private fun TrailerDraftManager(drafts: List<TrailerDraft>, model: NasFinderView
                 ) {
                     if (porcelain) PackIcon(PackGlyph.DRAFTS, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     else Icon(Icons.Default.MovieFilter, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("보관한 편집이 없습니다", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                    Text("편집본이 없습니다", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                     val metadataProblem = TrailerDraftStore.metadataProblem()
                     Text(
                         metadataProblem ?: "편집을 닫으면 앱 저장 공간에 보관되어 앱을 다시 열어도 이어서 편집할 수 있습니다.",
@@ -1741,8 +1842,8 @@ private fun TrailerDraftManager(drafts: List<TrailerDraft>, model: NasFinderView
         draftToDelete?.let { draft ->
             AlertDialog(
                 onDismissRequest = { draftToDelete = null },
-                title = { Text("이 편집을 지울까요?") },
-                text = { Text("이 편집의 임시 파일만 지워집니다. 원본 사진·영상은 지워지지 않습니다.") },
+                title = { Text("이 편집본을 지울까요?") },
+                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어, 컬렉션에 보관된 영상은 지워지지 않습니다.") },
                 dismissButton = { TextButton(onClick = { draftToDelete = null }) { Text("취소") } },
                 confirmButton = {
                     TextButton(onClick = {
@@ -1970,6 +2071,65 @@ internal fun rememberTrailerDraftDuration(draft: TrailerDraft): Double {
 /** Flat theme page colour; the six themes carry no background art. */
 private fun skyBrush(theme: AppTheme): Brush = SolidColor(paletteFor(theme).background)
 
+/**
+ * Phone bottom bar: exactly THREE visible main tabs (감상 / 영상 만들기 / 도구).
+ * Retains all internal routes/keys; folds home+finder under 감상, and exposes workbench via toolbar capsule/sheet.
+ */
+@Composable
+private fun MainTabBar(
+    selected: MainNavigationDestination,
+    onTogglePrivacy: () -> Unit,
+    onSelect: (MainNavigationDestination) -> Unit,
+) {
+    val tabs = listOf(
+        Triple(MainNavigationDestination.HOME, "감상", PackGlyph.PLAY),
+        Triple(MainNavigationDestination.VIDEO, "영상 만들기", PackGlyph.VIDEO),
+        Triple(MainNavigationDestination.TOOLS, "도구", PackGlyph.TRANSFER),
+    )
+    val current = selected
+    Column(Modifier.background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)).navigationBarsPadding()) {
+        HorizontalDivider(thickness = .5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).selectableGroup()) {
+            tabs.forEach { (tab, label, glyph) ->
+                val isSelected = when (tab) {
+                    MainNavigationDestination.HOME -> current == MainNavigationDestination.HOME || current == MainNavigationDestination.FINDER
+                    else -> current == tab
+                }
+                val color = if (isSelected) themePalette().accent else MaterialTheme.colorScheme.onSurfaceVariant
+                Column(
+                    Modifier.weight(1f).heightIn(min = 49.dp)
+                        .then(
+                            if (tab == MainNavigationDestination.TOOLS) {
+                                // 도구 탭을 길게 누르면 프라이버시 모드가 바뀐다. 짧게 누르는 동작(도구 열기)은 그대로다.
+                                Modifier
+                                    .semantics {
+                                        this.selected = isSelected
+                                        customActions = listOf(
+                                            CustomAccessibilityAction(if (com.armsone.nasfinder.data.PrivacyMode.isActive) "프라이버시 모드 끄기" else "프라이버시 모드 켜기") { onTogglePrivacy(); true },
+                                        )
+                                    }
+                                    .combinedClickable(
+                                        role = Role.Tab,
+                                        onClickLabel = "도구 열기",
+                                        onLongClickLabel = if (com.armsone.nasfinder.data.PrivacyMode.isActive) "프라이버시 모드 끄기" else "프라이버시 모드 켜기",
+                                        onClick = { onSelect(tab) },
+                                        onLongClick = onTogglePrivacy,
+                                    )
+                            } else {
+                                Modifier.selectable(selected = isSelected, role = Role.Tab, onClick = { onSelect(tab) })
+                            },
+                        ),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
+                ) {
+                    PackIcon(glyph, null, Modifier.size(26.dp), tint = color)
+                    Text(label, style = com.armsone.nasfinder.ui.theme.HomeType.FavoriteCaption, color = color, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     var connectionPendingDeletion by remember { mutableStateOf<RemoteConnection?>(null) }
@@ -1982,49 +2142,109 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     val fileImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         model.importPickedFiles(uris)
     }
+    val privacyActive by com.armsone.nasfinder.data.PrivacyMode.active.collectAsStateWithLifecycle()
+    val toolsTab = state.activeMainTab == MainNavigationDestination.TOOLS
+    val videoTab = state.activeMainTab == MainNavigationDestination.VIDEO
+    val finderRoot = state.activeMainTab == MainNavigationDestination.FINDER
+    val homeRoot = state.activeMainTab == MainNavigationDestination.HOME
+    val workbenchTab = state.activeMainTab == MainNavigationDestination.WORKBENCH
+    val finderTab = !toolsTab && !videoTab && !finderRoot && !homeRoot && !workbenchTab
+    BackHandler(enabled = (finderRoot || workbenchTab) && !rememberWideShell()) {
+        model.selectMainDestination(MainNavigationDestination.HOME)
+    }
     Scaffold(containerColor = Color.Transparent, topBar = {
-        TopAppBar(title = {
-            Row(
-                modifier = Modifier
-                    .semantics(mergeDescendants = true) { contentDescription = "NasFinder" }
-                    .clickable(
-                        onClickLabel = "마지막으로 보던 네트워크 폴더를 엽니다.",
-                        role = Role.Button,
-                        onClick = model::resumeLastLocation,
-                    ),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                // Approved 01-home header: 24 NAS glyph, gap 8, two-tone "NasFinder" wordmark (brand 22/700/28), no capsule.
-                if (usesUnifiedLayout(state.theme)) PackIcon(PackGlyph.NAS, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground) else Image(
-                    painterResource(launcherIconDrawable(state.launcherIcon)),
-                    null,
-                    Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).border(.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f), RoundedCornerShape(10.dp)),
-                )
-                if (usesUnifiedLayout(state.theme)) Text(
-                    androidx.compose.ui.text.buildAnnotatedString {
-                        append("Nas")
-                        // "Finder" in the theme accent (BK Style keeps the approved ornament #E44435).
-                        pushStyle(androidx.compose.ui.text.SpanStyle(color = themePalette().accent))
-                        append("Finder")
-                        pop()
-                    },
-                    style = com.armsone.nasfinder.ui.theme.HomeType.Brand,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    maxLines = 1,
-                ) else Text(
-                    "NasFinder",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = .82f),
-                )
+        TopAppBar(
+            navigationIcon = {
+                if ((finderRoot || workbenchTab) && !rememberWideShell()) {
+                    IconButton(onClick = { model.selectMainDestination(MainNavigationDestination.HOME) }) {
+                        PackIcon(PackGlyph.BACK, "홈으로 돌아가기", tint = MaterialTheme.colorScheme.onBackground)
+                    }
+                }
+            },
+            title = {
+            if (homeRoot || finderTab) {
+                Row(
+                    modifier = Modifier
+                        .semantics(mergeDescendants = true) { contentDescription = if (privacyActive) com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME else "NasFinder" }
+                        // iOS logo: a tap goes to 홈, a long press reopens the last network folder.
+                        // 프라이버시 모드에서는 한 번 누르면 모드를 끄고 홈으로 가며, 길게 누르기(마지막 폴더 열기)는 없다.
+                        .combinedClickable(
+                            onClickLabel = if (privacyActive) "프라이버시 모드를 끄고 홈으로 이동합니다." else "홈으로 이동합니다.",
+                            onLongClickLabel = if (privacyActive) null else "마지막으로 보던 네트워크 폴더를 엽니다.",
+                            role = Role.Button,
+                            onClick = {
+                                if (privacyActive) model.exitPrivacyToHome()
+                                else model.selectMainDestination(MainNavigationDestination.HOME)
+                            },
+                            onLongClick = if (privacyActive) null else model::resumeLastLocation,
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    // Approved 01-home header: 24 NAS glyph, gap 8, two-tone "NasFinder" wordmark (brand 22/700/28), no capsule.
+                    if (usesUnifiedLayout(state.theme)) PackIcon(PackGlyph.BRAND, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground) else Image(
+                        painterResource(launcherIconDrawable(state.launcherIcon)),
+                        null,
+                        Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).border(.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f), RoundedCornerShape(10.dp)),
+                    )
+                    if (usesUnifiedLayout(state.theme)) Text(
+                        androidx.compose.ui.text.buildAnnotatedString {
+                            if (privacyActive) {
+                                pushStyle(androidx.compose.ui.text.SpanStyle(color = themePalette().accent))
+                                append(com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME)
+                                pop()
+                            } else {
+                                append("Nas")
+                                // "Finder" in the theme accent (BK Style keeps the approved ornament #E44435).
+                                pushStyle(androidx.compose.ui.text.SpanStyle(color = themePalette().accent))
+                                append("Finder")
+                                pop()
+                            }
+                        },
+                        style = com.armsone.nasfinder.ui.theme.HomeType.Brand,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        maxLines = 1,
+                    ) else Text(
+                        if (privacyActive) com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME else "NasFinder",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = .82f),
+                    )
+                }
+            } else {
+                Text(if (toolsTab) "도구" else if (videoTab) "영상" else if (workbenchTab) "작업대" else "파인더", style = com.armsone.nasfinder.ui.theme.HomeType.Section, color = MaterialTheme.colorScheme.onBackground)
             }
         }, actions = {
             // iOS porcelainTrailingItems: 네트워크 추가(+) leads the trailing toolbar group.
             val settingsButton: @Composable () -> Unit = {
                 IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Settings, "설정", Modifier.size(28.dp)) }
             }
-            if (usesUnifiedLayout(state.theme)) {
+            if (usesUnifiedLayout(state.theme) && (finderTab || homeRoot)) {
+                val workbenchCount = state.materials.size
+                Surface(
+                    onClick = { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
+                    shape = RoundedCornerShape(99.dp),
+                    color = if (workbenchTab) themePalette().accent.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    border = BorderStroke(1.dp, if (workbenchTab) themePalette().accent else MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.padding(end = 4.dp).height(32.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        PackIcon(PackGlyph.WORKBENCH, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
+                        Text("작업대", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                        if (workbenchCount > 0) {
+                            Text(
+                                "$workbenchCount",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = themePalette().accent,
+                            )
+                        }
+                    }
+                }
                 // Compact, independent actions: glyph 24 in a 44 hit; order (추가 · 설정 · 테마) unchanged.
                 IconButton(onClick = { addingNetwork = true }, modifier = Modifier.size(44.dp)) {
                     PackIcon(PackGlyph.ADD, "네트워크 추가", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground)
@@ -2067,8 +2287,8 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         label = "themeBadge",
                     ) { theme ->
                         Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
-                            Icon(
-                                themeIcon(theme),
+                            ThemePackIcon(
+                                theme,
                                 contentDescription = null,
                                 modifier = Modifier.size(24.dp),
                                 tint = paletteFor(theme).accent,
@@ -2099,8 +2319,8 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                                                 .border(1.dp, badge.glyph, CircleShape),
                                             contentAlignment = Alignment.Center,
                                         ) {
-                                            Icon(
-                                                themeIcon(theme),
+                                            ThemePackIcon(
+                                                theme,
                                                 contentDescription = null,
                                                 modifier = Modifier.size(20.dp),
                                                 tint = badge.glyph,
@@ -2139,32 +2359,11 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
-            if (!usesUnifiedLayout(state.theme)) settingsButton()
+            if (!usesUnifiedLayout(state.theme) && (finderTab || homeRoot)) settingsButton()
         }, expandedHeight = 52.dp, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent))
     }, bottomBar = {
-        NavigationBar(
-            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
-            tonalElevation = 2.dp
-        ) {
-            NavigationBarItem(
-                selected = state.activeMainTab == MainNavigationDestination.FINDER,
-                onClick = { model.selectMainDestination(MainNavigationDestination.FINDER) },
-                icon = { PackIcon(PackGlyph.HOME, null, Modifier.size(22.dp)) },
-                label = { Text("파인더", fontSize = 12.sp) }
-            )
-            NavigationBarItem(
-                selected = state.activeMainTab == MainNavigationDestination.VIDEO,
-                onClick = { model.selectMainDestination(MainNavigationDestination.VIDEO) },
-                icon = { PackIcon(PackGlyph.VIDEO, null, Modifier.size(22.dp)) },
-                label = { Text("영상", fontSize = 12.sp) }
-            )
-            NavigationBarItem(
-                selected = state.activeMainTab == MainNavigationDestination.TOOLS,
-                onClick = { model.selectMainDestination(MainNavigationDestination.TOOLS) },
-                icon = { PackIcon(PackGlyph.SETTINGS, null, Modifier.size(22.dp)) },
-                label = { Text("도구", fontSize = 12.sp) }
-            )
-        }
+        // Wide windows navigate with the persistent sidebar only; the bottom tabs would repeat the same five destinations.
+        if (!rememberWideShell()) MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode) { model.selectMainDestination(it) }
     }) { padding ->
         val favoritesItems: LazyListScope.() -> Unit = {
             item { SectionTitle("즐겨찾기", Icons.Default.Star) }
@@ -2219,7 +2418,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                     }
                     DashboardRow(
                         Icons.Default.PhotoLibrary,
-                        "내 사진·영상",
+                        "내 미디어",
                         null,
                         iconTint = MaterialTheme.colorScheme.primary,
                         titleColor = MaterialTheme.colorScheme.onSurface,
@@ -2286,7 +2485,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 DashboardCard {
                     DashboardRow(
                         Icons.Default.MovieFilter,
-                        "보관한 편집",
+                        "편집본",
                         if (state.trailerDraftCount > 0) "${state.trailerDraftCount}개 보관됨 · 이어서 편집" else "없음",
                         iconTint = MaterialTheme.colorScheme.primary,
                         titleColor = MaterialTheme.colorScheme.onSurface,
@@ -2303,10 +2502,14 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 DashboardCard {
                     DashboardRow(
                         Icons.AutoMirrored.Filled.CompareArrows,
-                        "기기 간 사진 전송",
+                        "미디어 전송",
                         null,
                     ) {
                         model.show(Screen.PhotoTransfer)
+                    }
+                    DashboardRowDivider()
+                    DashboardRow(Icons.Default.PhotoLibrary, "사진 선별", null) {
+                        model.show(Screen.PhotoSelection)
                     }
                     DashboardRowDivider()
                     DashboardRow(Icons.Default.Settings, "설정", null) {
@@ -2328,7 +2531,52 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 )
             }
         }
-        if (usesUnifiedLayout(state.theme)) {
+        if (toolsTab) {
+            Box(Modifier.padding(padding)) {
+                PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.TOOLS) { PorcelainTools(state, model) }
+            }
+        } else if (videoTab) {
+            Box(Modifier.padding(padding)) {
+                PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.VIDEO) { PorcelainVideoHub(state, model) }
+            }
+        } else if (workbenchTab) {
+            // Wide windows keep the persistent sidebar (작업대 selected); narrow windows render the content alone.
+            Box(Modifier.padding(padding)) {
+                PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.WORKBENCH) {
+                    WorkbenchScreen(state, model, embedded = true)
+                }
+            }
+        } else if (homeRoot) {
+            // Wide windows keep the existing persistent sidebar beside the 홈 root; narrow windows render the content alone.
+            Box(Modifier.padding(padding)) {
+                PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.HOME) {
+                    PorcelainPhoneHome(
+                        state = state,
+                        model = model,
+                        onAddNetwork = { addingNetwork = true },
+                        onEditGooglePhotos = { googlePhotosName = state.googlePhotosName; editingGooglePhotos = true },
+                        onDeleteGooglePhotos = { deletingGooglePhotos = true },
+                        onDeleteConnection = { connectionPendingDeletion = it },
+                        onRemoveFavorite = { favoritePendingDeletion = it },
+                        onImportFiles = { fileImporter.launch(arrayOf("*/*")) },
+                    )
+                }
+            }
+        } else if (finderRoot) {
+            Box(Modifier.padding(padding)) {
+                PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.FINDER) {
+                    PorcelainFinder(
+                        state, model,
+                        onAddNetwork = { addingNetwork = true },
+                        onEditGooglePhotos = { googlePhotosName = state.googlePhotosName; editingGooglePhotos = true },
+                        onDeleteGooglePhotos = { deletingGooglePhotos = true },
+                        onDeleteConnection = { connectionPendingDeletion = it },
+                        onRemoveFavorite = { favoritePendingDeletion = it },
+                        onImportFiles = { fileImporter.launch(arrayOf("*/*")) },
+                    )
+                }
+            }
+        } else if (usesUnifiedLayout(state.theme)) {
             PorcelainHome(
                 state, model,
                 onAddNetwork = { addingNetwork = true },
@@ -2358,7 +2606,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     if (deletingGooglePhotos) {
         AlertDialog(
             onDismissRequest = { deletingGooglePhotos = false }, title = { Text("Google 포토 연결을 삭제할까요?") },
-            text = { Text("나스파인더의 네트워크 목록에서만 제거합니다. Google 계정, 원본 사진·영상, 선택한 항목과 가져온 파일은 그대로 유지됩니다. 네트워크 추가에서 다시 추가할 수 있습니다.") },
+            text = { Text("나스파인더의 네트워크 목록에서만 제거합니다. Google 계정, 원본 미디어, 선택한 항목과 가져온 파일은 그대로 유지됩니다. 네트워크 추가에서 다시 추가할 수 있습니다.") },
             confirmButton = { TextButton(onClick = {
                 model.saveGooglePhotosLocation(state.googlePhotosName, visible = false)
                 deletingGooglePhotos = false
@@ -2605,6 +2853,8 @@ private fun HomeFavoriteActionFlow(action: HomeFavoriteAction, state: AppState, 
                 supported = isPhoneHard || capabilities?.delete != false, unsupportedReason = "삭제가 지원되지 않는 연결입니다.",
                 isDestructive = true,
             ) { confirmDelete = true },
+            // Reference only (file or folder): the favorite's own connection and path are saved, nothing is read or copied.
+            fileAction("workbench", "작업대에 담기", Icons.Default.Inbox) { model.requestWorkbenchAddFavorites(listOf(favorite)) },
         )
         val mediaReason = if (isPhoneHard) "예고편 보기와 뮤직비디오는 영상과 폴더에서 쓸 수 있습니다."
         else "예고편 보기와 뮤직비디오는 사진, 영상과 폴더에서 쓸 수 있습니다."
@@ -2622,6 +2872,14 @@ private fun HomeFavoriteActionFlow(action: HomeFavoriteAction, state: AppState, 
                 icon = Icons.Default.Star,
                 enabled = true,
                 onClick = { sheetVisible = false; confirmRemoval = true },
+            ),
+            // 이 앱의 목록에서만 숨긴다. 일반 모드에서 비공개로 바꾸면 이 작업창은 곧바로 닫힌다.
+            BaselineAction(
+                id = "favorite-privacy",
+                title = if (favorite.isPrivate) "공개로 전환" else "비공개로 전환",
+                icon = if (favorite.isPrivate) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                enabled = true,
+                onClick = { sheetVisible = false; model.setRemoteFavoritePrivate(favorite.id, !favorite.isPrivate) },
             ),
             fileAction("trailer", "예고편 보기", Icons.Default.Movie, supported = canMedia, unsupportedReason = mediaReason) {
                 when (target) {
@@ -2775,7 +3033,7 @@ private fun HomeFavoriteActionFlow(action: HomeFavoriteAction, state: AppState, 
         AlertDialog(
             onDismissRequest = { folderMediaChoice = null },
             title = { Text(if (kind == HomeFavoriteFolderMedia.TRAILER) "영상 만들기" else "뮤직비디오") },
-            text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+            text = { Text("하위 폴더에 있는 미디어도 함께 모을까요?") },
             confirmButton = { TextButton(onClick = { start(true) }) { Text("하위 폴더 포함") } },
             dismissButton = { TextButton(onClick = { start(false) }) { Text("현재 폴더만") } },
         )
@@ -3182,7 +3440,7 @@ private fun SectionTitle(text: String, icon: androidx.compose.ui.graphics.vector
         verticalAlignment = Alignment.CenterVertically,
     ) {
         icon?.let {
-            Icon(it, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Icon(it, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant, design = destinationDesign(text))
         }
         Text(text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
@@ -3241,14 +3499,43 @@ internal fun DeviceStorageCard(onImportFiles: () -> Unit) {
     }
 }
 
+private fun destinationDesign(title: String): PackGlyph? = when (title) {
+    "사진 선별", "미디어 선별" -> PackGlyph.PHOTO_SELECTION
+    "폰하드" -> PackGlyph.PHONEHARD
+    "기기 파일" -> PackGlyph.DEVICE_FILES
+    "저장공간" -> PackGlyph.STORAGE
+    "썸네일 캐시" -> PackGlyph.THUMBNAIL_CACHE
+    "썸네일 캐시 및 생성", "썸네일 저장공간" -> PackGlyph.THUMBNAIL_STORAGE
+    "작업대", "작업대에 담기" -> PackGlyph.WORKBENCH
+    "컬렉션" -> PackGlyph.COLLECTION
+    "편집본" -> PackGlyph.DRAFTS
+    "연결 목록", "파인더" -> PackGlyph.CONNECTIONS
+    else -> null
+}
+
 @Composable
 private fun DashboardRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, detail: String?, iconTint: Color = MaterialTheme.colorScheme.primary, titleColor: Color = MaterialTheme.colorScheme.onSurface, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, null, tint = iconTint, modifier = Modifier.size(22.dp))
-        Spacer(Modifier.width(12.dp)); Text(title, Modifier.weight(1f), color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        detail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp)) }
+        Icon(icon, null, tint = iconTint, modifier = Modifier.size(22.dp), design = destinationDesign(title))
+        Spacer(Modifier.width(12.dp))
+        // 짧은 값(용량·'관리')은 오른쪽에, 설명 문장은 다른 행처럼 제목 아래에 둔다.
+        val stacked = (detail?.length ?: 0) > 12
+        if (stacked) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(detail.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        } else {
+            Text(title, Modifier.weight(1f), color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            detail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp)) }
+        }
         Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+}
+
+@Composable
+private fun SuperThumbnailMark(modifier: Modifier = Modifier) {
+    PackIcon(PackGlyph.SUPER_THUMBNAIL, null, modifier)
 }
 
 @Composable
@@ -3257,21 +3544,7 @@ private fun SuperThumbnailDashboardRow(detail: String, onClick: () -> Unit) {
         Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier.size(30.dp).background(
-                Brush.linearGradient(listOf(Color(0xFF5856D6), Color(0xFF0A84FF), Color(0xFF32ADE6))),
-                RoundedCornerShape(8.dp),
-            ),
-            contentAlignment = Alignment.Center,
-        ) {
-            Box(
-                Modifier.size(width = 19.dp, height = 15.dp).offset(x = (-2).dp, y = 2.dp)
-                    .background(Color.White.copy(alpha = .16f), RoundedCornerShape(3.dp))
-                    .border(1.1.dp, Color.White.copy(alpha = .88f), RoundedCornerShape(3.dp)),
-            )
-            Icon(Icons.Default.Image, null, Modifier.size(11.dp).offset(x = (-2).dp, y = 2.dp), tint = Color.White.copy(alpha = .94f))
-            Icon(Icons.Default.AutoAwesome, null, Modifier.size(11.dp).offset(x = 7.dp, y = (-7).dp).graphicsLayer(rotationZ = -14f), tint = Color.White)
-        }
+        SuperThumbnailMark(Modifier.size(30.dp))
         Spacer(Modifier.width(11.dp))
         Text("Super Thumbnail", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -3289,7 +3562,7 @@ private fun BrowserDashboardRow(onClick: () -> Unit) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
             Icon(Icons.Default.Language, null, Modifier.size(26.dp), tint = BrowserOrange)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Browser", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                Text("브라우저", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
                 Text(
                     "WWW",
                     style = MaterialTheme.typography.labelSmall,
@@ -3335,12 +3608,16 @@ private fun PhoneHardDashboardRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(contentAlignment = Alignment.TopEnd) {
+            if (LocalInterfaceIconPack.current != InterfaceIconPack.SOLID) {
+                PackIcon(PackGlyph.PHONEHARD, null, Modifier.size(DashboardIconWellSize))
+            } else {
             Image(
                 painter = painterResource(R.drawable.phone_hard_logo),
                 contentDescription = null,
                 modifier = Modifier.size(DashboardIconWellSize).clip(RoundedCornerShape(7.dp)),
                 contentScale = ContentScale.Fit,
             )
+            }
         }
         Spacer(Modifier.width(12.dp))
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
@@ -3373,7 +3650,7 @@ private fun ConnectionRow(connection: RemoteConnection, preferred: Boolean, them
             if (googleMark) {
                 GooglePhotosMark(Modifier.size(32.dp))
             } else {
-                Icon(icon, null, Modifier.size(32.dp), tint = color)
+                Icon(icon, null, Modifier.size(32.dp), tint = color, design = if (iconOverride == null && connection.kind == ConnectionKind.SYNOLOGY) PackGlyph.NAS else null)
             }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -3431,7 +3708,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
     val valid = if (kind.oauth) name.isNotBlank() && (password.isNotBlank() || oauthConnected)
         else name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && password.isNotBlank() && port.toIntOrNull() in 1..65535 && (kind != ConnectionKind.SYNOLOGY || otpValid)
     fun candidate() = RemoteConnection(draftId, name.trim(), kind, (host.ifBlank { cloudApiHost(kind) }).trim().removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':'), port.toIntOrNull() ?: kind.defaultPort, username.trim(), rootPath, tls, trustedHostKey, editing?.createdAt ?: System.currentTimeMillis())
-    Scaffold(containerColor = Color.Transparent, topBar = { TopAppBar(title = { Text(if (editing == null) "연결 추가" else "연결 수정") }, navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로") } }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy) { Text(if (editing == null) "연결" else "저장") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)) }) { padding ->
+    Scaffold(containerColor = Color.Transparent, topBar = { PorcelainTopBar(title = if (editing == null) "연결 추가" else "연결 수정", onBack = { model.show(Screen.Dashboard) }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editing == null) "연결" else "저장") } }) }) { padding ->
         LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { Text("연결 방식", style = MaterialTheme.typography.titleSmall) }
             item {
@@ -3632,7 +3909,7 @@ private fun ConnectionKindGrid(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.Center,
                         ) {
-                            Icon(connectionKindIcon(kind), null, tint = color, modifier = Modifier.size(22.dp))
+                            Icon(connectionKindIcon(kind), null, design = if (kind == ConnectionKind.SYNOLOGY) PackGlyph.NAS else null, tint = color, modifier = Modifier.size(22.dp))
                             Spacer(Modifier.height(5.dp))
                             Text(
                                 kind.title,
@@ -4123,7 +4400,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }
 
 
-    Scaffold(modifier = Modifier.onSizeChanged { viewportSize = it }, containerColor = Color.Transparent, topBar = { TopAppBar(title = {
+    Scaffold(modifier = Modifier.onSizeChanged { viewportSize = it }, containerColor = Color.Transparent, topBar = { CenterAlignedTopAppBar(expandedHeight = 52.dp, title = {
         // iOS principal title: headline, tap opens the current-folder search; the path lives in the path bar below.
         Text(
             browser.connection.name,
@@ -4196,16 +4473,20 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 onLayoutChosen = { explicitCoverFlow = false; autoCoverFlowSuppressed = false },
             )
         }
-    }, colors = TopAppBarDefaults.topAppBarColors(containerColor = if (selectionMode && usesUnifiedLayout(state.theme)) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)) }, bottomBar = {
+    }, colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = if (selectionMode && usesUnifiedLayout(state.theme)) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)) }, bottomBar = {
         if (pickMode) BottomAppBar {
             val pickable = selectedItems.filter { !it.isDirectory && (it.isVideo || it.isImage) }
             TextButton(onClick = model::cancelNetworkMediaPick, enabled = state.mediaPickStaging == null) { Text("돌아가기") }
+            TextButton(
+                onClick = { model.requestWorkbenchAddRemote(browser.connection, selectedItems.toList()); selectedIds.clear() },
+                enabled = selectedItems.isNotEmpty() && state.mediaPickStaging == null,
+            ) { Text("작업대에 담기") }
             Spacer(Modifier.weight(1f))
             Button(
                 onClick = { model.stageRemoteMediaForBasket(pickable); selectedIds.clear() },
                 enabled = pickable.isNotEmpty() && state.mediaPickStaging == null,
                 modifier = Modifier.padding(end = 12.dp),
-            ) { Text(if (pickable.isEmpty()) "사진·영상을 선택하세요" else "영상 만들기에 ${pickable.size}개 추가") }
+            ) { Text(if (pickable.isEmpty()) "미디어를 선택하세요" else "영상 만들기에 ${pickable.size}개 추가") }
         } else if (selectionMode) {
             val canTrailer = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }
             val canMusic = selectedItems.isNotEmpty() && selectedItems.all { !it.isDirectory && (it.isVideo || it.isImage) }
@@ -4224,7 +4505,8 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedItems.isNotEmpty() && capabilities.copy) { batchTransfer = RemoteTransferAction.COPY },
                     BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedItems.isNotEmpty() && capabilities.move) { batchTransfer = RemoteTransferAction.MOVE },
                     BrowserSelectionAction("삭제", Icons.Default.Delete, selectedItems.isNotEmpty() && capabilities.delete, destructive = true) { confirmBatchDelete = true },
-                    BrowserSelectionAction("재료함 담기", Icons.Default.Inbox, canTrailer) { model.addRemoteFilesToMaterialBasket(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
+                    // Files AND folders of any kind become references only; nothing is downloaded or listed here.
+                    BrowserSelectionAction("작업대에 담기", Icons.Default.Inbox, selectedItems.isNotEmpty()) { model.requestWorkbenchAddRemote(browser.connection, selectedItems.toList()); selectedIds.clear(); selectionMode = false },
                     // NAS/cloud paths are never durable references: this always stores an app-owned copy.
                     BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, selectedItems.any { it.isVideo }) { model.importRemoteFilesToCollection(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false },
@@ -4232,7 +4514,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     BrowserSelectionAction("다운로드", Icons.Default.Download, selectedItems.isNotEmpty()) { pendingDownloadItems = selectedItems.toList(); showDownloadDestDialog = true },
                     BrowserSelectionAction("공유", Icons.Default.Share, canShare) { model.shareItems(selectedItems); selectedIds.clear(); selectionMode = false },
                 ),
-                note = if (selectedItems.isNotEmpty() && !canTrailer) "예고편 보기와 뮤직비디오는 사진과 영상만 선택했을 때 쓸 수 있습니다." else null,
+                note = if (selectedItems.isNotEmpty() && !canTrailer) "예고편 보기와 뮤직비디오는 미디어만 선택했을 때 쓸 수 있습니다." else null,
             )
         }
     }) { padding ->
@@ -4451,7 +4733,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         AlertDialog(
             onDismissRequest = { folderTrailerTarget = null },
             title = { Text("영상 만들기") },
-            text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+            text = { Text("하위 폴더에 있는 미디어도 함께 모을까요?") },
             confirmButton = {
                 TextButton(onClick = {
                     folderTrailerTarget = null
@@ -4470,7 +4752,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         AlertDialog(
             onDismissRequest = { folderMusicOverlayTarget = null },
             title = { Text("뮤직비디오") },
-            text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+            text = { Text("하위 폴더에 있는 미디어도 함께 모을까요?") },
             confirmButton = {
                 TextButton(onClick = {
                     folderMusicOverlayTarget = null
@@ -6092,7 +6374,8 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             contentWindowInsets = if (showsAutomaticOverflow) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets,
             containerColor = Color.Transparent,
             topBar = {
-                if (!showsAutomaticOverflow) TopAppBar(
+                if (!showsAutomaticOverflow) CenterAlignedTopAppBar(
+                    expandedHeight = 52.dp,
                     title = {
                         // iOS principal title (headline); tapping it opens the current-folder search.
                         val phoneHardTitle = if (currentSubdirectory.isNullOrBlank()) "폰하드" else currentSubdirectory!!.substringAfterLast('/')
@@ -6185,7 +6468,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             }
                         }
                     },
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
                 )
             },
             bottomBar = {
@@ -6215,12 +6498,22 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { copyTargetsDialog = selectedTargets },
                             BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { moveTargetsDialog = selectedTargets },
                             BrowserSelectionAction("삭제", Icons.Default.Delete, selectedTargets.isNotEmpty() && !phoneHardOpBusy, destructive = true) { deleteTargetsDialog = selectedTargets },
-                            BrowserSelectionAction("재료함 담기", Icons.Default.Inbox, canTrailer) {
+                            // 이 앱의 목록에서만 숨긴다(파일은 그대로, 잠금·암호화 아님). 일반 모드에서 비공개로 바꾸면 목록에서 바로 사라진다.
+                            BrowserSelectionAction("비공개로 전환", Icons.Default.VisibilityOff, selectedTargets.isNotEmpty() && !phoneHardOpBusy) {
+                                selectedTargets.forEach { model.setPhoneHardPrivate(it.relativePath, it.isDirectory, true) }
+                                selectedFileIds.clear(); selectedFolderPaths.clear(); selectionMode = false
+                            },
+                            BrowserSelectionAction("공개로 전환", Icons.Default.Visibility, com.armsone.nasfinder.data.PrivacyMode.isActive && selectedTargets.isNotEmpty() && !phoneHardOpBusy) {
+                                selectedTargets.forEach { model.setPhoneHardPrivate(it.relativePath, it.isDirectory, false) }
+                                selectedFileIds.clear(); selectedFolderPaths.clear(); selectionMode = false
+                            },
+                            BrowserSelectionAction("작업대에 담기", Icons.Default.Inbox, selectedTargets.isNotEmpty()) {
                                 val targets = displayedFiles.filter { it.id in selectedFileIds }
+                                val folders = selectedFolderPaths.toList()
                                 selectedFileIds.clear()
                                 selectedFolderPaths.clear()
                                 selectionMode = false
-                                model.addPhoneHardToMaterialBasket(targets)
+                                model.requestWorkbenchAddPhoneHard(targets, folders)
                             },
                             // PhoneHard files are app-private storage, not a durable external reference: always copied.
                             BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, displayedFiles.any { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }) {
@@ -6810,7 +7103,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             AlertDialog(
                 onDismissRequest = { folderTrailerTarget = null },
                 title = { Text("영상 만들기") },
-                text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+                text = { Text("하위 폴더에 있는 미디어도 함께 모을까요?") },
                 confirmButton = {
                     TextButton(onClick = {
                         val p = folderRelPath
@@ -6832,7 +7125,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             AlertDialog(
                 onDismissRequest = { folderMusicTarget = null },
                 title = { Text("뮤직비디오") },
-                text = { Text("하위 폴더에 있는 사진과 영상도 함께 모을까요?") },
+                text = { Text("하위 폴더에 있는 미디어도 함께 모을까요?") },
                 confirmButton = {
                     TextButton(onClick = {
                         val p = folderRelPath
@@ -7082,7 +7375,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                     }.padding(vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Icon(connectionKindIcon(connection.kind), null, tint = serviceColor(connection.kind.name, state.theme))
+                                    Icon(connectionKindIcon(connection.kind), null, design = if (connection.kind == ConnectionKind.SYNOLOGY) PackGlyph.NAS else null, tint = serviceColor(connection.kind.name, state.theme))
                                     Spacer(Modifier.width(12.dp))
                                     Column(Modifier.weight(1f)) {
                                         Text(connection.name)
@@ -7210,7 +7503,7 @@ private fun PhoneHardServerExpandableHeader(
                     PackIcon(PackGlyph.PHONEHARD, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.primary)
                 }
                 Text("서버 열기", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                if (!expanded && running) Box(Modifier.size(8.dp).background(Color(0xFF34C759), CircleShape))
+                if (!expanded && running) Box(Modifier.size(8.dp).background(themePalette().accent, CircleShape))
                 Spacer(Modifier.weight(1f))
                 Icon(
                     if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
@@ -7827,7 +8120,7 @@ private fun scaleInboxThumbnail(bitmap: android.graphics.Bitmap, maxPixelSize: I
 }
 
 @Composable
-private fun EmptyState(
+internal fun EmptyState(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     title: String,
     description: String,
@@ -7937,11 +8230,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("Super Thumbnail", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
-            )
+            PorcelainTopBar(title = "Super Thumbnail", onBack = { model.show(Screen.Dashboard) })
         },
     ) { padding ->
         LazyColumn(
@@ -7971,9 +8260,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
                         }
                         HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                            Surface(Modifier.size(40.dp), shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                                Icon(Icons.Default.AutoAwesome, null, Modifier.padding(8.dp), tint = MaterialTheme.colorScheme.primary)
-                            }
+                            SuperThumbnailMark(Modifier.size(40.dp))
                             Text("선택한 폴더의 영상과 사진 썸네일을 미리 만듭니다.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = MaterialTheme.typography.bodyMedium.lineHeight)
                         }
                         HorizontalDivider(Modifier.padding(horizontal = 16.dp))
@@ -8032,7 +8319,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), contentColor = MaterialTheme.colorScheme.onSurface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                     Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                            Icon(if (conditions.isReady && selected != null) Icons.Default.CheckCircle else Icons.Default.Schedule, null, tint = if (conditions.isReady && selected != null) Color(0xFF34C759) else MaterialTheme.colorScheme.onSurfaceVariant)
+                            Icon(if (conditions.isReady && selected != null) Icons.Default.CheckCircle else Icons.Default.Schedule, null, tint = if (conditions.isReady && selected != null) themePalette().accent else MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
                                 when {
                                     selected == null -> "먼저 처리할 폴더를 선택하세요."
@@ -8239,15 +8526,11 @@ private fun SuperThumbnailFolderPickerScreen(state: AppState, model: NasFinderVi
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text(if (connection == null) "NAS 선택" else currentTitle) },
-                navigationIcon = {
-                    if (connection != null) {
-                        IconButton(model::openSuperThumbnailPickerParent) { Icon(Icons.Default.ArrowBack, "상위 폴더") }
-                    }
-                },
-                actions = { TextButton(model::closeSuperThumbnailFolderPicker) { Text("취소") } },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
+            PorcelainTopBar(
+                title = if (connection == null) "NAS 선택" else currentTitle,
+                onBack = if (connection != null) model::openSuperThumbnailPickerParent else null,
+                backLabel = "상위 폴더",
+                actions = { TextButton(model::closeSuperThumbnailFolderPicker, modifier = Modifier.heightIn(min = 48.dp)) { Text("취소") } },
             )
         },
         bottomBar = {
@@ -8282,7 +8565,7 @@ private fun SuperThumbnailFolderPickerScreen(state: AppState, model: NasFinderVi
                         headlineContent = { Text(item.name) },
                         supportingContent = { Text(item.normalizedRootPath, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                         leadingContent = {
-                            Icon(connectionKindIcon(item.kind), null, tint = serviceColor(item.kind.name, state.theme))
+                            Icon(connectionKindIcon(item.kind), null, design = if (item.kind == ConnectionKind.SYNOLOGY) PackGlyph.NAS else null, tint = serviceColor(item.kind.name, state.theme))
                         },
                         trailingContent = { Icon(Icons.Default.ChevronRight, null) },
                         modifier = Modifier.clickable { model.openSuperThumbnailPickerConnection(item.id) },
@@ -8444,11 +8727,7 @@ private fun SuperThumbnailReportScreen(state: AppState, model: NasFinderViewMode
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("Super Thumbnail") },
-                navigationIcon = { IconButton(model::closeSuperThumbnailProgressOrReport) { Icon(Icons.Default.ArrowBack, "뒤로") } },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
-            )
+            PorcelainTopBar(title = "Super Thumbnail", onBack = model::closeSuperThumbnailProgressOrReport)
         },
     ) { padding ->
         LazyColumn(
@@ -8599,11 +8878,7 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("썸네일 캐시") },
-                navigationIcon = { IconButton({ model.show(Screen.Dashboard) }) { Icon(Icons.Default.ArrowBack, "뒤로") } },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-            )
+            PorcelainTopBar(title = "썸네일 캐시", onBack = { model.show(Screen.Dashboard) })
         },
     ) { padding ->
         LazyColumn(
@@ -8702,20 +8977,16 @@ private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
     val working = state.googlePhotosPhase in setOf(GooglePhotosPhase.AUTHORIZING, GooglePhotosPhase.PREPARING, GooglePhotosPhase.WAITING_FOR_SELECTION, GooglePhotosPhase.IMPORTING)
     Scaffold(
         containerColor = Color.Transparent,
-        topBar = { CenterAlignedTopAppBar(
-            title = { Text("Google Photos") },
-            navigationIcon = { IconButton(onClick = { if (working) model.cancelGooglePhotosImport(); model.show(Screen.Dashboard) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로") } },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-        ) },
+        topBar = { PorcelainTopBar(title = "Google 포토", onBack = { if (working) model.cancelGooglePhotosImport(); model.show(Screen.Dashboard) }) },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             DashboardCard {
                 Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Icon(Icons.Default.PhotoLibrary, null, tint = Color(0xFF4285F4), modifier = Modifier.size(30.dp))
+                        Icon(Icons.Default.PhotoLibrary, null, tint = themePalette().accent, modifier = Modifier.size(30.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(if (state.googlePhotosConnected) "Google Photos 연결됨" else "Google Photos 연결 필요", fontWeight = FontWeight.SemiBold)
-                            Text("선택한 사진과 영상만 폰하드에 저장합니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(if (state.googlePhotosConnected) "Google 포토 연결됨" else "Google 포토 연결 필요", fontWeight = FontWeight.SemiBold)
+                            Text("선택한 미디어만 폰하드에 저장합니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                     if (working) {
@@ -8723,7 +8994,7 @@ private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
                         Text(when (state.googlePhotosPhase) {
                             GooglePhotosPhase.AUTHORIZING -> "브라우저에서 Google 로그인을 완료해 주세요."
                             GooglePhotosPhase.PREPARING -> "사진 선택 화면을 준비하고 있습니다."
-                            GooglePhotosPhase.WAITING_FOR_SELECTION -> "Google Photos에서 사진을 선택해 주세요."
+                            GooglePhotosPhase.WAITING_FOR_SELECTION -> "Google 포토에서 사진을 선택해 주세요."
                             GooglePhotosPhase.IMPORTING -> "선택한 파일을 폰하드로 가져오고 있습니다."
                             else -> "처리 중입니다."
                         }, style = MaterialTheme.typography.bodySmall)
@@ -8732,7 +9003,7 @@ private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
                         Button(
                             onClick = model::requestGooglePhotosImport,
                             modifier = Modifier.fillMaxWidth(),
-                        ) { Text(if (state.googlePhotosConnected) "사진 선택" else "Google Photos 연결") }
+                        ) { Text(if (state.googlePhotosConnected) "사진 선택" else "Google 포토 연결") }
                         if (state.googlePhotosPhase == GooglePhotosPhase.ERROR) {
                             OutlinedButton(model::retryGooglePhotosImport, Modifier.fillMaxWidth(), enabled = state.googlePhotosConnected) { Text("다시 시도") }
                         }
@@ -8747,8 +9018,8 @@ private fun GooglePhotosScreen(state: AppState, model: NasFinderViewModel) {
         AlertDialog(
             onDismissRequest = model::dismissGooglePhotosDisclosure,
             icon = { Icon(Icons.Default.PhotoLibrary, null) },
-            title = { Text("Google Photos에서 가져오기") },
-            text = { Text("Google에 접속해 선택 화면을 엽니다. 선택한 사진·영상 원본을 이 기기로 내려받아 폰하드에 저장합니다. 모바일 데이터가 사용될 수 있습니다.") },
+            title = { Text("Google 포토에서 가져오기") },
+            text = { Text("Google에 접속해 선택 화면을 엽니다. 선택한 미디어 원본을 이 기기로 내려받아 폰하드에 저장합니다. 모바일 데이터가 사용될 수 있습니다.") },
             confirmButton = { TextButton(model::confirmGooglePhotosDisclosure) { Text("계속") } },
             dismissButton = { TextButton(model::dismissGooglePhotosDisclosure) { Text("취소") } },
         )
@@ -8763,269 +9034,320 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("설정") },
-                navigationIcon = {
-                    IconButton(onClick = { model.show(Screen.Dashboard) }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "뒤로")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-            )
+            PorcelainTopBar(title = "설정", onBack = { model.show(Screen.Dashboard) })
         },
     ) { padding ->
-        Box(Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.TopCenter) {
-        LazyColumn(
-            Modifier.widthIn(max = 760.dp).fillMaxSize(),
+        BoxWithConstraints(Modifier.padding(padding).fillMaxSize()) {
+        // Settings use the whole content width: one column on phones, two from 900dp, three from 1500dp (iOS macSettingsColumns).
+        val settingsColumns = if (maxWidth >= 1500.dp) 3 else if (maxWidth >= 900.dp) 2 else 1
+        androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid(
+            columns = androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells.Fixed(settingsColumns),
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            verticalItemSpacing = 14.dp,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            item { SectionTitle("테마", Icons.Default.Palette) }
             item {
-                val columns = 3
-                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
-                    Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        AppTheme.entries.chunked(columns).forEach { row ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                row.forEach { theme ->
-                                    val selected = state.theme == theme
-                                    // Each swatch shows that theme's own page, text, accent and selected colours.
-                                    val swatch = paletteFor(theme)
-                                    Box(
-                                        Modifier.weight(1f).height(104.dp)
-                                            .background(swatch.background, RoundedCornerShape(12.dp))
-                                            .border(
-                                                if (selected) 1.5.dp else .5.dp,
-                                                if (selected) swatch.accent else swatch.border,
-                                                RoundedCornerShape(12.dp),
-                                            )
-                                            .clickable { model.setTheme(theme) }
-                                            .semantics(mergeDescendants = true) { this.selected = selected }
-                                    ) {
-                                        Column(Modifier.fillMaxSize().padding(9.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                                Icon(themeIcon(theme), null, Modifier.size(12.dp), tint = swatch.text)
-                                                Spacer(Modifier.weight(1f))
-                                                if (selected) Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(12.dp), tint = swatch.accent)
-                                            }
-                                            Spacer(Modifier.weight(1f))
-                                            AutoShrinkThemeTitle(themeTitle(theme), swatch.text)
-                                            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                                                listOf(swatch.accent, swatch.text, swatch.surface, swatch.selected).forEach { color ->
-                                                    Box(Modifier.size(5.dp).background(color, CircleShape).border(.5.dp, swatch.border, CircleShape))
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("테마", Icons.Default.Palette)
+                        val columns = 3
+                        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
+                            Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                AppTheme.entries.chunked(columns).forEach { row ->
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        row.forEach { theme ->
+                                            val selected = state.theme == theme
+                                            // Each swatch shows that theme's own page, text, accent and selected colours.
+                                            val swatch = paletteFor(theme)
+                                            Box(
+                                                Modifier.weight(1f).height(104.dp)
+                                                    .background(swatch.background, RoundedCornerShape(12.dp))
+                                                    .border(
+                                                        if (selected) 1.5.dp else .5.dp,
+                                                        if (selected) swatch.accent else swatch.border,
+                                                        RoundedCornerShape(12.dp),
+                                                    )
+                                                    .clickable { model.setTheme(theme) }
+                                                    .semantics(mergeDescendants = true) { this.selected = selected }
+                                            ) {
+                                                Column(Modifier.fillMaxSize().padding(9.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                                                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                                        ThemePackIcon(theme, null, Modifier.size(12.dp), tint = swatch.text)
+                                                        Spacer(Modifier.weight(1f))
+                                                        if (selected) Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(12.dp), tint = swatch.accent)
+                                                    }
+                                                    Spacer(Modifier.weight(1f))
+                                                    AutoShrinkThemeTitle(themeTitle(theme), swatch.text)
+                                                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                                        listOf(swatch.accent, swatch.text, swatch.surface, swatch.selected).forEach { color ->
+                                                            Box(Modifier.size(5.dp).background(color, CircleShape).border(.5.dp, swatch.border, CircleShape))
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
+                                        repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
                                     }
                                 }
-                                repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+                                HorizontalDivider()
+                                Text(
+                                    "선택한 테마는 앱을 다시 열어도 유지됩니다. 레이아웃·글꼴은 같고 색만 바뀝니다.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                         }
-                        HorizontalDivider()
-                        Text(
-                            "선택한 테마는 앱을 다시 열어도 유지됩니다. 레이아웃·글꼴은 같고 색만 바뀝니다.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
                 }
             }
-            item { SectionTitle("아이콘 스타일", Icons.Default.GridView) }
-            item { InterfaceIconPackChooser(state.iconPack, model::setIconPack) }
-            item { SectionTitle("앱 아이콘", Icons.Default.Apps) }
             item {
-                val choices = listOf(
-                    Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
-                    Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
-                    Triple(LauncherIconVariant.VIBE_CODER, "Vibe Coder", R.drawable.app_icon_vibe_coder),
-                    Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
-                    Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
-                    Triple(LauncherIconVariant.ENAMEL, "BK Style", R.drawable.app_icon_enamel),
-                )
-                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
-                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                        choices.chunked(3).forEach { row ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                row.forEach { (variant, label, drawable) ->
-                                    val selected = state.launcherIcon == variant
-                                    Column(
-                                        Modifier.weight(1f).height(104.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .56f))
-                                            .border(
-                                                BorderStroke(
-                                                    if (selected) 1.5.dp else 1.dp,
-                                                    if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .75f)
-                                                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f),
-                                                ),
-                                                RoundedCornerShape(12.dp),
-                                            )
-                                            .clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
-                                            .padding(8.dp)
-                                            .semantics(mergeDescendants = true) { this.selected = selected },
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically),
-                                    ) {
-                                        Image(
-                                            bitmap = ImageBitmap.imageResource(drawable),
-                                            contentDescription = "$label 앱 아이콘 미리보기",
-                                            modifier = Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)),
-                                            filterQuality = FilterQuality.High,
-                                        )
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                            Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            if (state.pendingLauncherIcon == variant) {
-                                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                                            } else if (selected) {
-                                                Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
-                                            }
-                                        }
-                                    }
-                                }
-                                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("아이콘 스타일", Icons.Default.GridView)
+                    InterfaceIconPackChooser(state.iconPack, model::setIconPack)
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("프라이버시", Icons.Default.VisibilityOff)
+                    DashboardCard {
+                        val privacyOn by com.armsone.nasfinder.data.PrivacyMode.active.collectAsStateWithLifecycle()
+                        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("프라이버시 모드", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                                Switch(checked = privacyOn, onCheckedChange = { model.setPrivacyMode(it) })
                             }
-                        }
-                        HorizontalDivider()
-                        Text(
-                            "선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다. 테마를 바꿔도 앱 아이콘은 그대로입니다.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-            item { SectionTitle("저장공간", Icons.Default.Storage) }
-            item {
-                DashboardCard {
-                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Cached, null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("현재 사용량")
                             Text(
-                                "${state.downloadCacheBytes?.let(::formatBytes) ?: "계산 중…"} · 7일 · 최대 512 MB",
-                                style = MaterialTheme.typography.bodySmall,
+                                "켜면 평소 기록에 더해 비공개로 지정한 기록도 함께 보입니다. 끄면 비공개 기록이 목록에서 숨겨집니다. 앱을 다시 열면 항상 꺼진 상태로 시작합니다. 도구 탭을 길게 눌러도 바꿀 수 있습니다. " +
+                                    com.armsone.nasfinder.data.PrivacyMode.HONEST_NOTE,
+                                style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        TextButton(
-                            onClick = { confirmCacheClear = true },
-                            enabled = (state.downloadCacheBytes ?: 0L) > 0L && !state.isBusy,
-                        ) { Text("전체 지우기") }
                     }
                 }
             }
-            item { SectionTitle("화면", Icons.Default.PhoneAndroid) }
             item {
-                DashboardCard {
-                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                            ScreenAwakeMode.entries.forEachIndexed { index, mode ->
-                                SegmentedButton(
-                                    selected = state.screenAwakeMode == mode,
-                                    onClick = { model.setScreenAwakeMode(mode) },
-                                    shape = SegmentedButtonDefaults.itemShape(index, ScreenAwakeMode.entries.size),
-                                ) { Text(when (mode) { ScreenAwakeMode.AUTOMATIC -> "오토"; ScreenAwakeMode.ALWAYS -> "항상 켜짐"; ScreenAwakeMode.OFF -> "끔" }) }
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("화면 켜짐", Icons.Default.PhoneAndroid)
+                        DashboardCard {
+                            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                                    ScreenAwakeMode.entries.forEachIndexed { index, mode ->
+                                        SegmentedButton(
+                                            selected = state.screenAwakeMode == mode,
+                                            onClick = { model.setScreenAwakeMode(mode) },
+                                            shape = SegmentedButtonDefaults.itemShape(index, ScreenAwakeMode.entries.size),
+                                        ) { Text(when (mode) { ScreenAwakeMode.AUTOMATIC -> "오토"; ScreenAwakeMode.ALWAYS -> "항상 켜짐"; ScreenAwakeMode.OFF -> "끔" }) }
+                                    }
+                                }
+                                Text(
+                                    when (state.screenAwakeMode) {
+                                        ScreenAwakeMode.AUTOMATIC -> "다운로드·썸네일 생성·파일 작업 중에만 화면을 켜 둡니다."
+                                        ScreenAwakeMode.ALWAYS -> "NasFinder가 화면에 열려 있는 동안 화면을 켜 둡니다."
+                                        ScreenAwakeMode.OFF -> "Android의 화면 자동 잠금 설정을 그대로 따릅니다."
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                         }
-                        Text(
-                            when (state.screenAwakeMode) {
-                                ScreenAwakeMode.AUTOMATIC -> "다운로드·썸네일 생성·파일 작업 중에만 화면을 켜 둡니다."
-                                ScreenAwakeMode.ALWAYS -> "NasFinder가 화면에 열려 있는 동안 화면을 켜 둡니다."
-                                ScreenAwakeMode.OFF -> "Android의 화면 자동 잠금 설정을 그대로 따릅니다."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("앱 아이콘", Icons.Default.Apps)
+                        val choices = listOf(
+                            Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
+                            Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
+                            Triple(LauncherIconVariant.VIBE_CODER, "Vibe Coder", R.drawable.app_icon_vibe_coder),
+                            Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
+                            Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
+                            Triple(LauncherIconVariant.ENAMEL, "BK Style", R.drawable.app_icon_enamel),
                         )
-                    }
-                }
-            }
-            item { SectionTitle("썸네일 캐시 및 생성", Icons.Default.PhotoLibrary) }
-            item {
-                DashboardCard {
-                    DashboardRow(
-                        Icons.Default.PhotoLibrary,
-                        "썸네일 캐시",
-                        formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes),
-                        MaterialTheme.colorScheme.onSurfaceVariant,
-                        MaterialTheme.colorScheme.onSurfaceVariant,
-                    ) { model.show(Screen.ThumbnailCache) }
-                    DashboardRowDivider()
-                    SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "0 B" else "관리") {
-                        model.show(Screen.SuperThumbnail)
-                    }
-                }
-            }
-            item { SectionTitle("프로토콜", Icons.Default.Hub) }
-            item {
-                DashboardCard {
-                    ConnectionKind.entries.forEachIndexed { index, kind ->
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(connectionKindIcon(kind), null, tint = serviceColor(kind.name, state.theme), modifier = Modifier.size(22.dp))
-                            Spacer(Modifier.width(11.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(kind.title, style = MaterialTheme.typography.bodyMedium)
-                                Text(protocolSupport(kind), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
+                            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                choices.chunked(3).forEach { row ->
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        row.forEach { (variant, label, drawable) ->
+                                            val selected = state.launcherIcon == variant
+                                            Column(
+                                                Modifier.weight(1f).height(104.dp)
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .56f))
+                                                    .border(
+                                                        BorderStroke(
+                                                            if (selected) 1.5.dp else 1.dp,
+                                                            if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .75f)
+                                                            else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f),
+                                                        ),
+                                                        RoundedCornerShape(12.dp),
+                                                    )
+                                                    .clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
+                                                    .padding(8.dp)
+                                                    .semantics(mergeDescendants = true) { this.selected = selected },
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically),
+                                            ) {
+                                                Image(
+                                                    bitmap = ImageBitmap.imageResource(drawable),
+                                                    contentDescription = "$label 앱 아이콘 미리보기",
+                                                    modifier = Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)),
+                                                    filterQuality = FilterQuality.High,
+                                                )
+                                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                    Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                    if (state.pendingLauncherIcon == variant) {
+                                                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                                    } else if (selected) {
+                                                        Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                                    }
+                                }
+                                HorizontalDivider()
+                                Text(
+                                    "선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다. 테마를 바꿔도 앱 아이콘은 그대로입니다.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                         }
-                        if (index != ConnectionKind.entries.lastIndex) HorizontalDivider()
-                    }
                 }
             }
-            item { SectionTitle("앱 정보", Icons.Default.Info) }
             item {
-                DashboardCard {
-                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
-                        Text("버전", Modifier.weight(1f))
-                        Text(state.appVersion, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    HorizontalDivider()
-                    Row(Modifier.fillMaxWidth().padding(14.dp)) {
-                        Text("저장된 연결", Modifier.weight(1f))
-                        Text("${state.connections.size}개", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    HorizontalDivider()
-                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("업데이트 자동 다운로드")
-                            Text("데이터 요금이 없는 네트워크에서 받습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("저장공간 관리", Icons.Default.Storage)
+                        DashboardCard {
+                            Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Cached, null, tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text("현재 사용량")
+                                    Text(
+                                        "${state.downloadCacheBytes?.let(::formatBytes) ?: "계산 중…"} · 7일 · 최대 512 MB",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                TextButton(
+                                    onClick = { confirmCacheClear = true },
+                                    enabled = (state.downloadCacheBytes ?: 0L) > 0L && !state.isBusy,
+                                ) { Text("전체 지우기") }
+                            }
                         }
-                        Switch(checked = automaticUpdateDownloadEnabled, onCheckedChange = onAutomaticUpdateDownloadChanged)
-                    }
-                    HorizontalDivider()
-                    TextButton(onClick = onCheckForUpdates, modifier = Modifier.fillMaxWidth()) { Text("업데이트 확인") }
                 }
             }
-            item { SectionTitle("파일 앱 연동", Icons.Default.FolderOpen) }
             item {
-                DashboardCard {
-                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                        Text(if (state.connections.isEmpty()) "먼저 NAS 또는 SFTP 연결을 추가해 주세요." else "현재 저장된 원격 위치 ${state.connections.size}개를 Android 파일 선택기에서도 열 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
-                        Text("1. 파일 앱 또는 파일 선택 화면의 저장 위치 메뉴를 엽니다.\n2. ‘NasFinder’를 선택합니다.\n3. 서버 이름을 선택해 원격 파일을 엽니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("지원되는 작업은 연결 방식과 서버 권한에 따라 달라집니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("썸네일 캐시 및 생성", Icons.Default.PhotoLibrary)
+                        DashboardCard {
+                            DashboardRow(
+                                Icons.Default.PhotoLibrary,
+                                "썸네일 캐시",
+                                formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes),
+                                MaterialTheme.colorScheme.onSurfaceVariant,
+                                MaterialTheme.colorScheme.onSurfaceVariant,
+                            ) { model.show(Screen.ThumbnailCache) }
+                            DashboardRowDivider()
+                            SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "0 B" else "관리") {
+                                model.show(Screen.SuperThumbnail)
+                            }
+                        }
                 }
             }
-            item { SectionTitle("오픈 소스", Icons.Default.Code) }
             item {
-                DashboardCard {
-                    DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "구성요소·버전·라이선스·공식 소스 보기") {
-                        uriHandler.openUri("https://github.com/armsone/NasFinder-Android/blob/main/docs/OPEN_SOURCE.md")
-                    }
-                    HorizontalDivider()
-                    DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("파일 선택기 연동", Icons.Default.FolderOpen)
+                        DashboardCard {
+                            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                                Text(if (state.connections.isEmpty()) "먼저 NAS 또는 SFTP 연결을 추가해 주세요." else "현재 저장된 원격 위치 ${state.connections.size}개를 Android 파일 선택기에서도 열 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
+                                Text("1. 파일 앱 또는 파일 선택 화면의 저장 위치 메뉴를 엽니다.\n2. ‘NasFinder’를 선택합니다.\n3. 서버 이름을 선택해 원격 파일을 엽니다.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("지원되는 작업은 연결 방식과 서버 권한에 따라 달라집니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
                 }
             }
-            item { SectionTitle("만든 사람", Icons.Default.Person) }
             item {
-                DashboardCard {
-                    DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
-                        uriHandler.openUri("https://github.com/armsone")
-                    }
-                    HorizontalDivider()
-                    DashboardRow(Icons.Default.Public, "공식 사이트 · nasfinder.com", "NasFinder 공식 홈페이지입니다.") {
-                        uriHandler.openUri("https://nasfinder.com")
-                    }
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("앱 정보", Icons.Default.Info)
+                        DashboardCard {
+                            Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                                Text("버전", Modifier.weight(1f))
+                                Text(state.appVersion, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            HorizontalDivider()
+                            Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                                Text("빌드", Modifier.weight(1f))
+                                Text(BuildConfig.BUILD_NUMBER, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            HorizontalDivider()
+                            Row(Modifier.fillMaxWidth().padding(14.dp)) {
+                                Text("저장된 연결", Modifier.weight(1f))
+                                Text("${state.connections.size}개", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("지원 프로토콜", Icons.Default.Hub)
+                        DashboardCard {
+                            ConnectionKind.entries.forEachIndexed { index, kind ->
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(connectionKindIcon(kind), null, design = if (kind == ConnectionKind.SYNOLOGY) PackGlyph.NAS else null, tint = serviceColor(kind.name, state.theme), modifier = Modifier.size(22.dp))
+                                    Spacer(Modifier.width(11.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(kind.title, style = MaterialTheme.typography.bodyMedium)
+                                        Text(protocolSupport(kind), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                                if (index != ConnectionKind.entries.lastIndex) HorizontalDivider()
+                            }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("업데이트", Icons.Default.Info)
+                        DashboardCard {
+                            Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("업데이트 자동 다운로드")
+                                    Text("데이터 요금이 없는 네트워크에서 받습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                Switch(checked = automaticUpdateDownloadEnabled, onCheckedChange = onAutomaticUpdateDownloadChanged)
+                            }
+                            HorizontalDivider()
+                            TextButton(onClick = onCheckForUpdates, modifier = Modifier.fillMaxWidth()) { Text("업데이트 확인") }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("오픈 소스", Icons.Default.Code)
+                        DashboardCard {
+                            DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "구성요소·버전·라이선스·공식 소스 보기") {
+                                uriHandler.openUri("https://github.com/armsone/NasFinder-Android/blob/main/docs/OPEN_SOURCE.md")
+                            }
+                            HorizontalDivider()
+                            DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("만든 사람", Icons.Default.Person)
+                        DashboardCard {
+                            DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
+                                uriHandler.openUri("https://github.com/armsone")
+                            }
+                            HorizontalDivider()
+                            DashboardRow(Icons.Default.Public, "공식 사이트 · nasfinder.com", "NasFinder 공식 홈페이지입니다.") {
+                                uriHandler.openUri("https://nasfinder.com")
+                            }
+                        }
                 }
             }
             item {
@@ -9062,7 +9384,7 @@ private fun InterfaceIconPackChooser(selectedPack: InterfaceIconPack, onSelect: 
         Triple(InterfaceIconPack.SIMPLE, "심플", "간결한 선으로 구성된 라인 스타일"),
         Triple(InterfaceIconPack.SOLID, "솔리드", "명확하고 단단한 면의 플랫 스타일"),
         Triple(InterfaceIconPack.DIMENSION, "입체", "부드러운 입체감의 모던 스타일"),
-        Triple(InterfaceIconPack.REALISTIC, "리얼리스틱", "실제 질감을 표현한 현실적인 스타일"),
+        Triple(InterfaceIconPack.REALISTIC, "리얼", "실제 질감을 표현한 현실적인 스타일"),
     )
     val samples = listOf(PackGlyph.NAS, PackGlyph.PHOTOS, PackGlyph.SETTINGS)
     val accent = MaterialTheme.colorScheme.primary
@@ -9097,7 +9419,7 @@ private fun InterfaceIconPackChooser(selectedPack: InterfaceIconPack, onSelect: 
                 }
             }
             Text(
-                "화면 테마·앱 아이콘과 따로 저장됩니다. 사진·영상·폴더 썸네일은 항상 실제 이미지를 보여 줍니다.",
+                "화면 테마·앱 아이콘과 따로 저장됩니다. 미디어·폴더 썸네일은 항상 실제 이미지를 보여 줍니다.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -9124,7 +9446,22 @@ private fun protocolSupport(kind: ConnectionKind) = when (kind) {
 }
 
 private fun themeTitle(theme: AppTheme) = theme.title
-private fun themeIcon(theme: AppTheme) = ThemeVectors.vectorFor(theme)
+@Composable
+private fun ThemePackIcon(theme: AppTheme, contentDescription: String?, modifier: Modifier = Modifier, tint: Color = Color.Unspecified) {
+    val glyph = when (theme) {
+        AppTheme.LIGHT -> PackGlyph.DISPLAY_LIGHT
+        AppTheme.BKSTYLE -> PackGlyph.THEME_HALF
+        AppTheme.NIGHT -> PackGlyph.DISPLAY_DARK
+        AppTheme.FRIDAY -> PackGlyph.THEME_HEXAGON
+        AppTheme.JARVIS, AppTheme.ULTRON -> null // Named colour themes retain their identity marks.
+    }
+    CompositionLocalProvider(LocalThemePalette provides paletteFor(theme)) {
+        val ink = if (LocalInterfaceIconPack.current == InterfaceIconPack.SIMPLE) {
+            if (paletteFor(theme).isDark) Color.White else Color.Black
+        } else tint
+        Icon(ThemeVectors.vectorFor(theme), contentDescription, modifier, ink, design = glyph)
+    }
+}
 
 private class ThemeChooserBadge(val fill: Color, val glyph: Color)
 

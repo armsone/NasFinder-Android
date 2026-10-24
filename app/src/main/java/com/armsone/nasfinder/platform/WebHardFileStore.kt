@@ -1,6 +1,7 @@
 package com.armsone.nasfinder.platform
 
 import android.content.Context
+import com.armsone.nasfinder.data.PrivacyMode
 import com.armsone.nasfinder.data.SharedInboxStore
 import java.io.Closeable
 import java.io.File
@@ -25,6 +26,7 @@ sealed class WebHardFileStoreException(message: String) : Exception(message) {
     class NotFound : WebHardFileStoreException("파일 또는 폴더를 찾을 수 없습니다.")
     class AlreadyExists : WebHardFileStoreException("같은 이름의 파일 또는 폴더가 이미 있습니다.")
     class Unsupported : WebHardFileStoreException("지원하지 않는 파일 형식입니다.")
+    class HiddenItems : WebHardFileStoreException("이 폴더에는 여기에 표시되지 않는 항목이 들어 있어 삭제할 수 없습니다. 앱에서 폴더를 확인해 주세요.")
 }
 
 class WebHardPreparedUpload internal constructor(
@@ -79,6 +81,8 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
             if (child.name.startsWith('.') || child.isHidden || Files.isSymbolicLink(child.toPath())) {
                 return@mapNotNull null
             }
+            // 로컬 웹하드는 앱 모드를 모르는 앱 밖 표면이다: 비공개 폰하드 경로는 목록에서 항상 뺀다.
+            if (isPrivatePhoneHardPath(child)) return@mapNotNull null
             val attributes = Files.readAttributes(
                 child.toPath(),
                 java.nio.file.attribute.BasicFileAttributes::class.java,
@@ -110,6 +114,10 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
     fun delete(path: String) {
         val target = existing(path, expectDirectory = null)
         if (target == rootDirectory) throw WebHardFileStoreException.InvalidPath()
+        // 재귀 삭제가 보이지 않는 비공개 하위 항목까지 지우지 않도록, 그런 항목이 있는 폴더는 항상 지우지 않는다.
+        if (target.isDirectory && PrivacyMode.hasPhoneHardPrivateDescendant(relativeStoredPath(target))) {
+            throw WebHardFileStoreException.HiddenItems()
+        }
         deleteWithoutFollowingLinks(target)
     }
 
@@ -179,6 +187,8 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
         validateNoSymlinkComponents(target)
         val canonical = target.canonicalFile
         validateInsideRoot(canonical)
+        // 직접 접근(주소 입력·다운로드·삭제)도 같은 규칙으로 막는다: 없는 항목처럼 응답한다.
+        if (isPrivatePhoneHardPath(canonical)) throw WebHardFileStoreException.NotFound()
         if (expectDirectory == true && !canonical.isDirectory) throw WebHardFileStoreException.Unsupported()
         if (expectDirectory == false && !canonical.isFile) throw WebHardFileStoreException.Unsupported()
         return canonical
@@ -198,7 +208,19 @@ class WebHardFileStore private constructor(root: File, @Suppress("UNUSED_PARAMET
         for (component in components) candidate = File(candidate, component)
         val absolute = candidate.absoluteFile.normalize()
         validateInsideRoot(absolute)
+        if (isPrivatePhoneHardPath(absolute)) throw WebHardFileStoreException.NotFound()
         return absolute
+    }
+
+    private fun relativeStoredPath(file: File): String =
+        file.absoluteFile.normalize().path.removePrefix(rootDirectory.path.trimEnd(File.separatorChar))
+            .trimStart(File.separatorChar).replace(File.separatorChar, '/')
+
+    private fun isPrivatePhoneHardPath(file: File): Boolean {
+        val rootPath = rootDirectory.path.trimEnd(File.separatorChar)
+        val path = file.absoluteFile.normalize().path
+        if (!path.startsWith("$rootPath${File.separator}")) return false
+        return PrivacyMode.isPhoneHardPathPrivate(path.removePrefix(rootPath).trimStart(File.separatorChar).replace(File.separatorChar, '/'))
     }
 
     private fun validateExistingAncestor(target: File) {

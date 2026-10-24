@@ -322,6 +322,9 @@ data class TrailerSession(
     val pendingAdds: List<EditorPendingAdd> = emptyList(),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
+    // 비공개 오염 플래그: 프라이버시 모드에서 시작했거나 입력 중 하나라도 비공개 출처이면 켜지고 풀리지 않는다.
+    // 편집본·출력(폰하드 파일)·컬렉션 영상으로 이어진다. 시작 시점에 한 번 정해지며 이후 모드 전환과 무관하다.
+    val originPrivate: Boolean = false,
 ) {
     val hasVideos: Boolean get() = sources.any { !it.isImage }
     // Music-overlay mode keeps every photo at a fixed 1s Ken Burns scene; trailer mode now weighs

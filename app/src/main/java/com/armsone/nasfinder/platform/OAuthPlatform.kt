@@ -140,7 +140,7 @@ class OAuthCoordinator(context: Context) {
 
     /** Returns null when the user has not configured a public client ID. */
     fun begin(provider: CloudOAuthProvider, connectionId: String, nowMillis: Long = System.currentTimeMillis()): String? {
-        if (connections.load().none { it.id == connectionId && it.kind == provider.connectionKind }) return null
+        if (connections.loadAll().none { it.id == connectionId && it.kind == provider.connectionKind }) return null
         val clientId = clients.clientId(provider) ?: return null
         val (state, session) = sessions.create(provider, connectionId, clientId, nowMillis)
         return OAuthSecurityPolicy.authorizationUrl(provider, clientId, state, session.codeVerifier)
@@ -150,7 +150,8 @@ class OAuthCoordinator(context: Context) {
         val callback = OAuthSecurityPolicy.parseCallback(rawUri)
         val session = sessions.consume(callback.state, nowMillis)
         if (callback.error != null) throw IOException("OAuth 로그인이 취소되었거나 거부되었습니다.")
-        if (connections.load().none { it.id == session.connectionId && it.kind == session.provider.connectionKind }) {
+        // 1회용 state를 이미 소진했으므로 표시 모드가 아니라 저장된 전체 연결로 확인한다.
+        if (connections.loadAll().none { it.id == session.connectionId && it.kind == session.provider.connectionKind }) {
             throw IOException("OAuth 연결을 찾을 수 없습니다.")
         }
         val configuredClientId = clients.clientId(session.provider)

@@ -615,24 +615,15 @@ fun WebHardScreen(onClose: () -> Unit) {
         modifier = Modifier.onSizeChanged { viewportSize = it },
         contentWindowInsets = if (showsCoverFlow) WindowInsets(0, 0, 0, 0) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
-            if (!showsCoverFlow) TopAppBar(
-                title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text("폰하드")
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = { if (currentPath == "/") { stop(); onClose() } else navigateUp() }) {
-                        Icon(Icons.Default.ArrowBack, if (currentPath == "/") "뒤로" else "상위 폴더")
-                    }
-                },
+            if (!showsCoverFlow) PorcelainTopBar(
+                title = "폰하드",
+                onBack = { if (currentPath == "/") { stop(); onClose() } else navigateUp() },
+                backLabel = if (currentPath == "/") "뒤로" else "상위 폴더",
                 actions = {
                     IconButton(
                         onClick = connection::refreshAddresses,
                         enabled = connection.server == null,
+                        modifier = Modifier.size(48.dp),
                     ) { Icon(Icons.Default.Refresh, "주소 새로고침") }
                 },
             )

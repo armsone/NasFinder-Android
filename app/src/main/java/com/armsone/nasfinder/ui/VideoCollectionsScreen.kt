@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -46,7 +47,9 @@ import java.util.Locale
 internal fun VideoCollectionsScreen(
     state: AppState,
     model: NasFinderViewModel,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    // 영상 hub embeds this screen under its own title / tab bar: no own title, back arrow or system insets.
+    embedded: Boolean = false
 ) {
     LaunchedEffect(Unit) {
         model.refreshCollections()
@@ -74,77 +77,42 @@ internal fun VideoCollectionsScreen(
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("컬렉션", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
-                        Text(
-                            "완성된 영상 및 가져온 영상 보관소 (${collections.size}개)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "뒤로")
-                    }
-                },
+            PorcelainTopBar(
+                title = if (embedded) "컬렉션 ${collections.size}편" else "컬렉션",
+                subtitle = if (embedded) null else "완성된 영상 및 가져온 영상 보관소 (${collections.size}개)",
+                onBack = if (embedded) null else onBack,
+                windowInsets = if (embedded) WindowInsets(0) else TopAppBarDefaults.windowInsets,
                 actions = {
-                    TextButton(onClick = { videoPicker.launch(arrayOf("video/*")) }) {
+                    TextButton(onClick = { videoPicker.launch(arrayOf("video/*")) }, modifier = Modifier.heightIn(min = 48.dp)) {
                         Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("영상 가져오기")
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
-        }
+        },
+        contentWindowInsets = if (embedded) WindowInsets(0) else ScaffoldDefaults.contentWindowInsets
     ) { padding ->
         if (collections.isEmpty()) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(32.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Icon(
-                        Icons.Default.VideoLibrary,
-                        contentDescription = null,
-                        modifier = Modifier.size(56.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        "컬렉션에 보관된 영상이 없습니다",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 16.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    // An unreadable store file is not an empty collection: say so.
-                    DurableCollectionStore.loadProblem()?.let { problem ->
-                        Text(problem, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            EmptyState(
+                icon = Icons.Default.VideoLibrary,
+                title = "컬렉션에 보관된 영상이 없습니다",
+                description = "영상을 내보내면 완성본이 이곳에 안전하게 보관되며, 원본 소스와 분리되어 언제든 재생하거나 공유할 수 있습니다.",
+                modifier = Modifier.fillMaxSize().padding(padding),
+                action = {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        // An unreadable store file is not an empty collection: say so.
+                        DurableCollectionStore.loadProblem()?.let { problem ->
+                            Text(problem, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
+                        }
+                        Button(onClick = { videoPicker.launch(arrayOf("video/*")) }, shape = RoundedCornerShape(10.dp), modifier = Modifier.heightIn(min = 48.dp)) {
+                            Icon(Icons.Default.Add, null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("기기 영상 가져오기")
+                        }
                     }
-                    Text(
-                        "영상을 내보내면 완성본이 이곳에 안전하게 보관되며, 원본 소스와 분리되어 언제든 재생하거나 공유할 수 있습니다.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp)
-                    )
-                    Button(
-                        onClick = { videoPicker.launch(arrayOf("video/*")) },
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Icon(Icons.Default.Add, null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("기기 영상 가져오기")
-                    }
-                }
-            }
+                },
+            )
         } else {
             BoxWithConstraints(
                 Modifier
@@ -156,7 +124,7 @@ internal fun VideoCollectionsScreen(
                 DurableCollectionStore.loadProblem()?.let { problem ->
                     Text(problem, Modifier.padding(horizontal = 16.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error)
                 }
-                state.compression?.let { op ->
+                state.compression?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }?.let { op ->
                     CompressionStatusCard(op, onCancel = model::cancelCollectionCompression, onDismiss = model::dismissCollectionCompression)
                 }
                 LazyVerticalGrid(
@@ -173,6 +141,7 @@ internal fun VideoCollectionsScreen(
                             onCompress = { compressItem = item },
                             onPlay = { model.previewCollectionVideo(item) },
                             onTogglePin = { model.toggleCollectionPin(item.id) },
+                            onSetPrivate = { model.setCollectionPrivate(item.id, it) },
                             onMove = { offset -> model.moveCollectionItem(item.id, offset) },
                             onRename = {
                                 editingItem = item
@@ -590,6 +559,7 @@ private fun CollectionPosterCard(
     onCompress: () -> Unit,
     onPlay: () -> Unit,
     onTogglePin: () -> Unit,
+    onSetPrivate: (Boolean) -> Unit = {},
     onMove: (Int) -> Unit,
     onRename: () -> Unit,
     onShare: () -> Unit,
@@ -767,6 +737,14 @@ private fun CollectionPosterCard(
                                 onClick = {
                                     menuExpanded = false
                                     onRename()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (item.isPrivate) "공개로 전환" else "비공개로 전환") },
+                                leadingIcon = { Icon(if (item.isPrivate) Icons.Default.Visibility else Icons.Default.VisibilityOff, null) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onSetPrivate(!item.isPrivate)
                                 }
                             )
                             DropdownMenuItem(

@@ -421,7 +421,10 @@ class NasFinderDocumentsProvider : DocumentsProvider() {
         if (cursor.getColumnIndex(column) >= 0) add(column, value)
     }
 
-    private fun supportedConnections(): List<RemoteConnection> = repository.load()
+    // 시스템 확장 표면은 앱 안 프라이버시 모드와 무관하게 항상 일반 모드 기준이다: 비공개 연결은 root 목록과
+    // 문서 id 직접 조회 모두에서 제외한다(이미 다른 앱이 보관한 URI도 같은 필터로 거부된다).
+    private fun supportedConnections(): List<RemoteConnection> = repository.loadAll()
+        .filterNot { it.isPrivate }
         .filter { it.kind in READABLE_CONNECTION_KINDS }
         .filter { runCatching { UUID.fromString(it.id) }.isSuccess }
         .filter { it.host.isNotBlank() && it.port in 1..65535 }

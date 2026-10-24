@@ -4,7 +4,7 @@
     <string name="widget_picker_title">NasFinder 바로 열기</string>
     <string name="widget_description">홈 화면에서 NasFinder를 바로 엽니다.</string>
     <string name="widget_open_label">NasFinder 열기</string>
-    <string name="share_save_label">NasFinder로 저장</string>
+    <string name="share_save_label">NasFinder</string>
     <string name="shortcut_inbox_short">폰하드</string>
     <string name="shortcut_inbox_long">NasFinder 폰하드 열기</string>
     <string name="shortcut_webhard_short">폰하드</string>

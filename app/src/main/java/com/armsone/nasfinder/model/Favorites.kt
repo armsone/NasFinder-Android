@@ -16,6 +16,8 @@ data class RemoteFavorite(
     val modifiedAt: Instant? = null,
     val mimeType: String? = null,
     val thumbnailUrl: String? = null,
+    /** 비공개 즐겨찾기(기본 false). 같은 대상당 레코드는 하나이며 플래그만 바뀐다. */
+    val isPrivate: Boolean = false,
 ) {
     fun toRemoteFileItem(): RemoteFileItem = RemoteFileItem(
         id = remoteItemId?.takeIf { it.isNotBlank() } ?: path,
@@ -35,6 +37,8 @@ data class BrowserFavorite(
     val url: String,
     val isHomepage: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
+    /** 비공개 웹 즐겨찾기(기본 false). 비공개 항목은 홈페이지가 될 수 없다. */
+    val isPrivate: Boolean = false,
 )
 
 object BrowserUrlPolicy {

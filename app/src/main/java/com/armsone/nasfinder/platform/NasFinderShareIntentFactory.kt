@@ -22,7 +22,17 @@ object NasFinderShareIntentFactory {
         return createInternal(context, files, forceMultiple = true)
     }
 
-    private fun createInternal(context: Context, files: List<File>, forceMultiple: Boolean): Intent {
+    /** Photo-selection results: same grant-scoped shares folder, but no inbox-sized item cap on the user's chosen N. */
+    fun createMultipleUncapped(context: Context, files: List<File>): Intent {
+        return createInternal(context, files, forceMultiple = true, maxItems = Int.MAX_VALUE)
+    }
+
+    private fun createInternal(
+        context: Context,
+        files: List<File>,
+        forceMultiple: Boolean,
+        maxItems: Int = InboxBatchContracts.MAX_SELECTED_ITEMS,
+    ): Intent {
         require(files.isNotEmpty()) { "공유할 파일이 없습니다." }
 
         val allowedRoots = listOf(
@@ -37,8 +47,8 @@ object NasFinderShareIntentFactory {
             }
             file
         }.distinctBy { it.path }
-        require(safeFiles.size <= InboxBatchContracts.MAX_SELECTED_ITEMS) {
-            "한 번에 최대 ${InboxBatchContracts.MAX_SELECTED_ITEMS}개까지 공유할 수 있습니다."
+        require(safeFiles.size <= maxItems) {
+            "한 번에 최대 ${maxItems}개까지 공유할 수 있습니다."
         }
 
         val authority = "${context.packageName}.sharefiles"
