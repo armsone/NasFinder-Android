@@ -152,6 +152,7 @@ internal fun PorcelainHome(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainFavorites(state, model, onRemoveFavorite) } }
+                    item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeCollection(state, model) } }
                     item {
                         Box(Modifier.widthIn(max = 640.dp)) {
                             PorcelainFileOpen(state, model, onAddNetwork, onEditGooglePhotos, onDeleteGooglePhotos, onDeleteConnection, allConnections = false)
@@ -169,6 +170,7 @@ internal fun PorcelainHome(
                     verticalArrangement = Arrangement.spacedBy(SectionGap),
                 ) {
                     item { PorcelainFavorites(state, model, onRemoveFavorite) }
+                    item { PorcelainHomeCollection(state, model) }
                     if (split) {
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(WideColumnGap)) {
@@ -245,6 +247,11 @@ internal fun PorcelainPhoneHome(
         }
         item {
             Box(Modifier.widthIn(max = 640.dp)) {
+                PorcelainHomeCollection(state, model)
+            }
+        }
+        item {
+            Box(Modifier.widthIn(max = 640.dp)) {
                 PorcelainFileOpen(
                     state = state,
                     model = model,
@@ -272,6 +279,22 @@ internal fun PorcelainPhoneHome(
         }
         item {
             Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeTools(model) }
+        }
+    }
+}
+
+/** 컬렉션 location on the 홈 screen: opens the saved finished videos collection destination. */
+@Composable
+private fun PorcelainHomeCollection(state: AppState, model: NasFinderViewModel) {
+    PorcelainSection("컬렉션") {
+        PorcelainPanel(Modifier.fillMaxWidth()) {
+            PorcelainRow(
+                "컬렉션",
+                PackGlyph.COLLECTION,
+                subtitle = "완성된 영상 및 재생 보관소",
+                trailing = { Text("${state.collections.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                onClick = { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
+            )
         }
     }
 }
@@ -961,14 +984,6 @@ private fun PorcelainVideo(state: AppState, model: NasFinderViewModel) {
                 subtitle = "저장된 영상 프로젝트",
                 trailing = { Text("${state.trailerDraftCount}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
                 onClick = { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) },
-            )
-            PorcelainDivider()
-            PorcelainRow(
-                "컬렉션",
-                PackGlyph.COLLECTION,
-                subtitle = "완성된 영상 및 재생 보관소",
-                trailing = { Text("${state.collections.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                onClick = { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
             )
         }
     }

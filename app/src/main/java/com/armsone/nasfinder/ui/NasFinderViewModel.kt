@@ -5887,6 +5887,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val self = coroutineContext[Job]
             val output = File(directory, "trailer-${UUID.randomUUID()}.mp4")
             try {
+                var exportRecoveredScenes = 0
+                var exportExcludedScenes = 0
                 TrailerExporter.export(
                     context = application,
                     scenes = scenes,
@@ -5898,12 +5900,32 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     autoDucking = autoDucking,
                     aspectSources = scenes.map { it.source },
                     musicVolume = musicVolume,
+                    onSuccess = { recovered, excluded ->
+                        exportRecoveredScenes = recovered
+                        exportExcludedScenes = excluded
+                    },
                 ) { status, progress ->
                     updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
                 }
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 val previous = _state.value.trailer?.takeIf { it.directory == directory }?.output
-                updateTrailer(directory) { it.copy(output = output, outputRevision = revision, export = null, saved = false) }
+                val finishedExportState = if (exportRecoveredScenes > 0 || exportExcludedScenes > 0) {
+                    val summary = buildString {
+                        append("완료 (")
+                        val parts = mutableListOf<String>()
+                        if (exportRecoveredScenes > 0) parts.add("복구 ${exportRecoveredScenes}장면")
+                        if (exportExcludedScenes > 0) parts.add("제외 ${exportExcludedScenes}장면")
+                        append(parts.joinToString("·"))
+                        append(")")
+                    }
+                    EditorExportState(
+                        running = false,
+                        snapshotRevision = revision,
+                        status = summary,
+                        error = null,
+                    )
+                } else null
+                updateTrailer(directory) { it.copy(output = output, outputRevision = revision, export = finishedExportState, saved = false) }
                 val live = _state.value.trailer?.takeIf { it.directory == directory }
                 val saved = live != null && withContext(Dispatchers.IO) { draftFromSession(live)?.let(TrailerDraftStore::saveDraft) == true }
                 // The superseded render of this same project is removed only after the new one is recorded.

@@ -525,6 +525,11 @@ private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRet
                     TextButton(onClick = onRetry) { Text("다시 시도") }
                     TextButton(onClick = onDismiss) { Text("닫기") }
                 }
+            } else if (export.status.isNotBlank()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(export.status, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 2)
+                    TextButton(onClick = onDismiss) { Text("닫기") }
+                }
             }
         }
     }
