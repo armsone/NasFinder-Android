@@ -8,8 +8,14 @@ import kotlin.math.*
 // (TrailerPhotoAnalysis.kt) fills in a real per-photo measurement; kept stable across preview
 // recomposition, export and saved-draft re-open because it lives on this immutable source.
 const val DEFAULT_PHOTO_DURATION_RATIO: Double = .55
-const val MIN_PHOTO_DURATION_RATIO: Double = .05
+const val MIN_PHOTO_DURATION_RATIO: Double = .01
 internal const val MIN_PHOTO_SCENE_DURATION: Double = 1.0 / 30.0
+
+fun migratePhotoDurationRatio(r: Double): Double {
+    if (!r.isFinite() || r <= 0.0) return DEFAULT_PHOTO_DURATION_RATIO
+    return if (r < 0.35) max(0.01, r * (0.10 / 0.35))
+    else 0.10 + (r.coerceIn(0.35, 0.75) - 0.35) * (0.85 / 0.40)
+}
 
 data class TrailerSource(
     val id: Int, val name: String, val file: File, val duration: Double,
@@ -17,16 +23,26 @@ data class TrailerSource(
     val isImage: Boolean = false,
     val captureTimeMillis: Long = 0L,
     // HanYang quality/similarity ratio of the configured video clip length this photo's scene
-    // should occupy: .35..75 ordinary (best photo highest, similar duplicates lower), down to
-    // MIN_PHOTO_DURATION_RATIO for extreme near-duplicates. Set by analyzeTrailerPhotos().
+    // should occupy: .10..95 ordinary (best photo highest, similar duplicates lower), down to
+    // MIN_PHOTO_DURATION_RATIO (.01) for extreme near-duplicates. Set by analyzeTrailerPhotos().
     val photoDurationRatio: Double = DEFAULT_PHOTO_DURATION_RATIO,
+    val photoPolicyVersion: Int = 2,
     // Stable identity of the Finder item this source was prepared from ("remote:<conn>:<path>",
     // "phonehard:<uuid>", "local:<uri>", "web:<path>"); null for legacy drafts. Only used to show 사용 중.
     val originKey: String? = null,
 ) {
+    fun effectivePhotoDurationRatio(): Double {
+        val raw = if (photoDurationRatio.isFinite() && photoDurationRatio > 0.0) photoDurationRatio else DEFAULT_PHOTO_DURATION_RATIO
+        val ratio = if (photoPolicyVersion < 2) migratePhotoDurationRatio(raw) else raw
+        return if (ratio.isFinite() && ratio > 0.0) ratio else DEFAULT_PHOTO_DURATION_RATIO
+    }
+
     // Actual scene duration for this photo given the configured video-clip ("base clip") length.
-    fun weightedPhotoLength(clipLength: Double): Double =
-        max(MIN_PHOTO_SCENE_DURATION, clipLength * photoDurationRatio)
+    // Uses raw stored ratio (clamped frame...30s) so opening legacy drafts does not silently change durations.
+    fun weightedPhotoLength(clipLength: Double): Double {
+        val raw = if (photoDurationRatio.isFinite() && photoDurationRatio > 0.0) photoDurationRatio else DEFAULT_PHOTO_DURATION_RATIO
+        return (clipLength * raw).coerceIn(MIN_PHOTO_SCENE_DURATION, MAX_EDITOR_PHOTO_SCENE_SECONDS)
+    }
     // This source's own evidence-based clip length (see TrailerSourceEvidence), always within
     // 0 < clip <= duration for a valid video, so sub-second videos stay valid.
     val recommendedLength: Double get() =
@@ -133,11 +149,16 @@ private fun commonClipLength(evidences: List<TrailerSourceEvidence?>): Double {
 // Recommended plan: every photo once at its weighted length in user order, every valid video its own
 // distinct evidence-based cuts of min(commonClip, duration). The plan's total is exactly the scene sum,
 // no repeats and no trimming. Videos with an invalid duration contribute nothing (as in trailerScenes).
-internal fun recommendTrailerPlan(sources: List<TrailerSource>): TrailerRecommendation? {
+internal fun recommendTrailerPlan(sources: List<TrailerSource>, explicitClip: Double? = null): TrailerRecommendation? {
     if (sources.isEmpty()) return null
-    val evidences = sources.map { if (it.isImage || !it.hasValidDuration) null else it.recommendationEvidence() }
-    val clip = commonClipLength(evidences)
-    val scenes = sources.flatMapIndexed { index, source ->
+    val effectiveSources = sources.map {
+        if (it.isImage && it.photoPolicyVersion < 2) {
+            it.copy(photoDurationRatio = it.effectivePhotoDurationRatio(), photoPolicyVersion = 2)
+        } else it
+    }
+    val evidences = effectiveSources.map { if (it.isImage || !it.hasValidDuration) null else it.recommendationEvidence() }
+    val clip = explicitClip?.takeIf { it.isFinite() && it > 0.0 } ?: commonClipLength(evidences)
+    val scenes = effectiveSources.flatMapIndexed { index, source ->
         val evidence = evidences[index]
         when {
             source.isImage -> listOf(TrailerScene(source, 0.0, source.weightedPhotoLength(clip)))
@@ -162,12 +183,11 @@ internal fun recommendedTrailerDefaults(sources: List<TrailerSource>): TrailerDe
 // null so trailerScenes keeps its explicit manual allocation/repetition semantics.
 internal fun automaticTrailerPlan(sources: List<TrailerSource>, total: Double, clipLength: Double): TrailerRecommendation? {
     if (!total.isFinite() || !clipLength.isFinite()) return null
-    val plan = recommendTrailerPlan(sources) ?: return null
+    val plan = recommendTrailerPlan(sources, explicitClip = clipLength) ?: return null
     val planTotal = plan.total
     return plan.takeIf {
         planTotal in 0.0..MAX_TRAILER_TOTAL_SECONDS &&
-            abs(total - planTotal) < AUTOMATIC_TOTAL_TOLERANCE &&
-            abs(clipLength - it.clipLength) < AUTOMATIC_TOTAL_TOLERANCE
+            abs(total - planTotal) < AUTOMATIC_TOTAL_TOLERANCE
     }
 }
 
@@ -505,6 +525,90 @@ internal fun trailerLengthTitle(seconds: Double): String {
     val n = seconds.roundToInt().coerceAtLeast(0)
     return listOfNotNull(if (n >= 3600) "${n / 3600}시간" else null, if (n / 60 % 60 > 0) "${n / 60 % 60}분" else null, if (n % 60 > 0 || n == 0) "${n % 60}초" else null).joinToString(" ")
 }
+
+internal fun formatAdaptiveDurationTitle(seconds: Double): String {
+    if (!seconds.isFinite() || seconds <= 0.0) return "0초"
+    val totalTenths = (seconds * 10).roundToLong()
+    val sTotal = totalTenths / 10.0
+    val h = (sTotal / 3600).toInt()
+    val rem = sTotal - h * 3600
+    val m = (rem / 60).toInt()
+    val s = rem - m * 60
+    val parts = mutableListOf<String>()
+    if (h > 0) parts.add("${h}시간")
+    if (m > 0) parts.add("${m}분")
+    val hasFraction = (s * 10).roundToLong() % 10L != 0L
+    if (hasFraction) {
+        parts.add("%.1f초".format(s))
+    } else {
+        val sInt = s.roundToInt()
+        if (sInt > 0 || (h == 0 && m == 0)) {
+            parts.add("${sInt}초")
+        }
+    }
+    return parts.joinToString(" ")
+}
+
+internal fun formatCandidateDuration(seconds: Double): String {
+    if (!seconds.isFinite() || seconds <= 0.0) return "0초"
+    if (seconds < 60.0) {
+        return if ((seconds * 10).roundToLong() % 10L != 0L) "%.1f초".format(seconds) else "${seconds.roundToInt()}초"
+    }
+    val totalTenths = (seconds * 10).roundToLong()
+    val sTotal = totalTenths / 10.0
+    val h = (sTotal / 3600).toInt()
+    val rem = sTotal - h * 3600
+    val m = (rem / 60).toInt()
+    val s = rem - m * 60
+    val hasFraction = (s * 10).roundToLong() % 10L != 0L
+    return if (h > 0) {
+        if (hasFraction) "%d:%02d:%04.1f".format(h, m, s) else "%d:%02d:%02d".format(h, m, s.roundToInt())
+    } else {
+        if (hasFraction) "%d:%04.1f".format(m, s) else "%d:%02d".format(m, s.roundToInt())
+    }
+}
+
+internal fun adaptiveStepSeconds(value: Double): Double = when {
+    value < 10.0 -> 0.5
+    value < 30.0 -> 1.0
+    value < 180.0 -> 5.0
+    value < 600.0 -> 30.0
+    else -> 60.0
+}
+
+internal fun snapToAdaptiveStep(value: Double, minVal: Double, maxVal: Double): Double {
+    val clamped = value.coerceIn(minVal, maxVal)
+    val step = adaptiveStepSeconds(clamped)
+    return (round(clamped / step) * step).coerceIn(minVal, maxVal)
+}
+
+internal fun formatStepAmount(seconds: Double): String = when {
+    seconds < 1.0 -> "${seconds}초"
+    seconds < 60.0 -> if (seconds % 1.0 == 0.0) "${seconds.toInt()}초" else "${seconds}초"
+    else -> {
+        val mins = (seconds / 60.0).roundToInt()
+        "${mins}분"
+    }
+}
+
+internal fun sliderPositionToValue(position: Float, min: Double, max: Double): Double {
+    if (max <= min) return min
+    val p = position.toDouble().coerceIn(0.0, 1.0)
+    val raw = min + (max - min) * (p * p)
+    return snapToAdaptiveStep(raw, min, max)
+}
+
+internal fun sliderValueToPosition(value: Double, min: Double, max: Double): Float {
+    if (max <= min) return 0f
+    val fraction = ((value - min) / (max - min)).coerceIn(0.0, 1.0)
+    return sqrt(fraction).toFloat()
+}
+
+internal fun totalSliderPositionToValue(position: Float, min: Double, max: Double): Double =
+    sliderPositionToValue(position, min, max)
+
+internal fun totalSliderValueToPosition(value: Double, min: Double, max: Double): Float =
+    sliderValueToPosition(value, min, max)
 
 internal val InboxDisplayItem.isTrailerVideo: Boolean get() = isTrailerMedia
 internal val InboxDisplayItem.isTrailerMedia: Boolean get() {

@@ -499,6 +499,7 @@ object TrailerDraftStore {
                 put("isImage", src.isImage)
                 put("captureTimeMillis", src.captureTimeMillis)
                 put("photoDurationRatio", src.photoDurationRatio)
+                put("photoPolicyVersion", src.photoPolicyVersion)
                 src.originKey?.let { put("originKey", it) }
             })
         }
@@ -638,6 +639,7 @@ object TrailerDraftStore {
                     isImage = sObj.optBoolean("isImage", false),
                     captureTimeMillis = sObj.optLong("captureTimeMillis", 0L),
                     photoDurationRatio = sObj.optDouble("photoDurationRatio", DEFAULT_PHOTO_DURATION_RATIO),
+                    photoPolicyVersion = sObj.optInt("photoPolicyVersion", 1),
                     originKey = sObj.optString("originKey").takeIf { it.isNotBlank() },
                 )
             )

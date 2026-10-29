@@ -34,9 +34,18 @@ suspend fun analyzeTrailerPhotos(application: Application, sources: List<Trailer
 
     val rankable = measurements.values.filter { it.quality != null && it.quality.isFinite() }
         .sortedWith(compareByDescending<PhotoMeasurement> { it.quality!! }.thenBy { it.sourceId })
+    val qualities = rankable.map { it.quality!! }.sorted()
+    val medianQuality = if (qualities.isEmpty()) 0.0 else qualities[qualities.size / 2]
     val baseRatioById = rankable.withIndex().associate { (rank, measurement) ->
         val normalizedRank = if (rankable.size <= 1) 1.0 else 1.0 - rank.toDouble() / (rankable.size - 1)
-        measurement.sourceId to (ORDINARY_MIN_RATIO + (ORDINARY_MAX_RATIO - ORDINARY_MIN_RATIO) * normalizedRank)
+        val ordinary = ORDINARY_MIN_RATIO + (ORDINARY_MAX_RATIO - ORDINARY_MIN_RATIO) * normalizedRank
+        val q = measurement.quality!!
+        val bonus = if (normalizedRank >= 0.9 && q - medianQuality > 0.15) {
+            0.30 * ((q - medianQuality - 0.15) / 0.35).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+        measurement.sourceId to (ordinary + bonus)
     }
 
     // Serial transient DINO vectors for the entire photo batch. Only used as an additional
@@ -76,7 +85,14 @@ private suspend fun finishPhotoRatios(
         coroutineContext.ensureActive()
         source.id to photoDurationRatio(measurements[source.id], baseRatioById[source.id], measurements.values, visualEmbeddings)
     }
-    return sources.map { source -> if (source.isImage) source.copy(photoDurationRatio = ratioById[source.id] ?: DEFAULT_PHOTO_DURATION_RATIO) else source }
+    return sources.map { source ->
+        if (source.isImage) {
+            source.copy(
+                photoDurationRatio = ratioById[source.id] ?: DEFAULT_PHOTO_DURATION_RATIO,
+                photoPolicyVersion = 2,
+            )
+        } else source
+    }
 }
 
 private fun photoDurationRatio(
@@ -113,8 +129,8 @@ private fun cosineDot(lhs: FloatArray, rhs: FloatArray): Double {
     return sum
 }
 
-private const val ORDINARY_MIN_RATIO = .35
-private const val ORDINARY_MAX_RATIO = .75
+private const val ORDINARY_MIN_RATIO = .10
+private const val ORDINARY_MAX_RATIO = .95
 private const val FINGERPRINT_DIMENSION = 16
 private const val ASPECT_RATIO_GATE = .06
 private const val LUMINANCE_DISTANCE_GATE = 28.0

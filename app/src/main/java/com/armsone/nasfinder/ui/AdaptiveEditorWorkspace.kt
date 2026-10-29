@@ -82,6 +82,9 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.round
 import kotlin.math.roundToInt
 
 /** Width tiers of the editing workspace, decided from the actual available width (never the device type). */
@@ -1290,165 +1293,314 @@ private fun ScreenSection(session: TrailerSession, scene: EditorScene?, source: 
     Text("내보내기 크기 ${w}×${h}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
+private fun formatClipDuration(seconds: Double): String = formatAdaptiveDurationTitle(seconds)
+
+@Composable
+private fun DurationControlRow(
+    currentValue: Double,
+    minValue: Double,
+    maxValue: Double,
+    recommendedValue: Double,
+    onValueSelected: (Double) -> Unit,
+) {
+    val hasVariation = maxValue > minValue + 1e-4
+
+    val stepRec = adaptiveStepSeconds(recommendedValue)
+    val lowerCandidate = (recommendedValue - stepRec).coerceIn(minValue, maxValue)
+    val higherCandidate = (recommendedValue + stepRec).coerceIn(minValue, maxValue)
+
+    val stepDown = adaptiveStepSeconds(currentValue)
+    val canStepDown = hasVariation && currentValue > minValue + 1e-4
+
+    val stepUp = adaptiveStepSeconds(currentValue)
+    val canStepUp = hasVariation && currentValue < maxValue - 1e-4
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        DurationActionButton(
+            label = "-${formatStepAmount(stepDown)}",
+            accessibilityLabel = "${formatStepAmount(stepDown)} 줄이기",
+            enabled = canStepDown,
+            modifier = Modifier.weight(1f),
+            onClick = {
+                val next = max(minValue, (round((currentValue - stepDown) * 10.0) / 10.0))
+                onValueSelected(next)
+            },
+        )
+
+        val hasLower = hasVariation && lowerCandidate < recommendedValue - 1e-4
+        DurationCandidateButton(
+            title = formatCandidateDuration(lowerCandidate),
+            accessibilityTitle = formatAdaptiveDurationTitle(lowerCandidate),
+            subtitle = null,
+            selected = hasLower && abs(currentValue - lowerCandidate) < 0.05,
+            enabled = hasLower,
+            modifier = Modifier.weight(1.1f),
+            onClick = { onValueSelected(lowerCandidate) },
+        )
+
+        DurationCandidateButton(
+            title = formatCandidateDuration(recommendedValue),
+            accessibilityTitle = "${formatAdaptiveDurationTitle(recommendedValue)} 추천",
+            subtitle = "추천",
+            selected = hasVariation && abs(currentValue - recommendedValue) < 0.05,
+            enabled = hasVariation,
+            modifier = Modifier.weight(1.2f),
+            onClick = { onValueSelected(recommendedValue) },
+        )
+
+        val hasHigher = hasVariation && higherCandidate > recommendedValue + 1e-4
+        DurationCandidateButton(
+            title = formatCandidateDuration(higherCandidate),
+            accessibilityTitle = formatAdaptiveDurationTitle(higherCandidate),
+            subtitle = null,
+            selected = hasHigher && abs(currentValue - higherCandidate) < 0.05,
+            enabled = hasHigher,
+            modifier = Modifier.weight(1.1f),
+            onClick = { onValueSelected(higherCandidate) },
+        )
+
+        DurationActionButton(
+            label = "+${formatStepAmount(stepUp)}",
+            accessibilityLabel = "${formatStepAmount(stepUp)} 늘리기",
+            enabled = canStepUp,
+            modifier = Modifier.weight(1f),
+            onClick = {
+                val next = min(maxValue, (round((currentValue + stepUp) * 10.0) / 10.0))
+                onValueSelected(next)
+            },
+        )
+    }
+}
+
+@Composable
+private fun DurationCandidateButton(
+    title: String,
+    accessibilityTitle: String,
+    subtitle: String?,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val accent = MaterialTheme.colorScheme.primary
+    val content = (if (selected) accent else MaterialTheme.colorScheme.onSurface).let { if (enabled) it else it.copy(alpha = 0.38f) }
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .heightIn(min = 44.dp)
+            .semantics {
+                this.selected = selected
+                contentDescription = accessibilityTitle
+            },
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant,
+        border = if (selected) BorderStroke(1.dp, accent) else null,
+        contentColor = content,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 2.dp, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                text = title,
+                fontSize = 12.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (selected) accent else MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DurationActionButton(
+    label: String,
+    accessibilityLabel: String,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val content = MaterialTheme.colorScheme.onSurface.let { if (enabled) it else it.copy(alpha = 0.38f) }
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .heightIn(min = 44.dp)
+            .semantics { contentDescription = accessibilityLabel },
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = content,
+    ) {
+        Box(
+            modifier = Modifier.padding(horizontal = 2.dp, vertical = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
 @Composable
 private fun PlanSection(session: TrailerSession, model: NasFinderViewModel, onOpenMusicPicker: () -> Unit) {
     val project = session.editor ?: return
     var confirmReset by remember { mutableStateOf(false) }
     var confirmMode by remember { mutableStateOf<Boolean?>(null) }
-    var customTotalText by remember { mutableStateOf("") }
-    var customClipText by remember { mutableStateOf("") }
 
     val totalTime = session.scenes.sumOf { it.length }
+    val recDefaults = remember(session.sources) { recommendedTrailerDefaults(session.sources) }
 
-    TrailerSectionTitle("전체 길이 (전체 시간)")
-    Text("현재 전체 영상 길이: ${trailerLengthTitle(totalTime)} (총 ${session.scenes.size}개 장면)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-    if (project.autoPlan) {
-        if (!session.isMusicOverlayMode) {
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
-                    TrailerChoice(trailerLengthTitle(value), abs(session.total - value) < .01, Modifier.widthIn(min = 60.dp)) {
-                        model.editorSetPlanTotal(value)
-                    }
-                }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = customTotalText,
-                    onValueChange = { customTotalText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("직접 입력 (초)") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                Button(
-                    onClick = {
-                        val sec = customTotalText.toDoubleOrNull()
-                        if (sec != null && sec.isFinite() && sec > 0.0) {
-                            model.editorSetPlanTotal(sec)
-                            customTotalText = ""
-                        }
-                    },
-                    enabled = customTotalText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
-                ) {
-                    Text("적용")
-                }
-            }
-        } else {
-            Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
+    if (session.isMusicOverlayMode) {
+        TrailerSectionTitle("전체 길이")
+        Text("현재 전체 영상 길이: ${formatAdaptiveDurationTitle(totalTime)} (총 ${session.scenes.size}개 장면)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        HorizontalDivider()
+
+        TrailerSectionTitle("영상 클립 길이")
+        Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-        val (minTotal, maxTotal) = calculateManualTotalBounds(project, session.sources)
-        Text("조절 가능 범위: ${trailerLengthTitle(minTotal)} ~ ${trailerLengthTitle(maxTotal)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf(30.0, 60.0, 120.0, 180.0, 300.0, 600.0).forEach { value ->
-                TrailerChoice(trailerLengthTitle(value), abs(totalTime - value) < 0.5, Modifier.widthIn(min = 60.dp)) {
-                    model.editorSetPlanTotal(value)
-                }
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = customTotalText,
-                onValueChange = { customTotalText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                label = { Text("직접 입력 (초)") },
-                singleLine = true,
-                modifier = Modifier.weight(1f),
-            )
-            Button(
-                onClick = {
-                    val sec = customTotalText.toDoubleOrNull()
-                    if (sec != null && sec.isFinite() && sec > 0.0) {
-                        model.editorSetPlanTotal(sec)
-                        customTotalText = ""
-                    }
-                },
-                enabled = customTotalText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
-            ) {
-                Text("적용")
-            }
-        }
-        Text("모든 장면의 길이를 비율대로 늘리거나 줄여 전체 길이를 조절합니다. 범위를 벗어난 목표는 조절 가능 한계로 안전하게 맞춰집니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-
-    HorizontalDivider()
-
-    TrailerSectionTitle("클립 길이 (한 장면 시간)")
-    if (project.autoPlan) {
-        if (!session.isMusicOverlayMode) {
-            val maxLength = minOf(30.0, session.sources.maxOfOrNull { if (it.isImage) 30.0 else it.duration } ?: 30.0)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                listOf(1.0, 1.5, 2.0, 4.0, 6.0).filter { it <= maxLength }.forEach { value ->
-                    TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", abs(session.clipLength - value) < .01, Modifier.widthIn(min = 52.dp)) {
-                        model.editorSetPlanClipLength(value)
-                    }
-                }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = customClipText,
-                    onValueChange = { customClipText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("클립 길이 직접 입력 (초)") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                Button(
-                    onClick = {
-                        val sec = customClipText.toDoubleOrNull()
-                        if (sec != null && sec.isFinite() && sec > 0.0) {
-                            model.editorSetPlanClipLength(sec)
-                            customClipText = ""
-                        }
-                    },
-                    enabled = customClipText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
-                ) {
-                    Text("적용")
-                }
-            }
-            Text("추천 구성은 장면을 직접 고치기 전까지 이 클립 길이를 따릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        // --- 전체 길이 ---
+        val (minTotal, maxTotal) = if (project.autoPlan) {
+            minOf(1.0, totalTime) to 7200.0
         } else {
-            Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            calculateManualTotalBounds(project, session.sources)
         }
-    } else {
-        val scenes = project.scenes
-        val minSceneLen = scenes.minOfOrNull { it.length } ?: 0.0
-        val maxSceneLen = scenes.maxOfOrNull { it.length } ?: 0.0
-        val allSame = scenes.isNotEmpty() && (maxSceneLen - minSceneLen) < 0.05
-        if (allSame) {
-            Text("현재 모든 장면 길이: ${seconds1(minSceneLen)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-        } else {
-            Text("현재 장면별 길이: 다양한 길이 (${seconds1(minSceneLen)} ~ ${seconds1(maxSceneLen)})", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-        }
-        Text("모든 장면에 일괄 적용할 클립 길이를 선택하세요. (개별 장면 조정은 '장면' 탭 이용)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val hasTotalVariation = maxTotal > minTotal + 1e-4
 
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf(1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0).forEach { value ->
-                val selected = allSame && abs(minSceneLen - value) < 0.05
-                TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", selected, Modifier.widthIn(min = 52.dp)) {
-                    model.editorSetPlanClipLength(value)
+        var localTotalPreview by remember(totalTime) { mutableStateOf<Double?>(null) }
+        val displayedTotal = if (hasTotalVariation) {
+            (localTotalPreview ?: totalTime).coerceIn(minTotal, maxTotal)
+        } else {
+            totalTime
+        }
+
+        TrailerSectionTitle("전체 길이")
+        Text(
+            text = "${formatAdaptiveDurationTitle(displayedTotal)} (총 ${session.scenes.size}개 장면)",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+
+        val recommendedTotal = recDefaults.total.coerceIn(minTotal, maxTotal)
+        DurationControlRow(
+            currentValue = displayedTotal,
+            minValue = minTotal,
+            maxValue = maxTotal,
+            recommendedValue = recommendedTotal,
+            onValueSelected = { model.editorSetPlanTotal(it) },
+        )
+
+        Slider(
+            value = if (hasTotalVariation) sliderValueToPosition(displayedTotal, minTotal, maxTotal) else 0f,
+            onValueChange = { pos ->
+                if (hasTotalVariation) {
+                    localTotalPreview = sliderPositionToValue(pos, minTotal, maxTotal)
                 }
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = customClipText,
-                onValueChange = { customClipText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                label = { Text("클립 길이 직접 입력 (초)") },
-                singleLine = true,
-                modifier = Modifier.weight(1f),
+            },
+            onValueChangeFinished = {
+                localTotalPreview?.let { model.editorSetPlanTotal(it) }
+                localTotalPreview = null
+            },
+            enabled = hasTotalVariation,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { contentDescription = "전체 길이 슬라이더" },
+        )
+
+        if (!project.autoPlan) {
+            Text(
+                "모든 장면의 길이를 비율대로 늘리거나 줄여 전체 길이를 조절합니다. 범위를 벗어난 목표는 조절 가능 한계로 안전하게 맞춰집니다.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Button(
-                onClick = {
-                    val sec = customClipText.toDoubleOrNull()
-                    if (sec != null && sec.isFinite() && sec > 0.0) {
-                        model.editorSetPlanClipLength(sec)
-                        customClipText = ""
-                    }
-                },
-                enabled = customClipText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
-            ) {
-                Text("적용")
-            }
         }
+
+        HorizontalDivider()
+
+        // --- 영상 클립 길이 ---
+        val validVideoDurations = session.sources.filter { !it.isImage && it.hasValidDuration }.map { it.duration }
+        val manualSpan = if (!project.autoPlan) {
+            val sourcesById = session.sources.associateBy { it.id }
+            project.scenes.maxOfOrNull { scene ->
+                val src = sourcesById[scene.sourceId]
+                if (src != null && !src.isImage && src.hasValidDuration) {
+                    val safeStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, src.duration)
+                    src.duration - safeStart
+                } else 0.0
+            } ?: 0.0
+        } else 0.0
+        val maxVideoSpan = maxOf(validVideoDurations.maxOrNull() ?: 0.0, manualSpan)
+        val baseCeiling = if (maxVideoSpan > 0.0) maxVideoSpan else 30.0
+        val savedClip = session.clipLength.takeIf { it.isFinite() && it > 0.0 } ?: baseCeiling
+        val maxClip = maxOf(baseCeiling, savedClip)
+        val minClip = minOf(0.5, maxClip)
+        val hasClipVariation = maxClip > minClip + 1e-4
+
+        var localClipPreview by remember(session.clipLength) { mutableStateOf<Double?>(null) }
+        val displayedClip = if (hasClipVariation) {
+            (localClipPreview ?: savedClip).coerceIn(minClip, maxClip)
+        } else {
+            savedClip
+        }
+
+        TrailerSectionTitle("영상 클립 길이")
+        Text(
+            "사진은 영상 클립 길이를 기준으로 중요도에 따라 조절돼요.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = formatAdaptiveDurationTitle(displayedClip),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+
+        val recommendedClip = recDefaults.clipLength.coerceIn(minClip, maxClip)
+        DurationControlRow(
+            currentValue = displayedClip,
+            minValue = minClip,
+            maxValue = maxClip,
+            recommendedValue = recommendedClip,
+            onValueSelected = { model.editorSetPlanClipLength(it) },
+        )
+
+        Slider(
+            value = if (hasClipVariation) sliderValueToPosition(displayedClip, minClip, maxClip) else 0f,
+            onValueChange = { pos ->
+                if (hasClipVariation) {
+                    localClipPreview = sliderPositionToValue(pos, minClip, maxClip)
+                }
+            },
+            onValueChangeFinished = {
+                localClipPreview?.let { model.editorSetPlanClipLength(it) }
+                localClipPreview = null
+            },
+            enabled = hasClipVariation,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { contentDescription = "영상 클립 길이 슬라이더" },
+        )
     }
 
     HorizontalDivider()

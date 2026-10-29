@@ -5398,7 +5398,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     /** Regenerates the scenes from the recommended plan; only valid while the project is still automatic. */
     private fun TrailerSession.withRegeneratedPlan(): TrailerSession {
         val project = editor ?: return this
-        return copy(editor = EditorProject.fromPlan(autoPlanScenes(), autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey))
+        val genScenes = autoPlanScenes()
+        val actualSum = genScenes.sumOf { it.length }
+        return copy(
+            total = if (actualSum > 0.0) actualSum else total,
+            editor = EditorProject.fromPlan(genScenes, autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey),
+        )
     }
 
     private fun TrailerSession.defaultSceneFor(source: TrailerSource, key: Long): EditorScene {
@@ -5582,11 +5587,45 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         editProject { session ->
             if (!length.isFinite() || length <= 0.0) return@editProject null
             val project = session.editor ?: return@editProject null
+            val migratedSources = session.sources.map { source ->
+                if (source.isImage && source.photoPolicyVersion < 2) {
+                    source.copy(
+                        photoDurationRatio = migratePhotoDurationRatio(source.photoDurationRatio),
+                        photoPolicyVersion = 2,
+                    )
+                } else {
+                    source
+                }
+            }
             if (project.autoPlan) {
-                session.copy(clipLength = length, photoClipLength = defaultPhotoClipLength(length, session.hasVideos)).withRegeneratedPlan()
+                if (session.isMusicOverlayMode) {
+                    session.copy(
+                        sources = migratedSources,
+                        clipLength = length,
+                        photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
+                    ).withRegeneratedPlan()
+                } else {
+                    val plan = recommendTrailerPlan(migratedSources, explicitClip = length)
+                    val newTotal = plan?.total ?: (length * migratedSources.size)
+                    val regeneratedScenes = plan?.scenes ?: emptyList()
+                    val newProject = EditorProject.fromPlan(
+                        regeneratedScenes,
+                        autoPlan = true,
+                        musicVolume = project.musicVolume,
+                        firstKey = project.nextKey,
+                    )
+                    session.copy(
+                        sources = migratedSources,
+                        total = newTotal,
+                        clipLength = length,
+                        photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
+                        editor = newProject,
+                    )
+                }
             } else {
-                val (newScenes, actualTotal) = applyManualClipLength(project, session.sources, length)
+                val (newScenes, actualTotal) = applyManualClipLength(project, migratedSources, length)
                 session.copy(
+                    sources = migratedSources,
                     total = actualTotal,
                     clipLength = length,
                     photoClipLength = defaultPhotoClipLength(length, session.hasVideos),

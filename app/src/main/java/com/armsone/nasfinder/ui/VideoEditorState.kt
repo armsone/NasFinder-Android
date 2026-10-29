@@ -244,7 +244,7 @@ internal fun redistributeManualTotal(
 }
 
 /**
- * Applies a uniform chosen clip length to every existing scene in manual mode,
+ * Applies a chosen clip length to every existing scene in manual mode (videos + weighted photos),
  * respecting per-source boundaries (video duration/start and photo max 30s) and preserving metadata.
  */
 internal fun applyManualClipLength(
@@ -264,7 +264,11 @@ internal fun applyManualClipLength(
             // Missing/invalid source duration: preserve that scene's duration
             scene
         } else if (source.isImage) {
-            val (start, length) = clampSceneWindow(source, 0.0, targetClipLength)
+            val migratedSource = if (source.photoPolicyVersion < 2) {
+                source.copy(photoDurationRatio = source.effectivePhotoDurationRatio(), photoPolicyVersion = 2)
+            } else source
+            val targetLen = migratedSource.weightedPhotoLength(targetClipLength)
+            val (start, length) = clampSceneWindow(migratedSource, 0.0, targetLen)
             scene.copy(start = start, length = length)
         } else {
             val minLen = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, source.duration)
