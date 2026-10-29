@@ -405,10 +405,9 @@ internal object AdaptiveOverflowPolicy {
         contentHeightDp: Float,
         itemCount: Int,
         selectionActive: Boolean,
-        smallestScreenWidthDp: Int,
+        smallestScreenWidthDp: Int = 0,
     ): Boolean = itemCount > 0 &&
         !selectionActive &&
-        smallestScreenWidthDp < PHONE_MAX_SMALLEST_WIDTH_DP &&
         contentWidthDp >= MIN_WIDTH_DP &&
         contentHeightDp >= MIN_HEIGHT_DP &&
         contentWidthDp / contentHeightDp.coerceAtLeast(1f) >= MIN_LANDSCAPE_ASPECT

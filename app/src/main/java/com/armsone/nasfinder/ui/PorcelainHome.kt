@@ -437,6 +437,8 @@ internal fun PorcelainWideHost(
     var navExpanded by rememberSaveable { mutableStateOf(false) }
     var portraitWorkbenchOverlay by rememberSaveable { mutableStateOf(false) }
     var wideWorkbenchExpanded by rememberSaveable { mutableStateOf(false) }
+    val currentContent by rememberUpdatedState(content)
+    val movableContent = remember { movableContentOf { currentContent() } }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val totalWidth = maxWidth
         val isLandscapeWide = isTablet && totalWidth >= 960.dp
@@ -444,7 +446,7 @@ internal fun PorcelainWideHost(
         val showSidebar = isTablet && totalWidth >= SidebarMinWidth && !fullscreen
         val showWorkbenchPanel = isLandscapeWide && !fullscreen && state.screen != Screen.MaterialBasket && state.activeMainTab != MainNavigationDestination.WORKBENCH
         if (!showSidebar) {
-            content()
+            movableContent()
         } else {
             Box(Modifier.fillMaxSize()) {
                 Row(Modifier.fillMaxSize()) {
@@ -482,7 +484,7 @@ internal fun PorcelainWideHost(
                         )
                     }
                     VerticalDividerLine()
-                    Box(Modifier.weight(1f).fillMaxHeight()) { content() }
+                    Box(Modifier.weight(1f).fillMaxHeight()) { movableContent() }
                     if (showWorkbenchPanel) {
                         VerticalDividerLine()
                         if (wideWorkbenchExpanded) {
