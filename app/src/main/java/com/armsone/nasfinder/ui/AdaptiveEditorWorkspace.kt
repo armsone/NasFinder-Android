@@ -1295,7 +1295,164 @@ private fun PlanSection(session: TrailerSession, model: NasFinderViewModel, onOp
     val project = session.editor ?: return
     var confirmReset by remember { mutableStateOf(false) }
     var confirmMode by remember { mutableStateOf<Boolean?>(null) }
-    var customTotal by remember { mutableStateOf(false) }
+    var customTotalText by remember { mutableStateOf("") }
+    var customClipText by remember { mutableStateOf("") }
+
+    val totalTime = session.scenes.sumOf { it.length }
+
+    TrailerSectionTitle("전체 길이 (전체 시간)")
+    Text("현재 전체 영상 길이: ${trailerLengthTitle(totalTime)} (총 ${session.scenes.size}개 장면)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+    if (project.autoPlan) {
+        if (!session.isMusicOverlayMode) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
+                    TrailerChoice(trailerLengthTitle(value), abs(session.total - value) < .01, Modifier.widthIn(min = 60.dp)) {
+                        model.editorSetPlanTotal(value)
+                    }
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = customTotalText,
+                    onValueChange = { customTotalText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                    label = { Text("직접 입력 (초)") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = {
+                        val sec = customTotalText.toDoubleOrNull()
+                        if (sec != null && sec.isFinite() && sec > 0.0) {
+                            model.editorSetPlanTotal(sec)
+                            customTotalText = ""
+                        }
+                    },
+                    enabled = customTotalText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
+                ) {
+                    Text("적용")
+                }
+            }
+        } else {
+            Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    } else {
+        val (minTotal, maxTotal) = calculateManualTotalBounds(project, session.sources)
+        Text("조절 가능 범위: ${trailerLengthTitle(minTotal)} ~ ${trailerLengthTitle(maxTotal)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            listOf(30.0, 60.0, 120.0, 180.0, 300.0, 600.0).forEach { value ->
+                TrailerChoice(trailerLengthTitle(value), abs(totalTime - value) < 0.5, Modifier.widthIn(min = 60.dp)) {
+                    model.editorSetPlanTotal(value)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = customTotalText,
+                onValueChange = { customTotalText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = { Text("직접 입력 (초)") },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            Button(
+                onClick = {
+                    val sec = customTotalText.toDoubleOrNull()
+                    if (sec != null && sec.isFinite() && sec > 0.0) {
+                        model.editorSetPlanTotal(sec)
+                        customTotalText = ""
+                    }
+                },
+                enabled = customTotalText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
+            ) {
+                Text("적용")
+            }
+        }
+        Text("모든 장면의 길이를 비율대로 늘리거나 줄여 전체 길이를 조절합니다. 범위를 벗어난 목표는 조절 가능 한계로 안전하게 맞춰집니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+
+    HorizontalDivider()
+
+    TrailerSectionTitle("클립 길이 (한 장면 시간)")
+    if (project.autoPlan) {
+        if (!session.isMusicOverlayMode) {
+            val maxLength = minOf(30.0, session.sources.maxOfOrNull { if (it.isImage) 30.0 else it.duration } ?: 30.0)
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                listOf(1.0, 1.5, 2.0, 4.0, 6.0).filter { it <= maxLength }.forEach { value ->
+                    TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", abs(session.clipLength - value) < .01, Modifier.widthIn(min = 52.dp)) {
+                        model.editorSetPlanClipLength(value)
+                    }
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = customClipText,
+                    onValueChange = { customClipText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                    label = { Text("클립 길이 직접 입력 (초)") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = {
+                        val sec = customClipText.toDoubleOrNull()
+                        if (sec != null && sec.isFinite() && sec > 0.0) {
+                            model.editorSetPlanClipLength(sec)
+                            customClipText = ""
+                        }
+                    },
+                    enabled = customClipText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
+                ) {
+                    Text("적용")
+                }
+            }
+            Text("추천 구성은 장면을 직접 고치기 전까지 이 클립 길이를 따릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    } else {
+        val scenes = project.scenes
+        val minSceneLen = scenes.minOfOrNull { it.length } ?: 0.0
+        val maxSceneLen = scenes.maxOfOrNull { it.length } ?: 0.0
+        val allSame = scenes.isNotEmpty() && (maxSceneLen - minSceneLen) < 0.05
+        if (allSame) {
+            Text("현재 모든 장면 길이: ${seconds1(minSceneLen)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        } else {
+            Text("현재 장면별 길이: 다양한 길이 (${seconds1(minSceneLen)} ~ ${seconds1(maxSceneLen)})", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        }
+        Text("모든 장면에 일괄 적용할 클립 길이를 선택하세요. (개별 장면 조정은 '장면' 탭 이용)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            listOf(1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0).forEach { value ->
+                val selected = allSame && abs(minSceneLen - value) < 0.05
+                TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", selected, Modifier.widthIn(min = 52.dp)) {
+                    model.editorSetPlanClipLength(value)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = customClipText,
+                onValueChange = { customClipText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = { Text("클립 길이 직접 입력 (초)") },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            Button(
+                onClick = {
+                    val sec = customClipText.toDoubleOrNull()
+                    if (sec != null && sec.isFinite() && sec > 0.0) {
+                        model.editorSetPlanClipLength(sec)
+                        customClipText = ""
+                    }
+                },
+                enabled = customClipText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true,
+            ) {
+                Text("적용")
+            }
+        }
+    }
+
+    HorizontalDivider()
+
     TrailerSectionTitle("제작 방식")
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         listOf(false to "예고편", true to "뮤직비디오").forEach { (music, title) ->
@@ -1332,47 +1489,12 @@ private fun PlanSection(session: TrailerSession, model: NasFinderViewModel, onOp
             TrailerChoice(mode, session.orderMode == mode, Modifier.weight(1f)) { model.editorApplyOrder(mode) }
         }
     }
-    HorizontalDivider()
-    val totalTime = session.scenes.sumOf { it.length }
-    TrailerSectionTitle("전체 길이 (전체 시간)")
-    Text("현재 전체 영상 길이: ${trailerLengthTitle(totalTime)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+
     if (!project.autoPlan) {
-        Text(
-            "직접 편집한 장면이 있어 전체 길이 자동 추천이 고정되어 있습니다. 각 장면의 길이는 '장면' 탭에서 직접 조절하거나, 전체를 새 길이로 다시 맞추려면 아래 버튼으로 자동 추천을 다시 적용할 수 있습니다.",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        HorizontalDivider()
         OutlinedButton(onClick = { confirmReset = true }, modifier = Modifier.fillMaxWidth()) {
-            Text("자동 추천 다시 적용 (전체/클립 길이 조절 활성화)")
+            Text("초기 자동 추천으로 다시 구성")
         }
-    } else if (!session.isMusicOverlayMode) {
-        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
-                TrailerChoice(trailerLengthTitle(value), abs(session.total - value) < .01, Modifier.weight(1f)) { model.editorSetPlanTotal(value) }
-            }
-        }
-        TextButton(onClick = { customTotal = !customTotal }, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
-            Text("다른 길이 선택", Modifier.weight(1f)); Text(trailerLengthTitle(session.total))
-        }
-        if (customTotal) TrailerDurationSlider(value = session.total, onValueChange = model::editorSetPlanTotal)
-    } else {
-        Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-    HorizontalDivider()
-    TrailerSectionTitle("클립 길이 (한 장면 시간)")
-    if (!project.autoPlan) {
-        Text("추천 기본 클립 길이: ${session.clipLength}초", style = MaterialTheme.typography.bodyMedium)
-        Text("직접 편집 중인 장면들은 이미 개별 길이가 정해져 있습니다. 개별 장면의 길이를 바꾸려면 '장면' 탭을 이용하세요.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    } else if (!session.isMusicOverlayMode) {
-        val maxLength = minOf(30.0, session.sources.maxOfOrNull { if (it.isImage) 30.0 else it.duration } ?: 30.0)
-        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf(1.0, 1.5, 2.0, 4.0, 6.0).filter { it <= maxLength }.forEach { value ->
-                TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", abs(session.clipLength - value) < .01, Modifier.weight(1f)) { model.editorSetPlanClipLength(value) }
-            }
-        }
-        Text("추천 구성은 장면을 직접 고치기 전까지 이 클립 길이를 따릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    } else {
-        Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
     if (confirmReset) AlertDialog(

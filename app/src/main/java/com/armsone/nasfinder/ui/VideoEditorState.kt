@@ -89,6 +89,193 @@ internal fun clampSceneWindow(source: TrailerSource, start: Double, length: Doub
     return safeStart to safeLength.coerceIn(minLength, max(minLength, duration - safeStart))
 }
 
+private data class SceneDurationBounds(
+    val safeStart: Double,
+    val minLen: Double,
+    val maxLen: Double,
+    val currentLen: Double,
+    val isFixed: Boolean,
+)
+
+private fun resolveSceneDurationBounds(scene: EditorScene, source: TrailerSource?): SceneDurationBounds {
+    if (source == null || (!source.isImage && (!source.duration.isFinite() || source.duration <= 0.0))) {
+        // Missing/invalid source duration: preserve that scene's duration without inventing capacity
+        val len = if (scene.length.isFinite() && scene.length > 0.0) scene.length else MIN_EDITOR_VIDEO_SCENE_SECONDS
+        return SceneDurationBounds(
+            safeStart = if (scene.start.isFinite()) scene.start else 0.0,
+            minLen = len,
+            maxLen = len,
+            currentLen = len,
+            isFixed = true,
+        )
+    }
+    if (source.isImage) {
+        val minLen = MIN_PHOTO_SCENE_DURATION
+        val maxLen = MAX_EDITOR_PHOTO_SCENE_SECONDS
+        val curLen = (if (scene.length.isFinite()) scene.length else minLen).coerceIn(minLen, maxLen)
+        return SceneDurationBounds(
+            safeStart = 0.0,
+            minLen = minLen,
+            maxLen = maxLen,
+            currentLen = curLen,
+            isFixed = false,
+        )
+    }
+    val duration = source.duration
+    val minLen = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, duration)
+    val safeStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, max(0.0, duration - minLen))
+    val maxLen = max(minLen, duration - safeStart)
+    val curLen = (if (scene.length.isFinite()) scene.length else minLen).coerceIn(minLen, maxLen)
+    return SceneDurationBounds(
+        safeStart = safeStart,
+        minLen = minLen,
+        maxLen = maxLen,
+        currentLen = curLen,
+        isFixed = false,
+    )
+}
+
+/** Computes achievable total duration range [minTotal, maxTotal] for manual editing. */
+internal fun calculateManualTotalBounds(project: EditorProject, sources: List<TrailerSource>): Pair<Double, Double> {
+    if (project.scenes.isEmpty()) return 0.0 to 0.0
+    val sourcesById = sources.associateBy { it.id }
+    var minSum = 0.0
+    var maxSum = 0.0
+    for (scene in project.scenes) {
+        val bounds = resolveSceneDurationBounds(scene, sourcesById[scene.sourceId])
+        minSum += bounds.minLen
+        maxSum += bounds.maxLen
+    }
+    return minSum to maxSum
+}
+
+/**
+ * Proportionally redistributes durations across existing scenes in manual mode.
+ * Uses monotone bisection over scaling factor lambda on current lengths, capping each scene to its [minLen, maxLen],
+ * and redistributes residual to scenes with remaining capacity so achievable target is met.
+ */
+internal fun redistributeManualTotal(
+    project: EditorProject,
+    sources: List<TrailerSource>,
+    targetTotal: Double,
+): Pair<List<EditorScene>, Double> {
+    if (project.scenes.isEmpty() || !targetTotal.isFinite() || targetTotal <= 0.0) {
+        return project.scenes to project.scenes.sumOf { it.length }
+    }
+    val sourcesById = sources.associateBy { it.id }
+    val sceneBounds = project.scenes.map { resolveSceneDurationBounds(it, sourcesById[it.sourceId]) }
+    val totalMin = sceneBounds.sumOf { it.minLen }
+    val totalMax = sceneBounds.sumOf { it.maxLen }
+    val clampedTarget = targetTotal.coerceIn(totalMin, totalMax)
+
+    val candidateLengths = DoubleArray(sceneBounds.size)
+    if (totalMax <= totalMin + 1e-6) {
+        for (i in sceneBounds.indices) candidateLengths[i] = sceneBounds[i].minLen
+    } else {
+        val adjustable = sceneBounds.filterNot { it.isFixed }
+        if (adjustable.isEmpty()) {
+            for (i in sceneBounds.indices) candidateLengths[i] = sceneBounds[i].currentLen
+        } else {
+            val maxRatio = adjustable.maxOfOrNull { it.maxLen / max(it.currentLen, 1e-4) } ?: 1.0
+            var low = 0.0
+            var high = max(1.0, maxRatio) * 1.5 + 1.0
+
+            for (iter in 0 until 60) {
+                val mid = (low + high) / 2.0
+                var sum = 0.0
+                for (i in sceneBounds.indices) {
+                    val b = sceneBounds[i]
+                    sum += if (b.isFixed) b.currentLen else (b.currentLen * mid).coerceIn(b.minLen, b.maxLen)
+                }
+                if (sum < clampedTarget) {
+                    low = mid
+                } else {
+                    high = mid
+                }
+            }
+
+            val factor = (low + high) / 2.0
+            for (i in sceneBounds.indices) {
+                val b = sceneBounds[i]
+                candidateLengths[i] = if (b.isFixed) b.currentLen else (b.currentLen * factor).coerceIn(b.minLen, b.maxLen)
+            }
+
+            var remainder = clampedTarget - candidateLengths.sum()
+            if (remainder > 1e-6) {
+                for (i in candidateLengths.indices) {
+                    val b = sceneBounds[i]
+                    if (b.isFixed) continue
+                    val cap = b.maxLen - candidateLengths[i]
+                    if (cap > 1e-6) {
+                        val delta = min(remainder, cap)
+                        candidateLengths[i] += delta
+                        remainder -= delta
+                        if (remainder <= 1e-6) break
+                    }
+                }
+            } else if (remainder < -1e-6) {
+                var deficit = -remainder
+                for (i in candidateLengths.indices) {
+                    val b = sceneBounds[i]
+                    if (b.isFixed) continue
+                    val reducible = candidateLengths[i] - b.minLen
+                    if (reducible > 1e-6) {
+                        val delta = min(deficit, reducible)
+                        candidateLengths[i] -= delta
+                        deficit -= delta
+                        if (deficit <= 1e-6) break
+                    }
+                }
+            }
+        }
+    }
+
+    val finalScenes = project.scenes.mapIndexed { i, scene ->
+        val b = sceneBounds[i]
+        val source = sourcesById[scene.sourceId]
+        val (safeStart, safeLen) = if (source != null && !b.isFixed) {
+            clampSceneWindow(source, b.safeStart, candidateLengths[i])
+        } else {
+            b.safeStart to candidateLengths[i]
+        }
+        scene.copy(start = safeStart, length = safeLen)
+    }
+    return finalScenes to finalScenes.sumOf { it.length }
+}
+
+/**
+ * Applies a uniform chosen clip length to every existing scene in manual mode,
+ * respecting per-source boundaries (video duration/start and photo max 30s) and preserving metadata.
+ */
+internal fun applyManualClipLength(
+    project: EditorProject,
+    sources: List<TrailerSource>,
+    targetClipLength: Double,
+): Pair<List<EditorScene>, Double> {
+    if (project.scenes.isEmpty() || !targetClipLength.isFinite() || targetClipLength <= 0.0) {
+        return project.scenes to project.scenes.sumOf { it.length }
+    }
+    val sourcesById = sources.associateBy { it.id }
+    val newScenes = project.scenes.map { scene ->
+        val source = sourcesById[scene.sourceId]
+        if (source == null) {
+            scene
+        } else if (!source.isImage && (!source.duration.isFinite() || source.duration <= 0.0)) {
+            // Missing/invalid source duration: preserve that scene's duration
+            scene
+        } else if (source.isImage) {
+            val (start, length) = clampSceneWindow(source, 0.0, targetClipLength)
+            scene.copy(start = start, length = length)
+        } else {
+            val minLen = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, source.duration)
+            val safeStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, max(0.0, source.duration - minLen))
+            val (start, length) = clampSceneWindow(source, safeStart, targetClipLength)
+            scene.copy(start = start, length = length)
+        }
+    }
+    return newScenes to newScenes.sumOf { it.length }
+}
+
 enum class EditorSaveState { IDLE, SAVING, SAVED, FAILED }
 
 /** A running or finished export of a fixed editor snapshot; editing continues independently. */

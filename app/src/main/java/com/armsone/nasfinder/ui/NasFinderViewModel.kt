@@ -5558,21 +5558,41 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         exportEditorProjectInternal(skipUnavailableMusic = true)
     }
 
-    /** Plan parameters only regenerate scenes while the project is automatic; manual edits are never overwritten. */
+    /** Plan parameters regenerate scenes while automatic; manual mode proportionally retimes or adjusts existing scenes. */
     fun editorSetPlanTotal(total: Double) {
         editProject { session ->
-            if (session.editor?.autoPlan != true || !total.isFinite()) return@editProject null
-            session.copy(
-                total = total.coerceIn(1.0, 7200.0),
-                musicPolicy = if (session.musicTrack != null) TrailerMusicPolicy.SINGLE else session.musicPolicy,
-            ).withRegeneratedPlan()
+            if (!total.isFinite() || total <= 0.0) return@editProject null
+            val project = session.editor ?: return@editProject null
+            if (project.autoPlan) {
+                session.copy(
+                    total = total.coerceIn(1.0, 7200.0),
+                    musicPolicy = if (session.musicTrack != null) TrailerMusicPolicy.SINGLE else session.musicPolicy,
+                ).withRegeneratedPlan()
+            } else {
+                val (newScenes, actualTotal) = redistributeManualTotal(project, session.sources, total)
+                session.copy(
+                    total = actualTotal,
+                    editor = project.copy(scenes = newScenes, autoPlan = false),
+                )
+            }
         }
     }
 
     fun editorSetPlanClipLength(length: Double) {
         editProject { session ->
-            if (session.editor?.autoPlan != true || !length.isFinite() || length <= 0.0) return@editProject null
-            session.copy(clipLength = length, photoClipLength = defaultPhotoClipLength(length, session.hasVideos)).withRegeneratedPlan()
+            if (!length.isFinite() || length <= 0.0) return@editProject null
+            val project = session.editor ?: return@editProject null
+            if (project.autoPlan) {
+                session.copy(clipLength = length, photoClipLength = defaultPhotoClipLength(length, session.hasVideos)).withRegeneratedPlan()
+            } else {
+                val (newScenes, actualTotal) = applyManualClipLength(project, session.sources, length)
+                session.copy(
+                    total = actualTotal,
+                    clipLength = length,
+                    photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
+                    editor = project.copy(scenes = newScenes, autoPlan = false),
+                )
+            }
         }
     }
 
