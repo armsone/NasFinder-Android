@@ -56,6 +56,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.compose.ui:ui:1.7.6")
     implementation("androidx.compose.ui:ui-tooling-preview:1.7.6")
+    // Photo Picker packages Foundation 1.8.1; compile FlowRow against the same API.
+    implementation("androidx.compose.foundation:foundation-layout:1.8.1")
     implementation("androidx.compose.material3:material3:1.3.1")
     implementation("androidx.compose.material:material:1.7.6")
     implementation("androidx.compose.material:material-ripple:1.7.6")
