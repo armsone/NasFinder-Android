@@ -94,7 +94,7 @@ private fun editorTier(width: Dp): EditorTier = when {
     else -> EditorTier.FOCUSED
 }
 
-private enum class InspectorTab(val title: String) { SCENE("장면"), SOUND("소리"), SCREEN("화면"), PLAN("구성") }
+private enum class InspectorTab(val title: String) { SCENE("장면"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
 
 private fun seconds1(value: Double): String = "%.1f초".format(value)
 
@@ -124,6 +124,7 @@ internal fun AdaptiveEditorWorkspace(
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
     var lowerPanelOpen by rememberSaveable(directoryKey) { mutableStateOf(true) }
     var showOutput by rememberSaveable(directoryKey) { mutableStateOf(false) }
+    var showMusicPicker by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var renameOpen by remember { mutableStateOf(false) }
     var collectionDialog by remember { mutableStateOf(false) }
     // Finder selections are held in the view model so route changes, web roundtrips and minimization preserve them.
@@ -207,10 +208,11 @@ internal fun AdaptiveEditorWorkspace(
                 )
                 VerticalHairline()
             }
+            val unifiedScroll = tier == EditorTier.FOCUSED || (tier != EditorTier.WIDE && this@BoxWithConstraints.maxHeight < 680.dp)
             Column(Modifier.weight(1f).fillMaxHeight()) {
                 EditorHeader(
                     session = session,
-                    compact = tier == EditorTier.FOCUSED || tier == EditorTier.RAIL_ONLY,
+                    compact = tier == EditorTier.FOCUSED,
                     outputCurrent = outputCurrent,
                     onClose = onRequestClose,
                     onRename = { renameOpen = true },
@@ -231,51 +233,107 @@ internal fun AdaptiveEditorWorkspace(
                         color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                val stageModifier = if (tier == EditorTier.FOCUSED) Modifier.fillMaxWidth().heightIn(min = 160.dp, max = this@BoxWithConstraints.maxHeight * 0.36f)
-                else Modifier.fillMaxWidth().weight(1f, fill = true)
-                EditorStage(
-                    session = session,
-                    scene = selectedScene,
-                    source = selectedSource,
-                    output = output,
-                    outputCurrent = outputCurrent,
-                    showOutput = showOutput && output != null,
-                    onShowOutput = { showOutput = it },
-                    onFullscreen = { onFullscreenChange(true) },
-                    onShare = ::shareOutput,
-                    onSaveToPhoneHard = model::saveTrailer,
-                    onCollection = { collectionDialog = true },
-                    modifier = stageModifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                )
-                SceneStrip(
-                    session = session,
-                    selectedKey = selectedSceneKey,
-                    onSelect = { selectedSceneKey = it; showOutput = false },
-                    onMoveTo = model::editorMoveSceneTo,
-                    onMove = model::editorMoveScene,
-                    onDuplicate = { key -> model.editorDuplicateScene(key)?.let { selectedSceneKey = it } },
-                    onRemove = model::editorRemoveScene,
-                    onAddMaterial = { finderOpen = true },
-                )
-                if (tier != EditorTier.WIDE && (lowerPanelOpen || tier == EditorTier.FOCUSED)) {
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                    EditorInspector(
+                if (unifiedScroll) {
+                    val mainScrollState = rememberScrollState()
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .verticalScroll(mainScrollState)
+                    ) {
+                        val stageMax = (this@BoxWithConstraints.maxHeight * 0.45f).coerceAtLeast(160.dp)
+                        val stageModifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 140.dp, max = stageMax)
+                        EditorStage(
+                            session = session,
+                            scene = selectedScene,
+                            source = selectedSource,
+                            output = output,
+                            outputCurrent = outputCurrent,
+                            showOutput = showOutput && output != null,
+                            onShowOutput = { showOutput = it },
+                            onFullscreen = { onFullscreenChange(true) },
+                            onShare = ::shareOutput,
+                            onSaveToPhoneHard = model::saveTrailer,
+                            onCollection = { collectionDialog = true },
+                            onExport = model::exportEditorProject,
+                            modifier = stageModifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                        SceneStrip(
+                            session = session,
+                            selectedKey = selectedSceneKey,
+                            onSelect = { selectedSceneKey = it; showOutput = false },
+                            onMoveTo = model::editorMoveSceneTo,
+                            onMove = model::editorMoveScene,
+                            onDuplicate = { key -> model.editorDuplicateScene(key)?.let { selectedSceneKey = it } },
+                            onRemove = model::editorRemoveScene,
+                            onAddMaterial = { finderOpen = true },
+                        )
+                        if (lowerPanelOpen || tier == EditorTier.FOCUSED) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                            EditorInspector(
+                                session = session,
+                                scene = selectedScene,
+                                source = selectedSource,
+                                tab = inspectorTab,
+                                onTab = { inspectorTab = it },
+                                model = model,
+                                onSelectScene = { selectedSceneKey = it },
+                                onOpenMusicPicker = { showMusicPicker = true },
+                                scrollable = false,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                } else {
+                    EditorStage(
                         session = session,
                         scene = selectedScene,
                         source = selectedSource,
-                        tab = inspectorTab,
-                        onTab = { inspectorTab = it },
-                        model = model,
-                        onSelectScene = { selectedSceneKey = it },
-                        modifier = if (tier == EditorTier.FOCUSED) Modifier.fillMaxWidth().weight(1f) else Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                        output = output,
+                        outputCurrent = outputCurrent,
+                        showOutput = showOutput && output != null,
+                        onShowOutput = { showOutput = it },
+                        onFullscreen = { onFullscreenChange(true) },
+                        onShare = ::shareOutput,
+                        onSaveToPhoneHard = model::saveTrailer,
+                        onCollection = { collectionDialog = true },
+                        onExport = model::exportEditorProject,
+                        modifier = Modifier.fillMaxWidth().weight(1f, fill = true).padding(horizontal = 12.dp, vertical = 6.dp),
                     )
+                    SceneStrip(
+                        session = session,
+                        selectedKey = selectedSceneKey,
+                        onSelect = { selectedSceneKey = it; showOutput = false },
+                        onMoveTo = model::editorMoveSceneTo,
+                        onMove = model::editorMoveScene,
+                        onDuplicate = { key -> model.editorDuplicateScene(key)?.let { selectedSceneKey = it } },
+                        onRemove = model::editorRemoveScene,
+                        onAddMaterial = { finderOpen = true },
+                    )
+                    if (tier != EditorTier.WIDE && lowerPanelOpen) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                        EditorInspector(
+                            session = session,
+                            scene = selectedScene,
+                            source = selectedSource,
+                            tab = inspectorTab,
+                            onTab = { inspectorTab = it },
+                            model = model,
+                            onSelectScene = { selectedSceneKey = it },
+                            onOpenMusicPicker = { showMusicPicker = true },
+                            scrollable = true,
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                        )
+                    }
                 }
                 if (tier == EditorTier.FOCUSED) {
                     FocusedFooter(
                         onAddMaterial = { finderOpen = true },
                         onExport = model::exportEditorProject,
                         exportEnabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
-                        outputCurrent = outputCurrent,
+                        outputCurrent = output != null,
                     )
                 }
             }
@@ -289,6 +347,8 @@ internal fun AdaptiveEditorWorkspace(
                     onTab = { inspectorTab = it },
                     model = model,
                     onSelectScene = { selectedSceneKey = it },
+                    onOpenMusicPicker = { showMusicPicker = true },
+                    scrollable = true,
                     modifier = Modifier.width(340.dp).fillMaxHeight(),
                 )
             }
@@ -357,6 +417,18 @@ internal fun AdaptiveEditorWorkspace(
 
     if (session.musicExportPrompt && session.musicTrack == null && session.unavailableMusic != null) {
         MissingMusicExportDialog(session, model)
+    }
+
+    if (showMusicPicker) {
+        UnifiedMusicPickerDialog(
+            model = model,
+            currentTrack = session.musicTrack,
+            onDismiss = { showMusicPicker = false },
+            onSelectTrack = { selected ->
+                showMusicPicker = false
+                selectReplacementMusic(session, selected, model)
+            },
+        )
     }
 
     if (collectionDialog && output != null) {
@@ -483,15 +555,16 @@ private fun EditorHeader(
         if (showPanelToggle) {
             IconButton(onClick = onTogglePanel) { Icon(if (panelOpen) Icons.Default.ExpandMore else Icons.Default.Tune, if (panelOpen) "편집 패널 접기" else "편집 패널 열기") }
         }
-        if (!compact) {
-            Button(
-                onClick = onExport,
-                enabled = session.export?.running != true && !session.busy && project?.scenes?.isNotEmpty() == true,
-                colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
-                modifier = Modifier.padding(end = 8.dp),
-            ) {
-                Text(if (outputCurrent) "다시 내보내기" else "내보내기")
-            }
+        val exportLabel = if (session.output != null) "다시 내보내기" else "내보내기"
+        val exportEnabled = session.export?.running != true && !session.busy && project?.scenes?.isNotEmpty() == true
+        Button(
+            onClick = onExport,
+            enabled = exportEnabled,
+            colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
+            contentPadding = if (compact) PaddingValues(horizontal = 10.dp, vertical = 6.dp) else ButtonDefaults.ContentPadding,
+            modifier = Modifier.padding(end = if (compact) 4.dp else 8.dp),
+        ) {
+            Text(exportLabel, fontSize = if (compact) 13.sp else 14.sp)
         }
     }
 }
@@ -576,13 +649,14 @@ private fun EditorStage(
     onShare: () -> Unit,
     onSaveToPhoneHard: () -> Unit,
     onCollection: () -> Unit,
+    onExport: () -> Unit,
     modifier: Modifier,
 ) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (output != null) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 TrailerChoice("장면 미리보기", !showOutput, Modifier.weight(1f)) { onShowOutput(false) }
-                TrailerChoice(if (outputCurrent) "완성본" else "이전 완성본", showOutput, Modifier.weight(1f)) { onShowOutput(true) }
+                TrailerChoice(if (outputCurrent) "완성본" else "이전 완성본 (수정됨)", showOutput, Modifier.weight(1f)) { onShowOutput(true) }
             }
         }
         Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
@@ -596,7 +670,17 @@ private fun EditorStage(
         }
         if (showOutput && output != null) {
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                if (!outputCurrent) Text("편집이 바뀌었습니다 · 다시 내보내면 반영됩니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!outputCurrent) {
+                    val palette = themePalette()
+                    Button(
+                        onClick = onExport,
+                        enabled = session.export?.running != true && !session.busy && session.editor?.scenes?.isNotEmpty() == true,
+                        colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    ) {
+                        Text("새 편집으로 다시 내보내기", fontSize = 12.sp)
+                    }
+                }
                 AssistChip(onClick = onFullscreen, label = { Text("전체화면") }, leadingIcon = { Icon(Icons.Default.Fullscreen, null, Modifier.size(18.dp)) })
                 AssistChip(onClick = onShare, label = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null, Modifier.size(18.dp)) })
                 AssistChip(onClick = onSaveToPhoneHard, enabled = !session.saved && !session.busy, label = { Text(if (session.saved) "폰하드에 저장됨" else "폰하드에 저장") }, leadingIcon = { Icon(Icons.Default.SaveAlt, null, Modifier.size(18.dp)) })
@@ -924,21 +1008,28 @@ private fun EditorInspector(
     onTab: (InspectorTab) -> Unit,
     model: NasFinderViewModel,
     onSelectScene: (Long) -> Unit,
+    onOpenMusicPicker: () -> Unit,
     modifier: Modifier,
+    scrollable: Boolean = true,
 ) {
     Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             InspectorTab.entries.forEach { entry -> TrailerChoice(entry.title, tab == entry, Modifier.weight(1f)) { onTab(entry) } }
         }
+        val contentModifier = if (scrollable) {
+            Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 4.dp)
+        } else {
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp)
+        }
         Column(
-            Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 4.dp),
+            modifier = contentModifier,
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             when (tab) {
                 InspectorTab.SCENE -> SceneSection(session, scene, source, model, onSelectScene)
-                InspectorTab.SOUND -> SoundSection(session, scene, source, model)
+                InspectorTab.SOUND -> SoundSection(session, scene, source, model, onOpenMusicPicker)
                 InspectorTab.SCREEN -> ScreenSection(session, scene, source, model)
-                InspectorTab.PLAN -> PlanSection(session, model)
+                InspectorTab.PLAN -> PlanSection(session, model, onOpenMusicPicker)
             }
             Spacer(Modifier.height(12.dp))
         }
@@ -948,7 +1039,13 @@ private fun EditorInspector(
 @Composable
 private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit) {
     if (scene == null || source == null) {
-        Text("선택한 장면이 없습니다.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("선택한 장면이 없습니다. 아래 타임라인에서 길이나 구간을 조절할 장면을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val firstKey = session.editor?.scenes?.firstOrNull()?.key
+            if (firstKey != null) {
+                OutlinedButton(onClick = { onSelectScene(firstKey) }) { Text("첫 번째 장면 선택") }
+            }
+        }
         return
     }
     val project = session.editor ?: return
@@ -957,7 +1054,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
     Text(source.name, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
     if (source.isImage) {
         var length by remember(scene.key, scene.length) { mutableFloatStateOf(scene.length.toFloat()) }
-        Text("보여 줄 시간 ${seconds1(length.toDouble())}", style = MaterialTheme.typography.labelMedium)
+        Text("보여 줄 사진 재생 시간: ${seconds1(length.toDouble())}", style = MaterialTheme.typography.labelMedium)
         Slider(
             value = length.coerceIn(MIN_EDITOR_PHOTO_SCENE_SECONDS.toFloat(), MAX_EDITOR_PHOTO_SCENE_SECONDS.toFloat()),
             onValueChange = { length = (it * 10).roundToInt() / 10f },
@@ -970,7 +1067,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
         var range by remember(scene.key, scene.start, scene.length) {
             mutableStateOf(scene.start.toFloat()..(scene.start + scene.length).toFloat().coerceAtMost(duration))
         }
-        Text("구간 ${seconds1(range.start.toDouble())} – ${seconds1(range.endInclusive.toDouble())} (원본 ${seconds1(source.duration)})", style = MaterialTheme.typography.labelMedium)
+        Text("영상 구간: ${seconds1(range.start.toDouble())} ~ ${seconds1(range.endInclusive.toDouble())} (클립 길이 ${seconds1((range.endInclusive - range.start).toDouble())} / 원본 ${seconds1(source.duration)})", style = MaterialTheme.typography.labelMedium)
         RangeSlider(
             value = range,
             onValueChange = { range = it },
@@ -1000,9 +1097,8 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
 }
 
 @Composable
-private fun SoundSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel) {
+private fun SoundSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onOpenMusicPicker: () -> Unit) {
     val project = session.editor ?: return
-    var showMusicPicker by remember { mutableStateOf(false) }
     TrailerSectionTitle("이 장면의 원본 소리")
     if (scene == null || source == null) {
         Text("장면을 선택하면 원본 소리 크기를 바꿀 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1023,18 +1119,22 @@ private fun SoundSection(session: TrailerSession, scene: EditorScene?, source: T
         }
     }
     HorizontalDivider()
-    TrailerSectionTitle("전체 영상 음악")
+    TrailerSectionTitle("전체 영상 배경 음악")
     val unavailable = session.unavailableMusic.takeIf { session.musicTrack == null }
     if (unavailable != null) {
-        UnavailableMusicCard(unavailable, session, model, onReselect = { showMusicPicker = true })
+        UnavailableMusicCard(unavailable, session, model, onReselect = onOpenMusicPicker)
     } else {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(session.musicTrack?.name ?: "음악 없음", maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
-                session.musicTrack?.let { Text(trailerLengthTitle(it.durationSeconds), style = MaterialTheme.typography.labelSmall) }
+                Text(
+                    session.musicTrack?.let { "음악 길이 ${trailerLengthTitle(it.durationSeconds)}" } ?: "영상에 넣을 배경 음악을 골라보세요",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (session.musicTrack != null) TextButton(onClick = { model.editorSetMusic(null, TrailerMusicPolicy.LOOP_MUSIC, 1) }) { Text("제거") }
-            Button(onClick = { showMusicPicker = true }) { Text("음악 선택") }
+            Button(onClick = onOpenMusicPicker) { Text(if (session.musicTrack != null) "음악 변경" else "음악 선택") }
         }
     }
     if (session.musicTrack != null) {
@@ -1072,17 +1172,6 @@ private fun SoundSection(session: TrailerSession, scene: EditorScene?, source: T
             }
             Switch(checked = session.autoDucking, onCheckedChange = model::editorSetAutoDucking)
         }
-    }
-    if (showMusicPicker) {
-        UnifiedMusicPickerDialog(
-            model = model,
-            currentTrack = session.musicTrack,
-            onDismiss = { showMusicPicker = false },
-            onSelectTrack = { selected ->
-                showMusicPicker = false
-                selectReplacementMusic(session, selected, model)
-            },
-        )
     }
 }
 
@@ -1202,7 +1291,7 @@ private fun ScreenSection(session: TrailerSession, scene: EditorScene?, source: 
 }
 
 @Composable
-private fun PlanSection(session: TrailerSession, model: NasFinderViewModel) {
+private fun PlanSection(session: TrailerSession, model: NasFinderViewModel, onOpenMusicPicker: () -> Unit) {
     val project = session.editor ?: return
     var confirmReset by remember { mutableStateOf(false) }
     var confirmMode by remember { mutableStateOf<Boolean?>(null) }
@@ -1217,36 +1306,73 @@ private fun PlanSection(session: TrailerSession, model: NasFinderViewModel) {
             }
         }
     }
+    HorizontalDivider()
+    TrailerSectionTitle("배경 음악")
+    val unavailable = session.unavailableMusic.takeIf { session.musicTrack == null }
+    if (unavailable != null) {
+        UnavailableMusicCard(unavailable, session, model, onReselect = onOpenMusicPicker)
+    } else {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(session.musicTrack?.name ?: "음악 없음", maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                Text(
+                    session.musicTrack?.let { "음악 길이 ${trailerLengthTitle(it.durationSeconds)}" } ?: "영상에 넣을 배경 음악을 골라보세요",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (session.musicTrack != null) TextButton(onClick = { model.editorSetMusic(null, TrailerMusicPolicy.LOOP_MUSIC, 1) }) { Text("제거") }
+            Button(onClick = onOpenMusicPicker) { Text(if (session.musicTrack != null) "음악 변경" else "음악 선택") }
+        }
+    }
+    HorizontalDivider()
     TrailerSectionTitle("순서")
     Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
         listOf("추가순", "시간순", "가나다순", "랜덤").forEach { mode ->
             TrailerChoice(mode, session.orderMode == mode, Modifier.weight(1f)) { model.editorApplyOrder(mode) }
         }
     }
+    HorizontalDivider()
+    val totalTime = session.scenes.sumOf { it.length }
+    TrailerSectionTitle("전체 길이 (전체 시간)")
+    Text("현재 전체 영상 길이: ${trailerLengthTitle(totalTime)}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     if (!project.autoPlan) {
-        Text("직접 편집한 장면이 있어 자동 길이 설정이 장면을 바꾸지 않습니다. 순서 버튼은 장면의 구간을 그대로 두고 순서만 바꿉니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        OutlinedButton(onClick = { confirmReset = true }, modifier = Modifier.fillMaxWidth()) { Text("자동 추천 다시 적용") }
+        Text(
+            "직접 편집한 장면이 있어 전체 길이 자동 추천이 고정되어 있습니다. 각 장면의 길이는 '장면' 탭에서 직접 조절하거나, 전체를 새 길이로 다시 맞추려면 아래 버튼으로 자동 추천을 다시 적용할 수 있습니다.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(onClick = { confirmReset = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("자동 추천 다시 적용 (전체/클립 길이 조절 활성화)")
+        }
     } else if (!session.isMusicOverlayMode) {
-        TrailerSectionTitle("얼마나 길게 볼까요?")
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             listOf(30.0, 60.0, 120.0, 180.0, 300.0).forEach { value ->
                 TrailerChoice(trailerLengthTitle(value), abs(session.total - value) < .01, Modifier.weight(1f)) { model.editorSetPlanTotal(value) }
             }
         }
         TextButton(onClick = { customTotal = !customTotal }, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
-            Text("다른 길이", Modifier.weight(1f)); Text(trailerLengthTitle(session.total))
+            Text("다른 길이 선택", Modifier.weight(1f)); Text(trailerLengthTitle(session.total))
         }
         if (customTotal) TrailerDurationSlider(value = session.total, onValueChange = model::editorSetPlanTotal)
-        TrailerSectionTitle("한 장면은 얼마나 볼까요?")
+    } else {
+        Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    HorizontalDivider()
+    TrailerSectionTitle("클립 길이 (한 장면 시간)")
+    if (!project.autoPlan) {
+        Text("추천 기본 클립 길이: ${session.clipLength}초", style = MaterialTheme.typography.bodyMedium)
+        Text("직접 편집 중인 장면들은 이미 개별 길이가 정해져 있습니다. 개별 장면의 길이를 바꾸려면 '장면' 탭을 이용하세요.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    } else if (!session.isMusicOverlayMode) {
         val maxLength = minOf(30.0, session.sources.maxOfOrNull { if (it.isImage) 30.0 else it.duration } ?: 30.0)
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             listOf(1.0, 1.5, 2.0, 4.0, 6.0).filter { it <= maxLength }.forEach { value ->
                 TrailerChoice(if (value % 1.0 == 0.0) "${value.toInt()}초" else "${value}초", abs(session.clipLength - value) < .01, Modifier.weight(1f)) { model.editorSetPlanClipLength(value) }
             }
         }
-        Text("추천 구성은 장면을 직접 고치기 전까지 이 설정을 따릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("추천 구성은 장면을 직접 고치기 전까지 이 클립 길이를 따릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-        Text("원본 영상을 자르지 않고 그대로 이어 붙입니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
     if (confirmReset) AlertDialog(
