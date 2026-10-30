@@ -77,6 +77,8 @@ import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.platform.NasFinderShareIntentFactory
 import com.armsone.nasfinder.ui.theme.themePalette
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -716,12 +718,81 @@ private fun OutputPlayer(output: File, modifier: Modifier) {
  * Framed still of the selected scene at its trim start, drawn with the scene's fit/focus in the whole-video aspect,
  * plus an optional clip player for video scenes (trimmed range, scene volume).
  */
+private data class PhotoPlanKey(
+    val filePath: String,
+    val lastModified: Long,
+    val length: Long,
+    val sourceId: Int,
+    val fit: SceneFit,
+    val focusX: Float,
+    val focusY: Float,
+    val outputWidth: Int,
+    val outputHeight: Int,
+    val duration: Double,
+)
+
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, modifier: Modifier) {
     val context = LocalContext.current
     val aspect = outputAspect(session)
     var playing by remember(scene.key) { mutableStateOf(false) }
+    val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
+    val planKey = if (source.isImage) {
+        PhotoPlanKey(
+            filePath = source.file.absolutePath,
+            lastModified = source.file.lastModified(),
+            length = source.file.length(),
+            sourceId = source.id,
+            fit = scene.fit,
+            focusX = scene.focusX,
+            focusY = scene.focusY,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            duration = scene.length,
+        )
+    } else null
+    val pendingPlan = when {
+        planKey == null -> null
+        scene.fit == SceneFit.FIT -> PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
+        scene.focusX != 0f || scene.focusY != 0f -> PhotoMotionPlan(mode = PhotoMotionMode.MANUAL_FILL, isFit = false)
+        else -> PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
+    }
+    val photoPlanEntry by produceState<Pair<PhotoPlanKey, PhotoMotionPlan>?>(
+        initialValue = planKey?.let { k -> pendingPlan?.let { p -> k to p } },
+        key1 = planKey,
+    ) {
+        value = planKey?.let { k -> pendingPlan?.let { p -> k to p } }
+        if (planKey != null) {
+            val computed = withContext(Dispatchers.Default) {
+                TrailerPhotoMotionPlanner.planMotion(
+                    source = source,
+                    fit = scene.fit,
+                    focusX = scene.focusX,
+                    focusY = scene.focusY,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    durationSeconds = scene.length,
+                )
+            }
+            value = planKey to computed
+        }
+    }
+    val photoPlan = if (photoPlanEntry?.first == planKey) photoPlanEntry?.second else pendingPlan
+    var photoPlayProgress by remember(scene.key, planKey) { mutableFloatStateOf(0f) }
+    LaunchedEffect(playing, source.isImage, scene.length, planKey, scene.key) {
+        if (!playing || !source.isImage) {
+            return@LaunchedEffect
+        }
+        val durationMs = (scene.length * 1000).toLong().coerceAtLeast(100L)
+        val startOffsetMs = ((photoPlayProgress.coerceIn(0f, 1f) % 1f) * durationMs).toLong()
+        val startTime = android.os.SystemClock.uptimeMillis() - startOffsetMs
+        while (isActive && playing) {
+            val elapsed = android.os.SystemClock.uptimeMillis() - startTime
+            photoPlayProgress = ((elapsed % durationMs).toFloat() / durationMs).coerceIn(0f, 1f)
+            delay(16)
+        }
+    }
     val frame by produceState<Bitmap?>(null, source.file, scene.start, source.isImage) {
         value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 960) }
     }
@@ -734,7 +805,6 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
             if (playing && !source.isImage) {
                 // The clip plays through the SAME framing effects the exporter applies (fit/focus in the output size).
                 // If this device's renderer rejects them, playback falls back to centered framing with a visible notice.
-                val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
                 var framingEffectsFailed by remember(scene.key, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight) { mutableStateOf(false) }
                 val player = remember(scene.key, scene.start, scene.length, source.file, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight, framingEffectsFailed) {
                     ExoPlayer.Builder(context).build().apply {
@@ -751,9 +821,9 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                         setMediaItem(
                             MediaItem.Builder().setUri(Uri.fromFile(source.file)).setClippingConfiguration(
                                 MediaItem.ClippingConfiguration.Builder()
-                                    .setStartPositionMs((scene.start * 1000).toLong())
-                                    .setEndPositionMs(((scene.start + scene.length) * 1000).toLong())
-                                    .build(),
+                                     .setStartPositionMs((scene.start * 1000).toLong())
+                                     .setEndPositionMs(((scene.start + scene.length) * 1000).toLong())
+                                     .build(),
                             ).build(),
                         )
                         repeatMode = Player.REPEAT_MODE_ONE
@@ -791,32 +861,47 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                     )
                 }
             } else {
+                val plan = photoPlan
+                val isFit = scene.fit == SceneFit.FIT || plan?.isFit == true
+                val contentScale = if (isFit) ContentScale.Fit else ContentScale.Crop
+                val alignment = if (isFit) {
+                    Alignment.Center
+                } else if (scene.focusX != 0f || scene.focusY != 0f) {
+                    BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f))
+                } else if (plan != null) {
+                    val (bx, by) = plan.computeBiasAlignment(photoPlayProgress)
+                    BiasAlignment(bx, by)
+                } else {
+                    BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f))
+                }
                 frame?.let {
                     Image(
                         it.asImageBitmap(),
                         contentDescription = "${source.name} 장면 화면",
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = if (scene.fit == SceneFit.FIT) ContentScale.Fit else ContentScale.Crop,
-                        alignment = BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f)),
+                        contentScale = contentScale,
+                        alignment = alignment,
                     )
                 } ?: CircularProgressIndicator(Modifier.size(28.dp))
                 if (source.isImage) {
-                    // The exporter adds a slow random zoom to photos; this still shows the framing only.
+                    val statusText = when {
+                        isFit -> "사진 전체 보기"
+                        plan?.mode == PhotoMotionMode.PAN_HORIZONTAL || plan?.mode == PhotoMotionMode.PAN_VERTICAL -> "사진 움직임 미리보기"
+                        else -> "사진 미리보기"
+                    }
                     Text(
-                        "정지 화면 미리보기 · 내보낼 때 약한 확대 움직임이 더해집니다",
+                        statusText,
                         Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
                         color = Color.White,
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
             }
-            if (!source.isImage) {
-                FilledIconButton(
-                    onClick = { playing = !playing },
-                    modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
-                ) {
-                    PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "장면 재생 멈춤" else "장면 재생", Modifier.size(20.dp))
-                }
+            FilledIconButton(
+                onClick = { playing = !playing },
+                modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
+            ) {
+                PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "장면 재생 멈춤" else "장면 재생", Modifier.size(20.dp))
             }
             Text(
                 "${seconds1(scene.length)}${if (!source.isImage) " · ${seconds1(scene.start)}부터" else ""}",
@@ -840,14 +925,34 @@ internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimen
                 androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
             )
         }.getOrDefault(androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL)
-        val degrees = when (orientation) {
-            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-            else -> 0f
+        try {
+            val matrix = android.graphics.Matrix()
+            when (orientation) {
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.postRotate(90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                androidx.exifinterface.media.ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.postRotate(270f)
+                    matrix.postScale(-1f, 1f)
+                }
+            }
+            if (!matrix.isIdentity) {
+                val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                if (rotated !== decoded) decoded.recycle()
+                rotated
+            } else {
+                decoded
+            }
+        } catch (e: Throwable) {
+            decoded.recycle()
+            throw e
         }
-        if (degrees == 0f) decoded
-        else Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, android.graphics.Matrix().apply { postRotate(degrees) }, true)
     } else {
         val retriever = MediaMetadataRetriever()
         try {

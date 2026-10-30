@@ -11,9 +11,9 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 427012
-        versionName = "2.28.5"
-        buildConfigField("String", "BUILD_NUMBER", "\"202610300002\"")
+        versionCode = 435646
+        versionName = "2.29.0"
+        buildConfigField("String", "BUILD_NUMBER", "\"202610301246\"")
         testInstrumentationRunner = "com.armsone.nasfinder.smoke.PhoneSmokeInstrumentation"
         vectorDrawables.useSupportLibrary = true
     }
@@ -69,6 +69,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:5.3.0")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     implementation("com.google.zxing:core:3.5.3")
+    implementation("com.google.mlkit:face-detection:16.1.7")
+    implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("com.github.mwiede:jsch:2.28.3")
     implementation("com.hierynomus:smbj:0.14.0")
     implementation(project(":hanai-onnx"))

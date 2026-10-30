@@ -32,36 +32,6 @@ import android.opengl.Matrix
 import androidx.media3.effect.GlMatrixTransformation
 import java.util.Random
 
-// Ken Burns transformation for image clips: random zoom 1.0->1.1 or 1.1->1.0 with a fixed focal point sampled once per clip.
-@androidx.annotation.OptIn(UnstableApi::class)
-private class ImageKenBurnsTransformation(
-    private val zoomIn: Boolean,
-    private val focalX: Float,
-    private val focalY: Float,
-    private val durationUs: Long,
-) : GlMatrixTransformation {
-    private var baseTimeUs: Long = -1L
-
-    override fun getGlMatrixArray(presentationTimeUs: Long): FloatArray {
-        if (baseTimeUs < 0L) {
-            baseTimeUs = presentationTimeUs
-        }
-        val elapsedUs = (presentationTimeUs - baseTimeUs).coerceAtLeast(0L)
-        val progress = if (durationUs > 0) (elapsedUs.toFloat() / durationUs).coerceIn(0f, 1f) else 0f
-        val currentZoom = if (zoomIn) 1.0f + 0.10f * progress else 1.10f - 0.10f * progress
-        val maxShiftX = (currentZoom - 1f) / currentZoom
-        val maxShiftY = (currentZoom - 1f) / currentZoom
-        val translateX = focalX * maxShiftX
-        val translateY = focalY * maxShiftY
-
-        val glMatrix = FloatArray(16)
-        Matrix.setIdentityM(glMatrix, 0)
-        Matrix.translateM(glMatrix, 0, translateX, translateY, 0f)
-        Matrix.scaleM(glMatrix, 0, currentZoom, currentZoom, 1f)
-        return glMatrix
-    }
-}
-
 /** Constant per-scene original-audio gain (0 mutes); applied only to that scene's own clip audio. */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class SceneGainAudioProcessor(private val gain: Float) : androidx.media3.common.audio.BaseAudioProcessor() {
@@ -370,6 +340,152 @@ internal object TrailerExporter {
         }
     }
 
+    private fun renderFullOrientedBitmapToJpeg(
+        orientedBitmap: Bitmap,
+        output: File,
+        maxLongEdge: Int = 2560,
+        maxPixels: Long = 4_194_304L,
+    ) {
+        val srcW = orientedBitmap.width
+        val srcH = orientedBitmap.height
+        val longEdge = maxOf(srcW, srcH)
+        val totalPixels = srcW.toLong() * srcH.toLong()
+
+        val scale = if (longEdge > maxLongEdge || totalPixels > maxPixels) {
+            val scaleEdge = maxLongEdge.toFloat() / longEdge
+            val scalePixels = kotlin.math.sqrt(maxPixels.toDouble() / totalPixels).toFloat()
+            minOf(scaleEdge, scalePixels)
+        } else {
+            1f
+        }
+
+        val finalW = (((srcW * scale).toInt() / 2) * 2).coerceAtLeast(2)
+        val finalH = (((srcH * scale).toInt() / 2) * 2).coerceAtLeast(2)
+
+        val workingBitmap = if (finalW != srcW || finalH != srcH) {
+            Bitmap.createScaledBitmap(orientedBitmap, finalW, finalH, true)
+        } else {
+            orientedBitmap
+        }
+
+        try {
+            FileOutputStream(output).use { fos ->
+                workingBitmap.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+            }
+        } finally {
+            if (workingBitmap !== orientedBitmap) {
+                workingBitmap.recycle()
+            }
+        }
+    }
+
+    private fun preprocessFullPhoto(source: File, output: File) {
+        if (!source.exists() || !source.isFile) {
+            throw java.io.FileNotFoundException("Source image not found: ${source.absolutePath}")
+        }
+        if (!source.canRead()) {
+            throw SecurityException("Source image not readable: ${source.absolutePath}")
+        }
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(source.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw ImageDecodeException("이미지를 읽을 수 없습니다: ${source.name}")
+        }
+
+        val exif = try {
+            ExifInterface(source.absolutePath)
+        } catch (e: Exception) {
+            if (e is CancellationException || e is SecurityException || e is java.io.IOException) throw e
+            throw ImageDecodeException("이미지 메타데이터를 읽을 수 없습니다: ${source.name}", e)
+        }
+        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        val isRotated90 = orientation == ExifInterface.ORIENTATION_ROTATE_90 || orientation == ExifInterface.ORIENTATION_ROTATE_270
+
+        val (rawW, rawH) = if (isRotated90) bounds.outHeight to bounds.outWidth else bounds.outWidth to bounds.outHeight
+        val maxLongEdge = 2560
+        val maxPixels = 4_194_304L
+
+        var sample = 1
+        var w = rawW
+        var h = rawH
+        while (maxOf(w, h) > maxLongEdge * 2 || (w.toLong() * h.toLong()) > maxPixels * 4L) {
+            sample *= 2
+            w = rawW / sample
+            h = rawH / sample
+        }
+        val samplePowerOfTwo = Integer.highestOneBit(sample).coerceAtLeast(1)
+
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = samplePowerOfTwo
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val decoded = try {
+            BitmapFactory.decodeFile(source.absolutePath, decodeOptions)
+        } catch (e: Exception) {
+            if (e is CancellationException || e is SecurityException || e is java.io.IOException) throw e
+            throw ImageDecodeException("이미지 디코딩에 실패했습니다: ${source.name}", e)
+        } ?: throw ImageDecodeException("이미지 디코딩에 실패했습니다: ${source.name}")
+
+        val orientedBitmap = try {
+            val matrix = AndroidMatrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.postRotate(90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.postRotate(270f)
+                    matrix.postScale(-1f, 1f)
+                }
+            }
+            if (!matrix.isIdentity) {
+                val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                if (rotated !== decoded) decoded.recycle()
+                rotated
+            } else {
+                decoded
+            }
+        } catch (e: Exception) {
+            decoded.recycle()
+            if (e is CancellationException || e is SecurityException || e is java.io.IOException) throw e
+            throw ImageDecodeException("이미지 변환 처리에 실패했습니다: ${source.name}", e)
+        }
+
+        try {
+            renderFullOrientedBitmapToJpeg(orientedBitmap, output, maxLongEdge, maxPixels)
+        } finally {
+            orientedBitmap.recycle()
+        }
+    }
+
+    private fun preprocessFullPhotoOrFallback(source: TrailerSource, output: File): Boolean {
+        try {
+            preprocessFullPhoto(source.file, output)
+            return false
+        } catch (e: ImageDecodeException) {
+            var cause: Throwable? = e.cause
+            while (cause != null) {
+                if (cause is CancellationException || cause is SecurityException || cause is java.io.IOException || cause is Error) {
+                    throw cause
+                }
+                cause = cause.cause
+            }
+            val thumb = source.thumbnail
+            if (thumb != null && !thumb.isRecycled) {
+                renderFullOrientedBitmapToJpeg(thumb, output)
+                return true
+            } else {
+                throw e
+            }
+        }
+    }
+
     private suspend fun createRecoveredStillScene(
         scene: TrailerScene,
         targetW: Int,
@@ -459,7 +575,7 @@ internal object TrailerExporter {
         }
     }
 
-    private fun buildVideoEditedMediaItem(
+    private suspend fun buildVideoEditedMediaItem(
         scene: TrailerScene,
         exportWidth: Int,
         exportHeight: Int,
@@ -473,37 +589,85 @@ internal object TrailerExporter {
         destinationParent: File,
     ): EditedMediaItem {
         return if (scene.source.isImage) {
-            val framingKey = "${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}"
-            val preprocessedFile = preprocessedBySource.getOrPut(framingKey) {
-                val tempFile = File(destinationParent, "preprocessed-${scene.source.id}-${UUID.randomUUID()}.jpg")
-                tempFiles.add(tempFile)
-                val usedFallback = try {
-                    preprocessImageOrFallback(scene.source, targetWidth, targetHeight, tempFile, scene.fit, scene.focusX, scene.focusY)
-                } catch (t: Throwable) {
-                    tempFile.delete()
-                    tempFiles.remove(tempFile)
-                    throw t
+            val isManual = scene.fit == SceneFit.FIT || scene.focusX != 0f || scene.focusY != 0f
+            if (isManual) {
+                val framingKey = "${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}"
+                val preprocessedFile = preprocessedBySource.getOrPut(framingKey) {
+                    val tempFile = File(destinationParent, "preprocessed-${scene.source.id}-${UUID.randomUUID()}.jpg")
+                    tempFiles.add(tempFile)
+                    val usedFallback = try {
+                        preprocessImageOrFallback(scene.source, targetWidth, targetHeight, tempFile, scene.fit, scene.focusX, scene.focusY)
+                    } catch (t: Throwable) {
+                        tempFile.delete()
+                        tempFiles.remove(tempFile)
+                        throw t
+                    }
+                    if (usedFallback) {
+                        thumbnailFallbackKeys.add(framingKey)
+                    }
+                    tempFile
                 }
-                if (usedFallback) {
-                    thumbnailFallbackKeys.add(framingKey)
+                val inputUri = Uri.fromFile(preprocessedFile)
+                val durationUs = (scene.length * 1_000_000).toLong()
+                val manualPresentation = if (scene.fit == SceneFit.FIT) {
+                    Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT)
+                } else {
+                    presentation
                 }
-                tempFile
+                val input = MediaItem.Builder()
+                    .setUri(inputUri)
+                    .setImageDurationMs((scene.length * 1000).toLong())
+                    .build()
+                EditedMediaItem.Builder(input)
+                    .setDurationUs(durationUs)
+                    .setFrameRate(30)
+                    .setEffects(Effects(emptyList(), listOf(manualPresentation)))
+                    .build()
+            } else {
+                val fullPhotoKey = "full:${scene.source.id}"
+                val preprocessedFile = preprocessedBySource.getOrPut(fullPhotoKey) {
+                    val tempFile = File(destinationParent, "preprocessed-full-${scene.source.id}-${UUID.randomUUID()}.jpg")
+                    tempFiles.add(tempFile)
+                    val usedFallback = try {
+                        preprocessFullPhotoOrFallback(scene.source, tempFile)
+                    } catch (t: Throwable) {
+                        tempFile.delete()
+                        tempFiles.remove(tempFile)
+                        throw t
+                    }
+                    if (usedFallback) {
+                        thumbnailFallbackKeys.add(fullPhotoKey)
+                    }
+                    tempFile
+                }
+                val inputUri = Uri.fromFile(preprocessedFile)
+                val durationUs = (scene.length * 1_000_000).toLong()
+                val plan = TrailerPhotoMotionPlanner.planMotion(
+                    source = scene.source,
+                    fit = scene.fit,
+                    focusX = scene.focusX,
+                    focusY = scene.focusY,
+                    outputWidth = exportWidth,
+                    outputHeight = exportHeight,
+                    durationSeconds = scene.length,
+                )
+                val effectsList = mutableListOf<androidx.media3.common.Effect>()
+                if (plan.isFit) {
+                    effectsList.add(Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT))
+                } else {
+                    effectsList.add(PhotoMotionGlTransformation(plan, durationUs))
+                    effectsList.add(presentation)
+                }
+                val input = MediaItem.Builder()
+                    .setUri(inputUri)
+                    .setImageDurationMs((scene.length * 1000).toLong())
+                    .build()
+                EditedMediaItem.Builder(input)
+                    .setDurationUs(durationUs)
+                    .setFrameRate(30)
+                    .setEffects(Effects(emptyList(), effectsList))
+                    .build()
             }
-            val inputUri = Uri.fromFile(preprocessedFile)
-            val durationUs = (scene.length * 1_000_000).toLong()
-            val zoomIn = random.nextBoolean()
-            val focalX = (random.nextFloat() * 2f - 1f)
-            val focalY = (random.nextFloat() * 2f - 1f)
-            val kenBurns = ImageKenBurnsTransformation(zoomIn, focalX, focalY, durationUs)
-            val input = MediaItem.Builder()
-                .setUri(inputUri)
-                .setImageDurationMs((scene.length * 1000).toLong())
-                .build()
-            EditedMediaItem.Builder(input)
-                .setDurationUs(durationUs)
-                .setFrameRate(30)
-                .setEffects(Effects(emptyList(), listOf(presentation, kenBurns)))
-                .build()
         } else {
             val inputUri = Uri.fromFile(scene.source.file)
             val input = MediaItem.Builder().setUri(inputUri)
@@ -821,7 +985,10 @@ internal object TrailerExporter {
                 onTransformerCreated = onTransformerCreated,
             )
             val fallbackRecoveries = scenes.count { scene ->
-                scene.source.isImage && thumbnailFallbackKeys.contains("${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}")
+                scene.source.isImage && (
+                    thumbnailFallbackKeys.contains("${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}") ||
+                    thumbnailFallbackKeys.contains("full:${scene.source.id}")
+                )
             }
             return GroupExportResult(
                 files = listOf(chunkFile),
