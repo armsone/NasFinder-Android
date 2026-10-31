@@ -20,7 +20,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -65,6 +68,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -146,6 +151,8 @@ internal fun AdaptiveEditorWorkspace(
     var lowerPanelOpen by rememberSaveable(directoryKey) { mutableStateOf(true) }
     var showOutput by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var showMusicPicker by rememberSaveable(directoryKey) { mutableStateOf(false) }
+    // UI-only preview size (1 = default); never part of the project, revision or undo.
+    var previewScale by rememberSaveable { mutableFloatStateOf(1f) }
     var renameOpen by remember { mutableStateOf(false) }
     var collectionDialog by remember { mutableStateOf(false) }
     // Finder selections are held in the view model so route changes, web roundtrips and minimization preserve them.
@@ -261,8 +268,8 @@ internal fun AdaptiveEditorWorkspace(
                 VerticalHairline()
             }
             if (isLandscape) {
-                // Expanded landscape: left ~2/3 multirow scene board, right ~1/3 small preview above existing inspector
-                Column(Modifier.weight(2f).fillMaxHeight()) {
+                // Expanded landscape: left scene board and right preview/inspector equal widths (1:1)
+                Column(Modifier.weight(1f).fillMaxHeight()) {
                     EditorHeader(
                         session = session,
                         compact = false,
@@ -330,6 +337,7 @@ internal fun AdaptiveEditorWorkspace(
                         onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
                         isPhone = false,
                         onOpenDetail = {},
+                        fixedColumns = 4,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                     )
                 }
@@ -351,8 +359,13 @@ internal fun AdaptiveEditorWorkspace(
                             onSaveToPhoneHard = model::saveTrailer,
                             onCollection = { collectionDialog = true },
                             onExport = model::exportEditorProject,
-                            visualHeight = stageVisualHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp)),
+                            visualHeight = scaledStageHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp), maxHeight * 0.5f, previewScale, imeVisible),
+                            baseVisualHeight = stageVisualHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp)),
+                            maxVisualHeight = scaledStageHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp), maxHeight * 0.5f, 2f, imeVisible),
+                            previewScale = previewScale,
+                            onPreviewScaleChange = { previewScale = it },
                             showControls = !imeVisible,
+                            inlinePlaybackAllowed = !fullscreenPlayback,
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         )
                     }
@@ -505,8 +518,13 @@ internal fun AdaptiveEditorWorkspace(
                                 onSaveToPhoneHard = model::saveTrailer,
                                 onCollection = { collectionDialog = true },
                                 onExport = model::exportEditorProject,
-                                visualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp)),
+                                visualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp), maxHeight * 0.45f, previewScale, imeVisible),
+                                baseVisualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp)),
+                                maxVisualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp), maxHeight * 0.45f, 2f, imeVisible),
+                                previewScale = previewScale,
+                                onPreviewScaleChange = { previewScale = it },
                                 showControls = !imeVisible,
+                                inlinePlaybackAllowed = !fullscreenPlayback,
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                             )
                         }
@@ -573,8 +591,13 @@ internal fun AdaptiveEditorWorkspace(
                                 onSaveToPhoneHard = model::saveTrailer,
                                 onCollection = { collectionDialog = true },
                                 onExport = model::exportEditorProject,
-                                visualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp)),
+                                visualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp), maxHeight * 0.34f, previewScale, imeVisible),
+                                baseVisualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp)),
+                                maxVisualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp), maxHeight * 0.34f, 2f, imeVisible),
+                                previewScale = previewScale,
+                                onPreviewScaleChange = { previewScale = it },
                                 showControls = !imeVisible,
+                                inlinePlaybackAllowed = !fullscreenPlayback,
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                             )
                         }
@@ -1003,6 +1026,17 @@ private fun outputAspect(session: TrailerSession): Float {
 private fun stageVisualHeight(session: TrailerSession, paneWidth: Dp, cap: Dp): Dp =
     minOf(paneWidth / outputAspect(session), cap)
 
+/**
+ * Default stage height times the user's preview size, never taller than the picture at full pane width nor
+ * [maxCap] (a share of the pane height, so the inspector keeps the rest). While typing the safe default is used.
+ */
+private fun scaledStageHeight(session: TrailerSession, paneWidth: Dp, cap: Dp, maxCap: Dp, scale: Float, imeVisible: Boolean): Dp {
+    val base = stageVisualHeight(session, paneWidth, cap)
+    if (imeVisible) return base
+    val limit = maxOf(base, stageVisualHeight(session, paneWidth, maxCap))
+    return (base * scale).coerceIn(minOf(base, 48.dp), limit)
+}
+
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun EditorStage(
@@ -1022,6 +1056,12 @@ private fun EditorStage(
     visualHeight: Dp,
     modifier: Modifier,
     showControls: Boolean = true,
+    previewScale: Float = 1f,
+    onPreviewScaleChange: ((Float) -> Unit)? = null,
+    baseVisualHeight: Dp = visualHeight,
+    maxVisualHeight: Dp = visualHeight,
+    // False while the fullscreen viewer is open: inline players pause (and stay paused on return) so only one plays.
+    inlinePlaybackAllowed: Boolean = true,
 ) {
     // The picture has its own bounded height; the selector and output actions add their own rows around it
     // instead of squeezing the video. While typing (showControls=false) only the picture stays.
@@ -1034,11 +1074,51 @@ private fun EditorStage(
         }
         Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
             if (showOutput && output != null) {
-                OutputPlayer(output, Modifier.fillMaxSize())
+                OutputPlayer(output, inlinePlaybackAllowed, Modifier.fillMaxSize())
             } else if (scene != null && source != null) {
-                ScenePreview(session, scene, source, caption, Modifier.fillMaxSize())
+                ScenePreview(session, scene, source, caption, inlinePlaybackAllowed, Modifier.fillMaxSize())
             } else {
                 Text("장면을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (onPreviewScaleChange != null && showControls) {
+            // Preview size is a UI preference only: dragging the handle under the picture changes this picture's
+            // height (down = larger), not framing or export. The scale is derived from the height actually shown so
+            // aspect/pane caps never leave a hidden overshoot (dead zone) to drag back through.
+            val currentVisual by rememberUpdatedState(visualHeight)
+            var dragHeight by remember { mutableStateOf(visualHeight) }
+            val minHeight = maxOf(baseVisualHeight * 0.5f, minOf(baseVisualHeight, 48.dp))
+            val maxHeight = maxOf(baseVisualHeight, maxVisualHeight)
+            fun applyHeight(height: Dp) {
+                dragHeight = height.coerceIn(minHeight, maxHeight)
+                if (baseVisualHeight > 0.dp) onPreviewScaleChange((dragHeight / baseVisualHeight).coerceIn(0.5f, 2f))
+            }
+            val density = LocalDensity.current
+            val dragState = rememberDraggableState { deltaPx -> applyHeight(dragHeight + with(density) { deltaPx.toDp() }) }
+            val step = baseVisualHeight * 0.1f
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .draggable(dragState, Orientation.Vertical, onDragStarted = { dragHeight = currentVisual }),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    Modifier.weight(1f).heightIn(min = 48.dp).semantics {
+                        contentDescription = "미리보기 크기 조절, 위아래로 드래그"
+                        customActions = listOf(
+                            CustomAccessibilityAction("미리보기 크게") { dragHeight = currentVisual; applyHeight(currentVisual + step); true },
+                            CustomAccessibilityAction("미리보기 작게") { dragHeight = currentVisual; applyHeight(currentVisual - step); true },
+                        )
+                    },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Box(Modifier.size(width = 48.dp, height = 5.dp).clip(CircleShape).background(MaterialTheme.colorScheme.onSurfaceVariant))
+                    Text("위아래로 드래그해 크기 조절", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
+                }
             }
         }
         if (showOutput && output != null && showControls) {
@@ -1066,7 +1146,7 @@ private fun EditorStage(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun OutputPlayer(output: File, modifier: Modifier) {
+private fun OutputPlayer(output: File, playbackAllowed: Boolean, modifier: Modifier) {
     val context = LocalContext.current
     val player = remember(output) {
         ExoPlayer.Builder(context).build().apply {
@@ -1076,6 +1156,8 @@ private fun OutputPlayer(output: File, modifier: Modifier) {
         }
     }
     DisposableEffect(player) { onDispose { player.release() } }
+    // Paused in the same frame fullscreen opens; position is kept and nothing auto-resumes on return.
+    if (!playbackAllowed) SideEffect { player.pause() }
     AndroidView(
         factory = { PlayerView(it).apply { useController = true; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT; this.player = player } },
         update = { it.player = player },
@@ -1102,10 +1184,13 @@ private data class PhotoPlanKey(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, modifier: Modifier) {
+private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, playbackAllowed: Boolean, modifier: Modifier) {
     val context = LocalContext.current
     val aspect = outputAspect(session)
     var playing by remember(scene.key) { mutableStateOf(false) }
+    // Fullscreen opened: the clip player leaves composition this frame (released) and play is reset, so returning
+    // shows the paused preview instead of auto-resuming. Photo progress is kept.
+    if (!playbackAllowed && playing) SideEffect { playing = false }
     val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
     val planKey = if (source.isImage) {
         PhotoPlanKey(
@@ -1178,7 +1263,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
             Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
-            if (playing && !source.isImage) {
+            if (playing && playbackAllowed && !source.isImage) {
                 // The clip plays through the SAME framing effects the exporter applies (fit/focus in the output size).
                 // If this device's renderer rejects them, playback falls back to centered framing with a visible notice.
                 var framingEffectsFailed by remember(scene.key, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight) { mutableStateOf(false) }
@@ -1393,6 +1478,7 @@ private fun SceneBoard(
     onRequestMoveDialog: (Set<Long>) -> Unit,
     isPhone: Boolean = false,
     onOpenDetail: () -> Unit = {},
+    fixedColumns: Int? = null,
     modifier: Modifier = Modifier,
 ) {
     val project = session.editor ?: return
@@ -1573,7 +1659,7 @@ private fun SceneBoard(
         // Multirow LazyVerticalGrid
         val minCellSize = if (compact) 92.dp else 136.dp
         LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = minCellSize),
+            columns = if (fixedColumns != null) GridCells.Fixed(fixedColumns) else GridCells.Adaptive(minSize = minCellSize),
             state = gridState,
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),

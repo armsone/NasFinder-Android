@@ -194,6 +194,13 @@ internal object PhotoMotionGeometry {
     /** Scenes at least this long get a start hold and a slow final push-in. */
     private const val LONG_SCENE_SECONDS = 2.0
     private const val RATE_SAMPLES = 120
+    /** Scenes up to this long never pan: one fixed center, at most a gentle push-in (pans felt nauseating). */
+    private const val GENTLE_SCENE_SECONDS = 3.0
+    /** Total push-in of a [GENTLE_SCENE_SECONDS] scene; shorter scenes get proportionally less. */
+    private const val GENTLE_MAX_ZOOM = 0.04f
+
+    private fun gentleZoom(durationSeconds: Double): Float =
+        GENTLE_MAX_ZOOM * (durationSeconds / GENTLE_SCENE_SECONDS).toFloat().coerceIn(0f, 1f)
 
     /**
      * Fastest camera travel at any instant of a 채우기 move, in viewport widths (horizontal) or heights (vertical)
@@ -245,8 +252,23 @@ internal object PhotoMotionGeometry {
         val shortScene = !durationSeconds.isFinite() || durationSeconds < MIN_MOTION_SECONDS
         val k = photoAspect / outputAspect
         if (fit == SceneFit.FIT) {
-            return if (shortScene) PhotoMotionPlan.still(photoAspect, outputAspect, "장면이 너무 짧음")
-            else fitMotion(k, durationSeconds, seed, "맞추기 선택")
+            return when {
+                shortScene -> PhotoMotionPlan.still(photoAspect, outputAspect, "장면이 너무 짧음")
+                durationSeconds <= GENTLE_SCENE_SECONDS -> {
+                    // Whole photo stays visible: centered, no drift, zooming in from slightly wide to exactly fit.
+                    val fitW = maxOf(1f, 1f / k)
+                    PhotoMotionPlan(
+                        PhotoMotionMode.FIT_MOTION,
+                        listOf(
+                            PhotoKeyframe(0f, 0.5f, 0.5f, fitW * (1f + gentleZoom(durationSeconds))),
+                            PhotoKeyframe(1f, 0.5f, 0.5f, fitW),
+                        ),
+                        cover = false,
+                        reason = "맞추기 선택 · 짧은 장면 살짝 확대",
+                    )
+                }
+                else -> fitMotion(k, durationSeconds, seed, "맞추기 선택")
+            }
         }
         return CoverPlanner(k, durationSeconds, seed).plan(
             focusX, focusY, shortScene,
@@ -372,6 +394,70 @@ internal object PhotoMotionGeometry {
             }.minBy { it.seconds }
         }
 
+        /**
+         * Scenes up to [GENTLE_SCENE_SECONDS]: no pan, no travelling start, no pull-back. The widest (cover) frame
+         * centered on the user's frame, else the primary head group, else the main subject, else the photo center;
+         * that center is legal at cover width so it stays legal (no clamp drift) for every narrower keyframe. Then a
+         * monotonic push-in of at most [gentleZoom], only as far as the kept people/subject stay fully inside;
+         * none when they do not fit tighter than cover. Under [MIN_MOTION_SECONDS]: the same frame, still.
+         */
+        fun gentlePlan(
+            manual: Boolean,
+            focusX: Float,
+            focusY: Float,
+            still: Boolean,
+            clusters: List<PhotoNormRect>,
+            majorObjects: List<PhotoNormRect>,
+            analysisReliable: Boolean,
+        ): PhotoMotionPlan {
+            val cx: Float
+            val cy: Float
+            val keep: PhotoNormRect?
+            val label: String
+            when {
+                manual -> {
+                    cx = 0.5f + focusX.coerceIn(-1f, 1f) * (1f - coverW) / 2f
+                    cy = 0.5f + focusY.coerceIn(-1f, 1f) * (1f - coverH) / 2f
+                    val userFrame = PhotoViewport(cx, cy, coverW, coverH)
+                    keep = clusters.filter { userFrame.contains(it) }.reduceOrNull { a, b -> a.union(b) }
+                    label = "지정 구도"
+                }
+                clusters.isNotEmpty() || majorObjects.isNotEmpty() -> {
+                    val target = clusters.firstOrNull() ?: majorObjects.first()
+                    val frame = frameFor(target, coverW, coverW)
+                    cx = frame.cx
+                    cy = frame.cy
+                    keep = target
+                    label = if (clusters.isNotEmpty()) "주인공" else "주요 피사체"
+                }
+                else -> {
+                    cx = 0.5f
+                    cy = 0.5f
+                    keep = null
+                    label = if (analysisReliable) "가운데" else "분석 결과 없음 · 가운데"
+                }
+            }
+            var endW = coverW / (1f + gentleZoom(duration))
+            if (keep != null) {
+                val need = maxOf(2f * maxOf(cx - keep.left, keep.right - cx), 2f * maxOf(cy - keep.top, keep.bottom - cy) / k)
+                endW = if (need >= coverW) coverW else maxOf(endW, need)
+            }
+            if (still || endW >= coverW - 1e-4f) {
+                return PhotoMotionPlan(
+                    PhotoMotionMode.STILL,
+                    listOf(PhotoKeyframe(0f, cx, cy, coverW)),
+                    cover = true,
+                    reason = if (still) "장면이 너무 짧음" else "짧은 장면 · $label 고정",
+                )
+            }
+            return PhotoMotionPlan(
+                if (manual) PhotoMotionMode.MANUAL_FILL else PhotoMotionMode.ZOOM,
+                listOf(PhotoKeyframe(0f, cx, cy, coverW), PhotoKeyframe(1f, cx, cy, endW)),
+                cover = true,
+                reason = "짧은 장면 · $label 살짝 확대",
+            )
+        }
+
         fun orders(items: List<Int>): List<List<Int>> =
             if (items.size <= 1) listOf(items) else items.flatMap { first -> orders(items - first).map { listOf(first) + it } }
 
@@ -394,6 +480,9 @@ internal object PhotoMotionGeometry {
                 k > 1.02f -> PhotoMotionMode.PAN_HORIZONTAL
                 k < 0.98f -> PhotoMotionMode.PAN_VERTICAL
                 else -> PhotoMotionMode.ZOOM
+            }
+            if (shortScene || duration <= GENTLE_SCENE_SECONDS) {
+                return gentlePlan(manual, focusX, focusY, shortScene, clusters, majorObjects, analysisReliable)
             }
 
             // Final target: the user's frame, else the primary person, else the main subject, else the center.
@@ -441,15 +530,6 @@ internal object PhotoMotionGeometry {
                     describe = { _ -> if (analysisReliable) "인물·피사체 없음 · 가운데로 이동" else "분석 결과 없음 · 가운데로 이동" }
                 }
             }
-            if (shortScene) {
-                return PhotoMotionPlan(
-                    PhotoMotionMode.STILL,
-                    listOf(PhotoKeyframe(0f, end.cx, end.cy, coverW)),
-                    cover = true,
-                    reason = "장면이 너무 짧음",
-                )
-            }
-
             // Long scenes open with a brief hold and close with a slow push-in onto the final framing.
             val longScene = duration >= LONG_SCENE_SECONDS
             val arrive = if (longScene) legal(Frame(end.cx, end.cy, minOf(coverW, end.w * 1.06f))) else end
