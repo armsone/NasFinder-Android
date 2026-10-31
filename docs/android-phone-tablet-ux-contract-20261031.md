@@ -215,4 +215,7 @@ Android 사실을 **의미 계약**으로 가져가고 표현은 각 플랫폼 �
 - **상태 보존 및 무변경 원칙:**
   - 선택 장면(`selectedSceneKey`), 다중 선택(`selectedSceneKeys`), 보드 스크롤(`gridScrollState`), 미적용 자막 초안(`captionDraft`), 미리보기 드래그 배율(`previewScale`), 인스펙터 탭은 회전·상세 왕복에도 유지되며 슬라이더 조작이나 리비전 변경으로 스크롤·컨트롤이 초기화되지 않는다.
   - 머리의 `편집본 저장`(`편집본 저장됨` 등 직접 저장 버튼), 아이콘 최소 24dp·툴바 28dp·터치 48dp 기준, 테마·스타일은 바꾸지 않았다.
-- **구현·검증 상태:** 소스 반영 완료(`AdaptiveEditorWorkspace.kt`, `app/build.gradle.kts` versionCode `437850`, versionName `2.34.2`, `BUILD_NUMBER` `202611010111` 유지). 이번 작업에서는 명령·빌드·실기기 실행을 수행하지 않았으며, 실기기(Fold6·TriFold 세로/가로) 런타임 시각 검증은 팀장(TM)의 격리 후보 빌드·설치 후 확인 대기 상태다.
+- **키보드(IME) 전체 창 밀림(adjustPan) 방지 보완:**
+  - TriFold 펼친 가로(2160×1584, density 320) 실기기 점검에서 오른쪽 인스펙터 하단 자막 입력창에 포커스를 주면 소프트 키보드가 열리면서 OS 기본 소프트 입력 동작(`adjustPan`)이 작동해 창 전체가 위로 밀려 상단 헤더·미리보기·탭이 물리 화면 및 상태 표시줄 위로 사라지는 현상이 확인되었다(`WindowInsets.safeDrawing` 패딩만으로는 Activity의 `adjustPan` 이동을 막지 못함).
+  - `AndroidManifest.xml`의 `MainActivity`에 플랫폼 표준 `android:windowSoftInputMode="adjustResize"`를 명시하고, `AdaptiveEditorWorkspace.kt` 루트 `Row`(및 전체화면/패널 파인더 `Box`)에 `.consumeWindowInsets(WindowInsets.safeDrawing)`을 함께 적용해 상위에서 소비한 시스템 바·IME 인셋이 하위 스크롤/포커스 컨테이너에서 중복 소비되지 않도록 고정했다. 전체 작업대를 세로 스크롤로 바꾸지 않고 상단 헤더·단계 표시·고정 미리보기·고정 인스펙터 탭을 그대로 유지한 채, 키보드 위 실제 가용 높이(`paneHeight`) 안에서 미리보기는 최대 112dp로 축소되고 인스펙터 본문(`verticalScroll`)만 입력창을 스크롤해 보여 준다.
+- **구현·검증 상태:** 소스 반영 완료(`AndroidManifest.xml`, `AdaptiveEditorWorkspace.kt`, `app/build.gradle.kts` versionCode `437850`, versionName `2.34.2`, `BUILD_NUMBER` `202611010111` 유지). 이번 작업에서는 명령·빌드·실기기 실행을 수행하지 않았으며, 실기기(Fold6·TriFold 세로/가로) 런타임 시각 검증은 팀장(TM)의 격리 후보 빌드·설치 후 확인 대기 상태다.

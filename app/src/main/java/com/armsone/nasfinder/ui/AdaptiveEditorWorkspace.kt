@@ -423,8 +423,14 @@ internal fun AdaptiveEditorWorkspace(
             }
         }
 
-        // Insets are consumed exactly once here: rail, header, stage controls and footer stay in the safe area.
-        Row(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+        // Insets are consumed exactly once here: rail, header, stage controls and footer stay in the safe area,
+        // and consumeWindowInsets prevents inner focus/scroll containers from double-panning above the keyboard.
+        Row(
+            Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .consumeWindowInsets(WindowInsets.safeDrawing),
+        ) {
             if (tier != EditorTier.FOCUSED && !isPhone) {
                 EditorRail(
                     expanded = railExpanded,
@@ -560,7 +566,12 @@ internal fun AdaptiveEditorWorkspace(
                 tonalElevation = 4.dp,
                 shadowElevation = 8.dp,
             ) {
-                Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                        .consumeWindowInsets(WindowInsets.safeDrawing),
+                ) {
                     EditorFinderPanel(
                         session = session,
                         appState = appState,
