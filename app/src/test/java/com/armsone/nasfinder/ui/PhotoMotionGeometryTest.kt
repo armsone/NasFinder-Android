@@ -12,7 +12,7 @@ import org.junit.Test
  * Samples the whole camera path (every 1% of the scene) the way the exporter renders it: through the GL matrix
  * applied to photo NDC. 채우기 must cover the output with photo pixels in EVERY frame (no letterbox, whatever the
  * people/analysis/focus/length), start at a stable random framing, show every separated main person at some time
- * and end framed on the primary person (else main subject, else center). Explicit 맞추기 keeps the whole photo.
+ * and end framed on the primary person (else main subject, else a stable random legal point). Explicit 맞추기 keeps the whole photo.
  * Time-aware: at every instant the rendered camera stays under the pan/zoom rate limits, so short scenes move
  * gently near their target and only long scenes travel to far people.
  */
@@ -199,17 +199,50 @@ class PhotoMotionGeometryTest {
                     assertCoversEveryFrame(p, pa, oa)
                     assertGentle(p, 3.0, pa, oa)
                     assertTrue("moves ${w}x$h -> ${outW}x$outH", p.isMoving)
-                    assertTrue(zoomRange(p, pa, oa) >= 0.05f)
+                    val zoom = zoomRange(p, pa, oa)
+                    assertTrue("gentle short zoom $zoom", zoom > 0f && zoom <= 0.04f + 1e-5f)
                 }
             }
         }
-        // 16:9 -> 9:16 with nothing detected and time to spare: both sides and the middle get on screen.
+        // 16:9 -> 9:16 with nothing detected and time to spare: both sides get on screen (the end is a random point).
         for (seed in seeds) {
             val p = plan(wideW, wideH, 1080, 1920, reliable = false, duration = 24.0, seed = seed)
             assertGentle(p, 24.0, wideAspect, storyAspect)
             assertSeenSometime(p, wideAspect, storyAspect, PhotoNormRect(0.02f, 0.4f, 0.10f, 0.6f))
             assertSeenSometime(p, wideAspect, storyAspect, PhotoNormRect(0.90f, 0.4f, 0.98f, 0.6f))
-            assertSeenSometime(p, wideAspect, storyAspect, PhotoNormRect(0.46f, 0.4f, 0.54f, 0.6f))
+        }
+    }
+
+    @Test
+    fun noTargetFillAimsAtAStableRandomLegalPoint() {
+        // Wide photo -> portrait has a horizontal range, tall photo -> landscape a vertical one.
+        for ((photo, out) in listOf((wideW to wideH) to (1080 to 1920), (1080 to 1920) to (1920 to 1080))) {
+            val pa = photo.first.toFloat() / photo.second
+            val oa = out.first.toFloat() / out.second
+            for (d in listOf(0.3, 1.0, 3.0, 8.0, 24.0)) {
+                val signs = mutableSetOf<Boolean>()
+                val ends = seeds.map { seed ->
+                    val p = plan(photo.first, photo.second, out.first, out.second, duration = d, seed = seed)
+                    assertEquals(p, plan(photo.first, photo.second, out.first, out.second, duration = d, seed = seed))
+                    assertCoversEveryFrame(p, pa, oa)
+                    val start = p.viewportAt(0f, pa, oa)
+                    val end = p.viewportAt(1f, pa, oa)
+                    if (d <= 3.0) {
+                        assertTrue(p.reason, p.reason.contains("랜덤 구도 살짝"))
+                        signs += end.width < start.width
+                        for (s in samples) {
+                            val v = p.viewportAt(s, pa, oa)
+                            assertEquals(start.centerX, v.centerX, 1e-6f)
+                            assertEquals(start.centerY, v.centerY, 1e-6f)
+                        }
+                    } else {
+                        assertTrue(p.reason, p.reason.endsWith("랜덤 위치로 이동"))
+                    }
+                    if (pa > oa) end.centerX else end.centerY
+                }
+                if (d <= 3.0) assertEquals("both directions ${d}s", setOf(true, false), signs)
+                assertTrue("end varies by photo ${d}s $ends", ends.map { (it * 100).toInt() }.distinct().size >= 3)
+            }
         }
     }
 
@@ -276,20 +309,65 @@ class PhotoMotionGeometryTest {
             assertCoversEveryFrame(p, wideAspect, storyAspect)
             assertTrue(visibleAt(p, 1f, wideAspect, storyAspect, middle))
         }
-        // Every positive short length keeps a face-safe, time-scaled push-in (<= 4% per 3 s) and never pans.
-        for (fit in listOf(SceneFit.FILL, SceneFit.FIT)) for (d in listOf(0.04, 0.2, 0.4)) {
-            val p = plan(wideW, wideH, 1080, 1920, faces = listOf(middle), fit = fit, duration = d)
-            assertNotEquals("short $fit ${d}s ${p.reason}", PhotoMotionMode.STILL, p.mode)
-            val start = p.viewportAt(0f, wideAspect, storyAspect)
-            val end = p.viewportAt(1f, wideAspect, storyAspect)
-            assertEquals("no pan x $fit ${d}s", start.centerX, end.centerX, 1e-6f)
-            assertEquals("no pan y $fit ${d}s", start.centerY, end.centerY, 1e-6f)
-            val zoom = zoomRange(p, wideAspect, storyAspect)
-            assertTrue("zooms at $fit ${d}s", zoom > 0f)
-            assertTrue("zoom $zoom scaled to ${d}s", zoom <= 0.04f * (d / 3.0).toFloat() + 1e-5f)
-            if (fit == SceneFit.FILL) {
-                assertCoversEveryFrame(p, wideAspect, storyAspect)
-                for (s in samples) assertTrue("face kept at s=$s ${d}s", visibleAt(p, s, wideAspect, storyAspect, middle))
+        // Every positive short length keeps a face-safe, time-scaled push-in or pull-out (<= 4% per 3 s) and never pans.
+        // Push-in or pull-out is stable per photo seed; both occur across seeds, same center either way. The seeds
+        // include sequential sources named IMG_0001.jpg.. (id * 31 + name.hashCode()), whose raw low bits all agree.
+        val sequentialSeeds = (1..6).map { i -> 31 * i + "IMG_%04d.jpg".format(i).hashCode() }
+        for (fit in listOf(SceneFit.FILL, SceneFit.FIT)) for (d in listOf(0.04, 0.2, 0.4, 3.0)) {
+            val signs = mutableSetOf<Boolean>()
+            val sequentialSigns = mutableSetOf<Boolean>()
+            for (seed in seeds + sequentialSeeds) {
+                val p = plan(wideW, wideH, 1080, 1920, faces = listOf(middle), fit = fit, duration = d, seed = seed)
+                assertEquals(p, plan(wideW, wideH, 1080, 1920, faces = listOf(middle), fit = fit, duration = d, seed = seed))
+                assertNotEquals("short $fit ${d}s ${p.reason}", PhotoMotionMode.STILL, p.mode)
+                val start = p.viewportAt(0f, wideAspect, storyAspect)
+                val end = p.viewportAt(1f, wideAspect, storyAspect)
+                val zoomIn = end.width < start.width
+                signs += zoomIn
+                if (seed in sequentialSeeds) sequentialSigns += zoomIn
+                assertTrue(p.reason, p.reason.endsWith(if (zoomIn) "살짝 확대" else "살짝 축소"))
+                for (s in samples) {
+                    val v = p.viewportAt(s, wideAspect, storyAspect)
+                    assertEquals("no pan x $fit ${d}s s=$s", start.centerX, v.centerX, 1e-6f)
+                    assertEquals("no pan y $fit ${d}s s=$s", start.centerY, v.centerY, 1e-6f)
+                }
+                val zoom = zoomRange(p, wideAspect, storyAspect)
+                assertTrue("zooms at $fit ${d}s", zoom > 0f)
+                assertTrue("zoom $zoom scaled to ${d}s", zoom <= 0.04f * (d / 3.0).toFloat() + 1e-5f)
+                if (fit == SceneFit.FILL) {
+                    assertCoversEveryFrame(p, wideAspect, storyAspect)
+                    for (s in samples) assertTrue("face kept at s=$s ${d}s", visibleAt(p, s, wideAspect, storyAspect, middle))
+                } else {
+                    for (s in samples) assertTrue("whole photo at s=$s ${d}s", visibleAt(p, s, wideAspect, storyAspect, PhotoNormRect.WHOLE))
+                }
+            }
+            assertEquals("both directions $fit ${d}s", setOf(true, false), signs)
+            assertEquals("sequential IMG_000n both directions $fit ${d}s", setOf(true, false), sequentialSigns)
+        }
+        // Automatic focus is never random: an off-center person beats a conflicting subject, the subject is used only
+        // without people, also from a partial (unreliable) analysis. Width direction matches the reason, both occur
+        // across seeds; same center either way.
+        val subject = PhotoNormRect(0.10f, 0.30f, 0.30f, 0.80f)
+        for ((faces, target) in listOf(listOf(right) to right, emptyList<PhotoNormRect>() to subject)) {
+            for (reliable in listOf(true, false)) for (d in listOf(1.0, 3.0)) {
+                val signs = mutableSetOf<Boolean>()
+                val ends = seeds.map { seed ->
+                    val p = plan(wideW, wideH, 1080, 1920, faces = faces, objects = listOf(subject), reliable = reliable, duration = d, seed = seed)
+                    val start = p.viewportAt(0f, wideAspect, storyAspect)
+                    val zoomIn = p.viewportAt(1f, wideAspect, storyAspect).width < start.width
+                    signs += zoomIn
+                    assertTrue(p.reason, p.reason.endsWith(if (zoomIn) "살짝 확대" else "살짝 축소"))
+                    assertCoversEveryFrame(p, wideAspect, storyAspect)
+                    for (s in samples) {
+                        val v = p.viewportAt(s, wideAspect, storyAspect)
+                        assertEquals(start.centerX, v.centerX, 1e-6f)
+                        assertTrue("$target kept at s=$s ${p.reason}", visibleAt(p, s, wideAspect, storyAspect, target))
+                    }
+                    start.centerX
+                }
+                assertEquals("both directions $target ${d}s", setOf(true, false), signs)
+                for (e in ends) assertEquals(ends[0], e, 1e-6f)
+                assertTrue("aims at $target, not the other side", abs(ends[0] - target.centerX) < 0.15f)
             }
         }
         assertEquals(PhotoMotionMode.STILL, plan(wideW, wideH, 1080, 1920, faces = listOf(middle), duration = 0.0).mode)

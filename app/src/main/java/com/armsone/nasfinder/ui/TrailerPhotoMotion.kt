@@ -205,6 +205,28 @@ internal object PhotoMotionGeometry {
         GENTLE_MAX_ZOOM * (durationSeconds / GENTLE_SCENE_SECONDS).toFloat().coerceIn(0f, 1f)
 
     /**
+     * Stable per-photo push-in vs pull-out for short (≤ 3 s) 맞추기/채우기 scenes: the whole seed is avalanche-mixed
+     * (murmur3 fmix32), not a raw seed bit — sequential ids + IMG_0001-style names share low and Random-first-draw bits.
+     * Pure function of the seed, so preview = export; no other random draw is touched.
+     */
+    private fun shortZoomsIn(seed: Int): Boolean {
+        var h = seed xor 0x3C6EF372
+        h = h xor (h ushr 16)
+        h *= -0x7a143595 // 0x85EBCA6B
+        h = h xor (h ushr 13)
+        h *= -0x3d4d51cb // 0xC2B2AE35
+        h = h xor (h ushr 16)
+        return h >= 0
+    }
+
+    /** The two gentle endpoints at times 0 and 1; pulling out just swaps them (same center, same widths). */
+    private fun gentleKeys(cx: Float, cy: Float, wideW: Float, tightW: Float, zoomIn: Boolean): List<PhotoKeyframe> =
+        listOf(
+            PhotoKeyframe(0f, cx, cy, if (zoomIn) wideW else tightW),
+            PhotoKeyframe(1f, cx, cy, if (zoomIn) tightW else wideW),
+        )
+
+    /**
      * Fastest camera travel at any instant of a 채우기 move, in viewport widths (horizontal) or heights (vertical)
      * per second: a point crosses the frame in no less than 2.5 s, a calm pan rather than a whip.
      */
@@ -230,7 +252,7 @@ internal object PhotoMotionGeometry {
 
     /**
      * @param faces individual detected faces; @param objects individual detected subjects (normalized, oriented photo).
-     * @param analysisReliable false when analysis failed/unavailable: 채우기 still covers, aiming at the photo center.
+     * @param analysisReliable false when analysis failed/unavailable: 채우기 still covers, aiming at a stable random legal point.
      */
     fun plan(
         photoWidth: Int,
@@ -259,16 +281,15 @@ internal object PhotoMotionGeometry {
         if (fit == SceneFit.FIT) {
             return when {
                 durationSeconds <= GENTLE_SCENE_SECONDS -> {
-                    // Whole photo stays visible: centered, no drift, zooming in from slightly wide to exactly fit.
+                    // Whole photo stays visible: centered, no drift, between slightly wide and exactly fit
+                    // (in or out per photo).
                     val fitW = maxOf(1f, 1f / k)
+                    val zoomIn = shortZoomsIn(seed)
                     PhotoMotionPlan(
                         PhotoMotionMode.FIT_MOTION,
-                        listOf(
-                            PhotoKeyframe(0f, 0.5f, 0.5f, fitW * (1f + gentleZoom(durationSeconds))),
-                            PhotoKeyframe(1f, 0.5f, 0.5f, fitW),
-                        ),
+                        gentleKeys(0.5f, 0.5f, fitW * (1f + gentleZoom(durationSeconds)), fitW, zoomIn),
                         cover = false,
-                        reason = "맞추기 선택 · 짧은 장면 살짝 확대",
+                        reason = if (zoomIn) "맞추기 선택 · 짧은 장면 살짝 확대" else "맞추기 선택 · 짧은 장면 살짝 축소",
                     )
                 }
                 else -> fitMotion(k, durationSeconds, seed, "맞추기 선택")
@@ -308,11 +329,11 @@ internal object PhotoMotionGeometry {
 
     /**
      * 채우기 camera path: random legal start (stable per-photo seed) → other people / major points → the primary
-     * person (else main subject, else photo center). All frames lie inside the photo; zoom-out stops at cover.
+     * person (else main subject, else a stable random legal point). All frames lie inside the photo; zoom-out stops at cover.
      * Time-aware: no instant pans faster than [MAX_PAN_SPEED] or zooms faster than [MAX_ZOOM_RATE]; stops that do
      * not fit the scene at that pace are skipped, and the start is only as far from the first target as time allows.
      */
-    private class CoverPlanner(private val k: Float, private val duration: Double, seed: Int) {
+    private class CoverPlanner(private val k: Float, private val duration: Double, private val seed: Int) {
         private val coverW = minOf(1f, 1f / k)
         private val coverH = coverW * k
         private val random = kotlin.random.Random(seed)
@@ -363,6 +384,13 @@ internal object PhotoMotionGeometry {
             return Frame(f.cx.coerceIn(f.w / 2f, 1f - f.w / 2f), f.cy.coerceIn(h / 2f, 1f - h / 2f), f.w)
         }
 
+        /** Nothing to aim at: a stable per-photo legal center at width [w], from its own Random so [random] is untouched. */
+        fun randomCenter(w: Float): Frame {
+            val r = kotlin.random.Random(seed xor 0x5EEDF00D)
+            val h = w * k
+            return legal(Frame(w / 2f + (1f - w) * r.nextFloat(), h / 2f + (1f - h) * r.nextFloat(), w))
+        }
+
         fun lerp(a: Frame, b: Frame, f: Float) = Frame(a.cx + (b.cx - a.cx) * f, a.cy + (b.cy - a.cy) * f, a.w + (b.w - a.w) * f)
 
         /** A smoothstep move to the next frame taking [seconds], pulling back mid-way by [pull]. */
@@ -400,9 +428,9 @@ internal object PhotoMotionGeometry {
 
         /**
          * Scenes up to [GENTLE_SCENE_SECONDS]: no pan, no travelling start, no pull-back. The widest (cover) frame
-         * centered on the user's frame, else the primary head group, else the main subject, else the photo center;
+         * centered on the user's frame, else the primary head group, else the main subject, else a random legal point;
          * that center is legal at cover width so it stays legal (no clamp drift) for every narrower keyframe. Then a
-         * monotonic push-in of at most [gentleZoom], only as far as the kept people/subject stay fully inside. Any
+         * monotonic push-in or pull-out (per-photo seed) of at most [gentleZoom], only as far as the kept people/subject stay fully inside. Any
          * nonzero face-safe amount is kept, however small (very short scenes); the frame is still only when the kept
          * people/subject leave no room tighter than cover — a safety reason, never the scene length.
          */
@@ -435,10 +463,12 @@ internal object PhotoMotionGeometry {
                     label = if (clusters.isNotEmpty()) "주인공" else "주요 피사체"
                 }
                 else -> {
-                    cx = 0.5f
-                    cy = 0.5f
+                    // Legal at cover width, so every narrower keyframe keeps this exact center.
+                    val frame = randomCenter(coverW)
+                    cx = frame.cx
+                    cy = frame.cy
                     keep = null
-                    label = if (analysisReliable) "가운데" else "분석 결과 없음 · 가운데"
+                    label = if (analysisReliable) "랜덤 구도" else "분석 결과 없음 · 랜덤 구도"
                 }
             }
             var endW = coverW / (1f + gentleZoom(duration))
@@ -457,11 +487,13 @@ internal object PhotoMotionGeometry {
                     reason = if (faceLimited) "짧은 장면 · $label 고정 (확대하면 잘림)" else "짧은 장면 · $label 고정",
                 )
             }
+            // Push-in (cover → endW) or pull-out (endW → cover) per photo: never wider than cover, own seeded draw.
+            val zoomIn = shortZoomsIn(seed)
             return PhotoMotionPlan(
                 if (manual) PhotoMotionMode.MANUAL_FILL else PhotoMotionMode.ZOOM,
-                listOf(PhotoKeyframe(0f, cx, cy, coverW), PhotoKeyframe(1f, cx, cy, endW)),
+                gentleKeys(cx, cy, coverW, endW, zoomIn),
                 cover = true,
-                reason = "짧은 장면 · $label 살짝 확대",
+                reason = if (zoomIn) "짧은 장면 · $label 살짝 확대" else "짧은 장면 · $label 살짝 축소",
             )
         }
 
@@ -491,7 +523,7 @@ internal object PhotoMotionGeometry {
                 return gentlePlan(manual, focusX, focusY, clusters, majorObjects, analysisReliable)
             }
 
-            // Final target: the user's frame, else the primary person, else the main subject, else the center.
+            // Final target: the user's frame, else the primary person, else the main subject, else a random legal point.
             // Other people/points (most important first) are optional stops on the way.
             val end: Frame
             val stops: List<Frame>
@@ -524,7 +556,7 @@ internal object PhotoMotionGeometry {
                     describe = { _ -> "인물 없음 · 주요 피사체로 이동" }
                 }
                 else -> {
-                    end = frameFor(PhotoNormRect(0.5f, 0.5f, 0.5f, 0.5f), coverW / 1.15f, coverW / 1.15f)
+                    end = randomCenter(coverW / 1.15f)
                     // Nothing detected but much of the photo is off screen: both far sides are optional stops.
                     val w = end.w
                     val sides = when {
@@ -533,7 +565,7 @@ internal object PhotoMotionGeometry {
                         else -> emptyList()
                     }
                     stops = if (random.nextBoolean()) sides else sides.reversed()
-                    describe = { _ -> if (analysisReliable) "인물·피사체 없음 · 가운데로 이동" else "분석 결과 없음 · 가운데로 이동" }
+                    describe = { _ -> if (analysisReliable) "인물·피사체 없음 · 랜덤 위치로 이동" else "분석 결과 없음 · 랜덤 위치로 이동" }
                 }
             }
             // Long scenes open with a brief hold and close with a slow push-in onto the final framing.
@@ -625,7 +657,7 @@ internal object PhotoMotionGeometry {
     }
 }
 
-/** Individual detected faces and subjects (normalized, orientation applied); [failed] when analysis did not run. */
+/** Individual detected faces and subjects (normalized, orientation applied); [failed] when any detector did not run cleanly (valid rects kept, not cached). */
 internal data class PhotoAnalysisData(
     val faces: List<PhotoNormRect>,
     val objects: List<PhotoNormRect>,
@@ -770,26 +802,40 @@ object TrailerPhotoMotionPlanner {
         var resources: AnalysisResources? = null
 
         try {
-            faceDetector = FaceDetection.getClient(
-                FaceDetectorOptions.Builder()
-                    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-                    .build()
-            )
-            objectDetector = ObjectDetection.getClient(
-                ObjectDetectorOptions.Builder()
-                    .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
-                    .enableMultipleObjects()
-                    .build()
-            )
+            // Each detector is independent: one failing keeps the other's valid rects, flagged [failed] so the partial
+            // result is retried later instead of cached as a real "nothing here".
+            var detectionFailed = false
+            faceDetector = try {
+                FaceDetection.getClient(
+                    FaceDetectorOptions.Builder()
+                        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                        .build()
+                )
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                detectionFailed = true
+                null
+            }
+            objectDetector = try {
+                ObjectDetection.getClient(
+                    ObjectDetectorOptions.Builder()
+                        .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
+                        .enableMultipleObjects()
+                        .build()
+                )
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                detectionFailed = true
+                null
+            }
             val res = AnalysisResources(bitmap, faceDetector, objectDetector)
             resources = res
 
             val inputImage = InputImage.fromBitmap(bitmap, 0)
             val faceRects = mutableListOf<PhotoNormRect>()
             val objectRects = mutableListOf<PhotoNormRect>()
-            var detectionFailed = false
 
-            try {
+            if (faceDetector != null) try {
                 val faceTask = faceDetector.process(inputImage)
                 res.registerTask(faceTask)
                 val faces = faceTask.awaitCancellable()
@@ -803,7 +849,7 @@ object TrailerPhotoMotionPlanner {
                         box.width() <= 0 || box.height() <= 0 || right <= left || bottom <= top
                     ) {
                         detectionFailed = true
-                        break
+                        continue
                     }
                     faceRects.add(
                         PhotoNormRect(
@@ -819,7 +865,8 @@ object TrailerPhotoMotionPlanner {
                 detectionFailed = true
             }
 
-            if (!detectionFailed) {
+            // People come first: with a face found the subject pass is not needed.
+            if (faceRects.isEmpty() && objectDetector != null) {
                 try {
                     val objectTask = objectDetector.process(inputImage)
                     res.registerTask(objectTask)
@@ -834,7 +881,7 @@ object TrailerPhotoMotionPlanner {
                             box.width() <= 0 || box.height() <= 0 || right <= left || bottom <= top
                         ) {
                             detectionFailed = true
-                            break
+                            continue
                         }
                         objectRects.add(
                             PhotoNormRect(
@@ -851,11 +898,7 @@ object TrailerPhotoMotionPlanner {
                 }
             }
 
-            if (detectionFailed) {
-                return@withContext PhotoAnalysisData.FAILED
-            }
-
-            PhotoAnalysisData(faceRects, objectRects, failed = false)
+            PhotoAnalysisData(faceRects, objectRects, failed = detectionFailed)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             PhotoAnalysisData.FAILED
@@ -923,7 +966,7 @@ object TrailerPhotoMotionPlanner {
         )
     }
 
-    /** Plan before analysis finishes (preview placeholder): covers the frame and aims at the center until people are known. */
+    /** Plan before analysis finishes (preview placeholder): covers the frame and aims at a stable random legal point until people are known. */
     fun pendingPlan(
         source: TrailerSource,
         fit: SceneFit,
