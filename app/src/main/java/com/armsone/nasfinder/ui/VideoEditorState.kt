@@ -293,6 +293,8 @@ data class EditorExportState(
     val status: String,
     val progress: Float? = null,
     val error: String? = null,
+    // The snapshot's scenes while running (render preview only; never persisted).
+    val scenes: List<TrailerScene> = emptyList(),
 )
 
 enum class EditorAddPhase(val title: String) {

@@ -6331,7 +6331,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val musicFitCount = session.musicFitCount
         val autoDucking = session.autoDucking
         val musicVolume = session.editor?.musicVolume ?: 1f
-        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, "장면을 준비하는 중…")) }
+        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, "장면을 준비하는 중…", scenes = scenes)) }
         editorExportJob = viewModelScope.launch {
             val self = coroutineContext[Job]
             val output = File(directory, "trailer-${UUID.randomUUID()}.mp4")

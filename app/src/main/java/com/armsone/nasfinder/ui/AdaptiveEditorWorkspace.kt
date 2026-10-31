@@ -113,8 +113,11 @@ private fun editorTier(width: Dp): EditorTier = when {
 
 private enum class InspectorTab(val title: String) { SCENE("장면"), CAPTION("자막"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
 
-/** Three separate steps of one project. Choosing a step never renders or saves; only their explicit buttons do. */
-private enum class EditorPhase(val title: String) { EDIT("1 편집"), REVIEW("2 전체 미리보기"), SAVE("3 저장") }
+/**
+ * Two views of one project: editing (the editable draft is saved from the header) and the optional video export.
+ * Choosing a view never renders or saves; only their explicit buttons do.
+ */
+private enum class EditorPhase(val title: String) { EDIT("편집"), EXPORT("영상 만들기") }
 
 // Very short scenes (e.g. near-duplicate photos at 1% weight) would otherwise all read "0.0초".
 private fun seconds1(value: Double): String = if (value > 0.0 && value < 0.095) "%.2f초".format(value) else "%.1f초".format(value)
@@ -150,7 +153,7 @@ internal fun AdaptiveEditorWorkspace(
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var railExpanded by rememberSaveable { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
-    // Entering a project always starts at 1 장면 편집; a render finishing never moves the user to another step.
+    // Entering a project always starts at 편집; a render finishing never moves the user to another view.
     var phase by rememberSaveable(directoryKey) { mutableStateOf(EditorPhase.EDIT) }
     var showMusicPicker by rememberSaveable(directoryKey) { mutableStateOf(false) }
     // UI-only preview size (1 = default); never part of the project, revision or undo.
@@ -186,10 +189,7 @@ internal fun AdaptiveEditorWorkspace(
     val outputCurrent = output != null && session.outputRevision == session.revision
     val rendering = session.export?.running == true
     val saveReady = outputCurrent && !rendering && !session.busy
-    // 3 저장 only exists for the current render: an edit, undo or missing file drops back to 2 (make again there).
-    val shownPhase = if (phase == EditorPhase.SAVE && !outputCurrent) EditorPhase.REVIEW else phase
-    LaunchedEffect(shownPhase) { if (phase != shownPhase) phase = shownPhase }
-    val fullscreenAllowed = shownPhase == EditorPhase.REVIEW && outputCurrent
+    val fullscreenAllowed = phase == EditorPhase.EXPORT && outputCurrent && !rendering
     LaunchedEffect(fullscreenPlayback, fullscreenAllowed) { if (fullscreenPlayback && !fullscreenAllowed) onFullscreenChange(false) }
     // An unapplied 자막 form (its scene changed, or deleted) is never carried silently into the whole video.
     val captionPending = captionDraft?.let { draft ->
@@ -210,7 +210,7 @@ internal fun AdaptiveEditorWorkspace(
     BackHandler(enabled = !fullscreenPlayback) {
         when {
             finderOpen -> finderOpen = false
-            shownPhase != EditorPhase.EDIT -> phase = EditorPhase.EDIT
+            phase != EditorPhase.EDIT -> phase = EditorPhase.EDIT
             phoneDetailOpen -> phoneDetailOpen = false
             else -> onRequestClose()
         }
@@ -241,26 +241,34 @@ internal fun AdaptiveEditorWorkspace(
         // While typing, stages keep only their (smaller) picture so the inspector field and 적용/취소 stay reachable.
         val imeVisible = WindowInsets.isImeVisible
 
-        // Moving to 2/3 first sends an unapplied 자막 form back to its own 적용/취소 (no silent apply or discard).
-        fun requestPhase(target: EditorPhase) {
-            if (target == EditorPhase.SAVE && !saveReady) return
-            if (target != EditorPhase.EDIT && captionPending) {
-                phase = EditorPhase.EDIT
-                inspectorTab = InspectorTab.CAPTION
-                val ownerKey = captionDraft?.sceneKey?.takeIf { project.scene(it) != null }
-                if (ownerKey != null && ownerKey != selectedSceneKey) {
-                    selectedSceneKey = ownerKey
-                    selectedSceneKeys = setOf(ownerKey)
-                }
-                if (isPhone) phoneDetailOpen = true
-                return
+        // Exporting or saving the draft first sends an unapplied 자막 form back to its own 적용/취소 (no silent apply or discard).
+        fun showPendingCaption(): Boolean {
+            if (!captionPending) return false
+            phase = EditorPhase.EDIT
+            inspectorTab = InspectorTab.CAPTION
+            val ownerKey = captionDraft?.sceneKey?.takeIf { project.scene(it) != null }
+            if (ownerKey != null && ownerKey != selectedSceneKey) {
+                selectedSceneKey = ownerKey
+                selectedSceneKeys = setOf(ownerKey)
             }
+            if (isPhone) phoneDetailOpen = true
+            return true
+        }
+
+        fun requestPhase(target: EditorPhase) {
+            if (target != EditorPhase.EDIT && showPendingCaption()) return
             if (target != EditorPhase.EDIT) finderOpen = false
             phase = target
         }
 
+        // Explicit 편집본 저장: writes the project now (no render needed); the header shows the real saved/failed result.
+        fun requestDraftSave() {
+            if (showPendingCaption()) return
+            model.retryEditorAutosave()
+        }
+
         // Step 1 arranges the same parts per width: the scene board, then the selected scene (preview → tabs →
-        // inspector). Phases change only in the header navigation; steps 2 and 3 replace the area with one task each.
+        // inspector). Phases change only in the header navigation; 영상 만들기 replaces the area with the export.
         @Composable
         fun Board(isPhone: Boolean, fixedColumns: Int?, modifier: Modifier) {
             SceneBoard(
@@ -308,19 +316,20 @@ internal fun AdaptiveEditorWorkspace(
         }
 
         @Composable
-        fun Stage(baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp) {
-            // maxHeight is the editing area left above the keyboard (IME insets are in the Row's padding).
+        fun Stage(paneHeight: Dp, baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp) {
+            // paneHeight is the editing area left above the keyboard (IME insets are in the Row's padding).
             BoxWithConstraints(Modifier.fillMaxWidth()) {
-                val paneWidth = maxWidth - horizontalPadding * 2
-                val cap = (maxHeight * baseShare).coerceIn(72.dp, baseMax)
+                val paneWidth = (maxWidth - horizontalPadding * 2).coerceAtLeast(1.dp)
+                val safePaneHeight = paneHeight.coerceAtLeast(72.dp)
+                val cap = (safePaneHeight * baseShare).coerceIn(72.dp, baseMax)
                 EditorStage(
                     session = session,
                     scene = selectedScene,
                     source = selectedSource,
                     caption = previewCaption,
-                    visualHeight = scaledStageHeight(session, paneWidth, cap, maxHeight * maxShare, previewScale, imeVisible),
+                    visualHeight = scaledStageHeight(session, paneWidth, cap, safePaneHeight * maxShare, previewScale, imeVisible),
                     baseVisualHeight = stageVisualHeight(session, paneWidth, cap),
-                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, maxHeight * maxShare, 2f, imeVisible),
+                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, safePaneHeight * maxShare, 2f, imeVisible),
                     previewScale = previewScale,
                     onPreviewScaleChange = { previewScale = it },
                     showControls = !imeVisible,
@@ -352,50 +361,23 @@ internal fun AdaptiveEditorWorkspace(
             )
         }
 
-        // Step 2: the whole video only. Without a current render nothing old is shown, just the explicit make action.
+        // Optional export: make → watch → 폰하드/공유/컬렉션, all for the current revision only. While rendering the
+        // stage shows the snapshot scene the progress has reached (still frames, no player, no sound); an older
+        // video is never shown, and 저장됨 appears only after the actual 폰하드 save of the current video.
         @Composable
-        fun ReviewPhase(modifier: Modifier) {
+        fun ExportPhase(modifier: Modifier) {
+            val savedCurrent = outputCurrent && session.saved
+            val export = session.export
             Column(modifier) {
                 ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                if (outputCurrent && output != null) {
-                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { onFullscreenChange(true) }, modifier = Modifier.heightIn(min = IconHitTarget)) {
-                            Icon(Icons.Default.Fullscreen, null, Modifier.size(24.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("전체화면")
-                        }
-                    }
-                    // Left on exit (the player is released); fullscreen pauses it in the same frame, nothing autoplays.
-                    OutputPlayer(output, !fullscreenPlayback, Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
-                } else Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                    PhasePrimaryButton(
-                        if (rendering) "영상 만드는 중…" else "영상 만들기",
-                        enabled = !rendering && !session.busy && project.scenes.isNotEmpty(),
-                        modifier = Modifier.widthIn(min = 240.dp),
-                        onClick = model::exportEditorProject,
-                    )
-                }
-            }
-        }
-
-        // Step 3: one destination (폰하드) and one primary action; 저장됨 appears only after the actual save.
-        @Composable
-        fun SavePhase(modifier: Modifier) {
-            val savedCurrent = outputCurrent && session.saved
-            Column(modifier) {
-                Column(
-                    Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    TrailerSectionTitle("저장 위치 · 폰하드")
-                    if (savedCurrent) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Icon(Icons.Default.CheckCircle, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
-                            Text("폰하드에 저장됨", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (rendering && export != null) {
+                    RenderScenePreview(session, export, Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
+                } else if (outputCurrent && output != null) {
+                    FlowRow(
+                        Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
                         OutlinedButton(onClick = ::shareOutput, enabled = saveReady, modifier = Modifier.heightIn(min = IconHitTarget)) {
                             Icon(Icons.Default.Share, null, Modifier.size(24.dp))
                             Spacer(Modifier.width(6.dp))
@@ -406,19 +388,37 @@ internal fun AdaptiveEditorWorkspace(
                             Spacer(Modifier.width(6.dp))
                             Text("컬렉션에 보관")
                         }
+                        TextButton(onClick = { onFullscreenChange(true) }, modifier = Modifier.heightIn(min = IconHitTarget)) {
+                            Icon(Icons.Default.Fullscreen, null, Modifier.size(24.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("전체화면")
+                        }
                     }
-                }
-                PhaseActionRow {
-                    if (savedCurrent) {
-                        PhasePrimaryButton("닫기", enabled = true, modifier = Modifier.weight(1f), onClick = onRequestClose)
-                    } else {
-                        PhasePrimaryButton(
-                            if (session.busy && session.status == PHONEHARD_SAVING_STATUS) "폰하드에 저장 중…" else "폰하드에 저장",
-                            enabled = saveReady,
-                            modifier = Modifier.weight(1f),
-                            onClick = model::saveTrailer,
-                        )
+                    // Left on exit (the player is released); fullscreen pauses it in the same frame, nothing autoplays.
+                    OutputPlayer(output, !fullscreenPlayback, Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
+                    PhaseActionRow {
+                        if (savedCurrent) {
+                            Row(Modifier.weight(1f).heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Default.CheckCircle, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+                                Text("폰하드에 저장됨", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            PhasePrimaryButton("닫기", enabled = true, modifier = Modifier.widthIn(min = 120.dp), onClick = onRequestClose)
+                        } else {
+                            PhasePrimaryButton(
+                                if (session.busy && session.status == PHONEHARD_SAVING_STATUS) "폰하드에 저장 중…" else "폰하드에 저장",
+                                enabled = saveReady,
+                                modifier = Modifier.weight(1f),
+                                onClick = model::saveTrailer,
+                            )
+                        }
                     }
+                } else Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    PhasePrimaryButton(
+                        "영상 만들기",
+                        enabled = !session.busy && project.scenes.isNotEmpty(),
+                        modifier = Modifier.widthIn(min = 240.dp),
+                        onClick = model::exportEditorProject,
+                    )
                 }
             }
         }
@@ -430,7 +430,7 @@ internal fun AdaptiveEditorWorkspace(
                     expanded = railExpanded,
                     finderOpen = finderOpen,
                     onToggleExpanded = { railExpanded = !railExpanded },
-                    // Adding material is editing, so opening the Finder returns to 1 장면 편집.
+                    // Adding material is editing, so opening the Finder returns to 편집.
                     onToggleFinder = {
                         if (!finderOpen) phase = EditorPhase.EDIT
                         finderOpen = !finderOpen
@@ -457,7 +457,7 @@ internal fun AdaptiveEditorWorkspace(
             }
             // One header and the step navigation across every width; below them only the current step's task.
             Column(Modifier.weight(1f).fillMaxHeight()) {
-                if (isPhone && phoneDetailOpen && shownPhase == EditorPhase.EDIT) {
+                if (isPhone && phoneDetailOpen && phase == EditorPhase.EDIT) {
                     Row(
                         Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -488,24 +488,26 @@ internal fun AdaptiveEditorWorkspace(
                         onRename = { renameOpen = true },
                         onUndo = model::editorUndo,
                         onRedo = model::editorRedo,
-                        onRetrySave = model::retryEditorAutosave,
+                        onSaveDraft = ::requestDraftSave,
                     )
                 }
-                EditorPhaseNavigation(current = shownPhase, saveEnabled = saveReady, rendering = rendering, onSelect = ::requestPhase)
+                EditorPhaseNavigation(current = phase, rendering = rendering, onSelect = ::requestPhase)
                 SessionStatusLine(session)
-                when (shownPhase) {
-                    EditorPhase.REVIEW -> ReviewPhase(Modifier.weight(1f).fillMaxWidth())
-                    EditorPhase.SAVE -> SavePhase(Modifier.weight(1f).fillMaxWidth())
+                when (phase) {
+                    EditorPhase.EXPORT -> ExportPhase(Modifier.weight(1f).fillMaxWidth())
                     EditorPhase.EDIT -> if (isLandscape) {
                         // Expanded landscape: left 4-column scene board | right selected scene (preview → tabs →
                         // scrolling inspector) at 1:1.
                         Row(Modifier.weight(1f).fillMaxWidth()) {
                             Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(1f).fillMaxHeight())
                             VerticalHairline()
-                            Column(Modifier.weight(1f).fillMaxHeight()) {
-                                Stage(baseShare = 0.24f, baseMax = 200.dp, maxShare = 0.5f, horizontalPadding = 8.dp)
-                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                                Inspector(Modifier.weight(1f).fillMaxWidth())
+                            BoxWithConstraints(Modifier.weight(1f).fillMaxHeight()) {
+                                val paneHeight = maxHeight
+                                Column(Modifier.fillMaxSize()) {
+                                    Stage(paneHeight = paneHeight, baseShare = 0.24f, baseMax = 180.dp, maxShare = 0.46f, horizontalPadding = 8.dp)
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                                    Inspector(Modifier.weight(1f).fillMaxWidth())
+                                }
                             }
                         }
                     } else if (isPhone) {
@@ -517,20 +519,30 @@ internal fun AdaptiveEditorWorkspace(
                                 FocusedFooter(editEnabled = selectedScene != null, onEditSelected = { phoneDetailOpen = true })
                             }
                         } else {
-                            Stage(baseShare = 0.30f, baseMax = 240.dp, maxShare = 0.45f, horizontalPadding = 12.dp)
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                            Inspector(Modifier.weight(1f).fillMaxWidth())
+                            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                                val paneHeight = maxHeight
+                                Column(Modifier.fillMaxSize()) {
+                                    Stage(paneHeight = paneHeight, baseShare = 0.28f, baseMax = 200.dp, maxShare = 0.44f, horizontalPadding = 12.dp)
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                                    Inspector(Modifier.weight(1f).fillMaxWidth())
+                                }
+                            }
                         }
                     } else {
-                        // Expanded portrait: the board in the upper ~45% of the height, then the selected scene
-                        // (preview → tabs → scrolling inspector).
-                        // While typing, the board yields height so the inspector field and 적용/취소 stay reachable.
-                        Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(if (imeVisible) 0.25f else 0.45f).fillMaxWidth())
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                        Column(Modifier.weight(if (imeVisible) 0.75f else 0.55f).fillMaxWidth()) {
-                            Stage(baseShare = 0.28f, baseMax = 180.dp, maxShare = 0.42f, horizontalPadding = 12.dp)
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                            Inspector(Modifier.weight(1f).fillMaxWidth())
+                        // Expanded portrait: selected-scene preview fixed at the top under the header/nav,
+                        // and below it two equal-width panes filling the remaining height (left 4-column scene grid
+                        // with its own scroll, right inspector with fixed tabs and its own parameter scroll).
+                        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                            val paneHeight = maxHeight
+                            Column(Modifier.fillMaxSize()) {
+                                Stage(paneHeight = paneHeight, baseShare = 0.20f, baseMax = 172.dp, maxShare = 0.34f, horizontalPadding = 12.dp)
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                                Row(Modifier.weight(1f).fillMaxWidth()) {
+                                    Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(1f).fillMaxHeight())
+                                    VerticalHairline()
+                                    Inspector(Modifier.weight(1f).fillMaxHeight())
+                                }
+                            }
                         }
                     }
                 }
@@ -568,7 +580,7 @@ internal fun AdaptiveEditorWorkspace(
     }
 
     if (fullscreenPlayback && fullscreenAllowed && output != null) {
-        // Only the current whole video of step 2 goes full-bleed; the existing viewer keeps its own safe controls.
+        // Only the current whole video of 영상 만들기 goes full-bleed; the existing viewer keeps its own safe controls.
         val item = remember(output) { RemoteFileItem(output.name, "${session.displayTitle}.mp4", output.absolutePath, false, output.length(), mimeType = "video/mp4") }
         val preview = remember(output) { ImagePreviewState(null, listOf(item), 0, BuiltInPreviewKind.VIDEO, cachedFile = output, localFiles = listOf(output)) }
         Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -764,7 +776,7 @@ private fun EditorHeader(
     onRename: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
-    onRetrySave: () -> Unit,
+    onSaveDraft: () -> Unit,
 ) {
     val palette = themePalette()
     val project = session.editor
@@ -779,7 +791,7 @@ private fun EditorHeader(
             Text(session.displayTitle, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val saveLabel = when (session.saveState) {
                 EditorSaveState.SAVING -> "편집본 저장 중…"
-                EditorSaveState.SAVED -> "편집본 자동 저장됨"
+                EditorSaveState.SAVED -> "편집본 저장됨"
                 EditorSaveState.FAILED -> "편집본 저장 실패"
                 EditorSaveState.IDLE -> ""
             }
@@ -792,8 +804,15 @@ private fun EditorHeader(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (session.saveState == EditorSaveState.FAILED) {
-            TextButton(onClick = onRetrySave) { Text("다시 저장", color = palette.danger) }
+        // The editable draft (not a video): saved now on demand, also autosaved; failures stay visible and retry here.
+        TextButton(onClick = onSaveDraft, enabled = session.saveState != EditorSaveState.SAVING, modifier = Modifier.heightIn(min = IconHitTarget)) {
+            val buttonLabel = when (session.saveState) {
+                EditorSaveState.SAVING -> "편집본 저장 중…"
+                EditorSaveState.SAVED -> "편집본 저장됨"
+                EditorSaveState.FAILED -> "저장 다시 시도"
+                EditorSaveState.IDLE -> "편집본 저장"
+            }
+            Text(buttonLabel, color = if (session.saveState == EditorSaveState.FAILED) palette.danger else Color.Unspecified, maxLines = 1)
         }
         IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon)) }
         IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon)) }
@@ -804,31 +823,26 @@ private fun EditorHeader(
 private const val PHONEHARD_SAVING_STATUS = "폰하드에 저장하는 중…"
 
 /**
- * Always-visible step navigation under the header and the only phase control: 1 편집 / 2 전체 미리보기 / 3 저장.
- * The current step is filled and underlined; 3 opens only for the current render while nothing runs. A running render is shown on 2.
+ * Always-visible navigation under the header and the only phase control: 편집 / 영상 만들기.
+ * The current view is filled and underlined; a running render is marked on 영상 만들기.
  */
 @Composable
-private fun EditorPhaseNavigation(current: EditorPhase, saveEnabled: Boolean, rendering: Boolean, onSelect: (EditorPhase) -> Unit) {
+private fun EditorPhaseNavigation(current: EditorPhase, rendering: Boolean, onSelect: (EditorPhase) -> Unit) {
     val palette = themePalette()
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
         EditorPhase.entries.forEach { entry ->
             val selected = entry == current
-            val enabled = selected || entry != EditorPhase.SAVE || saveEnabled
-            val color = when {
-                selected -> MaterialTheme.colorScheme.primary
-                enabled -> MaterialTheme.colorScheme.onSurface
-                else -> MaterialTheme.colorScheme.onSurface.copy(alpha = .38f)
-            }
+            val color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
             Column(
                 Modifier
-                    .weight(if (entry == EditorPhase.REVIEW) 1.4f else 1f)
+                    .weight(1f)
                     .heightIn(min = IconHitTarget)
                     .clip(RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp))
                     .background(if (selected) palette.selected else Color.Transparent)
-                    .clickable(enabled = enabled && !selected, role = Role.Tab) { onSelect(entry) }
+                    .clickable(enabled = !selected, role = Role.Tab) { onSelect(entry) }
                     .semantics {
                         this.selected = selected
-                        if (entry == EditorPhase.REVIEW && rendering) stateDescription = "전체 영상 만드는 중"
+                        if (entry == EditorPhase.EXPORT && rendering) stateDescription = "전체 영상 만드는 중"
                     },
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Bottom,
@@ -846,7 +860,7 @@ private fun EditorPhaseNavigation(current: EditorPhase, saveEnabled: Boolean, re
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (entry == EditorPhase.REVIEW && rendering) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    if (entry == EditorPhase.EXPORT && rendering) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                 }
                 Box(Modifier.fillMaxWidth().height(3.dp).background(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent))
             }
@@ -855,7 +869,7 @@ private fun EditorPhaseNavigation(current: EditorPhase, saveEnabled: Boolean, re
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
 }
 
-/** The fixed bottom row of step 3 (never inside a scrolling pane) holding its single primary action. */
+/** The fixed bottom row of 영상 만들기 (never inside a scrolling pane) holding its single primary action. */
 @Composable
 private fun PhaseActionRow(content: @Composable RowScope.() -> Unit) {
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
@@ -961,11 +975,12 @@ private fun stageVisualHeight(session: TrailerSession, paneWidth: Dp, cap: Dp): 
 
 /**
  * Default stage height times the user's preview size, never taller than the picture at full pane width nor
- * [maxCap] (a share of the pane height, so the inspector keeps the rest). While typing the safe default is used.
+ * [maxCap] (a share of the pane height, so the inspector keeps the rest). While typing, a compact cap is used
+ * so the keyboard leaves ample height for the inspector and its buttons.
  */
 private fun scaledStageHeight(session: TrailerSession, paneWidth: Dp, cap: Dp, maxCap: Dp, scale: Float, imeVisible: Boolean): Dp {
     val base = stageVisualHeight(session, paneWidth, cap)
-    if (imeVisible) return base
+    if (imeVisible) return minOf(base, maxCap.coerceAtLeast(56.dp), 112.dp)
     val limit = maxOf(base, stageVisualHeight(session, paneWidth, maxCap))
     return (base * scale).coerceIn(minOf(base, 48.dp), limit)
 }
@@ -987,7 +1002,7 @@ private fun EditorStage(
     // False while the fullscreen viewer is open: inline players pause (and stay paused on return) so only one plays.
     inlinePlaybackAllowed: Boolean = true,
 ) {
-    // Step 1 stage: the selected scene only (the whole video lives in step 2). The picture has its own bounded
+    // 편집 stage: the selected scene only (the whole video lives in 영상 만들기). The picture has its own bounded
     // height and the resize handle sits under it. While typing (showControls=false) only the picture stays.
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
@@ -1056,6 +1071,50 @@ private fun OutputPlayer(output: File, playbackAllowed: Boolean, modifier: Modif
         update = { it.player = player },
         modifier = modifier.clip(RoundedCornerShape(10.dp)).background(Color.Black),
     )
+}
+
+/**
+ * While the whole video renders: the still of the snapshot scene its progress has reached (by scene length), framed
+ * like the scene preview. Silent and control-free; it never shows an older render as the result.
+ */
+@Composable
+private fun RenderScenePreview(session: TrailerSession, export: EditorExportState, modifier: Modifier) {
+    val scenes = export.scenes
+    val totalLength = scenes.sumOf { it.length }
+    val reached = (export.progress ?: 0f).coerceIn(0f, 1f) * totalLength
+    var index = 0
+    var elapsed = 0.0
+    while (index < scenes.lastIndex && elapsed + scenes[index].length <= reached) {
+        elapsed += scenes[index].length
+        index++
+    }
+    val scene = scenes.getOrNull(index)
+    // Keyed by the shown frame only; the previous still stays until the next one is decoded (no flashing).
+    val frame by produceState<Bitmap?>(null, scene?.source?.file, scene?.start) {
+        value = scene?.let { withContext(Dispatchers.IO) { loadFrame(it.source.file, it.source.isImage, it.start, 960) } }
+    }
+    val (outputWidth, outputHeight) = session.format.resolveDimensions(scenes.map { it.source }.ifEmpty { session.sources })
+    val aspect = if (outputHeight > 0) outputWidth.toFloat() / outputHeight else 16f / 9f
+    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+        val boxWidth = minOf(maxWidth, maxHeight * aspect)
+        Box(
+            Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            val bitmap = frame
+            if (scene != null && bitmap != null) {
+                val isFit = scene.fit == SceneFit.FIT
+                val image = remember(bitmap) { bitmap.asImageBitmap() }
+                Image(
+                    image,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = if (isFit) ContentScale.Fit else ContentScale.Crop,
+                    alignment = if (isFit) Alignment.Center else BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f)),
+                )
+            } else CircularProgressIndicator(Modifier.size(28.dp))
+        }
+    }
 }
 
 /**
@@ -1277,7 +1336,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 onClick = { playing = !playing },
                 modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
             ) {
-                PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "장면 재생 멈춤" else "장면 재생", Modifier.size(20.dp))
+                PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "장면 재생 멈춤" else "장면 재생", Modifier.size(24.dp))
             }
             Text(
                 "${seconds1(scene.length)}${if (!source.isImage) " · ${seconds1(scene.start)}부터" else ""}",
@@ -2608,7 +2667,7 @@ private fun PhotosFinder(
             onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
-            PackIcon(PackGlyph.PHOTOS, null, Modifier.size(18.dp))
+            PackIcon(PackGlyph.PHOTOS, null, Modifier.size(24.dp))
             Spacer(Modifier.width(6.dp))
             Text("시스템 사진 선택기에서 고르기")
         }
@@ -2673,7 +2732,7 @@ private fun NetworkFinder(
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box {
                 TextButton(onClick = { connectionMenu = true }) {
-                    PackIcon(PackGlyph.NAS, null, Modifier.size(18.dp))
+                    PackIcon(PackGlyph.NAS, null, Modifier.size(24.dp))
                     Spacer(Modifier.width(4.dp))
                     Text(connection?.name ?: "연결 선택", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
@@ -2756,7 +2815,7 @@ private fun WebFinder(
             Text("지금 받은 미디어 다운로드가 없습니다.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         OutlinedButton(onClick = { model.show(Screen.WebBrowser) }) {
-            PackIcon(PackGlyph.BROWSER, null, Modifier.size(18.dp))
+            PackIcon(PackGlyph.BROWSER, null, Modifier.size(24.dp))
             Spacer(Modifier.width(6.dp))
             Text("브라우저 열기 (편집은 유지됨)")
         }
