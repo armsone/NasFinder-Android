@@ -139,8 +139,6 @@ internal fun AdaptiveEditorWorkspace(
     var selectedSceneKeys by rememberSaveable(directoryKey) { mutableStateOf(setOfNotNull(project.scenes.firstOrNull()?.key)) }
     var phoneDetailOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     val gridScrollState = rememberLazyGridState()
-    var compactThumbnails by rememberSaveable(directoryKey) { mutableStateOf(false) }
-    var boardSearchQuery by rememberSaveable(directoryKey) { mutableStateOf("") }
     var moveTargetDialogKeys by remember { mutableStateOf<Set<Long>?>(null) }
     // Unapplied 자막 form of one scene (preview only until 적용); survives rotation, never moves to another scene.
     var captionDraft by rememberSaveable(directoryKey, stateSaver = CaptionDraftSaver) { mutableStateOf<CaptionDraft?>(null) }
@@ -148,7 +146,6 @@ internal fun AdaptiveEditorWorkspace(
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var railExpanded by rememberSaveable { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
-    var lowerPanelOpen by rememberSaveable(directoryKey) { mutableStateOf(true) }
     var showOutput by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var showMusicPicker by rememberSaveable(directoryKey) { mutableStateOf(false) }
     // UI-only preview size (1 = default); never part of the project, revision or undo.
@@ -176,8 +173,15 @@ internal fun AdaptiveEditorWorkspace(
         }
         knownSceneKeys = keys
     }
+    // Entering the editor starts on the scene preview, not the last finished output; only a render that finishes
+    // while editing (a new output file or revision) switches to its result. Rotation keeps the seen output.
+    var seenOutputKey by rememberSaveable(directoryKey) { mutableStateOf("${session.output?.absolutePath}@${session.outputRevision}") }
     LaunchedEffect(session.output, session.outputRevision) {
-        if (session.output != null && session.outputRevision == session.revision) showOutput = true
+        val outputKey = "${session.output?.absolutePath}@${session.outputRevision}"
+        if (outputKey != seenOutputKey) {
+            seenOutputKey = outputKey
+            if (session.output != null && session.outputRevision == session.revision) showOutput = true
+        }
     }
     // An actual edit (revision change) that leaves the render stale returns to the live scene preview, so the
     // edit screen never keeps showing old pixels while trim/framing moves. Recomposition, rotation and play/pause
@@ -195,7 +199,6 @@ internal fun AdaptiveEditorWorkspace(
         ?: selectedScene?.caption?.normalizedOrNull().takeIf { captionDraft?.sceneKey != selectedScene?.key }
     val output = session.output?.takeIf { it.isFile && it.length() > 0L }
     val outputCurrent = output != null && session.outputRevision == session.revision
-    val outputStatus = editorOutputStatus(session, output != null, outputCurrent)
     val usedSourceIds = project.scenes.map { it.sourceId }.toSet()
     val usedOrigins = session.sources.filter { it.id in usedSourceIds }.mapNotNull { it.originKey }.toSet()
     val originToSource = session.sources.filter { it.originKey != null }.associateBy { it.originKey!! }
@@ -240,6 +243,123 @@ internal fun AdaptiveEditorWorkspace(
         // While typing, stages keep only their (smaller) picture so the inspector field and 적용/취소 stay reachable.
         val imeVisible = WindowInsets.isImeVisible
 
+        // The three layouts below arrange the same parts: '장면 고르기' board, then '선택한 장면 편집'
+        // (preview → tabs → inspector), then the final make → save step under the editing area.
+        @Composable
+        fun Board(isPhone: Boolean, fixedColumns: Int?, modifier: Modifier) {
+            SceneBoard(
+                session = session,
+                selectedKey = selectedSceneKey,
+                selectedKeys = selectedSceneKeys,
+                onSelectKey = { key ->
+                    selectedSceneKey = key
+                    selectedSceneKeys = setOf(key)
+                    showOutput = false
+                },
+                onToggleSelectKey = { key ->
+                    selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
+                    if (key in selectedSceneKeys) selectedSceneKey = key
+                },
+                onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
+                onClearSelection = { selectedSceneKeys = emptySet() },
+                onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
+                onMoveStep ={ key, delta -> model.editorMoveScene(key, delta) },
+                onDuplicate = { keys ->
+                    if (keys.size == 1) {
+                        model.editorDuplicateScene(keys.first())?.let { newKey ->
+                            selectedSceneKey = newKey
+                            selectedSceneKeys = setOf(newKey)
+                        }
+                    } else {
+                        val newKeys = model.editorDuplicateScenes(keys)
+                        if (newKeys.isNotEmpty()) {
+                            selectedSceneKeys = newKeys.toSet()
+                            selectedSceneKey = newKeys.first()
+                        }
+                    }
+                },
+                onRemove = { keys ->
+                    if (keys.size == 1) model.editorRemoveScene(keys.first())
+                    else model.editorRemoveScenes(keys)
+                },
+                onAddMaterial = { finderOpen = true },
+                gridState = gridScrollState,
+                onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
+                isPhone = isPhone,
+                onOpenDetail = { phoneDetailOpen = true },
+                fixedColumns = fixedColumns,
+                modifier = modifier,
+            )
+        }
+
+        @Composable
+        fun Stage(baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp) {
+            // maxHeight is the editing area left above the keyboard (IME insets are in the Row's padding).
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                val paneWidth = maxWidth - horizontalPadding * 2
+                val cap = (maxHeight * baseShare).coerceIn(72.dp, baseMax)
+                EditorStage(
+                    session = session,
+                    scene = selectedScene,
+                    source = selectedSource,
+                    caption = previewCaption,
+                    output = output,
+                    outputCurrent = outputCurrent,
+                    showOutput = showOutput && output != null,
+                    onShowOutput = { showOutput = it },
+                    onFullscreen = { onFullscreenChange(true) },
+                    onShare = ::shareOutput,
+                    onCollection = { collectionDialog = true },
+                    visualHeight = scaledStageHeight(session, paneWidth, cap, maxHeight * maxShare, previewScale, imeVisible),
+                    baseVisualHeight = stageVisualHeight(session, paneWidth, cap),
+                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, maxHeight * maxShare, 2f, imeVisible),
+                    previewScale = previewScale,
+                    onPreviewScaleChange = { previewScale = it },
+                    showControls = !imeVisible,
+                    inlinePlaybackAllowed = !fullscreenPlayback,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
+                )
+            }
+        }
+
+        @Composable
+        fun Inspector(modifier: Modifier) {
+            EditorInspector(
+                session = session,
+                scene = selectedScene,
+                source = selectedSource,
+                selectedKeys = selectedSceneKeys,
+                captionDraft = captionDraft,
+                onCaptionDraftChange = { captionDraft = it },
+                tab = inspectorTab,
+                onTab = { inspectorTab = it },
+                model = model,
+                onSelectScene = { key ->
+                    selectedSceneKey = key
+                    selectedSceneKeys = setOf(key)
+                },
+                onOpenMusicPicker = { showMusicPicker = true },
+                scrollable = true,
+                modifier = modifier,
+            )
+        }
+
+        // Small pane title naming what is being edited; the inspector keeps the scene's detailed line.
+        @Composable
+        fun EditingHeading() {
+            val index = project.scenes.indexOfFirst { it.key == selectedSceneKey }
+            Row(
+                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("선택한 장면 편집", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                if (index >= 0) {
+                    Text("${index + 1}번 장면", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 1)
+                }
+            }
+        }
+
         // Insets are consumed exactly once here: rail, header, stage controls and footer stay in the safe area.
         Row(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             if (tier != EditorTier.FOCUSED && !isPhone) {
@@ -269,409 +389,108 @@ internal fun AdaptiveEditorWorkspace(
                 VerticalHairline()
             }
             if (isLandscape) {
-                // Expanded landscape: left scene board and right preview/inspector equal widths (1:1)
+                // Expanded landscape: header across, then left '장면 고르기' board and right '선택한 장면 편집'
+                // (preview → tabs → scrolling inspector) at 1:1; the final make → save step closes the editing pane.
                 Column(Modifier.weight(1f).fillMaxHeight()) {
                     EditorHeader(
                         session = session,
-                        compact = false,
-                        outputCurrent = outputCurrent,
                         onClose = onRequestClose,
                         onRename = { renameOpen = true },
                         onUndo = model::editorUndo,
                         onRedo = model::editorRedo,
-                        onExport = model::exportEditorProject,
-                        onSaveToPhoneHard = model::saveTrailer,
                         onRetrySave = model::retryEditorAutosave,
-                        showPanelToggle = false,
-                        panelOpen = true,
-                        onTogglePanel = {},
                     )
-                    ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                    if (session.busy || session.error != null) {
-                        Text(
-                            session.error ?: session.status,
-                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    SessionStatusLine(session)
+                    Row(Modifier.weight(1f).fillMaxWidth()) {
+                        Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(1f).fillMaxHeight())
+                        VerticalHairline()
+                        Column(Modifier.weight(1f).fillMaxHeight()) {
+                            EditingHeading()
+                            Stage(baseShare = 0.24f, baseMax = 200.dp, maxShare = 0.5f, horizontalPadding = 8.dp)
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                            Inspector(Modifier.weight(1f).fillMaxWidth())
+                            EditorPrimaryRow(session, outputCurrent, onExport = model::exportEditorProject, onSaveToPhoneHard = model::saveTrailer)
+                        }
                     }
-                    SceneBoard(
-                        session = session,
-                        selectedKey = selectedSceneKey,
-                        selectedKeys = selectedSceneKeys,
-                        onSelectKey = { key ->
-                            selectedSceneKey = key
-                            selectedSceneKeys = setOf(key)
-                            showOutput = false
-                        },
-                        onToggleSelectKey = { key ->
-                            selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
-                            if (key in selectedSceneKeys) selectedSceneKey = key
-                        },
-                        onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
-                        onClearSelection = { selectedSceneKeys = emptySet() },
-                        onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
-                        onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
-                        onDuplicate = { keys ->
-                            if (keys.size == 1) {
-                                model.editorDuplicateScene(keys.first())?.let { newKey ->
-                                    selectedSceneKey = newKey
-                                    selectedSceneKeys = setOf(newKey)
-                                }
-                            } else {
-                                val newKeys = model.editorDuplicateScenes(keys)
-                                if (newKeys.isNotEmpty()) {
-                                    selectedSceneKeys = newKeys.toSet()
-                                    selectedSceneKey = newKeys.first()
-                                }
-                            }
-                        },
-                        onRemove = { keys ->
-                            if (keys.size == 1) model.editorRemoveScene(keys.first())
-                            else model.editorRemoveScenes(keys)
-                        },
-                        onAddMaterial = { finderOpen = true },
-                        gridState = gridScrollState,
-                        compact = compactThumbnails,
-                        onToggleCompact = { compactThumbnails = !compactThumbnails },
-                        searchQuery = boardSearchQuery,
-                        onSearchQueryChange = { boardSearchQuery = it },
-                        onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
-                        isPhone = false,
-                        onOpenDetail = {},
-                        fixedColumns = 4,
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                    )
-                }
-                VerticalHairline()
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    // maxHeight is the pane height left above the keyboard (IME insets are in the Row's padding).
-                    BoxWithConstraints(Modifier.fillMaxWidth()) {
-                        EditorStage(
-                            session = session,
-                            scene = selectedScene,
-                            source = selectedSource,
-                            caption = previewCaption,
-                            output = output,
-                            outputCurrent = outputCurrent,
-                            showOutput = showOutput && output != null,
-                            onShowOutput = { showOutput = it },
-                            onFullscreen = { onFullscreenChange(true) },
-                            onShare = ::shareOutput,
-                            onSaveToPhoneHard = model::saveTrailer,
-                            onCollection = { collectionDialog = true },
-                            onExport = model::exportEditorProject,
-                            visualHeight = scaledStageHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp), maxHeight * 0.5f, previewScale, imeVisible),
-                            baseVisualHeight = stageVisualHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp)),
-                            maxVisualHeight = scaledStageHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp), maxHeight * 0.5f, 2f, imeVisible),
-                            previewScale = previewScale,
-                            onPreviewScaleChange = { previewScale = it },
-                            showControls = !imeVisible,
-                            inlinePlaybackAllowed = !fullscreenPlayback,
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                        )
-                    }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                    EditorInspector(
-                        session = session,
-                        scene = selectedScene,
-                        source = selectedSource,
-                        selectedKeys = selectedSceneKeys,
-                        captionDraft = captionDraft,
-                        onCaptionDraftChange = { captionDraft = it },
-                        tab = inspectorTab,
-                        onTab = { inspectorTab = it },
-                        model = model,
-                        onSelectScene = { key ->
-                            selectedSceneKey = key
-                            selectedSceneKeys = setOf(key)
-                        },
-                        onOpenMusicPicker = { showMusicPicker = true },
-                        scrollable = true,
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                    )
                 }
             } else if (isPhone) {
-                // Folded phone: board fills content, selecting scene opens detail editor, back returns to board preserving scroll
+                // Phone: the '장면 고르기' board comes first; a scene tap or '선택한 장면 편집' opens the editing view whose
+                // bottom holds the final make → save step. Back closes the editing view at the same board position.
                 Column(Modifier.weight(1f).fillMaxHeight()) {
                     if (!phoneDetailOpen) {
                         EditorHeader(
                             session = session,
-                            compact = true,
-                            outputCurrent = outputCurrent,
                             onClose = onRequestClose,
                             onRename = { renameOpen = true },
                             onUndo = model::editorUndo,
                             onRedo = model::editorRedo,
-                            onExport = model::exportEditorProject,
-                            onSaveToPhoneHard = model::saveTrailer,
                             onRetrySave = model::retryEditorAutosave,
-                            showPanelToggle = false,
-                            panelOpen = true,
-                            onTogglePanel = {},
                         )
-                        ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                        if (session.busy || session.error != null) {
-                            Text(
-                                session.error ?: session.status,
-                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        // Selection label and move/duplicate/delete/상세 편집 live only in the board's own toolbar.
-                        SceneBoard(
-                            session = session,
-                            selectedKey = selectedSceneKey,
-                            selectedKeys = selectedSceneKeys,
-                            onSelectKey = { key ->
-                                selectedSceneKey = key
-                                selectedSceneKeys = setOf(key)
-                                showOutput = false
-                            },
-                            onToggleSelectKey = { key ->
-                                selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
-                                if (key in selectedSceneKeys) selectedSceneKey = key
-                            },
-                            onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
-                            onClearSelection = { selectedSceneKeys = emptySet() },
-                            onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
-                            onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
-                            onDuplicate = { keys ->
-                                if (keys.size == 1) {
-                                    model.editorDuplicateScene(keys.first())?.let { newKey ->
-                                        selectedSceneKey = newKey
-                                        selectedSceneKeys = setOf(newKey)
-                                    }
-                                } else {
-                                    val newKeys = model.editorDuplicateScenes(keys)
-                                    if (newKeys.isNotEmpty()) {
-                                        selectedSceneKeys = newKeys.toSet()
-                                        selectedSceneKey = newKeys.first()
-                                    }
-                                }
-                            },
-                            onRemove = { keys ->
-                                if (keys.size == 1) model.editorRemoveScene(keys.first())
-                                else model.editorRemoveScenes(keys)
-                            },
-                            onAddMaterial = { finderOpen = true },
-                            gridState = gridScrollState,
-                            compact = compactThumbnails,
-                            onToggleCompact = { compactThumbnails = !compactThumbnails },
-                            searchQuery = boardSearchQuery,
-                            onSearchQueryChange = { boardSearchQuery = it },
-                            onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
-                            isPhone = true,
-                            onOpenDetail = { phoneDetailOpen = true },
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                        )
+                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        SessionStatusLine(session)
+                        Board(isPhone = true, fixedColumns = null, modifier = Modifier.weight(1f).fillMaxWidth())
                         FocusedFooter(
                             onAddMaterial = { finderOpen = true },
-                            primary = editorPrimary(session, outputCurrent),
-                            onExport = model::exportEditorProject,
-                            onSaveToPhoneHard = model::saveTrailer,
+                            editEnabled = selectedScene != null,
+                            onEditSelected = { phoneDetailOpen = true },
                         )
                     } else {
-                        // Phone detail view: small preview + scrollable inspector; Back closes detail
                         Row(
-                            Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 4.dp),
+                            Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            IconButton(onClick = { phoneDetailOpen = false }) {
-                                Icon(Icons.Default.ArrowBack, "장면 보드로 돌아가기")
+                            IconButton(onClick = { phoneDetailOpen = false }, modifier = Modifier.size(IconHitTarget)) {
+                                PackIcon(PackGlyph.BACK, "장면 고르기로 돌아가기", Modifier.size(ToolbarActionIcon))
                             }
                             val curIdx = project.scenes.indexOfFirst { it.key == selectedSceneKey }
                             Text(
-                                if (curIdx >= 0) "${curIdx + 1}번 장면 상세 편집" else "장면 상세 편집",
+                                if (curIdx >= 0) "${curIdx + 1}번 장면 편집" else "선택한 장면 편집",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.weight(1f),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            IconButton(onClick = model::editorUndo, enabled = session.canUndo && !session.busy) {
-                                Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소")
+                            IconButton(onClick = model::editorUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                                Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon))
                             }
-                            IconButton(onClick = model::editorRedo, enabled = session.canRedo && !session.busy) {
-                                Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행")
-                            }
-                            val primary = editorPrimary(session, outputCurrent)
-                            Button(
-                                onClick = { primary.dispatch(model::exportEditorProject, model::saveTrailer) },
-                                enabled = primary.enabled,
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier.padding(end = 4.dp),
-                            ) {
-                                Text(primary.label, fontSize = 13.sp, maxLines = 1)
+                            IconButton(onClick = model::editorRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                                Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon))
                             }
                         }
-                        ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                        BoxWithConstraints(Modifier.fillMaxWidth()) {
-                            EditorStage(
-                                session = session,
-                                scene = selectedScene,
-                                source = selectedSource,
-                                caption = previewCaption,
-                                output = output,
-                                outputCurrent = outputCurrent,
-                                showOutput = showOutput && output != null,
-                                onShowOutput = { showOutput = it },
-                                onFullscreen = { onFullscreenChange(true) },
-                                onShare = ::shareOutput,
-                                onSaveToPhoneHard = model::saveTrailer,
-                                onCollection = { collectionDialog = true },
-                                onExport = model::exportEditorProject,
-                                visualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp), maxHeight * 0.45f, previewScale, imeVisible),
-                                baseVisualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp)),
-                                maxVisualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp), maxHeight * 0.45f, 2f, imeVisible),
-                                previewScale = previewScale,
-                                onPreviewScaleChange = { previewScale = it },
-                                showControls = !imeVisible,
-                                inlinePlaybackAllowed = !fullscreenPlayback,
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                            )
-                        }
+                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        SessionStatusLine(session)
+                        Stage(baseShare = 0.30f, baseMax = 240.dp, maxShare = 0.45f, horizontalPadding = 12.dp)
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                        EditorInspector(
-                            session = session,
-                            scene = selectedScene,
-                            source = selectedSource,
-                            selectedKeys = selectedSceneKeys,
-                            captionDraft = captionDraft,
-                            onCaptionDraftChange = { captionDraft = it },
-                            tab = inspectorTab,
-                            onTab = { inspectorTab = it },
-                            model = model,
-                            onSelectScene = { key ->
-                                selectedSceneKey = key
-                                selectedSceneKeys = setOf(key)
-                            },
-                            onOpenMusicPicker = { showMusicPicker = true },
-                            scrollable = true,
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                        )
+                        Inspector(Modifier.weight(1f).fillMaxWidth())
+                        EditorPrimaryRow(session, outputCurrent, onExport = model::exportEditorProject, onSaveToPhoneHard = model::saveTrailer)
                     }
                 }
             } else {
-                // Expanded portrait: practical detail area and wide multirow board using available height
+                // Expanded portrait: '장면 고르기' board first in the upper ~45% of the available height, then
+                // '선택한 장면 편집' (preview → tabs → scrolling inspector) with the final make → save step at its bottom.
                 Column(Modifier.weight(1f).fillMaxHeight()) {
                     EditorHeader(
                         session = session,
-                        compact = false,
-                        outputCurrent = outputCurrent,
                         onClose = onRequestClose,
                         onRename = { renameOpen = true },
                         onUndo = model::editorUndo,
                         onRedo = model::editorRedo,
-                        onExport = model::exportEditorProject,
-                        onSaveToPhoneHard = model::saveTrailer,
                         onRetrySave = model::retryEditorAutosave,
-                        showPanelToggle = true,
-                        panelOpen = lowerPanelOpen,
-                        onTogglePanel = { lowerPanelOpen = !lowerPanelOpen },
                     )
-                    ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                    if (session.busy || session.error != null) {
-                        Text(
-                            session.error ?: session.status,
-                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    if (lowerPanelOpen) {
-                        BoxWithConstraints(Modifier.fillMaxWidth()) {
-                            EditorStage(
-                                session = session,
-                                scene = selectedScene,
-                                source = selectedSource,
-                                caption = previewCaption,
-                                output = output,
-                                outputCurrent = outputCurrent,
-                                showOutput = showOutput && output != null,
-                                onShowOutput = { showOutput = it },
-                                onFullscreen = { onFullscreenChange(true) },
-                                onShare = ::shareOutput,
-                                onSaveToPhoneHard = model::saveTrailer,
-                                onCollection = { collectionDialog = true },
-                                onExport = model::exportEditorProject,
-                                visualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp), maxHeight * 0.34f, previewScale, imeVisible),
-                                baseVisualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp)),
-                                maxVisualHeight = scaledStageHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp), maxHeight * 0.34f, 2f, imeVisible),
-                                previewScale = previewScale,
-                                onPreviewScaleChange = { previewScale = it },
-                                showControls = !imeVisible,
-                                inlinePlaybackAllowed = !fullscreenPlayback,
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                            )
-                        }
-                        EditorInspector(
-                            session = session,
-                            scene = selectedScene,
-                            source = selectedSource,
-                            selectedKeys = selectedSceneKeys,
-                            captionDraft = captionDraft,
-                            onCaptionDraftChange = { captionDraft = it },
-                            tab = inspectorTab,
-                            onTab = { inspectorTab = it },
-                            model = model,
-                            onSelectScene = { key ->
-                                selectedSceneKey = key
-                                selectedSceneKeys = setOf(key)
-                            },
-                            onOpenMusicPicker = { showMusicPicker = true },
-                            scrollable = true,
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp),
-                        )
+                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    SessionStatusLine(session)
+                    // While typing, the board yields height so the inspector field and 적용/취소 stay reachable.
+                    Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(if (imeVisible) 0.25f else 0.45f).fillMaxWidth())
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                    Column(Modifier.weight(if (imeVisible) 0.75f else 0.55f).fillMaxWidth()) {
+                        EditingHeading()
+                        Stage(baseShare = 0.28f, baseMax = 180.dp, maxShare = 0.42f, horizontalPadding = 12.dp)
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                        Inspector(Modifier.weight(1f).fillMaxWidth())
+                        EditorPrimaryRow(session, outputCurrent, onExport = model::exportEditorProject, onSaveToPhoneHard = model::saveTrailer)
                     }
-                    SceneBoard(
-                        session = session,
-                        selectedKey = selectedSceneKey,
-                        selectedKeys = selectedSceneKeys,
-                        onSelectKey = { key ->
-                            selectedSceneKey = key
-                            selectedSceneKeys = setOf(key)
-                            showOutput = false
-                        },
-                        onToggleSelectKey = { key ->
-                            selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
-                            if (key in selectedSceneKeys) selectedSceneKey = key
-                        },
-                        onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
-                        onClearSelection = { selectedSceneKeys = emptySet() },
-                        onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
-                        onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
-                        onDuplicate = { keys ->
-                            if (keys.size == 1) {
-                                model.editorDuplicateScene(keys.first())?.let { newKey ->
-                                    selectedSceneKey = newKey
-                                    selectedSceneKeys = setOf(newKey)
-                                }
-                            } else {
-                                val newKeys = model.editorDuplicateScenes(keys)
-                                if (newKeys.isNotEmpty()) {
-                                    selectedSceneKeys = newKeys.toSet()
-                                    selectedSceneKey = newKeys.first()
-                                }
-                            }
-                        },
-                        onRemove = { keys ->
-                            if (keys.size == 1) model.editorRemoveScene(keys.first())
-                            else model.editorRemoveScenes(keys)
-                        },
-                        onAddMaterial = { finderOpen = true },
-                        gridState = gridScrollState,
-                        compact = compactThumbnails,
-                        onToggleCompact = { compactThumbnails = !compactThumbnails },
-                        searchQuery = boardSearchQuery,
-                        onSearchQueryChange = { boardSearchQuery = it },
-                        onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
-                        isPhone = false,
-                        onOpenDetail = {},
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                    )
                 }
             }
         }
@@ -788,10 +607,8 @@ internal fun AdaptiveEditorWorkspace(
                         val dest1Based = parsed ?: return@Button
                         model.editorMoveScenesTo(targetKeys, dest1Based - 1)
                         moveTargetDialogKeys = null
-                        if (boardSearchQuery.isBlank()) {
-                            coroutineScope.launch {
-                                gridScrollState.animateScrollToItem((dest1Based - 1).coerceAtLeast(0))
-                            }
+                        coroutineScope.launch {
+                            gridScrollState.animateScrollToItem((dest1Based - 1).coerceAtLeast(0))
                         }
                     },
                     enabled = isValid,
@@ -901,18 +718,11 @@ private fun RailButton(expanded: Boolean, label: String, selected: Boolean, onCl
 @Composable
 private fun EditorHeader(
     session: TrailerSession,
-    compact: Boolean,
-    outputCurrent: Boolean,
     onClose: () -> Unit,
     onRename: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
-    onExport: () -> Unit,
-    onSaveToPhoneHard: () -> Unit,
     onRetrySave: () -> Unit,
-    showPanelToggle: Boolean,
-    panelOpen: Boolean,
-    onTogglePanel: () -> Unit,
 ) {
     val palette = themePalette()
     val project = session.editor
@@ -945,19 +755,7 @@ private fun EditorHeader(
         }
         IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon)) }
         IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon)) }
-        if (showPanelToggle) {
-            IconButton(onClick = onTogglePanel, modifier = Modifier.size(IconHitTarget)) { Icon(if (panelOpen) Icons.Default.ExpandMore else Icons.Default.Tune, if (panelOpen) "편집 패널 접기" else "편집 패널 열기", Modifier.size(ToolbarActionIcon)) }
-        }
-        val primary = editorPrimary(session, outputCurrent)
-        Button(
-            onClick = { primary.dispatch(onExport, onSaveToPhoneHard) },
-            enabled = primary.enabled,
-            colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
-            contentPadding = if (compact) PaddingValues(horizontal = 10.dp, vertical = 6.dp) else ButtonDefaults.ContentPadding,
-            modifier = Modifier.padding(end = if (compact) 4.dp else 8.dp),
-        ) {
-            Text(primary.label, fontSize = if (compact) 13.sp else 14.sp, maxLines = 1)
-        }
+        Spacer(Modifier.width(4.dp))
     }
 }
 
@@ -998,32 +796,39 @@ private fun editorPrimary(session: TrailerSession, outputCurrent: Boolean): Edit
     return EditorPrimary(step, label, enabled)
 }
 
-/** Short output state for the status line; null while rendering/busy (their own progress is shown) or before any output. */
-private fun editorOutputStatus(session: TrailerSession, hasOutput: Boolean, outputCurrent: Boolean): String? = when {
-    session.export?.running == true || session.busy -> null
-    outputCurrent && session.saved -> "폰하드에 저장됨"
-    outputCurrent -> "영상 준비됨 · 폰하드에 저장해 주세요"
-    hasOutput -> "수정 내용으로 영상을 다시 만들어 주세요"
-    else -> null
+/**
+ * The final step closes the editing area as one stable full-width row (never inside the scrolling inspector):
+ * 영상 만들기 / 수정본 만들기 → 폰하드에 저장 → 저장됨. The label itself says where the output stands.
+ */
+@Composable
+private fun EditorPrimaryRow(session: TrailerSession, outputCurrent: Boolean, onExport: () -> Unit, onSaveToPhoneHard: () -> Unit) {
+    val palette = themePalette()
+    val primary = editorPrimary(session, outputCurrent)
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+    Button(
+        onClick = { primary.dispatch(onExport, onSaveToPhoneHard) },
+        enabled = primary.enabled,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).heightIn(min = 48.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
+    ) { Text(primary.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
 }
 
+/** Actual work or failure only (e.g. 폰하드에 저장하는 중…, a save error); a normal finished state adds no line. */
 @Composable
-private fun ExportStatusBar(session: TrailerSession, outputStatus: String?, onCancel: () -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
-    val export = session.export
-    if (export == null) {
-        // Render done ≠ saved: one plain line says where the output stands and what to do next.
-        if (outputStatus != null) {
-            Text(
-                outputStatus,
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        return
-    }
+private fun SessionStatusLine(session: TrailerSession) {
+    if (!session.busy && session.error == null) return
+    Text(
+        session.error ?: session.status,
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.labelMedium,
+        color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** Render progress/cancel, render errors/retry and recovered/excluded notes only; no normal "ready/saved" row. */
+@Composable
+private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
+    val export = session.export ?: return
     val palette = themePalette()
     Surface(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1054,7 +859,7 @@ private fun ExportStatusBar(session: TrailerSession, outputStatus: String?, onCa
                 // Finished-with-notes summary: a render result, never a 폰하드 save confirmation.
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        listOfNotNull(outputStatus, "영상 만들기 ${export.status}").joinToString("\n"),
+                        "영상 만들기 ${export.status}",
                         Modifier.weight(1f),
                         style = MaterialTheme.typography.labelMedium,
                         maxLines = 3,
@@ -1066,8 +871,9 @@ private fun ExportStatusBar(session: TrailerSession, outputStatus: String?, onCa
     }
 }
 
+/** Phone board footer: add material, or open the selected scene for editing (the final step lives there). */
 @Composable
-private fun FocusedFooter(onAddMaterial: () -> Unit, primary: EditorPrimary, onExport: () -> Unit, onSaveToPhoneHard: () -> Unit) {
+private fun FocusedFooter(onAddMaterial: () -> Unit, editEnabled: Boolean, onEditSelected: () -> Unit) {
     val palette = themePalette()
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -1079,11 +885,11 @@ private fun FocusedFooter(onAddMaterial: () -> Unit, primary: EditorPrimary, onE
             Text("재료 추가")
         }
         Button(
-            onClick = { primary.dispatch(onExport, onSaveToPhoneHard) },
-            enabled = primary.enabled,
+            onClick = onEditSelected,
+            enabled = editEnabled,
             modifier = Modifier.weight(1f).heightIn(min = 48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
-        ) { Text(primary.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        ) { Text("선택한 장면 편집", maxLines = 1, overflow = TextOverflow.Ellipsis) }
     }
 }
 
@@ -1121,9 +927,7 @@ private fun EditorStage(
     onShowOutput: (Boolean) -> Unit,
     onFullscreen: () -> Unit,
     onShare: () -> Unit,
-    onSaveToPhoneHard: () -> Unit,
     onCollection: () -> Unit,
-    onExport: () -> Unit,
     visualHeight: Dp,
     modifier: Modifier,
     showControls: Boolean = true,
@@ -1190,24 +994,11 @@ private fun EditorStage(
             }
         }
         if (showOutput && output != null && showControls) {
+            // Secondary output actions only; 수정본 만들기 / 폰하드에 저장 is the final step under the editing area.
             // 폰 폭에서도 칩이 잘리지 않고 다음 줄로 이어진다(가로 스크롤로 숨기지 않음).
             FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                if (!outputCurrent) {
-                    val palette = themePalette()
-                    // Stale output: the same primary step as the header/footer (수정본 만들기), not a separate option.
-                    val primary = editorPrimary(session, outputCurrent)
-                    Button(
-                        onClick = onExport,
-                        enabled = primary.enabled,
-                        colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    ) {
-                        Text(primary.label, fontSize = 12.sp)
-                    }
-                }
                 AssistChip(onClick = onFullscreen, label = { Text("전체화면") }, leadingIcon = { Icon(Icons.Default.Fullscreen, null, Modifier.size(18.dp)) })
                 AssistChip(onClick = onShare, enabled = outputCurrent, label = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null, Modifier.size(18.dp)) })
-                AssistChip(onClick = onSaveToPhoneHard, enabled = outputCurrent && !session.saved && !session.busy, label = { Text(if (session.saved) "폰하드에 저장됨" else "폰하드에 저장") }, leadingIcon = { Icon(Icons.Default.SaveAlt, null, Modifier.size(18.dp)) })
                 AssistChip(onClick = onCollection, enabled = outputCurrent && !session.busy && session.export?.running != true, label = { Text("컬렉션에 보관") }, leadingIcon = { Icon(Icons.Default.VideoLibrary, null, Modifier.size(18.dp)) })
             }
         }
@@ -1523,8 +1314,7 @@ internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimen
 
 /**
  * The explicit scene board (separate from source files): lazy multirow grid, visible numbered thumbnails,
- * duration and source filename, compact/normal size toggle, number/filename search & filter, direct jump to scene,
- * multi-select, and target position dialog.
+ * duration and source filename, every scene in project order, text-labelled multi-select, and target position dialog.
  */
 @Composable
 private fun SceneBoard(
@@ -1541,10 +1331,6 @@ private fun SceneBoard(
     onRemove: (Set<Long>) -> Unit,
     onAddMaterial: () -> Unit,
     gridState: LazyGridState,
-    compact: Boolean,
-    onToggleCompact: () -> Unit,
-    searchQuery: String,
-    onSearchQueryChange: (String) -> Unit,
     onRequestMoveDialog: (Set<Long>) -> Unit,
     isPhone: Boolean = false,
     onOpenDetail: () -> Unit = {},
@@ -1553,127 +1339,63 @@ private fun SceneBoard(
 ) {
     val project = session.editor ?: return
     val sourcesById = session.sources.associateBy { it.id }
-    val coroutineScope = rememberCoroutineScope()
     var multiSelectMode by rememberSaveable { mutableStateOf(false) }
     var menuSceneKey by remember { mutableStateOf<Long?>(null) }
-
-    // Filter scenes by scene number (1-based index in project) or source filename
-    val trimmedQuery = searchQuery.trim()
     val indexedScenes = remember(project.scenes) { project.scenes.mapIndexed { idx, s -> idx to s } }
-    val filteredScenes = remember(indexedScenes, trimmedQuery, sourcesById) {
-        if (trimmedQuery.isEmpty()) {
-            indexedScenes
-        } else {
-            val queryNumber = trimmedQuery.toIntOrNull()
-            indexedScenes.filter { (idx, scene) ->
-                val sceneNum = idx + 1
-                val source = sourcesById[scene.sourceId]
-                (queryNumber != null && sceneNum == queryNumber) ||
-                    sceneNum.toString().contains(trimmedQuery) ||
-                    (source?.name?.contains(trimmedQuery, ignoreCase = true) == true)
-            }
-        }
-    }
 
     Column(modifier) {
-        // Toolbar: Search/Filter + View Size + Multi-select mode
+        // Compact toolbar: what this area is (장면 고르기 + count/length), one text toggle for multi-selection, and
+        // the selected scenes' actions wrapping below. Every scene is always shown in project order.
+        val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
+        val multiActive = multiSelectMode || effectiveSelectedKeys.size > 1
         Surface(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
             shape = RoundedCornerShape(10.dp),
         ) {
-            Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(
+            Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                FlowRow(
                     Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = onSearchQueryChange,
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp),
-                        placeholder = { Text("장면 번호 또는 파일명", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        leadingIcon = { Icon(Icons.Default.Search, null) },
-                        trailingIcon = {
-                            if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { onSearchQueryChange("") }, modifier = Modifier.size(IconHitTarget)) {
-                                    Icon(Icons.Default.Clear, "검색 지우기")
-                                }
-                            }
-                        },
-                        singleLine = true,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
-                    )
-                    // If user typed a valid scene number, offer a 1-tap direct jump button
-                    val jumpTarget = trimmedQuery.toIntOrNull()
-                    if (jumpTarget != null && jumpTarget in 1..project.scenes.size) {
-                        FilledTonalButton(
-                            onClick = {
-                                val targetScene = project.scenes[jumpTarget - 1]
-                                onSelectKey(targetScene.key)
-                                coroutineScope.launch {
-                                    val gridIdx = filteredScenes.indexOfFirst { it.second.key == targetScene.key }
-                                    if (gridIdx >= 0) gridState.animateScrollToItem(gridIdx)
-                                }
-                                if (isPhone) onOpenDetail()
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            modifier = Modifier.heightIn(min = 40.dp),
-                        ) {
-                            Text("${jumpTarget}번 이동", fontSize = 12.sp)
-                        }
-                    }
-                    IconButton(onClick = onToggleCompact, modifier = Modifier.size(IconHitTarget)) {
-                        Icon(
-                            if (compact) Icons.Default.ViewModule else Icons.Default.GridView,
-                            contentDescription = if (compact) "보통 크기로 보기" else "작은 크기로 보기",
-                        )
-                    }
-                    IconButton(
-                        onClick = {
-                            multiSelectMode = !multiSelectMode
-                            if (!multiSelectMode && selectedKeys.size > 1) {
-                                onClearSelection()
-                            }
-                        },
-                        modifier = Modifier.size(IconHitTarget),
-                    ) {
-                        Icon(
-                            Icons.Default.CheckBox,
-                            contentDescription = "다중 선택 모드",
-                            tint = if (multiSelectMode || selectedKeys.size > 1) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                // Active filter summary or selection bar
-                val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
-                // Summary + selection count own one row; the selection actions wrap below it instead of shrinking.
-                Row(
-                    Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    if (trimmedQuery.isNotEmpty()) {
+                    Column(Modifier.align(Alignment.CenterVertically).padding(start = 4.dp, end = 8.dp)) {
+                        Text("장면 고르기", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1)
                         Text(
-                            "검색 결과 ${filteredScenes.size}개 / 전체 ${project.scenes.size}개",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                    } else {
-                        Text(
-                            "전체 장면 ${project.scenes.size}개 · ${trailerLengthTitle(project.scenes.sumOf { it.length })}",
+                            "${project.scenes.size}개 · ${trailerLengthTitle(project.scenes.sumOf { it.length })} · " +
+                                if (multiSelectMode) "눌러서 여러 장면 선택" else "장면을 눌러 편집",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
                         )
                     }
-                    if (effectiveSelectedKeys.isNotEmpty()) {
+                    val toggleLabel = if (multiActive) "선택 끝내기" else "여러 장면 선택"
+                    val toggle: () -> Unit = {
+                        if (multiActive) {
+                            multiSelectMode = false
+                            if (effectiveSelectedKeys.size > 1) onClearSelection()
+                        } else {
+                            multiSelectMode = true
+                        }
+                    }
+                    if (multiActive) {
+                        FilledTonalButton(onClick = toggle, modifier = Modifier.align(Alignment.CenterVertically).heightIn(min = IconHitTarget)) {
+                            Text(toggleLabel, maxLines = 1)
+                        }
+                    } else {
+                        OutlinedButton(onClick = toggle, modifier = Modifier.align(Alignment.CenterVertically).heightIn(min = IconHitTarget)) {
+                            Text(toggleLabel, maxLines = 1)
+                        }
+                    }
+                }
+                if (effectiveSelectedKeys.isNotEmpty()) {
+                    // Selection count and the actions on it share one wrapping row instead of shrinking.
+                    FlowRow(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
                         Text(
                             if (effectiveSelectedKeys.size == 1) {
                                 val curIdx = project.scenes.indexOfFirst { it.key == effectiveSelectedKeys.first() }
@@ -1681,34 +1403,23 @@ private fun SceneBoard(
                             } else {
                                 "${effectiveSelectedKeys.size}개 선택됨"
                             },
+                            Modifier.align(Alignment.CenterVertically).padding(start = 4.dp),
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary,
                             maxLines = 1,
                         )
-                        if (multiSelectMode || effectiveSelectedKeys.size > 1) {
+                        if (multiActive) {
                             TextButton(
                                 onClick = {
                                     if (effectiveSelectedKeys.size == project.scenes.size) onClearSelection()
                                     else onSelectAll()
                                 },
-                                contentPadding = PaddingValues(horizontal = 6.dp),
-                                modifier = Modifier.heightIn(min = IconHitTarget),
+                                contentPadding = PaddingValues(horizontal = 8.dp),
+                                modifier = Modifier.align(Alignment.CenterVertically).heightIn(min = IconHitTarget),
                             ) {
-                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택", fontSize = 12.sp)
+                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택")
                             }
-                        }
-                    }
-                }
-                if (effectiveSelectedKeys.isNotEmpty()) {
-                    FlowRow(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        if (isPhone) {
-                            // Phone: card tap opens the detail editor; this keeps it reachable for multi-selection.
-                            SceneSelectionAction(PackGlyph.SLIDERS, "상세 편집", onClick = onOpenDetail)
                         }
                         SceneSelectionAction(PackGlyph.MOVE, "위치 이동", onClick = { onRequestMoveDialog(effectiveSelectedKeys) })
                         SceneSelectionAction(PackGlyph.DUPLICATE, "복제", description = "장면 복제", onClick = { onDuplicate(effectiveSelectedKeys) })
@@ -1725,7 +1436,7 @@ private fun SceneBoard(
         }
 
         // Multirow LazyVerticalGrid
-        val minCellSize = if (compact) 92.dp else 136.dp
+        val minCellSize = 136.dp
         LazyVerticalGrid(
             columns = if (fixedColumns != null) GridCells.Fixed(fixedColumns) else GridCells.Adaptive(minSize = minCellSize),
             state = gridState,
@@ -1734,7 +1445,7 @@ private fun SceneBoard(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.weight(1f).fillMaxWidth(),
         ) {
-            itemsIndexed(filteredScenes, key = { _, item -> item.second.key }) { _, (originalIndex, scene) ->
+            itemsIndexed(indexedScenes, key = { _, item -> item.second.key }) { _, (originalIndex, scene) ->
                 val source = sourcesById[scene.sourceId] ?: return@itemsIndexed
                 val isSelected = scene.key in selectedKeys || scene.key == selectedKey
                 val thumb by produceState<Bitmap?>(source.thumbnail, source.file, scene.start) {
@@ -1976,7 +1687,7 @@ private fun EditorInspector(
 private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit) {
     if (scene == null || source == null) {
         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("선택한 장면이 없습니다. 아래 타임라인에서 길이나 구간을 조절할 장면을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("선택한 장면이 없습니다. 장면 고르기에서 길이나 구간을 조절할 장면을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             val firstKey = session.editor?.scenes?.firstOrNull()?.key
             if (firstKey != null) {
                 OutlinedButton(onClick = { onSelectScene(firstKey) }) { Text("첫 번째 장면 선택") }
