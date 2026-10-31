@@ -3,6 +3,7 @@ package com.armsone.nasfinder.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
@@ -59,6 +60,20 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
         }
         onDispose {
             controller?.show(WindowInsetsCompat.Type.statusBars())
+        }
+    }
+    // Editor-scoped: the keyboard arrives as IME insets (resize) instead of panning the whole window, so the header,
+    // status bar area and preview stay put and only the inspector scrolls to the focused field. Restored on close.
+    DisposableEffect(context) {
+        val window = context.findHostActivity()?.window
+        val previousMode = window?.attributes?.softInputMode
+        if (window != null && previousMode != null) {
+            @Suppress("DEPRECATION")
+            val resize = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            window.setSoftInputMode((previousMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST.inv()) or resize)
+        }
+        onDispose {
+            if (window != null && previousMode != null) window.setSoftInputMode(previousMode)
         }
     }
 

@@ -453,6 +453,7 @@ object TrailerDraftStore {
         put("focusX", scene.focusX.toDouble())
         put("focusY", scene.focusY.toDouble())
         put("sourceVolume", scene.sourceVolume.toDouble())
+        scene.caption?.normalizedOrNull()?.let { put("caption", it.toJson()) }
     }
 
     private fun draftJson(draft: TrailerDraft) = JSONObject().apply {
@@ -662,6 +663,7 @@ object TrailerDraftStore {
                     focusX = sc.optDouble("focusX", 0.0).toFloat(),
                     focusY = sc.optDouble("focusY", 0.0).toFloat(),
                     sourceVolume = sc.optDouble("sourceVolume", 1.0).toFloat(),
+                    caption = sceneCaptionFromJson(sc.optJSONObject("caption")),
                 )
             }
             if (scenes.isEmpty()) null

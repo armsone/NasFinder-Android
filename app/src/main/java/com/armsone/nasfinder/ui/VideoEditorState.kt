@@ -25,6 +25,8 @@ data class EditorScene(
     val focusX: Float = 0f,
     val focusY: Float = 0f,
     val sourceVolume: Float = 1f,
+    // Optional manual caption for this scene's whole duration; null = no caption (old drafts).
+    val caption: SceneCaption? = null,
 )
 
 /**
@@ -54,6 +56,7 @@ data class EditorProject(
                 focusX = scene.focusX.coerceIn(-1f, 1f),
                 focusY = scene.focusY.coerceIn(-1f, 1f),
                 sourceVolume = if (source.isImage) 1f else scene.sourceVolume.coerceIn(0f, 2f),
+                caption = scene.caption?.normalizedOrNull(),
             )
         }
     }
@@ -71,6 +74,7 @@ data class EditorProject(
                     focusX = scene.focusX,
                     focusY = scene.focusY,
                     sourceVolume = scene.sourceVolume,
+                    caption = scene.caption,
                 )
             }
             return EditorProject(scenes, autoPlan, musicVolume, firstKey + scenes.size)

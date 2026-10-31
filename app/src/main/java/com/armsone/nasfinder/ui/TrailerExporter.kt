@@ -578,7 +578,29 @@ internal object TrailerExporter {
         }
     }
 
+    /**
+     * The scene's caption as a full-frame transparent bitmap overlay, appended AFTER framing/photo motion so it stays
+     * fixed to the output frame. Bitmaps are shared per identical caption within a chunk and never recycled here
+     * (the GL pipeline may still sample them until the export ends).
+     */
+    private fun captionOverlayEffects(
+        context: Context,
+        caption: SceneCaption?,
+        exportWidth: Int,
+        exportHeight: Int,
+        captionBitmaps: MutableMap<SceneCaption, Bitmap>,
+    ): List<androidx.media3.common.Effect> {
+        val normalized = caption?.normalizedOrNull() ?: return emptyList()
+        val bitmap = captionBitmaps.getOrPut(normalized) {
+            SceneCaptionRenderer.render(context, normalized, exportWidth, exportHeight) ?: return emptyList()
+        }
+        val overlay: androidx.media3.effect.TextureOverlay = androidx.media3.effect.BitmapOverlay.createStaticBitmapOverlay(bitmap)
+        return listOf(androidx.media3.effect.OverlayEffect(com.google.common.collect.ImmutableList.of(overlay)))
+    }
+
     private suspend fun buildVideoEditedMediaItem(
+        context: Context,
+        captionBitmaps: MutableMap<SceneCaption, Bitmap>,
         scene: TrailerScene,
         exportWidth: Int,
         exportHeight: Int,
@@ -629,7 +651,7 @@ internal object TrailerExporter {
             // The camera path renders straight into the export size (zoom/pan in photo coordinates, no later crop).
             val effectsList = listOf<androidx.media3.common.Effect>(
                 PhotoMotionGlTransformation(plan, durationUs, exportWidth, exportHeight, plannedAspect),
-            )
+            ) + captionOverlayEffects(context, scene.caption, exportWidth, exportHeight, captionBitmaps)
             val input = MediaItem.Builder()
                 .setUri(inputUri)
                 .setImageDurationMs((scene.length * 1000).toLong())
@@ -648,7 +670,11 @@ internal object TrailerExporter {
             val gain = scene.sourceVolume.coerceIn(0f, 2f)
             val audioEffects = if (abs(gain - 1f) < 0.005f) emptyList() else listOf<androidx.media3.common.audio.AudioProcessor>(SceneGainAudioProcessor(gain))
             EditedMediaItem.Builder(input).setFrameRate(30)
-                .setEffects(Effects(audioEffects, sceneFramingVideoEffects(scene.fit, scene.focusX, scene.focusY, scene.source.width, scene.source.height, exportWidth, exportHeight)))
+                .setEffects(Effects(
+                    audioEffects,
+                    sceneFramingVideoEffects(scene.fit, scene.focusX, scene.focusY, scene.source.width, scene.source.height, exportWidth, exportHeight) +
+                        captionOverlayEffects(context, scene.caption, exportWidth, exportHeight, captionBitmaps),
+                ))
                 .build()
         }
     }
@@ -887,9 +913,12 @@ internal object TrailerExporter {
         onTransformerCreated: (Transformer) -> Unit,
     ) {
         val presentation = Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)
+        val captionBitmaps = mutableMapOf<SceneCaption, Bitmap>()
         val edited = withContext(Dispatchers.IO) {
             scenes.map { scene ->
                 buildVideoEditedMediaItem(
+                    context = context,
+                    captionBitmaps = captionBitmaps,
                     scene = scene,
                     exportWidth = exportWidth,
                     exportHeight = exportHeight,

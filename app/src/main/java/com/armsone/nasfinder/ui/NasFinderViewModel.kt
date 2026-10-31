@@ -5756,6 +5756,23 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    fun editorMoveScenesTo(keys: Set<Long>, targetIndex: Int) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val scenes = session.editor?.scenes ?: return@editProject null
+            val (selected, remaining) = scenes.partition { it.key in keys }
+            if (selected.isEmpty()) return@editProject null
+            val insertAt = targetIndex.coerceIn(0, remaining.size)
+            val newScenes = ArrayList<EditorScene>(scenes.size).apply {
+                addAll(remaining.subList(0, insertAt))
+                addAll(selected)
+                addAll(remaining.subList(insertAt, remaining.size))
+            }
+            if (newScenes == scenes) return@editProject null
+            session.withManualScenes(newScenes)
+        }
+    }
+
     /** Duplicates a scene right after itself; returns the new scene key (or null). */
     fun editorDuplicateScene(key: Long): Long? {
         var newKey: Long? = null
@@ -5774,12 +5791,57 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return newKey
     }
 
+    fun editorDuplicateScenes(keys: Set<Long>): List<Long> {
+        if (keys.isEmpty()) return emptyList()
+        val newKeys = mutableListOf<Long>()
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scenes.none { it.key in keys }) return@editProject null
+            var nextKey = project.nextKey
+            val newScenes = ArrayList<EditorScene>(project.scenes.size + keys.size)
+            for (scene in project.scenes) {
+                newScenes.add(scene)
+                if (scene.key in keys) {
+                    val copyScene = scene.copy(key = nextKey++)
+                    newKeys.add(copyScene.key)
+                    newScenes.add(copyScene)
+                }
+            }
+            session.copy(editor = project.copy(
+                scenes = newScenes,
+                autoPlan = false,
+                nextKey = nextKey,
+            ))
+        }
+        return newKeys
+    }
+
     /** Removes a scene from the project only; the source file and other scenes using it stay. */
     fun editorRemoveScene(key: Long) {
         editProject { session ->
             val scenes = session.editor?.scenes ?: return@editProject null
             if (scenes.none { it.key == key }) return@editProject null
             session.withManualScenes(scenes.filterNot { it.key == key })
+        }
+    }
+
+    fun editorRemoveScenes(keys: Set<Long>) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val scenes = session.editor?.scenes ?: return@editProject null
+            if (scenes.none { it.key in keys }) return@editProject null
+            session.withManualScenes(scenes.filterNot { it.key in keys })
+        }
+    }
+
+    /** Applies one caption (text + style) to the given scenes as a single undoable edit; blank text removes it. */
+    fun editorApplySceneCaption(keys: Set<Long>, caption: SceneCaption?): Boolean {
+        if (keys.isEmpty()) return false
+        val normalized = caption?.normalizedOrNull()
+        return editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scenes.none { it.key in keys }) return@editProject null
+            session.withManualScenes(project.scenes.map { if (it.key in keys) it.copy(caption = normalized) else it })
         }
     }
 

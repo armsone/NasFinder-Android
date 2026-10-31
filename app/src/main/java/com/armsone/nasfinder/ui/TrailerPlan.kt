@@ -267,6 +267,8 @@ data class TrailerScene(
     val focusY: Float = 0f,
     // Original clip audio gain (0 = mute, 1 = as recorded); independent of the whole-video music volume.
     val sourceVolume: Float = 1f,
+    // Manual caption burned in after framing/photo motion, fixed to the output frame; null = none.
+    val caption: SceneCaption? = null,
 )
 enum class TrailerFormat(val title: String, val width: Int, val height: Int) {
     ORIGINAL("원본", 0, 0),

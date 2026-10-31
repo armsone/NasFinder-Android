@@ -25,8 +25,11 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -102,7 +105,7 @@ private fun editorTier(width: Dp): EditorTier = when {
     else -> EditorTier.FOCUSED
 }
 
-private enum class InspectorTab(val title: String) { SCENE("장면"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
+private enum class InspectorTab(val title: String) { SCENE("장면"), CAPTION("자막"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
 
 // Very short scenes (e.g. near-duplicate photos at 1% weight) would otherwise all read "0.0초".
 private fun seconds1(value: Double): String = if (value > 0.0 && value < 0.095) "%.2f초".format(value) else "%.1f초".format(value)
@@ -128,6 +131,15 @@ internal fun AdaptiveEditorWorkspace(
 
     // Workspace UI state survives the temporary picker, panels and rotation for this project only.
     var selectedSceneKey by rememberSaveable(directoryKey) { mutableStateOf(project.scenes.firstOrNull()?.key) }
+    var selectedSceneKeys by rememberSaveable(directoryKey) { mutableStateOf(setOfNotNull(project.scenes.firstOrNull()?.key)) }
+    var phoneDetailOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
+    val gridScrollState = rememberLazyGridState()
+    var compactThumbnails by rememberSaveable(directoryKey) { mutableStateOf(false) }
+    var boardSearchQuery by rememberSaveable(directoryKey) { mutableStateOf("") }
+    var moveTargetDialogKeys by remember { mutableStateOf<Set<Long>?>(null) }
+    // Unapplied 자막 form of one scene (preview only until 적용); survives rotation, never moves to another scene.
+    var captionDraft by rememberSaveable(directoryKey, stateSaver = CaptionDraftSaver) { mutableStateOf<CaptionDraft?>(null) }
+    val coroutineScope = rememberCoroutineScope()
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var railExpanded by rememberSaveable { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
@@ -142,10 +154,18 @@ internal fun AdaptiveEditorWorkspace(
     var knownSceneKeys by remember(directoryKey) { mutableStateOf(project.scenes.map { it.key }) }
     LaunchedEffect(project.scenes.map { it.key }) {
         val keys = project.scenes.map { it.key }
+        val keySet = keys.toSet()
+        val validSelected = selectedSceneKeys.filter { it in keySet }.toSet()
+        if (validSelected != selectedSceneKeys) {
+            selectedSceneKeys = validSelected
+        }
         if (selectedSceneKey == null || project.scene(selectedSceneKey!!) == null) {
             // A removed scene hands the selection to the scene that took its place, not back to scene 1.
             val oldIndex = knownSceneKeys.indexOf(selectedSceneKey).takeIf { it >= 0 }
             selectedSceneKey = if (oldIndex == null) keys.firstOrNull() else (keys.getOrNull(oldIndex) ?: keys.lastOrNull())
+        }
+        if (selectedSceneKeys.isEmpty() && selectedSceneKey != null) {
+            selectedSceneKeys = setOf(selectedSceneKey!!)
         }
         knownSceneKeys = keys
     }
@@ -164,6 +184,8 @@ internal fun AdaptiveEditorWorkspace(
     }
     val selectedScene = selectedSceneKey?.let(project::scene)
     val selectedSource = selectedScene?.let { scene -> session.sources.firstOrNull { it.id == scene.sourceId } }
+    val previewCaption = captionDraft?.takeIf { it.sceneKey == selectedScene?.key }?.caption?.normalizedOrNull()
+        ?: selectedScene?.caption?.normalizedOrNull().takeIf { captionDraft?.sceneKey != selectedScene?.key }
     val output = session.output?.takeIf { it.isFile && it.length() > 0L }
     val outputCurrent = output != null && session.outputRevision == session.revision
     val usedSourceIds = project.scenes.map { it.sourceId }.toSet()
@@ -180,6 +202,7 @@ internal fun AdaptiveEditorWorkspace(
     BackHandler(enabled = !fullscreenPlayback) {
         when {
             finderOpen -> finderOpen = false
+            phoneDetailOpen -> phoneDetailOpen = false
             else -> onRequestClose()
         }
     }
@@ -201,20 +224,17 @@ internal fun AdaptiveEditorWorkspace(
             },
     ) {
         val tier = editorTier(maxWidth)
-        val panelFinderInline = finderOpen && (tier == EditorTier.WIDE || tier == EditorTier.MEDIUM)
-        // 펼친 TriFold(~792dp)처럼 760..919dp에서는 Finder를 오버레이로 두고 우측 300dp 인스펙터를 쓴다(미리보기 >= 360dp).
-        // 패널 토글은 이 우측 인스펙터를 접고 펼치는 데 쓰인다.
-        // MEDIUM(펼친 가로 1080x792dp 등)도 Finder가 인라인으로 열려 있지 않을 때만 우측 인스펙터를 쓰고, 열려 있으면 하단 인스펙터로 폴백한다.
-        // 펼친 세로(~792x1080dp)는 폭이 760..919dp여도 세로가 넉넉하므로 미리보기-장면-편집 패널을 전체 폭으로 쌓는다(우측 패널 없음).
-        val stackedPortrait = tier == EditorTier.RAIL_ONLY && maxHeight > maxWidth
-        val isLandscape = maxWidth > maxHeight
-        val sideInspector = !stackedPortrait && (tier == EditorTier.WIDE ||
-            ((tier == EditorTier.RAIL_ONLY || tier == EditorTier.MEDIUM) && lowerPanelOpen && !panelFinderInline))
-        val sideInspectorWidth = if (tier == EditorTier.WIDE) 340.dp else 300.dp
+        // Two panes only when both stay readable (board ≥ ~500dp, preview+inspector ≥ ~250dp, height ≥ 480dp);
+        // a phone in landscape or any short/narrow window uses the phone board → detail flow instead.
+        val isLandscape = maxWidth > maxHeight && maxWidth >= 840.dp && maxHeight >= 480.dp
+        val isPhone = !isLandscape && (tier == EditorTier.FOCUSED || maxHeight < 560.dp)
+        val panelFinderInline = finderOpen && !isPhone && (tier == EditorTier.WIDE || tier == EditorTier.MEDIUM)
+        // While typing, stages keep only their (smaller) picture so the inspector field and 적용/취소 stay reachable.
+        val imeVisible = WindowInsets.isImeVisible
 
         // Insets are consumed exactly once here: rail, header, stage controls and footer stay in the safe area.
         Row(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-            if (tier != EditorTier.FOCUSED) {
+            if (tier != EditorTier.FOCUSED && !isPhone) {
                 EditorRail(
                     expanded = railExpanded,
                     finderOpen = finderOpen,
@@ -240,52 +260,88 @@ internal fun AdaptiveEditorWorkspace(
                 )
                 VerticalHairline()
             }
-            val unifiedScroll = tier == EditorTier.FOCUSED || (!sideInspector && tier != EditorTier.WIDE && tier != EditorTier.RAIL_ONLY && this@BoxWithConstraints.maxHeight < 680.dp)
-            Column(Modifier.weight(1f).fillMaxHeight()) {
-                EditorHeader(
-                    session = session,
-                    compact = tier == EditorTier.FOCUSED,
-                    outputCurrent = outputCurrent,
-                    onClose = onRequestClose,
-                    onRename = { renameOpen = true },
-                    onUndo = model::editorUndo,
-                    onRedo = model::editorRedo,
-                    onExport = model::exportEditorProject,
-                    onRetrySave = model::retryEditorAutosave,
-                    showPanelToggle = (tier == EditorTier.MEDIUM || tier == EditorTier.RAIL_ONLY) && !stackedPortrait,
-                    panelOpen = lowerPanelOpen,
-                    onTogglePanel = { lowerPanelOpen = !lowerPanelOpen },
-                )
-                ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
-                if (session.busy || session.error != null) {
-                    Text(
-                        session.error ?: session.status,
-                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+            if (isLandscape) {
+                // Expanded landscape: left ~2/3 multirow scene board, right ~1/3 small preview above existing inspector
+                Column(Modifier.weight(2f).fillMaxHeight()) {
+                    EditorHeader(
+                        session = session,
+                        compact = false,
+                        outputCurrent = outputCurrent,
+                        onClose = onRequestClose,
+                        onRename = { renameOpen = true },
+                        onUndo = model::editorUndo,
+                        onRedo = model::editorRedo,
+                        onExport = model::exportEditorProject,
+                        onRetrySave = model::retryEditorAutosave,
+                        showPanelToggle = false,
+                        panelOpen = true,
+                        onTogglePanel = {},
+                    )
+                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    if (session.busy || session.error != null) {
+                        Text(
+                            session.error ?: session.status,
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    SceneBoard(
+                        session = session,
+                        selectedKey = selectedSceneKey,
+                        selectedKeys = selectedSceneKeys,
+                        onSelectKey = { key ->
+                            selectedSceneKey = key
+                            selectedSceneKeys = setOf(key)
+                            showOutput = false
+                        },
+                        onToggleSelectKey = { key ->
+                            selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
+                            if (key in selectedSceneKeys) selectedSceneKey = key
+                        },
+                        onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
+                        onClearSelection = { selectedSceneKeys = emptySet() },
+                        onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
+                        onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
+                        onDuplicate = { keys ->
+                            if (keys.size == 1) {
+                                model.editorDuplicateScene(keys.first())?.let { newKey ->
+                                    selectedSceneKey = newKey
+                                    selectedSceneKeys = setOf(newKey)
+                                }
+                            } else {
+                                val newKeys = model.editorDuplicateScenes(keys)
+                                if (newKeys.isNotEmpty()) {
+                                    selectedSceneKeys = newKeys.toSet()
+                                    selectedSceneKey = newKeys.first()
+                                }
+                            }
+                        },
+                        onRemove = { keys ->
+                            if (keys.size == 1) model.editorRemoveScene(keys.first())
+                            else model.editorRemoveScenes(keys)
+                        },
+                        onAddMaterial = { finderOpen = true },
+                        gridState = gridScrollState,
+                        compact = compactThumbnails,
+                        onToggleCompact = { compactThumbnails = !compactThumbnails },
+                        searchQuery = boardSearchQuery,
+                        onSearchQueryChange = { boardSearchQuery = it },
+                        onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
+                        isPhone = false,
+                        onOpenDetail = {},
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
                     )
                 }
-                if (unifiedScroll) {
-                    val mainScrollState = rememberScrollState()
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .verticalScroll(mainScrollState)
-                    ) {
-                        val stageCeiling = (this@BoxWithConstraints.maxHeight * 0.45f).coerceAtLeast(160.dp)
-                        // 가로 영상처럼 납작한 출력은 폭 기준 높이(+컨트롤 행 여유)만 쓰고, 세로/짧은 화면은 기존 상한을 유지한다.
-                        val stageContentWidth = this@BoxWithConstraints.maxWidth - 24.dp
-                        val stageControlsHeight = if (output != null) 108.dp else 0.dp
-                        val stageWanted = stageContentWidth / outputAspect(session).coerceIn(0.4f, 3f) + stageControlsHeight
-                        val stageMax = stageWanted.coerceIn(160.dp, stageCeiling)
-                        val stageModifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 140.dp, max = stageMax)
+                VerticalHairline()
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    // maxHeight is the pane height left above the keyboard (IME insets are in the Row's padding).
+                    BoxWithConstraints(Modifier.fillMaxWidth()) {
                         EditorStage(
                             session = session,
                             scene = selectedScene,
                             source = selectedSource,
+                            caption = previewCaption,
                             output = output,
                             outputCurrent = outputCurrent,
                             showOutput = showOutput && output != null,
@@ -295,68 +351,151 @@ internal fun AdaptiveEditorWorkspace(
                             onSaveToPhoneHard = model::saveTrailer,
                             onCollection = { collectionDialog = true },
                             onExport = model::exportEditorProject,
-                            modifier = stageModifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            visualHeight = stageVisualHeight(session, maxWidth - 16.dp, (maxHeight * 0.24f).coerceIn(72.dp, 200.dp)),
+                            showControls = !imeVisible,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         )
-                        SceneStrip(
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                    EditorInspector(
+                        session = session,
+                        scene = selectedScene,
+                        source = selectedSource,
+                        selectedKeys = selectedSceneKeys,
+                        captionDraft = captionDraft,
+                        onCaptionDraftChange = { captionDraft = it },
+                        tab = inspectorTab,
+                        onTab = { inspectorTab = it },
+                        model = model,
+                        onSelectScene = { key ->
+                            selectedSceneKey = key
+                            selectedSceneKeys = setOf(key)
+                        },
+                        onOpenMusicPicker = { showMusicPicker = true },
+                        scrollable = true,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                    )
+                }
+            } else if (isPhone) {
+                // Folded phone: board fills content, selecting scene opens detail editor, back returns to board preserving scroll
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    if (!phoneDetailOpen) {
+                        EditorHeader(
                             session = session,
-                            selectedKey = selectedSceneKey,
-                            onSelect = { selectedSceneKey = it; showOutput = false },
-                            onMoveTo = model::editorMoveSceneTo,
-                            onMove = model::editorMoveScene,
-                            onDuplicate = { key -> model.editorDuplicateScene(key)?.let { selectedSceneKey = it } },
-                            onRemove = model::editorRemoveScene,
-                            onAddMaterial = { finderOpen = true },
+                            compact = true,
+                            outputCurrent = outputCurrent,
+                            onClose = onRequestClose,
+                            onRename = { renameOpen = true },
+                            onUndo = model::editorUndo,
+                            onRedo = model::editorRedo,
+                            onExport = model::exportEditorProject,
+                            onRetrySave = model::retryEditorAutosave,
+                            showPanelToggle = false,
+                            panelOpen = true,
+                            onTogglePanel = {},
                         )
-                        if (lowerPanelOpen || tier == EditorTier.FOCUSED) {
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
-                            EditorInspector(
-                                session = session,
-                                scene = selectedScene,
-                                source = selectedSource,
-                                tab = inspectorTab,
-                                onTab = { inspectorTab = it },
-                                model = model,
-                                onSelectScene = { selectedSceneKey = it },
-                                onOpenMusicPicker = { showMusicPicker = true },
-                                scrollable = false,
-                                modifier = Modifier.fillMaxWidth(),
+                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        if (session.busy || session.error != null) {
+                            Text(
+                                session.error ?: session.status,
+                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                    }
-                } else {
-                    if (stackedPortrait) {
-                        // 가로 영상은 폭 기준 높이만, 세로 영상은 화면 높이의 46%까지만 쓰고 나머지는 장면 스트립과 편집 패널이 쓴다.
-                        val stageWidth = this@BoxWithConstraints.maxWidth - 24.dp
-                        val controlsHeight = if (output != null) 108.dp else 0.dp
-                        val wantedHeight = stageWidth / outputAspect(session).coerceIn(0.4f, 3f) + controlsHeight + 12.dp
-                        val stageHeight = wantedHeight.coerceIn(200.dp, (this@BoxWithConstraints.maxHeight * 0.46f).coerceAtLeast(200.dp))
-                        EditorStage(
+                        // Selection label and move/duplicate/delete/상세 편집 live only in the board's own toolbar.
+                        SceneBoard(
                             session = session,
-                            scene = selectedScene,
-                            source = selectedSource,
-                            output = output,
-                            outputCurrent = outputCurrent,
-                            showOutput = showOutput && output != null,
-                            onShowOutput = { showOutput = it },
-                            onFullscreen = { onFullscreenChange(true) },
-                            onShare = ::shareOutput,
-                            onSaveToPhoneHard = model::saveTrailer,
-                            onCollection = { collectionDialog = true },
-                            onExport = model::exportEditorProject,
-                            modifier = Modifier.fillMaxWidth().height(stageHeight).padding(horizontal = 12.dp, vertical = 6.dp),
+                            selectedKey = selectedSceneKey,
+                            selectedKeys = selectedSceneKeys,
+                            onSelectKey = { key ->
+                                selectedSceneKey = key
+                                selectedSceneKeys = setOf(key)
+                                showOutput = false
+                            },
+                            onToggleSelectKey = { key ->
+                                selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
+                                if (key in selectedSceneKeys) selectedSceneKey = key
+                            },
+                            onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
+                            onClearSelection = { selectedSceneKeys = emptySet() },
+                            onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
+                            onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
+                            onDuplicate = { keys ->
+                                if (keys.size == 1) {
+                                    model.editorDuplicateScene(keys.first())?.let { newKey ->
+                                        selectedSceneKey = newKey
+                                        selectedSceneKeys = setOf(newKey)
+                                    }
+                                } else {
+                                    val newKeys = model.editorDuplicateScenes(keys)
+                                    if (newKeys.isNotEmpty()) {
+                                        selectedSceneKeys = newKeys.toSet()
+                                        selectedSceneKey = newKeys.first()
+                                    }
+                                }
+                            },
+                            onRemove = { keys ->
+                                if (keys.size == 1) model.editorRemoveScene(keys.first())
+                                else model.editorRemoveScenes(keys)
+                            },
+                            onAddMaterial = { finderOpen = true },
+                            gridState = gridScrollState,
+                            compact = compactThumbnails,
+                            onToggleCompact = { compactThumbnails = !compactThumbnails },
+                            searchQuery = boardSearchQuery,
+                            onSearchQueryChange = { boardSearchQuery = it },
+                            onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
+                            isPhone = true,
+                            onOpenDetail = { phoneDetailOpen = true },
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
                         )
-                    } else if (sideInspector) {
-                        // 우측 인스펙터를 뺀 실제 중앙 폭 기준으로 스테이지 높이를 제한해 검은 빈 공간과 장면 스트립 사이 간격을 없앤다.
-                        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f, fill = false), contentAlignment = Alignment.TopCenter) {
-                            val availableHeight = maxHeight
-                            val centerContentWidth = maxWidth - 24.dp
-                            val controlsHeight = if (output != null) 108.dp else 0.dp
-                            val wantedHeight = centerContentWidth / outputAspect(session).coerceIn(0.4f, 3f) + controlsHeight + 12.dp
-                            val stageHeight = wantedHeight.coerceAtLeast(160.dp).coerceAtMost(availableHeight)
+                        FocusedFooter(
+                            onAddMaterial = { finderOpen = true },
+                            onExport = model::exportEditorProject,
+                            exportEnabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
+                            outputCurrent = output != null,
+                        )
+                    } else {
+                        // Phone detail view: small preview + scrollable inspector; Back closes detail
+                        Row(
+                            Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            IconButton(onClick = { phoneDetailOpen = false }) {
+                                Icon(Icons.Default.ArrowBack, "장면 보드로 돌아가기")
+                            }
+                            val curIdx = project.scenes.indexOfFirst { it.key == selectedSceneKey }
+                            Text(
+                                if (curIdx >= 0) "${curIdx + 1}번 장면 상세 편집" else "장면 상세 편집",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            IconButton(onClick = model::editorUndo, enabled = session.canUndo && !session.busy) {
+                                Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소")
+                            }
+                            IconButton(onClick = model::editorRedo, enabled = session.canRedo && !session.busy) {
+                                Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행")
+                            }
+                            Button(
+                                onClick = model::exportEditorProject,
+                                enabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.padding(end = 4.dp),
+                            ) {
+                                Text("내보내기", fontSize = 13.sp)
+                            }
+                        }
+                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
                             EditorStage(
                                 session = session,
                                 scene = selectedScene,
                                 source = selectedSource,
+                                caption = previewCaption,
                                 output = output,
                                 outputCurrent = outputCurrent,
                                 showOutput = showOutput && output != null,
@@ -366,85 +505,156 @@ internal fun AdaptiveEditorWorkspace(
                                 onSaveToPhoneHard = model::saveTrailer,
                                 onCollection = { collectionDialog = true },
                                 onExport = model::exportEditorProject,
-                                modifier = Modifier.fillMaxWidth().height(stageHeight).padding(horizontal = 12.dp, vertical = 6.dp),
+                                visualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.30f).coerceIn(72.dp, 240.dp)),
+                                showControls = !imeVisible,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                             )
                         }
-                    } else {
-                    EditorStage(
-                        session = session,
-                        scene = selectedScene,
-                        source = selectedSource,
-                        output = output,
-                        outputCurrent = outputCurrent,
-                        showOutput = showOutput && output != null,
-                        onShowOutput = { showOutput = it },
-                        onFullscreen = { onFullscreenChange(true) },
-                        onShare = ::shareOutput,
-                        onSaveToPhoneHard = model::saveTrailer,
-                        onCollection = { collectionDialog = true },
-                        onExport = model::exportEditorProject,
-                        modifier = Modifier.fillMaxWidth().weight(1f, fill = true).padding(horizontal = 12.dp, vertical = 6.dp),
-                    )
-                    }
-                    SceneStrip(
-                        session = session,
-                        selectedKey = selectedSceneKey,
-                        onSelect = { selectedSceneKey = it; showOutput = false },
-                        onMoveTo = model::editorMoveSceneTo,
-                        onMove = model::editorMoveScene,
-                        onDuplicate = { key -> model.editorDuplicateScene(key)?.let { selectedSceneKey = it } },
-                        onRemove = model::editorRemoveScene,
-                        onAddMaterial = { finderOpen = true },
-                    )
-                    if (stackedPortrait || (!sideInspector && tier != EditorTier.WIDE && tier != EditorTier.RAIL_ONLY && lowerPanelOpen)) {
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                         EditorInspector(
                             session = session,
                             scene = selectedScene,
                             source = selectedSource,
+                            selectedKeys = selectedSceneKeys,
+                            captionDraft = captionDraft,
+                            onCaptionDraftChange = { captionDraft = it },
                             tab = inspectorTab,
                             onTab = { inspectorTab = it },
                             model = model,
-                            onSelectScene = { selectedSceneKey = it },
+                            onSelectScene = { key ->
+                                selectedSceneKey = key
+                                selectedSceneKeys = setOf(key)
+                            },
                             onOpenMusicPicker = { showMusicPicker = true },
                             scrollable = true,
-                            modifier = if (stackedPortrait) Modifier.fillMaxWidth().weight(1f) else Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
                         )
                     }
                 }
-                if (tier == EditorTier.FOCUSED) {
-                    FocusedFooter(
-                        onAddMaterial = { finderOpen = true },
+            } else {
+                // Expanded portrait: practical detail area and wide multirow board using available height
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    EditorHeader(
+                        session = session,
+                        compact = false,
+                        outputCurrent = outputCurrent,
+                        onClose = onRequestClose,
+                        onRename = { renameOpen = true },
+                        onUndo = model::editorUndo,
+                        onRedo = model::editorRedo,
                         onExport = model::exportEditorProject,
-                        exportEnabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
-                        outputCurrent = output != null,
+                        onRetrySave = model::retryEditorAutosave,
+                        showPanelToggle = true,
+                        panelOpen = lowerPanelOpen,
+                        onTogglePanel = { lowerPanelOpen = !lowerPanelOpen },
+                    )
+                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    if (session.busy || session.error != null) {
+                        Text(
+                            session.error ?: session.status,
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (session.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (lowerPanelOpen) {
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            EditorStage(
+                                session = session,
+                                scene = selectedScene,
+                                source = selectedSource,
+                                caption = previewCaption,
+                                output = output,
+                                outputCurrent = outputCurrent,
+                                showOutput = showOutput && output != null,
+                                onShowOutput = { showOutput = it },
+                                onFullscreen = { onFullscreenChange(true) },
+                                onShare = ::shareOutput,
+                                onSaveToPhoneHard = model::saveTrailer,
+                                onCollection = { collectionDialog = true },
+                                onExport = model::exportEditorProject,
+                                visualHeight = stageVisualHeight(session, maxWidth - 24.dp, (maxHeight * 0.16f).coerceIn(72.dp, 160.dp)),
+                                showControls = !imeVisible,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            )
+                        }
+                        EditorInspector(
+                            session = session,
+                            scene = selectedScene,
+                            source = selectedSource,
+                            selectedKeys = selectedSceneKeys,
+                            captionDraft = captionDraft,
+                            onCaptionDraftChange = { captionDraft = it },
+                            tab = inspectorTab,
+                            onTab = { inspectorTab = it },
+                            model = model,
+                            onSelectScene = { key ->
+                                selectedSceneKey = key
+                                selectedSceneKeys = setOf(key)
+                            },
+                            onOpenMusicPicker = { showMusicPicker = true },
+                            scrollable = true,
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp),
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                    }
+                    SceneBoard(
+                        session = session,
+                        selectedKey = selectedSceneKey,
+                        selectedKeys = selectedSceneKeys,
+                        onSelectKey = { key ->
+                            selectedSceneKey = key
+                            selectedSceneKeys = setOf(key)
+                            showOutput = false
+                        },
+                        onToggleSelectKey = { key ->
+                            selectedSceneKeys = if (key in selectedSceneKeys) selectedSceneKeys - key else selectedSceneKeys + key
+                            if (key in selectedSceneKeys) selectedSceneKey = key
+                        },
+                        onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
+                        onClearSelection = { selectedSceneKeys = emptySet() },
+                        onMoveTo = { keys, targetIdx -> model.editorMoveScenesTo(keys, targetIdx) },
+                        onMoveStep = { key, delta -> model.editorMoveScene(key, delta) },
+                        onDuplicate = { keys ->
+                            if (keys.size == 1) {
+                                model.editorDuplicateScene(keys.first())?.let { newKey ->
+                                    selectedSceneKey = newKey
+                                    selectedSceneKeys = setOf(newKey)
+                                }
+                            } else {
+                                val newKeys = model.editorDuplicateScenes(keys)
+                                if (newKeys.isNotEmpty()) {
+                                    selectedSceneKeys = newKeys.toSet()
+                                    selectedSceneKey = newKeys.first()
+                                }
+                            }
+                        },
+                        onRemove = { keys ->
+                            if (keys.size == 1) model.editorRemoveScene(keys.first())
+                            else model.editorRemoveScenes(keys)
+                        },
+                        onAddMaterial = { finderOpen = true },
+                        gridState = gridScrollState,
+                        compact = compactThumbnails,
+                        onToggleCompact = { compactThumbnails = !compactThumbnails },
+                        searchQuery = boardSearchQuery,
+                        onSearchQueryChange = { boardSearchQuery = it },
+                        onRequestMoveDialog = { keys -> moveTargetDialogKeys = keys },
+                        isPhone = false,
+                        onOpenDetail = {},
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
                     )
                 }
-            }
-            if (sideInspector) {
-                VerticalHairline()
-                val inspectorModifier = if (isLandscape) Modifier.weight(1f).fillMaxHeight() else Modifier.width(sideInspectorWidth).fillMaxHeight()
-                EditorInspector(
-                    session = session,
-                    scene = selectedScene,
-                    source = selectedSource,
-                    tab = inspectorTab,
-                    onTab = { inspectorTab = it },
-                    model = model,
-                    onSelectScene = { selectedSceneKey = it },
-                    onOpenMusicPicker = { showMusicPicker = true },
-                    scrollable = true,
-                    modifier = inspectorModifier,
-                )
             }
         }
 
         // Temporary Finder: beside the rail at 760..919, full-screen picker below 760. The editor stays composed
         // underneath, so the project, selected scene, playback position and Finder selections are preserved.
-        if (finderOpen && (tier == EditorTier.RAIL_ONLY || tier == EditorTier.FOCUSED)) {
+        val finderFullScreen = tier == EditorTier.FOCUSED || isPhone
+        if (finderOpen && !panelFinderInline) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .32f)).clickable(onClick = { finderOpen = false }))
             Surface(
-                modifier = if (tier == EditorTier.FOCUSED) Modifier.fillMaxSize() else Modifier.fillMaxHeight().width(380.dp).padding(start = 65.dp),
+                modifier = if (finderFullScreen) Modifier.fillMaxSize() else Modifier.fillMaxHeight().width(380.dp).padding(start = 65.dp),
                 color = MaterialTheme.colorScheme.background,
                 tonalElevation = 4.dp,
                 shadowElevation = 8.dp,
@@ -460,7 +670,7 @@ internal fun AdaptiveEditorWorkspace(
                         selectedSceneKey = selectedSceneKey,
                         onUsedAgain = { key -> selectedSceneKey = key },
                         onClose = { finderOpen = false },
-                        onAdded = { if (tier == EditorTier.FOCUSED) finderOpen = false },
+                        onAdded = { if (finderFullScreen) finderOpen = false },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -497,6 +707,75 @@ internal fun AdaptiveEditorWorkspace(
             text = { OutlinedTextField(title, { title = it }, singleLine = true, label = { Text("제목") }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { model.editorRename(title); renameOpen = false }) { Text("확인") } },
             dismissButton = { TextButton(onClick = { renameOpen = false }) { Text("취소") } },
+        )
+    }
+
+    if (moveTargetDialogKeys != null) {
+        val targetKeys = moveTargetDialogKeys!!
+        val totalScenes = project.scenes.size
+        val selectedCount = targetKeys.size
+        val maxAllowed = totalScenes - selectedCount + 1
+        var inputStr by remember(targetKeys) { mutableStateOf("") }
+        val parsed = inputStr.trim().toIntOrNull()
+        val isError = inputStr.isNotBlank() && (parsed == null || parsed !in 1..maxAllowed)
+        val isValid = parsed != null && parsed in 1..maxAllowed
+
+        AlertDialog(
+            onDismissRequest = { moveTargetDialogKeys = null },
+            title = {
+                Text(if (selectedCount == 1) "장면 위치 이동" else "${selectedCount}개 장면 위치 이동")
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        if (selectedCount == 1) {
+                            val currentPos = project.scenes.indexOfFirst { it.key in targetKeys } + 1
+                            "현재 ${currentPos}번 장면입니다.\n이동할 새 위치 번호를 입력하세요 (1 ~ ${totalScenes}번)."
+                        } else {
+                            "선택한 ${selectedCount}개 장면의 원래 순서를 유지하며 연속 이동합니다.\n첫 번째 선택 장면이 위치할 새 번호를 입력하세요 (1 ~ ${maxAllowed}번)."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedTextField(
+                        value = inputStr,
+                        onValueChange = { inputStr = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("새 위치 번호 (1 ~ $maxAllowed)") },
+                        placeholder = { Text("예: 3") },
+                        singleLine = true,
+                        isError = isError,
+                        supportingText = {
+                            if (isError) {
+                                Text("1부터 ${maxAllowed}까지의 숫자를 입력해 주세요.", color = MaterialTheme.colorScheme.error)
+                            } else {
+                                Text("1 ~ ${maxAllowed}번 중 입력")
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val dest1Based = parsed ?: return@Button
+                        model.editorMoveScenesTo(targetKeys, dest1Based - 1)
+                        moveTargetDialogKeys = null
+                        if (boardSearchQuery.isBlank()) {
+                            coroutineScope.launch {
+                                gridScrollState.animateScrollToItem((dest1Based - 1).coerceAtLeast(0))
+                            }
+                        }
+                    },
+                    enabled = isValid,
+                ) {
+                    Text("이동")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { moveTargetDialogKeys = null }) {
+                    Text("취소")
+                }
+            },
         )
     }
 
@@ -720,12 +999,17 @@ private fun outputAspect(session: TrailerSession): Float {
     return if (h > 0) w.toFloat() / h else 16f / 9f
 }
 
+/** Picture height of a stage: the pane width at the output aspect, never above [cap] (a share of the pane height). */
+private fun stageVisualHeight(session: TrailerSession, paneWidth: Dp, cap: Dp): Dp =
+    minOf(paneWidth / outputAspect(session), cap)
+
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun EditorStage(
     session: TrailerSession,
     scene: EditorScene?,
     source: TrailerSource?,
+    caption: SceneCaption?,
     output: File?,
     outputCurrent: Boolean,
     showOutput: Boolean,
@@ -735,25 +1019,29 @@ private fun EditorStage(
     onSaveToPhoneHard: () -> Unit,
     onCollection: () -> Unit,
     onExport: () -> Unit,
+    visualHeight: Dp,
     modifier: Modifier,
+    showControls: Boolean = true,
 ) {
+    // The picture has its own bounded height; the selector and output actions add their own rows around it
+    // instead of squeezing the video. While typing (showControls=false) only the picture stays.
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (output != null) {
+        if (output != null && showControls) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 TrailerChoice("장면 미리보기", !showOutput, Modifier.weight(1f)) { onShowOutput(false) }
                 TrailerChoice(if (outputCurrent) "완성본" else "이전 완성본 (수정됨)", showOutput, Modifier.weight(1f)) { onShowOutput(true) }
             }
         }
-        Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
             if (showOutput && output != null) {
                 OutputPlayer(output, Modifier.fillMaxSize())
             } else if (scene != null && source != null) {
-                ScenePreview(session, scene, source, Modifier.fillMaxSize())
+                ScenePreview(session, scene, source, caption, Modifier.fillMaxSize())
             } else {
                 Text("장면을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        if (showOutput && output != null) {
+        if (showOutput && output != null && showControls) {
             // 폰 폭에서도 칩이 잘리지 않고 다음 줄로 이어진다(가로 스크롤로 숨기지 않음).
             FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 if (!outputCurrent) {
@@ -814,7 +1102,7 @@ private data class PhotoPlanKey(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, modifier: Modifier) {
+private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, modifier: Modifier) {
     val context = LocalContext.current
     val aspect = outputAspect(session)
     var playing by remember(scene.key) { mutableStateOf(false) }
@@ -874,6 +1162,15 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
     }
     val frame by produceState<Bitmap?>(null, source.file, scene.start, source.isImage) {
         value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 960, exact = true) }
+    }
+    // The exporter's own caption bitmap (exact output size, same layout) scaled into this output-shaped box.
+    val captionBitmap by produceState<Bitmap?>(null, caption, outputWidth, outputHeight) {
+        if (caption == null) {
+            value = null
+            return@produceState
+        }
+        delay(120)
+        value = withContext(Dispatchers.Default) { SceneCaptionRenderer.render(context, caption, outputWidth, outputHeight) }
     }
     BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
         val boxWidth = minOf(maxWidth, maxHeight * aspect)
@@ -974,12 +1271,14 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                     PhotoMotionMode.STILL -> "사진 고정 · ${plan.reason}"
                     null -> "사진 미리보기"
                 }
-                Text(
-                    statusText,
-                    Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall,
-                )
+                if (caption == null) {
+                    Text(
+                        statusText,
+                        Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
             } else {
                 val isFit = scene.fit == SceneFit.FIT
                 frame?.let {
@@ -991,6 +1290,10 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                         alignment = if (isFit) Alignment.Center else BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f)),
                     )
                 } ?: CircularProgressIndicator(Modifier.size(28.dp))
+            }
+            captionBitmap?.let { bitmap ->
+                val captionImage = remember(bitmap) { bitmap.asImageBitmap() }
+                Image(captionImage, contentDescription = caption?.text, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
             }
             FilledIconButton(
                 onClick = { playing = !playing },
@@ -1064,124 +1367,363 @@ internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimen
 }.getOrNull()
 
 /**
- * The explicit scene list (separate from source files): select, long-press drag to reorder (committed once on drop),
- * and per-scene menu/accessibility actions for move/duplicate/remove.
+ * The explicit scene board (separate from source files): lazy multirow grid, visible numbered thumbnails,
+ * duration and source filename, compact/normal size toggle, number/filename search & filter, direct jump to scene,
+ * multi-select, and target position dialog.
  */
 @Composable
-private fun SceneStrip(
+private fun SceneBoard(
     session: TrailerSession,
     selectedKey: Long?,
-    onSelect: (Long) -> Unit,
-    onMoveTo: (Long, Int) -> Unit,
-    onMove: (Long, Int) -> Unit,
-    onDuplicate: (Long) -> Unit,
-    onRemove: (Long) -> Unit,
+    selectedKeys: Set<Long>,
+    onSelectKey: (Long) -> Unit,
+    onToggleSelectKey: (Long) -> Unit,
+    onSelectAll: () -> Unit,
+    onClearSelection: () -> Unit,
+    onMoveTo: (Set<Long>, Int) -> Unit,
+    onMoveStep: (Long, Int) -> Unit,
+    onDuplicate: (Set<Long>) -> Unit,
+    onRemove: (Set<Long>) -> Unit,
     onAddMaterial: () -> Unit,
+    gridState: LazyGridState,
+    compact: Boolean,
+    onToggleCompact: () -> Unit,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
+    onRequestMoveDialog: (Set<Long>) -> Unit,
+    isPhone: Boolean = false,
+    onOpenDetail: () -> Unit = {},
+    modifier: Modifier = Modifier,
 ) {
     val project = session.editor ?: return
     val sourcesById = session.sources.associateBy { it.id }
-    val density = LocalDensity.current
-    val cardWidth = 92.dp
-    val strideX = with(density) { (cardWidth + 8.dp).toPx() }
-    var draggingKey by remember { mutableStateOf<Long?>(null) }
-    var dragOffset by remember { mutableFloatStateOf(0f) }
-    var order by remember(project.scenes) { mutableStateOf(project.scenes) }
-    var menuKey by remember { mutableStateOf<Long?>(null) }
-    val liveOrder by rememberUpdatedState(order)
+    val coroutineScope = rememberCoroutineScope()
+    var multiSelectMode by rememberSaveable { mutableStateOf(false) }
+    var menuSceneKey by remember { mutableStateOf<Long?>(null) }
 
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-            val selectedIndex = project.scenes.indexOfFirst { it.key == selectedKey }
-            val selectedLabel = if (selectedIndex >= 0) " · 선택 ${selectedIndex + 1}번" else ""
-            Text("장면 ${project.scenes.size}개$selectedLabel · ${trailerLengthTitle(project.scenes.sumOf { it.length })}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
-            Text("길게 눌러 옮기기 · ⋮ 메뉴", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    // Filter scenes by scene number (1-based index in project) or source filename
+    val trimmedQuery = searchQuery.trim()
+    val indexedScenes = remember(project.scenes) { project.scenes.mapIndexed { idx, s -> idx to s } }
+    val filteredScenes = remember(indexedScenes, trimmedQuery, sourcesById) {
+        if (trimmedQuery.isEmpty()) {
+            indexedScenes
+        } else {
+            val queryNumber = trimmedQuery.toIntOrNull()
+            indexedScenes.filter { (idx, scene) ->
+                val sceneNum = idx + 1
+                val source = sourcesById[scene.sourceId]
+                (queryNumber != null && sceneNum == queryNumber) ||
+                    sceneNum.toString().contains(trimmedQuery) ||
+                    (source?.name?.contains(trimmedQuery, ignoreCase = true) == true)
+            }
         }
-        LazyRow(
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+    }
+
+    Column(modifier) {
+        // Toolbar: Search/Filter + View Size + Multi-select mode
+        Surface(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(10.dp),
         ) {
-            itemsIndexed(order, key = { _, scene -> scene.key }) { index, scene ->
-                val source = sourcesById[scene.sourceId] ?: return@itemsIndexed
-                val selected = scene.key == selectedKey
-                val dragging = scene.key == draggingKey
-                val thumb by produceState<Bitmap?>(source.thumbnail, source.file, scene.start) {
-                    if (value == null || !source.isImage) value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 200) } ?: value
-                }
-                Box(
-                    Modifier
-                        .width(cardWidth)
-                        .graphicsOffset(if (dragging) dragOffset else 0f)
-                        .semantics {
-                            contentDescription = "${index + 1}번 장면, ${source.name}, ${seconds1(scene.length)}"
-                            this.selected = selected
-                            customActions = listOf(
-                                CustomAccessibilityAction("앞으로 이동") { onMove(scene.key, -1); true },
-                                CustomAccessibilityAction("뒤로 이동") { onMove(scene.key, 1); true },
-                                CustomAccessibilityAction("장면 복제") { onDuplicate(scene.key); true },
-                                CustomAccessibilityAction("장면 삭제 (원본은 유지)") { onRemove(scene.key); true },
-                            )
-                        }
-                        .pointerInput(scene.key) {
-                            detectDragGesturesAfterLongPress(
-                                onDragStart = { draggingKey = scene.key; dragOffset = 0f },
-                                onDragCancel = { draggingKey = null; dragOffset = 0f; order = project.scenes },
-                                onDragEnd = {
-                                    val key = draggingKey
-                                    draggingKey = null
-                                    dragOffset = 0f
-                                    if (key != null) {
-                                        val finalIndex = liveOrder.indexOfFirst { it.key == key }
-                                        if (finalIndex >= 0 && finalIndex != project.scenes.indexOfFirst { it.key == key }) onMoveTo(key, finalIndex)
-                                    }
-                                },
-                            ) { change, amount ->
-                                change.consume()
-                                dragOffset += amount.x
-                                val key = draggingKey ?: return@detectDragGesturesAfterLongPress
-                                val current = liveOrder.indexOfFirst { it.key == key }
-                                if (current < 0) return@detectDragGesturesAfterLongPress
-                                val delta = when {
-                                    dragOffset > strideX / 2 && current < liveOrder.lastIndex -> 1
-                                    dragOffset < -strideX / 2 && current > 0 -> -1
-                                    else -> 0
-                                }
-                                if (delta != 0) {
-                                    order = liveOrder.toMutableList().apply { add(current + delta, removeAt(current)) }
-                                    dragOffset -= delta * strideX
+            Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = onSearchQueryChange,
+                        modifier = Modifier.weight(1f).heightIn(min = 44.dp),
+                        placeholder = { Text("장면 번호 또는 파일명", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        leadingIcon = { Icon(Icons.Default.Search, null, Modifier.size(18.dp)) },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { onSearchQueryChange("") }, modifier = Modifier.size(24.dp)) {
+                                    Icon(Icons.Default.Clear, "검색 지우기", Modifier.size(16.dp))
                                 }
                             }
                         },
-                ) {
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .border(if (selected || dragging) 2.dp else 1.dp, if (selected || dragging) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
-                            .clickable { onSelect(scene.key) },
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
+                    )
+                    // If user typed a valid scene number, offer a 1-tap direct jump button
+                    val jumpTarget = trimmedQuery.toIntOrNull()
+                    if (jumpTarget != null && jumpTarget in 1..project.scenes.size) {
+                        FilledTonalButton(
+                            onClick = {
+                                val targetScene = project.scenes[jumpTarget - 1]
+                                onSelectKey(targetScene.key)
+                                coroutineScope.launch {
+                                    val gridIdx = filteredScenes.indexOfFirst { it.second.key == targetScene.key }
+                                    if (gridIdx >= 0) gridState.animateScrollToItem(gridIdx)
+                                }
+                                if (isPhone) onOpenDetail()
+                            },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.heightIn(min = 40.dp),
+                        ) {
+                            Text("${jumpTarget}번 이동", fontSize = 12.sp)
+                        }
+                    }
+                    IconButton(onClick = onToggleCompact, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            if (compact) Icons.Default.ViewModule else Icons.Default.GridView,
+                            contentDescription = if (compact) "보통 크기로 보기" else "작은 크기로 보기",
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            multiSelectMode = !multiSelectMode
+                            if (!multiSelectMode && selectedKeys.size > 1) {
+                                onClearSelection()
+                            }
+                        },
+                        modifier = Modifier.size(40.dp),
                     ) {
-                        Box(Modifier.fillMaxWidth().aspectRatio(1f).background(MaterialTheme.colorScheme.surfaceVariant)) {
-                            thumb?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
-                            Text(
-                                "${index + 1}",
-                                Modifier.align(Alignment.TopStart).padding(3.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp),
-                                color = Color.White, style = MaterialTheme.typography.labelSmall,
-                            )
-                            Box(Modifier.align(Alignment.TopEnd)) {
-                                IconButton(onClick = { menuKey = scene.key }, modifier = Modifier.size(32.dp)) {
-                                    Icon(Icons.Default.MoreVert, "${index + 1}번 장면 메뉴", tint = Color.White, modifier = Modifier.background(Color.Black.copy(alpha = .45f), CircleShape).padding(2.dp))
-                                }
-                                DropdownMenu(expanded = menuKey == scene.key, onDismissRequest = { menuKey = null }) {
-                                    DropdownMenuItem(text = { Text("앞으로 이동") }, enabled = index > 0, onClick = { menuKey = null; onMove(scene.key, -1) })
-                                    DropdownMenuItem(text = { Text("뒤로 이동") }, enabled = index < order.lastIndex, onClick = { menuKey = null; onMove(scene.key, 1) })
-                                    DropdownMenuItem(text = { Text("장면 복제") }, onClick = { menuKey = null; onDuplicate(scene.key) })
-                                    DropdownMenuItem(text = { Text("장면 삭제 (원본 파일은 유지)") }, onClick = { menuKey = null; onRemove(scene.key) })
-                                }
+                        Icon(
+                            Icons.Default.CheckBox,
+                            contentDescription = "다중 선택 모드",
+                            tint = if (multiSelectMode || selectedKeys.size > 1) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                // Active filter summary or selection bar
+                val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    // The summary yields width (one line, ellipsis) so the selection actions always fit on a phone.
+                    if (trimmedQuery.isNotEmpty()) {
+                        Text(
+                            "검색 결과 ${filteredScenes.size}개 / 전체 ${project.scenes.size}개",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                    } else {
+                        Text(
+                            "전체 장면 ${project.scenes.size}개 · ${trailerLengthTitle(project.scenes.sumOf { it.length })}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (effectiveSelectedKeys.isNotEmpty()) {
+                        Text(
+                            if (effectiveSelectedKeys.size == 1) {
+                                val curIdx = project.scenes.indexOfFirst { it.key == effectiveSelectedKeys.first() }
+                                "${curIdx + 1}번 선택됨"
+                            } else {
+                                "${effectiveSelectedKeys.size}개 선택됨"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                        )
+                        if (isPhone) {
+                            // Phone: card tap opens the detail editor; this keeps it reachable for multi-selection.
+                            IconButton(onClick = onOpenDetail, modifier = Modifier.size(32.dp)) {
+                                Icon(Icons.Default.Tune, "상세 편집", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
                             }
                         }
+                        IconButton(
+                            onClick = { onRequestMoveDialog(effectiveSelectedKeys) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(Icons.Default.DriveFileMove, "위치 지정 이동", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                        }
+                        IconButton(
+                            onClick = { onDuplicate(effectiveSelectedKeys) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(Icons.Default.ContentCopy, "장면 복제", Modifier.size(18.dp))
+                        }
+                        IconButton(
+                            onClick = { onRemove(effectiveSelectedKeys) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(Icons.Default.DeleteOutline, "장면 삭제 (원본 파일은 유지)", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
+                        }
+                        if (multiSelectMode || effectiveSelectedKeys.size > 1) {
+                            TextButton(
+                                onClick = {
+                                    if (effectiveSelectedKeys.size == project.scenes.size) onClearSelection()
+                                    else onSelectAll()
+                                },
+                                contentPadding = PaddingValues(horizontal = 6.dp),
+                            ) {
+                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Multirow LazyVerticalGrid
+        val minCellSize = if (compact) 92.dp else 136.dp
+        LazyVerticalGrid(
+            columns = GridCells.Adaptive(minSize = minCellSize),
+            state = gridState,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+        ) {
+            itemsIndexed(filteredScenes, key = { _, item -> item.second.key }) { _, (originalIndex, scene) ->
+                val source = sourcesById[scene.sourceId] ?: return@itemsIndexed
+                val isSelected = scene.key in selectedKeys || scene.key == selectedKey
+                val thumb by produceState<Bitmap?>(source.thumbnail, source.file, scene.start) {
+                    if (value == null || !source.isImage) {
+                        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 220) } ?: value
+                    }
+                }
+
+                Surface(
+                    onClick = {
+                        if (multiSelectMode) {
+                            onToggleSelectKey(scene.key)
+                        } else {
+                            onSelectKey(scene.key)
+                            if (isPhone) onOpenDetail()
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics {
+                            contentDescription = "${originalIndex + 1}번 장면, ${source.name}, ${seconds1(scene.length)}"
+                            this.selected = isSelected
+                            customActions = listOf(
+                                CustomAccessibilityAction("앞으로 이동") { onMoveStep(scene.key, -1); true },
+                                CustomAccessibilityAction("뒤로 이동") { onMoveStep(scene.key, 1); true },
+                                CustomAccessibilityAction("위치 지정 이동") { onRequestMoveDialog(setOf(scene.key)); true },
+                                CustomAccessibilityAction("장면 복제") { onDuplicate(setOf(scene.key)); true },
+                                CustomAccessibilityAction("장면 삭제 (원본은 유지)") { onRemove(setOf(scene.key)); true },
+                            )
+                        },
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(
+                        if (isSelected) 2.dp else 1.dp,
+                        if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                    ),
+                    color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface,
+                    tonalElevation = if (isSelected) 3.dp else 0.dp,
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(1.25f)
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                        ) {
+                            thumb?.let {
+                                Image(
+                                    it.asImageBitmap(),
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop,
+                                )
+                            }
+                            // 1-based Scene Number Badge (clearly scene number)
+                            Text(
+                                "${originalIndex + 1}",
+                                Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(4.dp)
+                                    .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 5.dp, vertical = 2.dp),
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontSize = 11.sp),
+                            )
+                            // Multi-select Checkbox OR Dropdown Menu on top right
+                            if (multiSelectMode) {
+                                Checkbox(
+                                    checked = isSelected,
+                                    onCheckedChange = { onToggleSelectKey(scene.key) },
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(28.dp),
+                                )
+                            } else {
+                                Box(Modifier.align(Alignment.TopEnd)) {
+                                    IconButton(
+                                        onClick = { menuSceneKey = scene.key },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(
+                                            Icons.Default.MoreVert,
+                                            contentDescription = "${originalIndex + 1}번 장면 메뉴",
+                                            tint = Color.White,
+                                            modifier = Modifier.background(Color.Black.copy(alpha = 0.45f), CircleShape).padding(2.dp),
+                                        )
+                                    }
+                                    DropdownMenu(
+                                        expanded = menuSceneKey == scene.key,
+                                        onDismissRequest = { menuSceneKey = null },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("앞으로 이동") },
+                                            enabled = originalIndex > 0,
+                                            onClick = { menuSceneKey = null; onMoveStep(scene.key, -1) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("뒤로 이동") },
+                                            enabled = originalIndex < project.scenes.lastIndex,
+                                            onClick = { menuSceneKey = null; onMoveStep(scene.key, 1) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("위치 지정 이동…") },
+                                            onClick = { menuSceneKey = null; onRequestMoveDialog(setOf(scene.key)) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("장면 복제") },
+                                            onClick = { menuSceneKey = null; onDuplicate(setOf(scene.key)) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("장면 삭제 (원본 파일은 유지)") },
+                                            onClick = { menuSceneKey = null; onRemove(setOf(scene.key)) },
+                                        )
+                                    }
+                                }
+                            }
+                            // Media Kind tag (bottom-left)
+                            Text(
+                                if (source.isImage) "사진" else "영상",
+                                Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(4.dp)
+                                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(3.dp))
+                                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            )
+                            // Duration badge (bottom-right)
+                            Text(
+                                seconds1(scene.length),
+                                Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(4.dp)
+                                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(3.dp))
+                                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium, fontSize = 10.sp),
+                            )
+                        }
+                        // Source Filename below thumbnail
                         Text(
-                            "${if (source.isImage) "사진" else "영상"} ${seconds1(scene.length)}",
-                            Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                            style = MaterialTheme.typography.labelSmall, maxLines = 1,
+                            source.name,
+                            Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
@@ -1189,13 +1731,20 @@ private fun SceneStrip(
             item {
                 Surface(
                     onClick = onAddMaterial,
-                    modifier = Modifier.width(cardWidth).aspectRatio(.82f).semantics { contentDescription = "재료 추가" },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1.25f)
+                        .semantics { contentDescription = "재료 추가" },
                     shape = RoundedCornerShape(8.dp),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                     color = Color.Transparent,
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
                         PackIcon(PackGlyph.ADD, null, Modifier.size(24.dp))
+                        Spacer(Modifier.height(4.dp))
                         Text("재료 추가", style = MaterialTheme.typography.labelSmall)
                     }
                 }
@@ -1211,6 +1760,9 @@ private fun EditorInspector(
     session: TrailerSession,
     scene: EditorScene?,
     source: TrailerSource?,
+    selectedKeys: Set<Long>,
+    captionDraft: CaptionDraft?,
+    onCaptionDraftChange: (CaptionDraft?) -> Unit,
     tab: InspectorTab,
     onTab: (InspectorTab) -> Unit,
     model: NasFinderViewModel,
@@ -1220,8 +1772,16 @@ private fun EditorInspector(
     scrollable: Boolean = true,
 ) {
     Column(modifier) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            InspectorTab.entries.forEach { entry -> TrailerChoice(entry.title, tab == entry, Modifier.weight(1f)) { onTab(entry) } }
+        // Five tabs wrap into rows on narrow panes instead of squeezing into one cramped line.
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            FlowRow(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                maxItemsInEachRow = if (maxWidth < 420.dp) 3 else InspectorTab.entries.size,
+            ) {
+                InspectorTab.entries.forEach { entry -> TrailerChoice(entry.title, tab == entry, Modifier.weight(1f)) { onTab(entry) } }
+            }
         }
         val contentModifier = if (scrollable) {
             Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 4.dp)
@@ -1234,6 +1794,7 @@ private fun EditorInspector(
         ) {
             when (tab) {
                 InspectorTab.SCENE -> SceneSection(session, scene, source, model, onSelectScene)
+                InspectorTab.CAPTION -> SceneCaptionSection(session, scene, selectedKeys, captionDraft, onCaptionDraftChange, model, onSelectScene)
                 InspectorTab.SOUND -> SoundSection(session, scene, source, model, onOpenMusicPicker)
                 InspectorTab.SCREEN -> ScreenSection(session, scene, source, model)
                 InspectorTab.PLAN -> PlanSection(session, model, onOpenMusicPicker)
