@@ -195,6 +195,7 @@ internal fun AdaptiveEditorWorkspace(
         ?: selectedScene?.caption?.normalizedOrNull().takeIf { captionDraft?.sceneKey != selectedScene?.key }
     val output = session.output?.takeIf { it.isFile && it.length() > 0L }
     val outputCurrent = output != null && session.outputRevision == session.revision
+    val outputStatus = editorOutputStatus(session, output != null, outputCurrent)
     val usedSourceIds = project.scenes.map { it.sourceId }.toSet()
     val usedOrigins = session.sources.filter { it.id in usedSourceIds }.mapNotNull { it.originKey }.toSet()
     val originToSource = session.sources.filter { it.originKey != null }.associateBy { it.originKey!! }
@@ -279,12 +280,13 @@ internal fun AdaptiveEditorWorkspace(
                         onUndo = model::editorUndo,
                         onRedo = model::editorRedo,
                         onExport = model::exportEditorProject,
+                        onSaveToPhoneHard = model::saveTrailer,
                         onRetrySave = model::retryEditorAutosave,
                         showPanelToggle = false,
                         panelOpen = true,
                         onTogglePanel = {},
                     )
-                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
                     if (session.busy || session.error != null) {
                         Text(
                             session.error ?: session.status,
@@ -402,12 +404,13 @@ internal fun AdaptiveEditorWorkspace(
                             onUndo = model::editorUndo,
                             onRedo = model::editorRedo,
                             onExport = model::exportEditorProject,
+                            onSaveToPhoneHard = model::saveTrailer,
                             onRetrySave = model::retryEditorAutosave,
                             showPanelToggle = false,
                             panelOpen = true,
                             onTogglePanel = {},
                         )
-                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
                         if (session.busy || session.error != null) {
                             Text(
                                 session.error ?: session.status,
@@ -465,9 +468,9 @@ internal fun AdaptiveEditorWorkspace(
                         )
                         FocusedFooter(
                             onAddMaterial = { finderOpen = true },
+                            primary = editorPrimary(session, outputCurrent),
                             onExport = model::exportEditorProject,
-                            exportEnabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
-                            outputCurrent = output != null,
+                            onSaveToPhoneHard = model::saveTrailer,
                         )
                     } else {
                         // Phone detail view: small preview + scrollable inspector; Back closes detail
@@ -493,16 +496,17 @@ internal fun AdaptiveEditorWorkspace(
                             IconButton(onClick = model::editorRedo, enabled = session.canRedo && !session.busy) {
                                 Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행")
                             }
+                            val primary = editorPrimary(session, outputCurrent)
                             Button(
-                                onClick = model::exportEditorProject,
-                                enabled = session.export?.running != true && !session.busy && project.scenes.isNotEmpty(),
+                                onClick = { primary.dispatch(model::exportEditorProject, model::saveTrailer) },
+                                enabled = primary.enabled,
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                                 modifier = Modifier.padding(end = 4.dp),
                             ) {
-                                Text("내보내기", fontSize = 13.sp)
+                                Text(primary.label, fontSize = 13.sp, maxLines = 1)
                             }
                         }
-                        ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                        ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
                         BoxWithConstraints(Modifier.fillMaxWidth()) {
                             EditorStage(
                                 session = session,
@@ -561,12 +565,13 @@ internal fun AdaptiveEditorWorkspace(
                         onUndo = model::editorUndo,
                         onRedo = model::editorRedo,
                         onExport = model::exportEditorProject,
+                        onSaveToPhoneHard = model::saveTrailer,
                         onRetrySave = model::retryEditorAutosave,
                         showPanelToggle = true,
                         panelOpen = lowerPanelOpen,
                         onTogglePanel = { lowerPanelOpen = !lowerPanelOpen },
                     )
-                    ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
+                    ExportStatusBar(session, outputStatus, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
                     if (session.busy || session.error != null) {
                         Text(
                             session.error ?: session.status,
@@ -903,6 +908,7 @@ private fun EditorHeader(
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onExport: () -> Unit,
+    onSaveToPhoneHard: () -> Unit,
     onRetrySave: () -> Unit,
     showPanelToggle: Boolean,
     panelOpen: Boolean,
@@ -914,15 +920,15 @@ private fun EditorHeader(
         Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.BACK, "편집 닫기 (자동 저장됨)", Modifier.size(ToolbarActionIcon)) }
+        IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.BACK, "편집 닫기 (편집본 자동 저장)", Modifier.size(ToolbarActionIcon)) }
         Column(
             Modifier.weight(1f).clickable(onClickLabel = "프로젝트 이름 바꾸기", onClick = onRename).padding(vertical = 4.dp),
         ) {
             Text(session.displayTitle, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val saveLabel = when (session.saveState) {
-                EditorSaveState.SAVING -> "저장 중…"
-                EditorSaveState.SAVED -> "저장됨"
-                EditorSaveState.FAILED -> "저장 실패"
+                EditorSaveState.SAVING -> "편집본 저장 중…"
+                EditorSaveState.SAVED -> "편집본 자동 저장됨"
+                EditorSaveState.FAILED -> "편집본 저장 실패"
                 EditorSaveState.IDLE -> ""
             }
             val counts = "재료 ${session.sources.size}개 · 장면 ${project?.scenes?.size ?: 0}개 · ${trailerLengthTitle(session.scenes.sumOf { it.length })}"
@@ -942,23 +948,82 @@ private fun EditorHeader(
         if (showPanelToggle) {
             IconButton(onClick = onTogglePanel, modifier = Modifier.size(IconHitTarget)) { Icon(if (panelOpen) Icons.Default.ExpandMore else Icons.Default.Tune, if (panelOpen) "편집 패널 접기" else "편집 패널 열기", Modifier.size(ToolbarActionIcon)) }
         }
-        val exportLabel = if (session.output != null) "다시 내보내기" else "내보내기"
-        val exportEnabled = session.export?.running != true && !session.busy && project?.scenes?.isNotEmpty() == true
+        val primary = editorPrimary(session, outputCurrent)
         Button(
-            onClick = onExport,
-            enabled = exportEnabled,
+            onClick = { primary.dispatch(onExport, onSaveToPhoneHard) },
+            enabled = primary.enabled,
             colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
             contentPadding = if (compact) PaddingValues(horizontal = 10.dp, vertical = 6.dp) else ButtonDefaults.ContentPadding,
             modifier = Modifier.padding(end = if (compact) 4.dp else 8.dp),
         ) {
-            Text(exportLabel, fontSize = if (compact) 13.sp else 14.sp)
+            Text(primary.label, fontSize = if (compact) 13.sp else 14.sp, maxLines = 1)
         }
     }
 }
 
+/** One primary action whose label/target follows the output: make → (edit) remake → save to 폰하드 → saved. */
+private enum class EditorPrimaryStep { CREATE, RECREATE, SAVE, SAVED }
+
+private data class EditorPrimary(val step: EditorPrimaryStep, val label: String, val enabled: Boolean) {
+    fun dispatch(onExport: () -> Unit, onSaveToPhoneHard: () -> Unit) = when (step) {
+        EditorPrimaryStep.CREATE, EditorPrimaryStep.RECREATE -> onExport()
+        EditorPrimaryStep.SAVE -> onSaveToPhoneHard()
+        EditorPrimaryStep.SAVED -> Unit
+    }
+}
+
+private const val PHONEHARD_SAVING_STATUS = "폰하드에 저장하는 중…"
+
+private fun editorPrimary(session: TrailerSession, outputCurrent: Boolean): EditorPrimary {
+    val rendering = session.export?.running == true
+    val step = when {
+        outputCurrent && session.saved -> EditorPrimaryStep.SAVED
+        outputCurrent -> EditorPrimaryStep.SAVE
+        session.output != null -> EditorPrimaryStep.RECREATE
+        else -> EditorPrimaryStep.CREATE
+    }
+    val label = when {
+        rendering -> "영상 만드는 중…"
+        step == EditorPrimaryStep.SAVE && session.busy && session.status == PHONEHARD_SAVING_STATUS -> "폰하드에 저장 중…"
+        step == EditorPrimaryStep.CREATE -> "영상 만들기"
+        step == EditorPrimaryStep.RECREATE -> "수정본 만들기"
+        step == EditorPrimaryStep.SAVE -> "폰하드에 저장"
+        else -> "저장됨"
+    }
+    val enabled = !rendering && !session.busy && when (step) {
+        EditorPrimaryStep.CREATE, EditorPrimaryStep.RECREATE -> session.editor?.scenes?.isNotEmpty() == true
+        EditorPrimaryStep.SAVE -> true
+        EditorPrimaryStep.SAVED -> false
+    }
+    return EditorPrimary(step, label, enabled)
+}
+
+/** Short output state for the status line; null while rendering/busy (their own progress is shown) or before any output. */
+private fun editorOutputStatus(session: TrailerSession, hasOutput: Boolean, outputCurrent: Boolean): String? = when {
+    session.export?.running == true || session.busy -> null
+    outputCurrent && session.saved -> "폰하드에 저장됨"
+    outputCurrent -> "영상 준비됨 · 폰하드에 저장해 주세요"
+    hasOutput -> "수정 내용으로 영상을 다시 만들어 주세요"
+    else -> null
+}
+
 @Composable
-private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
-    val export = session.export ?: return
+private fun ExportStatusBar(session: TrailerSession, outputStatus: String?, onCancel: () -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
+    val export = session.export
+    if (export == null) {
+        // Render done ≠ saved: one plain line says where the output stands and what to do next.
+        if (outputStatus != null) {
+            Text(
+                outputStatus,
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        return
+    }
     val palette = themePalette()
     Surface(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -969,25 +1034,31 @@ private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRet
             if (export.running) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val percent = export.progress?.let { " ${(it * 100).roundToInt().coerceIn(0, 100)}%" } ?: ""
-                    Text("내보내는 중: ${export.status}$percent", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 2)
+                    Text("영상 만드는 중: ${export.status}$percent", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 2)
                     TextButton(onClick = onCancel) { Text("취소") }
                 }
                 val progress = export.progress
                 if (progress != null) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                 else LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (session.revision != export.snapshotRevision) {
-                    Text("내보내기 시작 후 바뀐 편집은 다음 내보내기에 반영됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("만들기 시작 후 바뀐 편집은 다음 수정본에 반영됩니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             } else if (export.error != null) {
                 Text(export.error, color = palette.danger, style = MaterialTheme.typography.labelMedium)
-                Text("편집 중인 프로젝트는 그대로 저장되어 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("편집본은 그대로 남아 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row {
                     TextButton(onClick = onRetry) { Text("다시 시도") }
                     TextButton(onClick = onDismiss) { Text("닫기") }
                 }
             } else if (export.status.isNotBlank()) {
+                // Finished-with-notes summary: a render result, never a 폰하드 save confirmation.
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(export.status, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 2)
+                    Text(
+                        listOfNotNull(outputStatus, "영상 만들기 ${export.status}").joinToString("\n"),
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 3,
+                    )
                     TextButton(onClick = onDismiss) { Text("닫기") }
                 }
             }
@@ -996,7 +1067,7 @@ private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRet
 }
 
 @Composable
-private fun FocusedFooter(onAddMaterial: () -> Unit, onExport: () -> Unit, exportEnabled: Boolean, outputCurrent: Boolean) {
+private fun FocusedFooter(onAddMaterial: () -> Unit, primary: EditorPrimary, onExport: () -> Unit, onSaveToPhoneHard: () -> Unit) {
     val palette = themePalette()
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -1008,11 +1079,11 @@ private fun FocusedFooter(onAddMaterial: () -> Unit, onExport: () -> Unit, expor
             Text("재료 추가")
         }
         Button(
-            onClick = onExport,
-            enabled = exportEnabled,
+            onClick = { primary.dispatch(onExport, onSaveToPhoneHard) },
+            enabled = primary.enabled,
             modifier = Modifier.weight(1f).heightIn(min = 48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
-        ) { Text(if (outputCurrent) "다시 내보내기" else "내보내기") }
+        ) { Text(primary.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
     }
 }
 
@@ -1069,7 +1140,7 @@ private fun EditorStage(
         if (output != null && showControls) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 TrailerChoice("장면 미리보기", !showOutput, Modifier.weight(1f)) { onShowOutput(false) }
-                TrailerChoice(if (outputCurrent) "완성본" else "이전 완성본 (수정됨)", showOutput, Modifier.weight(1f)) { onShowOutput(true) }
+                TrailerChoice(if (outputCurrent) "만든 영상" else "이전 영상 (수정 전)", showOutput, Modifier.weight(1f)) { onShowOutput(true) }
             }
         }
         Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
@@ -1123,13 +1194,15 @@ private fun EditorStage(
             FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 if (!outputCurrent) {
                     val palette = themePalette()
+                    // Stale output: the same primary step as the header/footer (수정본 만들기), not a separate option.
+                    val primary = editorPrimary(session, outputCurrent)
                     Button(
                         onClick = onExport,
-                        enabled = session.export?.running != true && !session.busy && session.editor?.scenes?.isNotEmpty() == true,
+                        enabled = primary.enabled,
                         colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                     ) {
-                        Text("새 편집으로 다시 내보내기", fontSize = 12.sp)
+                        Text(primary.label, fontSize = 12.sp)
                     }
                 }
                 AssistChip(onClick = onFullscreen, label = { Text("전체화면") }, leadingIcon = { Icon(Icons.Default.Fullscreen, null, Modifier.size(18.dp)) })
@@ -1312,7 +1385,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 )
                 if (framingEffectsFailed && scene.fit == SceneFit.FILL && (scene.focusX != 0f || scene.focusY != 0f)) {
                     Text(
-                        "이 기기 재생 미리보기는 가운데 기준입니다 · 내보내기에는 위치가 반영됩니다",
+                        "이 기기 재생 미리보기는 가운데 기준입니다 · 만든 영상에는 위치가 반영됩니다",
                         Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
                         color = Color.White,
                         style = MaterialTheme.typography.labelSmall,
@@ -2068,7 +2141,7 @@ private fun UnavailableMusicCard(track: TrailerMusicTrack, session: TrailerSessi
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.error,
             )
-            Text("선택과 설정은 그대로 보관됩니다. 해결하기 전에는 이 음악 없이 내보내지 않습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("선택과 설정은 그대로 보관됩니다. 해결하기 전에는 이 음악 없이 영상을 만들지 않습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { model.editorRecheckMusic() }) { Text("다시 확인") }
                 Button(onClick = onReselect) { Text("다시 고르기") }
@@ -2089,11 +2162,11 @@ private fun MissingMusicExportDialog(session: TrailerSession, model: NasFinderVi
         title = { Text("음악 파일을 찾을 수 없습니다") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("이 편집에 고른 음악 ‘${track.name}’을(를) 지금 읽을 수 없어, 그대로 내보내면 의도와 다른 소리가 됩니다.")
+                Text("이 편집에 고른 음악 ‘${track.name}’을(를) 지금 읽을 수 없어, 그대로 만들면 의도와 다른 소리가 됩니다.")
                 if (session.isMusicOverlayMode) {
                     Text("뮤직비디오는 음악이 필요합니다. 파일을 다시 확인하거나 다른 음악을 골라 주세요.", style = MaterialTheme.typography.bodySmall)
                 } else {
-                    Text("‘음악 없이 내보내기’는 이번 결과물에만 적용되며, 음악 선택은 편집에 계속 보관됩니다.", style = MaterialTheme.typography.bodySmall)
+                    Text("‘음악 없이 만들기’는 이번 영상에만 적용되며, 음악 선택은 편집에 계속 보관됩니다.", style = MaterialTheme.typography.bodySmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedButton(onClick = { model.editorRecheckMusic() }) { Text("다시 확인") }
@@ -2103,7 +2176,7 @@ private fun MissingMusicExportDialog(session: TrailerSession, model: NasFinderVi
         },
         confirmButton = {
             if (!session.isMusicOverlayMode) {
-                TextButton(onClick = model::exportEditorProjectWithoutUnavailableMusic) { Text("음악 없이 내보내기") }
+                TextButton(onClick = model::exportEditorProjectWithoutUnavailableMusic) { Text("음악 없이 만들기") }
             }
         },
         dismissButton = { TextButton(onClick = model::dismissMusicExportPrompt) { Text("취소") } },
@@ -2159,9 +2232,9 @@ private fun ScreenSection(session: TrailerSession, scene: EditorScene?, source: 
         }
     }
     val (w, h) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
-    Text("내보내기 크기 ${w}×${h}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text("영상 크기 ${w}×${h}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (session.format == TrailerFormat.ORIGINAL) {
-        Text("'원본'은 첫 번째 영상의 비율을 따릅니다. 첫 영상의 순서를 바꾸면 내보내기 방향이 바뀔 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("'원본'은 첫 번째 영상의 비율을 따릅니다. 첫 영상의 순서를 바꾸면 영상 방향이 바뀔 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
