@@ -72,7 +72,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -115,7 +114,7 @@ private fun editorTier(width: Dp): EditorTier = when {
 private enum class InspectorTab(val title: String) { SCENE("장면"), CAPTION("자막"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
 
 /** Three separate steps of one project. Choosing a step never renders or saves; only their explicit buttons do. */
-private enum class EditorPhase(val title: String) { EDIT("1 장면 편집"), REVIEW("2 전체 영상 확인"), SAVE("3 저장") }
+private enum class EditorPhase(val title: String) { EDIT("1 편집"), REVIEW("2 전체 미리보기"), SAVE("3 저장") }
 
 // Very short scenes (e.g. near-duplicate photos at 1% weight) would otherwise all read "0.0초".
 private fun seconds1(value: Double): String = if (value > 0.0 && value < 0.095) "%.2f초".format(value) else "%.1f초".format(value)
@@ -260,8 +259,8 @@ internal fun AdaptiveEditorWorkspace(
             phase = target
         }
 
-        // Step 1 arranges the same parts per width: '장면 고르기' board, then '선택한 장면' (preview → tabs →
-        // inspector) with '전체 영상 확인' under it. Steps 2 and 3 replace the whole area with one task each.
+        // Step 1 arranges the same parts per width: the scene board, then the selected scene (preview → tabs →
+        // inspector). Phases change only in the header navigation; steps 2 and 3 replace the area with one task each.
         @Composable
         fun Board(isPhone: Boolean, fixedColumns: Int?, modifier: Modifier) {
             SceneBoard(
@@ -353,43 +352,13 @@ internal fun AdaptiveEditorWorkspace(
             )
         }
 
-        // Small pane title naming what is being edited; the inspector keeps the scene's detailed line.
-        @Composable
-        fun EditingHeading() {
-            val index = project.scenes.indexOfFirst { it.key == selectedSceneKey }
-            Row(
-                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text("선택한 장면", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                if (index >= 0) {
-                    Text("${index + 1}번", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 1)
-                }
-            }
-        }
-
-        // Step 1 closes its editing area with the way to step 2; it never renders or saves by itself.
-        @Composable
-        fun ReviewAction() {
-            PhaseActionRow {
-                PhasePrimaryButton("전체 영상 확인", enabled = true, modifier = Modifier.weight(1f)) { requestPhase(EditorPhase.REVIEW) }
-            }
-        }
-
         // Step 2: the whole video only. Without a current render nothing old is shown, just the explicit make action.
         @Composable
         fun ReviewPhase(modifier: Modifier) {
             Column(modifier) {
                 ExportStatusBar(session, onCancel = model::cancelEditorExport, onRetry = model::exportEditorProject, onDismiss = model::dismissEditorExportError)
                 if (outputCurrent && output != null) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(Icons.Default.CheckCircle, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
-                        Text("현재 편집 내용 반영됨", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp), horizontalArrangement = Arrangement.End) {
                         TextButton(onClick = { onFullscreenChange(true) }, modifier = Modifier.heightIn(min = IconHitTarget)) {
                             Icon(Icons.Default.Fullscreen, null, Modifier.size(24.dp))
                             Spacer(Modifier.width(6.dp))
@@ -398,33 +367,13 @@ internal fun AdaptiveEditorWorkspace(
                     }
                     // Left on exit (the player is released); fullscreen pauses it in the same frame, nothing autoplays.
                     OutputPlayer(output, !fullscreenPlayback, Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp))
-                } else Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Column(
-                        Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Text(
-                            "현재 편집 내용으로 전체 영상을 만들어 확인합니다",
-                            style = MaterialTheme.typography.bodyLarge,
-                            textAlign = TextAlign.Center,
-                        )
-                        Text(
-                            "장면 ${project.scenes.size}개 · ${trailerLengthTitle(session.scenes.sumOf { it.length })}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        PhasePrimaryButton(
-                            if (rendering) "전체 영상 만드는 중…" else "전체 영상 만들기",
-                            enabled = !rendering && !session.busy && project.scenes.isNotEmpty(),
-                            modifier = Modifier.widthIn(min = 240.dp),
-                            onClick = model::exportEditorProject,
-                        )
-                    }
-                }
-                PhaseActionRow {
-                    PhaseSecondaryButton("편집으로 돌아가기", Modifier.weight(1f)) { requestPhase(EditorPhase.EDIT) }
-                    PhasePrimaryButton("다음: 저장", enabled = saveReady, modifier = Modifier.weight(1f)) { requestPhase(EditorPhase.SAVE) }
+                } else Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    PhasePrimaryButton(
+                        if (rendering) "영상 만드는 중…" else "영상 만들기",
+                        enabled = !rendering && !session.busy && project.scenes.isNotEmpty(),
+                        modifier = Modifier.widthIn(min = 240.dp),
+                        onClick = model::exportEditorProject,
+                    )
                 }
             }
         }
@@ -439,12 +388,6 @@ internal fun AdaptiveEditorWorkspace(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     TrailerSectionTitle("저장 위치 · 폰하드")
-                    Text(
-                        "${session.displayTitle} · ${trailerLengthTitle(session.scenes.sumOf { it.length })}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
                     if (savedCurrent) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Default.CheckCircle, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
@@ -467,10 +410,8 @@ internal fun AdaptiveEditorWorkspace(
                 }
                 PhaseActionRow {
                     if (savedCurrent) {
-                        PhaseSecondaryButton("편집 계속", Modifier.weight(1f)) { requestPhase(EditorPhase.EDIT) }
                         PhasePrimaryButton("닫기", enabled = true, modifier = Modifier.weight(1f), onClick = onRequestClose)
                     } else {
-                        PhaseSecondaryButton("편집으로 돌아가기", Modifier.weight(1f)) { requestPhase(EditorPhase.EDIT) }
                         PhasePrimaryButton(
                             if (session.busy && session.status == PHONEHARD_SAVING_STATUS) "폰하드에 저장 중…" else "폰하드에 저장",
                             enabled = saveReady,
@@ -556,47 +497,40 @@ internal fun AdaptiveEditorWorkspace(
                     EditorPhase.REVIEW -> ReviewPhase(Modifier.weight(1f).fillMaxWidth())
                     EditorPhase.SAVE -> SavePhase(Modifier.weight(1f).fillMaxWidth())
                     EditorPhase.EDIT -> if (isLandscape) {
-                        // Expanded landscape: left 4-column '장면 고르기' board | right '선택한 장면' (preview → tabs →
-                        // scrolling inspector) at 1:1, closed by '전체 영상 확인'.
+                        // Expanded landscape: left 4-column scene board | right selected scene (preview → tabs →
+                        // scrolling inspector) at 1:1.
                         Row(Modifier.weight(1f).fillMaxWidth()) {
                             Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(1f).fillMaxHeight())
                             VerticalHairline()
                             Column(Modifier.weight(1f).fillMaxHeight()) {
-                                EditingHeading()
                                 Stage(baseShare = 0.24f, baseMax = 200.dp, maxShare = 0.5f, horizontalPadding = 8.dp)
                                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                                 Inspector(Modifier.weight(1f).fillMaxWidth())
-                                ReviewAction()
                             }
                         }
                     } else if (isPhone) {
-                        // Phone: the board comes first; a scene tap or '선택한 장면 편집' opens the detail, and back
-                        // returns to the same board position. Step 2 is reached from the step navigation.
+                        // Phone: the board comes first; a scene tap opens the detail, and back returns to the same
+                        // board position. With several scenes picked, '선택한 장면 편집' opens them for a batch caption.
                         if (!phoneDetailOpen) {
                             Board(isPhone = true, fixedColumns = null, modifier = Modifier.weight(1f).fillMaxWidth())
-                            FocusedFooter(
-                                onAddMaterial = { finderOpen = true },
-                                editEnabled = selectedScene != null,
-                                onEditSelected = { phoneDetailOpen = true },
-                            )
+                            if (selectedSceneKeys.size > 1) {
+                                FocusedFooter(editEnabled = selectedScene != null, onEditSelected = { phoneDetailOpen = true })
+                            }
                         } else {
                             Stage(baseShare = 0.30f, baseMax = 240.dp, maxShare = 0.45f, horizontalPadding = 12.dp)
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                             Inspector(Modifier.weight(1f).fillMaxWidth())
-                            ReviewAction()
                         }
                     } else {
-                        // Expanded portrait: the board in the upper ~45% of the height, then '선택한 장면'
-                        // (preview → tabs → scrolling inspector) closed by '전체 영상 확인'.
+                        // Expanded portrait: the board in the upper ~45% of the height, then the selected scene
+                        // (preview → tabs → scrolling inspector).
                         // While typing, the board yields height so the inspector field and 적용/취소 stay reachable.
                         Board(isPhone = false, fixedColumns = 4, modifier = Modifier.weight(if (imeVisible) 0.25f else 0.45f).fillMaxWidth())
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                         Column(Modifier.weight(if (imeVisible) 0.75f else 0.55f).fillMaxWidth()) {
-                            EditingHeading()
                             Stage(baseShare = 0.28f, baseMax = 180.dp, maxShare = 0.42f, horizontalPadding = 12.dp)
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                             Inspector(Modifier.weight(1f).fillMaxWidth())
-                            ReviewAction()
                         }
                     }
                 }
@@ -870,8 +804,8 @@ private fun EditorHeader(
 private const val PHONEHARD_SAVING_STATUS = "폰하드에 저장하는 중…"
 
 /**
- * Always-visible step navigation under the header: 1 장면 편집 / 2 전체 영상 확인 / 3 저장. The current step is
- * filled and underlined; 3 opens only for the current render while nothing runs. A running render is shown on 2.
+ * Always-visible step navigation under the header and the only phase control: 1 편집 / 2 전체 미리보기 / 3 저장.
+ * The current step is filled and underlined; 3 opens only for the current render while nothing runs. A running render is shown on 2.
  */
 @Composable
 private fun EditorPhaseNavigation(current: EditorPhase, saveEnabled: Boolean, rendering: Boolean, onSelect: (EditorPhase) -> Unit) {
@@ -921,7 +855,7 @@ private fun EditorPhaseNavigation(current: EditorPhase, saveEnabled: Boolean, re
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
 }
 
-/** The fixed bottom row of each step (never inside a scrolling pane): secondary on the left, primary on the right. */
+/** The fixed bottom row of step 3 (never inside a scrolling pane) holding its single primary action. */
 @Composable
 private fun PhaseActionRow(content: @Composable RowScope.() -> Unit) {
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
@@ -941,13 +875,6 @@ private fun PhasePrimaryButton(label: String, enabled: Boolean, modifier: Modifi
         modifier = modifier.heightIn(min = 48.dp),
         colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
     ) { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
-}
-
-@Composable
-private fun PhaseSecondaryButton(label: String, modifier: Modifier, onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick, modifier = modifier.heightIn(min = 48.dp)) {
-        Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
-    }
 }
 
 /** Actual work or failure only (e.g. 폰하드에 저장하는 중…, a save error); a normal finished state adds no line. */
@@ -1008,19 +935,11 @@ private fun ExportStatusBar(session: TrailerSession, onCancel: () -> Unit, onRet
     }
 }
 
-/** Phone board footer: add material, or open the selected scene for editing (step 2 is in the step navigation). */
+/** Phone board footer, only while several scenes are picked: opens them together (e.g. for a batch caption). */
 @Composable
-private fun FocusedFooter(onAddMaterial: () -> Unit, editEnabled: Boolean, onEditSelected: () -> Unit) {
+private fun FocusedFooter(editEnabled: Boolean, onEditSelected: () -> Unit) {
     val palette = themePalette()
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        OutlinedButton(onClick = onAddMaterial, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
-            PackIcon(PackGlyph.ADD, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("재료 추가")
-        }
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         Button(
             onClick = onEditSelected,
             enabled = editEnabled,
@@ -1457,8 +1376,8 @@ private fun SceneBoard(
     val indexedScenes = remember(project.scenes) { project.scenes.mapIndexed { idx, s -> idx to s } }
 
     Column(modifier) {
-        // Compact toolbar: what this area is (장면 고르기 + count/length), one text toggle for multi-selection, and
-        // the selected scenes' actions wrapping below. Every scene is always shown in project order.
+        // Compact toolbar: the scene count and one text toggle for multi-selection; count, 전체 선택 and the
+        // move/clone/delete actions appear only while selecting several (a single scene uses its ⋮ menu).
         val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
         val multiActive = multiSelectMode || effectiveSelectedKeys.size > 1
         Surface(
@@ -1472,17 +1391,13 @@ private fun SceneBoard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Column(Modifier.align(Alignment.CenterVertically).padding(start = 4.dp, end = 8.dp)) {
-                        Text("장면 고르기", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                        Text(
-                            "${project.scenes.size}개 · ${trailerLengthTitle(project.scenes.sumOf { it.length })} · " +
-                                if (multiSelectMode) "눌러서 여러 장면 선택" else "장면을 눌러 편집",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
+                    Text(
+                        "장면 ${project.scenes.size}개",
+                        Modifier.align(Alignment.CenterVertically).padding(start = 4.dp, end = 8.dp),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                    )
                     val toggleLabel = if (multiActive) "선택 끝내기" else "여러 장면 선택"
                     val toggle: () -> Unit = {
                         if (multiActive) {
@@ -1502,7 +1417,7 @@ private fun SceneBoard(
                         }
                     }
                 }
-                if (effectiveSelectedKeys.isNotEmpty()) {
+                if (multiActive && effectiveSelectedKeys.isNotEmpty()) {
                     // Selection count and the actions on it share one wrapping row instead of shrinking.
                     FlowRow(
                         Modifier.fillMaxWidth(),
@@ -1522,17 +1437,15 @@ private fun SceneBoard(
                             color = MaterialTheme.colorScheme.primary,
                             maxLines = 1,
                         )
-                        if (multiActive) {
-                            TextButton(
-                                onClick = {
-                                    if (effectiveSelectedKeys.size == project.scenes.size) onClearSelection()
-                                    else onSelectAll()
-                                },
-                                contentPadding = PaddingValues(horizontal = 8.dp),
-                                modifier = Modifier.align(Alignment.CenterVertically).heightIn(min = IconHitTarget),
-                            ) {
-                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택")
-                            }
+                        TextButton(
+                            onClick = {
+                                if (effectiveSelectedKeys.size == project.scenes.size) onClearSelection()
+                                else onSelectAll()
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp),
+                            modifier = Modifier.align(Alignment.CenterVertically).heightIn(min = IconHitTarget),
+                        ) {
+                            Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택")
                         }
                         SceneSelectionAction(PackGlyph.MOVE, "위치 이동", onClick = { onRequestMoveDialog(effectiveSelectedKeys) })
                         SceneSelectionAction(PackGlyph.DUPLICATE, "복제", description = "장면 복제", onClick = { onDuplicate(effectiveSelectedKeys) })
