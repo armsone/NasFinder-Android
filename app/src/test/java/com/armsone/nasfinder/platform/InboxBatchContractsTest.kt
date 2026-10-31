@@ -2,6 +2,7 @@ package com.armsone.nasfinder.platform
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.UUID
@@ -80,6 +81,73 @@ class InboxBatchContractsTest {
                 ),
             )
         }
+    }
+
+    @Test fun uploadedCopyAcceptsNewSameSizeFileWithOriginalName() {
+        assertEquals(
+            "photo.jpg",
+            InboxBatchContracts.findUploadedCopy("photo.jpg", 10L, setOf("other.txt"), listOf("other.txt" to 3L, "photo.jpg" to 10L)),
+        )
+        assertEquals("notes", InboxBatchContracts.findUploadedCopy("notes", 4L, emptySet(), listOf("notes" to 4L)))
+    }
+
+    @Test fun uploadedCopyAcceptsCollisionRenamedFileOnlyWhenNew() {
+        assertEquals(
+            "photo (1).jpg",
+            InboxBatchContracts.findUploadedCopy(
+                "photo.jpg", 10L, setOf("photo.jpg"), listOf("photo.jpg" to 10L, "photo (1).jpg" to 10L),
+            ),
+        )
+        // 이미 번호 이름이 있었다면 서비스가 다음 번호를 붙인다.
+        assertEquals(
+            "photo (2).jpg",
+            InboxBatchContracts.findUploadedCopy(
+                "photo.jpg", 10L, setOf("photo.jpg", "photo (1).jpg"),
+                listOf("photo.jpg" to 10L, "photo (1).jpg" to 10L, "photo (2).jpg" to 10L),
+            ),
+        )
+        // 원래 이름이 이미 번호를 가졌다면 서비스는 그 번호를 떼고 다음 번호를 붙인다.
+        assertEquals(
+            "photo (2).jpg",
+            InboxBatchContracts.findUploadedCopy(
+                "photo (1).jpg", 10L, setOf("photo (1).jpg"), listOf("photo (1).jpg" to 10L, "photo (2).jpg" to 10L),
+            ),
+        )
+    }
+
+    @Test fun uploadedCopyRejectsPreexistingSameNameAndSize() {
+        // 업로드 전에 있던 파일만 보이면 이번 업로드의 결과로 볼 수 없다.
+        assertNull(InboxBatchContracts.findUploadedCopy("photo.jpg", 10L, setOf("photo.jpg"), listOf("photo.jpg" to 10L)))
+        assertNull(
+            InboxBatchContracts.findUploadedCopy(
+                "photo.jpg", 10L, setOf("photo.jpg", "photo (1).jpg"),
+                listOf("photo.jpg" to 10L, "photo (1).jpg" to 10L),
+            ),
+        )
+    }
+
+    @Test fun uploadedCopyRejectsWrongSizeUnknownAndUnrelatedNames() {
+        assertNull(InboxBatchContracts.findUploadedCopy("photo.jpg", 10L, emptySet(), listOf("photo.jpg" to 9L)))
+        assertNull(InboxBatchContracts.findUploadedCopy("photo.jpg", 10L, emptySet(), listOf("photo (1).jpg" to 11L)))
+        assertNull(InboxBatchContracts.findUploadedCopy("photo.jpg", 10L, emptySet(), emptyList()))
+        // 크기가 같아도 이름이 다른 새 파일, 비슷해 보이는 이름은 받지 않는다.
+        assertNull(
+            InboxBatchContracts.findUploadedCopy(
+                "photo.jpg", 10L, emptySet(),
+                listOf("other.jpg" to 10L, "photo(1).jpg" to 10L, "photo (x).jpg" to 10L, "xphoto (1).jpg" to 10L,
+                    "photo (1).png" to 10L, "photo (1).jpg.bak" to 10L),
+            ),
+        )
+    }
+
+    @Test fun uploadedCopyPicksTheNewCandidateAmongPreexistingFiles() {
+        assertEquals(
+            "photo (3).jpg",
+            InboxBatchContracts.findUploadedCopy(
+                "photo.jpg", 10L, setOf("photo.jpg", "photo (1).jpg", "photo (2).jpg"),
+                listOf("photo.jpg" to 10L, "photo (1).jpg" to 10L, "photo (2).jpg" to 10L, "photo (3).jpg" to 10L),
+            ),
+        )
     }
 
     private inline fun <reified T : Throwable> assertFails(block: () -> Unit) {

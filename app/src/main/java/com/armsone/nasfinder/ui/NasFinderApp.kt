@@ -589,6 +589,9 @@ internal fun BuiltInPreviewScreen(
     var controlsVisible by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
     var controlInteraction by remember(previewSourceKey) { mutableIntStateOf(0) }
     var slideshowPlaying by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
+    // Index reached by end-of-playback auto-advance (not by the user); a failure there must stay visible in the app.
+    var implicitAdvanceIndex by remember(previewSourceKey) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(preview.index) { if (implicitAdvanceIndex != preview.index) implicitAdvanceIndex = null }
     val focusRequester = remember { FocusRequester() }
 
     fun revealControls() { controlsVisible = true; controlInteraction++ }
@@ -790,11 +793,14 @@ internal fun BuiltInPreviewScreen(
                         onInteraction = ::revealControls,
                         onDismiss = onClose,
                         onPlaybackFailure = onPlaybackFailure,
+                        autoRouteOnFailure = implicitAdvanceIndex != preview.index,
                         playbackSuspended = playbackSuspended,
                         onNextMedia = if (preview.images.size > 1) {
                             {
                                 slideshowPlaying = true
-                                onSelectIndex(MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode))
+                                val nextIndex = MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)
+                                implicitAdvanceIndex = nextIndex
+                                onSelectIndex(nextIndex)
                             }
                         } else null,
                     )
@@ -1169,6 +1175,7 @@ private fun MediaPreviewContent(
     onDismiss: () -> Unit,
     onPlaybackFailure: (() -> Unit)?,
     onNextMedia: (() -> Unit)? = null,
+    autoRouteOnFailure: Boolean = true,
     playbackSuspended: Boolean = false,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -1588,11 +1595,12 @@ private fun MediaPreviewContent(
         }
         // A video this viewer cannot show is routed to the system's own player chooser right away when the file is already
         // on this device (a remote stream is never downloaded without the user pressing the button below). Closing the
-        // chooser returns here, where 닫기 / 다시 시도 stay available. Runtime decoder support is not assumed.
+        // chooser returns here, where 닫기 / 다시 시도 stay available. Runtime decoder support is not assumed. An item reached by
+        // end-of-playback auto-advance never opens the chooser by itself: the error stays here with the explicit button.
         var autoRoutedToChooser by remember(mediaSourceKey) { mutableStateOf(false) }
         LaunchedEffect(playbackError) {
             if (playbackError != null && !autoRoutedToChooser && preview.kind == BuiltInPreviewKind.VIDEO &&
-                preview.remoteStream == null && onPlaybackFailure != null
+                preview.remoteStream == null && onPlaybackFailure != null && autoRouteOnFailure
             ) {
                 autoRoutedToChooser = true
                 onPlaybackFailure()
@@ -1708,7 +1716,8 @@ private fun MediaPreviewContent(
                                     audioManager.abandonAudioFocus(focusChangeListener)
                                     playing = false
                                 } else {
-                                    audioManager.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+                                    // ExoPlayer already owns audio focus (handleAudioFocus); a second app-level request here made
+                                    // the player's own request deliver LOSS to this listener, which paused it again right away.
                                     player?.play()
                                     playing = true
                                 }
@@ -2040,8 +2049,14 @@ internal fun rememberTrailerDraftCover(draft: TrailerDraft, maxPixelSize: Int = 
 /** Draft length exactly as the draft manager shows it: completed output metadata, else the planned scene sum. */
 @Composable
 internal fun rememberTrailerDraftDuration(draft: TrailerDraft): Double {
-    val hasCompletedOutput = draft.output != null && draft.output.exists() && draft.output.length() > 0
-    return remember(draft.id, draft.timestamp) {
+    // 편집본이 있으면 출력 리비전이 현재와 일치함이 확인될 때만 출력 길이를 쓴다(알 수 없는 레거시 출력은 낡은 것으로 취급).
+    val outputStale = if (draft.editor != null) {
+        draft.revision == null || draft.outputRevision == null || draft.outputRevision != draft.revision
+    } else {
+        draft.revision != null && draft.outputRevision != null && draft.outputRevision != draft.revision
+    }
+    val hasCompletedOutput = draft.output != null && draft.output.exists() && draft.output.length() > 0 && !outputStale
+    return remember(draft.id, draft.timestamp, draft.output, draft.revision, draft.outputRevision, hasCompletedOutput) {
         if (hasCompletedOutput) {
             val duration = runCatching {
                 val retriever = android.media.MediaMetadataRetriever()
@@ -2054,8 +2069,11 @@ internal fun rememberTrailerDraftDuration(draft: TrailerDraft): Double {
             }.getOrNull()
             if (duration != null && duration.isFinite() && duration > 0.0) duration else null
         } else null
-    } ?: remember(draft.id, draft.sources, draft.total, draft.clipLength, draft.photoClipLength, draft.musicTrack, draft.musicPolicy, draft.musicFitCount) {
-        val scenes = if (draft.isMusicOverlayMode) {
+    } ?: remember(draft.id, draft.sources, draft.total, draft.clipLength, draft.photoClipLength, draft.musicTrack, draft.musicPolicy, draft.musicFitCount, draft.editor) {
+        val scenes = if (draft.editor != null) {
+            // 저장된 편집 장면이 있으면 계획이 아니라 실제 편집 결과 길이를 보여준다.
+            draft.editor.toTrailerScenes(draft.sources)
+        } else if (draft.isMusicOverlayMode) {
             musicOverlayScenes(draft.sources, draft.photoClipLength, draft.musicTrack, draft.musicPolicy, draft.musicFitCount)
         } else {
             trailerScenes(draft.sources, draft.total, draft.clipLength, draft.photoClipLength, draft.musicTrack, draft.musicPolicy, draft.musicFitCount)
@@ -3689,6 +3707,7 @@ private fun connectionKindDashboardLabel(kind: ConnectionKind) = when (kind) {
 
 @Composable
 private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model: NasFinderViewModel) {
+    val localNetworkGate = rememberLocalNetworkGate()
     val draftId = remember { editing?.id ?: java.util.UUID.randomUUID().toString() }
     var kind by remember { mutableStateOf(editing?.kind ?: ConnectionKind.SYNOLOGY) }
     var name by remember { mutableStateOf(editing?.name.orEmpty()) }; var host by remember { mutableStateOf(editing?.host.orEmpty()) }
@@ -3708,7 +3727,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
     val valid = if (kind.oauth) name.isNotBlank() && (password.isNotBlank() || oauthConnected)
         else name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && password.isNotBlank() && port.toIntOrNull() in 1..65535 && (kind != ConnectionKind.SYNOLOGY || otpValid)
     fun candidate() = RemoteConnection(draftId, name.trim(), kind, (host.ifBlank { cloudApiHost(kind) }).trim().removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':'), port.toIntOrNull() ?: kind.defaultPort, username.trim(), rootPath, tls, trustedHostKey, editing?.createdAt ?: System.currentTimeMillis())
-    Scaffold(containerColor = Color.Transparent, topBar = { PorcelainTopBar(title = if (editing == null) "연결 추가" else "연결 수정", onBack = { model.show(Screen.Dashboard) }, actions = { TextButton(onClick = { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } }, enabled = valid && !state.isBusy, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editing == null) "연결" else "저장") } }) }) { padding ->
+    Scaffold(containerColor = Color.Transparent, topBar = { PorcelainTopBar(title = if (editing == null) "연결 추가" else "연결 수정", onBack = { model.show(Screen.Dashboard) }, actions = { TextButton(onClick = { localNetworkGate { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } } }, enabled = valid && !state.isBusy, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editing == null) "연결" else "저장") } }) }) { padding ->
         LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { Text("연결 방식", style = MaterialTheme.typography.titleSmall) }
             item {
@@ -3774,7 +3793,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
                 } else {
                     item { OutlinedTextField(password, { password = it }, label = { Text("수동 OAuth 액세스 토큰") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 }
-                item { OutlinedButton(onClick = { model.testConnection(candidate(), password) }, enabled = valid && !state.isBusy, modifier = Modifier.fillMaxWidth()) { Text("연결만 확인") } }
+                item { OutlinedButton(onClick = { localNetworkGate { model.testConnection(candidate(), password) } }, enabled = valid && !state.isBusy, modifier = Modifier.fillMaxWidth()) { Text("연결만 확인") } }
                 item { Text(if (oauthConfigured) "PKCE 브라우저 로그인으로 받은 토큰은 Android Keystore로 보호됩니다." else "client ID가 없으면 기존 수동 액세스 토큰 방식만 사용합니다. 토큰은 Android Keystore로 보호됩니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             } else {
                 item {
@@ -4189,6 +4208,92 @@ internal fun DownloadDestinationDialog(
     )
 }
 
+/** 선택한 PhoneHard 항목과 복사/이동 구분. 대상 위치를 고르는 동안만 기억한다. */
+private class PhoneHardTransferRequest(val targets: List<PhoneHardTarget>, val move: Boolean)
+
+/**
+ * 폰하드 복사/이동의 위치 선택: NAS·네트워크 / 내 휴대폰 폴더(SAF) / 폰하드 안 다른 폴더(기존 동작).
+ * NAS·휴대폰 폴더는 파일만 한 개씩 보내므로 폴더를 함께 골랐다면 제외된다는 점을 먼저 알려 준다.
+ */
+@Composable
+private fun PhoneHardTransferDestinationDialog(
+    move: Boolean,
+    fileCount: Int,
+    folderCount: Int,
+    hasConnections: Boolean,
+    onDismiss: () -> Unit,
+    onSelectNas: () -> Unit,
+    onSelectDeviceFolder: () -> Unit,
+    onSelectPhoneHardFolder: () -> Unit,
+) {
+    val verb = if (move) "이동" else "복사"
+    @Composable
+    fun Option(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, detail: String, enabled: Boolean, onClick: () -> Unit) {
+        Surface(
+            onClick = onClick,
+            enabled = enabled,
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (enabled) 0.6f else 0.3f),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+        ) {
+            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Icon(icon, null, tint = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = .38f))
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = .38f))
+                    Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("어디로 ${verb}할까요?") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    buildString {
+                        append("파일 ${fileCount}개")
+                        if (folderCount > 0) append(", 폴더 ${folderCount}개")
+                        append("를 선택했습니다. NAS·휴대폰 폴더로는 ZIP 없이 원래 이름의 파일을 한 개씩 ${verb}합니다.")
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (folderCount > 0) {
+                    Text(
+                        "폴더 ${folderCount}개는 NAS·휴대폰 폴더로 개별 전송하지 않고 제외됩니다(선택은 그대로 남습니다). 폴더는 ‘폰하드 안 다른 폴더’로만 ${verb}할 수 있고, 폴더째 내보내려면 ‘다운로드’를 쓰세요.",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (move) {
+                    Text(
+                        "이동은 한 개씩 대상에 저장하고 크기를 확인한 파일만 폰하드에서 지웁니다. 실패하거나 확인하지 못한 파일은 폰하드에 남습니다.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Option(
+                    Icons.Default.CloudUpload,
+                    "NAS · 네트워크",
+                    if (fileCount == 0) "파일을 선택했을 때만 쓸 수 있습니다." else if (hasConnections) "저장해 둔 연결을 고른 뒤 폴더를 찾아 보냅니다." else "저장된 연결이 없습니다. 다음 단계에서 연결을 추가할 수 있습니다.",
+                    fileCount > 0,
+                    onSelectNas,
+                )
+                Option(
+                    Icons.Default.SdCard,
+                    "내 휴대폰 폴더",
+                    if (fileCount == 0) "파일을 선택했을 때만 쓸 수 있습니다." else "다운로드, SD 카드 등 폴더를 직접 고릅니다. 같은 이름은 덮어쓰지 않고 번호를 붙입니다.",
+                    fileCount > 0,
+                    onSelectDeviceFolder,
+                )
+                Option(Icons.Default.Folder, "폰하드 안 다른 폴더", "폰하드 최상위 또는 특정 폴더로 ${verb}합니다(폴더 포함).", true, onSelectPhoneHardFolder)
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } },
+    )
+}
+
 @Composable
 internal fun NetworkDownloadProgressDialog(
     progress: com.armsone.nasfinder.ui.NetworkDownloadProgress,
@@ -4285,6 +4390,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     }
     var coverFlowDark by rememberSaveable(browser.connection.id) { mutableStateOf(true) }
     val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        model.setBrowserSystemPickerOpen(false)
         uri?.let(model::uploadDocument)
     }
     var pendingDownloadItems by remember { mutableStateOf<List<RemoteFileItem>?>(null) }
@@ -4293,7 +4399,11 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
     var folderTrailerTarget by remember { mutableStateOf<RemoteFileItem?>(null) }
     var folderMusicOverlayTarget by remember { mutableStateOf<RemoteFileItem?>(null) }
     var actionToastMessage by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(state.notice) {
+        state.notice?.let { actionToastMessage = it; model.consumeNotice() }
+    }
     val externalTreeDownloadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        model.setBrowserSystemPickerOpen(false)
         if (treeUri != null) {
             val items = pendingDownloadItems ?: return@rememberLauncherForActivityResult
             model.downloadRemoteItems(browser.connection, items, NetworkDownloadDestination.ExternalTree(treeUri))
@@ -4459,11 +4569,12 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                 preferences = browser.preferences,
                 canCreateFolder = capabilities.createFolder,
                 canPaste = capabilities.upload || state.pendingTransfer?.connectionId == browser.connection.id,
+                pasteUploads = state.pendingTransfer?.connectionId != browser.connection.id,
                 onSelect = { selectionMode = true },
                 onCreateFolder = { folderName = ""; creatingFolder = true },
                 onPaste = {
                     if (state.pendingTransfer?.connectionId == browser.connection.id) model.applyTransferDestination()
-                    else uploadLauncher.launch(arrayOf("*/*"))
+                    else { model.setBrowserSystemPickerOpen(true); uploadLauncher.launch(arrayOf("*/*")) }
                 },
                 onRefresh = model::refreshBrowser,
                 update = model::updateBrowserPreferences,
@@ -4519,7 +4630,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         }
     }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
-            ThumbnailTrafficStatus(state.thumbnailTraffic)
+            if (state.pendingInboxUpload == null) ThumbnailTrafficStatus(state.thumbnailTraffic)
             state.mediaPickStaging?.let { staging ->
                 AlertDialog(
                     onDismissRequest = {},
@@ -4544,14 +4655,23 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                         Icon(Icons.Default.CloudUpload, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(9.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(if (pending.isUploading) "NAS로 보내는 중…" else "NAS로 보낼 폴더를 선택하세요", style = MaterialTheme.typography.labelLarge)
-                            Text("${pending.items.size}개 파일 → ${browser.path}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                if (pending.deleteSourceAfterUpload) {
+                                    if (pending.isUploading) "NAS로 이동하는 중… (확인된 파일만 폰하드에서 삭제)" else "NAS로 이동할 폴더를 선택하세요"
+                                } else {
+                                    if (pending.isUploading) "NAS로 보내는 중…" else "NAS로 보낼 폴더를 선택하세요"
+                                },
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                            val firstName = pending.items.first().originalFilename
+                            val what = if (pending.items.size == 1) "‘$firstName’" else "‘$firstName’ 외 ${pending.items.size - 1}개"
+                            Text("$what → ${browser.connection.name}:${browser.path}", style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         }
-                        TextButton(onClick = model::cancelInboxUpload, enabled = !pending.isUploading) { Text("취소") }
+                        TextButton(onClick = model::cancelInboxUpload) { Text(if (pending.isUploading) "중단" else "취소") }
                         Button(
                             onClick = model::applyInboxUploadDestination,
                             enabled = pending.connectionId == browser.connection.id && capabilities.upload && !pending.isUploading && !state.isBusy,
-                        ) { Text("여기로 보내기") }
+                        ) { Text(if (pending.deleteSourceAfterUpload) "여기로 이동" else "여기로 보내기") }
                     }
                 }
             }
@@ -4584,7 +4704,9 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     shape = RoundedCornerShape(12.dp),
                 ) {
                     Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("${pending.items.size}개 항목 $verb 대상: ${browser.path}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                        val firstName = pending.items.first().name
+                        val what = if (pending.items.size == 1) "‘$firstName’" else "‘$firstName’ 외 ${pending.items.size - 1}개"
+                        Text("$what $verb 대상: ${browser.path}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         TextButton(onClick = model::cancelTransfer) { Text("취소") }
                         Button(
                             onClick = model::applyTransferDestination,
@@ -4782,6 +4904,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             },
             onSelectExternalSaf = {
                 showDownloadDestDialog = false
+                model.setBrowserSystemPickerOpen(true)
                 externalTreeDownloadLauncher.launch(null)
             },
         )
@@ -5415,6 +5538,7 @@ private fun FileRow(
             // iOS RemoteFileListRow: 58pt (accessibility 50) thumbnail, corner 9, thumbnailSurface fill and 1pt thumbnailBorder.
             val porcelainRow = usesUnifiedLayout(theme)
             val artworkSide = if (accessibilityLayout) 50.dp else 58.dp
+            val wideRow = !accessibilityLayout && LocalConfiguration.current.screenWidthDp >= 600
             Box(
                 modifier = Modifier
                     .size(artworkSide)
@@ -5491,9 +5615,20 @@ private fun FileRow(
                         )
                     }
                 }
-                item.modifiedAt?.let { modified ->
+                if (!wideRow) item.modifiedAt?.let { modified ->
                     Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(modified)), style = MaterialTheme.typography.labelMedium, color = fileMetaColor(), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
+            }
+            // 태블릿 폭에서는 수정 시각을 오른쪽 열로 보내 이름 줄을 길게 쓰고 목록을 훑기 쉽게 한다.
+            if (wideRow) item.modifiedAt?.let { modified ->
+                Text(
+                    DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(modified)),
+                    modifier = Modifier.padding(start = 12.dp).width(190.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = fileMetaColor(),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
             if (selectionMode) SelectionIndicator(selected)
         }
@@ -5800,6 +5935,8 @@ private fun BrowserMenu(
     onPickLayout: (BrowserLayout) -> Unit = {},
     /** PhoneHard with nothing to paste: the paste tile is the existing file importer and says "가져오기" (iOS). */
     pasteImports: Boolean = false,
+    /** NAS browser with no copy/move pending: the paste tile opens the device file picker and uploads into this folder. */
+    pasteUploads: Boolean = false,
     /** PhoneHard only: the existing Google 포토 entry, shown while that location is not hidden. */
     onGooglePhotos: (() -> Unit)? = null,
     /** NAS browser only: explicit 커버플로우 button right of 포스터; null (PhoneHard/pickers) hides it. */
@@ -5825,6 +5962,8 @@ private fun BrowserMenu(
                     BrowserActionTile("선택", Icons.Default.CheckCircle, Modifier.weight(1f)) { expanded = false; onSelect() }
                     if (pasteImports) {
                         BrowserActionTile("가져오기", Icons.AutoMirrored.Filled.NoteAdd, Modifier.weight(1f), enabled = canPaste) { expanded = false; onPaste() }
+                    } else if (pasteUploads) {
+                        BrowserActionTile("기기에서 올리기", Icons.Default.CloudUpload, Modifier.weight(1f), enabled = canPaste) { expanded = false; onPaste() }
                     } else {
                         BrowserActionTile("붙여넣기", Icons.Default.ContentPaste, Modifier.weight(1f), enabled = canPaste) { expanded = false; onPaste() }
                     }
@@ -5985,6 +6124,8 @@ private fun BrowserSelectionBar(
     onToggleAll: () -> Unit,
     actions: List<BrowserSelectionAction>,
     note: String?,
+    // 스크롤 줄 밖에 항상 보이는 주 동작(폭을 나눠 가진 버튼). 좁은 폰에서도 화면 밖으로 밀리지 않는다.
+    primaryActions: List<BrowserSelectionAction> = emptyList(),
 ) {
     Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f)) {
         Column(Modifier.fillMaxWidth()) {
@@ -6007,6 +6148,21 @@ private fun BrowserSelectionBar(
                     )
                 }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = .32f))
+                if (primaryActions.isNotEmpty()) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        primaryActions.forEach { action ->
+                            FilledTonalButton(
+                                onClick = action.onClick,
+                                enabled = action.enabled && count > 0,
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            ) {
+                                Icon(action.icon, null, Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(action.title, maxLines = 1)
+                            }
+                        }
+                    }
+                }
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
@@ -6315,6 +6471,10 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
     var showPhoneHardPickerForLocalDownload by remember { mutableStateOf(false) }
     var localDownloadTargets by remember { mutableStateOf<List<PhoneHardTarget>?>(null) }
     var pendingSendIds by remember { mutableStateOf<List<java.util.UUID>?>(null) }
+    // NAS 연결 선택 다이얼로그가 복사(기본)인지 이동인지.
+    var pendingSendMove by remember { mutableStateOf(false) }
+    // 복사/이동 → 위치 선택 다이얼로그의 요청, 그리고 휴대폰 폴더 선택기를 띄워 둔 동안 기억하는 요청.
+    var transferChoice by remember { mutableStateOf<PhoneHardTransferRequest?>(null) }
     var phoneHardOpBusy by remember { mutableStateOf(false) }
     var phoneHardOpStatus by remember { mutableStateOf<String?>(null) }
     var actionToastMessage by remember { mutableStateOf<String?>(null) }
@@ -6343,6 +6503,44 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     }
                 }
             }
+        }
+    }
+
+    // 휴대폰 폴더로 파일을 ZIP 없이 한 개씩 복사/이동: 같은 SAF 폴더 선택기(OpenDocumentTree)를 쓴다.
+    val deviceTransferLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        // 요청은 ViewModel이 들고 있다(선택기가 열린 동안 화면이 다시 만들어져도 잃지 않는다).
+        val (ids, move) = model.takeStagedDeviceTransfer() ?: return@rememberLauncherForActivityResult
+        val verb = if (move) "이동" else "복사"
+        if (treeUri == null) {
+            actionToastMessage = "폴더를 고르지 않아 ${verb}하지 않았습니다. 선택은 그대로 남겨 두었습니다."
+            return@rememberLauncherForActivityResult
+        }
+        phoneHardOpBusy = true
+        phoneHardOpStatus = "파일을 한 개씩 ${verb}하는 중입니다…"
+        // 결과 안내(성공 문구·오류 대화상자)와 실패분 재선택은 ViewModel 상태가 맡는다. 여기서는 목록과 선택만 갱신한다.
+        model.transferPhoneHardFilesToExternalTree(ids, treeUri, move) { result ->
+            folderItems = model.loadPhoneHardFolder(currentSubdirectory)
+            phoneHardOpBusy = false
+            phoneHardOpStatus = null
+            // 끝난 파일은 선택에서 빼고, 실패·취소로 남은 파일(과 선택한 폴더)은 선택해 둔다.
+            selectedFileIds.retainAll(result.retryIds(ids).toSet())
+            if (selectedFileIds.isEmpty() && selectedFolderPaths.isEmpty()) selectionMode = false
+        }
+    }
+
+    // NAS 전송에서 돌아오면(취소·부분 실패) 남은 파일을 같은 폴더에서 다시 선택해 둔다.
+    LaunchedEffect(state.inboxRetrySelectIds, files) {
+        val retry = state.inboxRetrySelectIds
+        if (retry.isEmpty()) return@LaunchedEffect
+        val inFolder = files.filter { it.id in retry }
+        if (inFolder.isNotEmpty()) {
+            selectedFolderPaths.clear()
+            selectedFileIds.clear()
+            selectedFileIds.addAll(inFolder.map { it.id })
+            selectionMode = true
+            model.consumeInboxRetrySelection()
+        } else if (state.initialInboxSubpath == null) {
+            model.consumeInboxRetrySelection()
         }
     }
 
@@ -6494,9 +6692,16 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 selectedFileIds.addAll(displayedFiles.map { it.id })
                             }
                         },
+                        // 복사·이동은 스크롤 줄 밖의 고정 버튼으로 둔다. 누르면 NAS·네트워크 / 내 휴대폰 폴더 / 폰하드 안 폴더를 고른다.
+                        primaryActions = listOf(
+                            BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedTargets.isNotEmpty() && !phoneHardOpBusy) {
+                                transferChoice = PhoneHardTransferRequest(selectedTargets, move = false)
+                            },
+                            BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedTargets.isNotEmpty() && !phoneHardOpBusy) {
+                                transferChoice = PhoneHardTransferRequest(selectedTargets, move = true)
+                            },
+                        ),
                         actions = listOf(
-                            BrowserSelectionAction("복사", Icons.Default.ContentCopy, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { copyTargetsDialog = selectedTargets },
-                            BrowserSelectionAction("이동", Icons.Default.DriveFileMove, selectedTargets.isNotEmpty() && !phoneHardOpBusy) { moveTargetsDialog = selectedTargets },
                             BrowserSelectionAction("삭제", Icons.Default.Delete, selectedTargets.isNotEmpty() && !phoneHardOpBusy, destructive = true) { deleteTargetsDialog = selectedTargets },
                             // 이 앱의 목록에서만 숨긴다(파일은 그대로, 잠금·암호화 아님). 일반 모드에서 비공개로 바꾸면 목록에서 바로 사라진다.
                             BrowserSelectionAction("비공개로 전환", Icons.Default.VisibilityOff, selectedTargets.isNotEmpty() && !phoneHardOpBusy) {
@@ -6552,11 +6757,12 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 model.sharePhoneHardTargets(folders, fileIds)
                             },
                             BrowserSelectionAction("NAS로 보내기", Icons.Default.CloudUpload, selectedFileIds.isNotEmpty() && selectedFolderPaths.isEmpty()) {
+                                pendingSendMove = false
                                 pendingSendIds = selectedFileIds.toList()
                             },
                         ),
                         note = when {
-                            selectedTargets.isEmpty() -> null
+                            selectedTargets.isEmpty() -> "복사하거나 이동할 파일을 먼저 선택하세요."
                             !canTrailer -> "예고편 보기와 뮤직비디오는 영상만 선택했을 때 쓸 수 있습니다."
                             selectedFileIds.isEmpty() -> "NAS로 보내기는 파일만 보낼 수 있습니다."
                             else -> null
@@ -6604,7 +6810,8 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     )
                 }
 
-                val totalCount = folderItems.size + files.size
+                // folderItems는 폴더와 파일을 모두 담고 있으므로 폴더만 센다(파일은 files로 센다). 안 그러면 파일이 두 번 세어진다.
+                val totalCount = folderItems.count { it.kind == PhoneHardEntryKind.DIRECTORY } + files.size
                 val dispCount = displayedFolders.size + displayedFiles.size
                 val phoneHardSegments = currentSubdirectory.orEmpty().split('/').filter { it.isNotEmpty() }
                 BrowserPathBar(
@@ -6903,7 +7110,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     enabled = true,
                     onClick = {
                         actionTarget = null
-                        copyTargetsDialog = listOf(target)
+                        transferChoice = PhoneHardTransferRequest(listOf(target), move = false)
                     },
                 ),
                 BaselineAction(
@@ -6913,7 +7120,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                     enabled = true,
                     onClick = {
                         actionTarget = null
-                        moveTargetsDialog = listOf(target)
+                        transferChoice = PhoneHardTransferRequest(listOf(target), move = true)
                     },
                 ),
                 BaselineAction(
@@ -7345,33 +7552,77 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
             )
         }
 
+        transferChoice?.let { request ->
+            val fileTargets = request.targets.filter { !it.isDirectory }
+            PhoneHardTransferDestinationDialog(
+                move = request.move,
+                fileCount = fileTargets.size,
+                folderCount = request.targets.size - fileTargets.size,
+                hasConnections = state.connections.isNotEmpty(),
+                onDismiss = { transferChoice = null },
+                onSelectNas = {
+                    transferChoice = null
+                    pendingSendMove = request.move
+                    pendingSendIds = fileTargets.mapNotNull { it.id }
+                },
+                onSelectDeviceFolder = {
+                    transferChoice = null
+                    model.stageDeviceTransfer(fileTargets.mapNotNull { it.id }, request.move)
+                    deviceTransferLauncher.launch(null)
+                },
+                onSelectPhoneHardFolder = {
+                    transferChoice = null
+                    if (request.move) moveTargetsDialog = request.targets else copyTargetsDialog = request.targets
+                },
+            )
+        }
+
+        state.phoneHardTransferProgress?.let { progress ->
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text(if (progress.move) "휴대폰 폴더로 이동하는 중" else "휴대폰 폴더로 복사하는 중") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("${progress.current}/${progress.total}번째 파일 · 원래 이름으로 한 개씩 저장합니다.", style = MaterialTheme.typography.bodyMedium)
+                        LinearProgressIndicator(progress = { ((progress.current - 1).toFloat() / progress.total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                        if (progress.move) Text("대상에 저장하고 크기를 확인한 파일만 폰하드에서 지웁니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                confirmButton = { TextButton(onClick = model::cancelPhoneHardTransfer) { Text("중단") } },
+            )
+        }
+
         pendingSendIds?.let { ids ->
             val selectedFiles = ids.mapNotNull { id -> files.firstOrNull { it.id == id } }
             val connections = state.connections.sortedBy { if (it.id == state.preferredId) 0 else 1 }
             AlertDialog(
                 onDismissRequest = {
                     pendingSendIds = null
-                    if (selectionMode) {
-                        selectedFileIds.clear()
-                        selectedFolderPaths.clear()
-                        selectionMode = false
-                    }
+                    pendingSendMove = false
                 },
-                title = { Text("NAS로 보내기") },
+                title = { if (pendingSendMove) Text("NAS로 이동") else Text("NAS로 보내기") },
                 text = {
                     if (connections.isEmpty()) {
                         Text("먼저 NAS 또는 원격 서버 연결을 저장해 주세요.")
                     } else {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text("${selectedFiles.size}개 파일을 보낼 연결을 선택하세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                if (pendingSendMove) "다음 화면에서 폴더를 고르면 파일을 한 개씩 올리고, NAS 폴더에서 이름·크기를 확인한 파일만 폰하드에서 지웁니다. ZIP으로 묶지 않습니다."
+                                else "다음 화면에서 폴더를 고르면 파일을 원래 이름으로 한 개씩 올립니다. 폰하드 파일은 그대로 남습니다.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                             connections.forEach { connection ->
                                 Row(
                                     Modifier.fillMaxWidth().clickable {
+                                        val move = pendingSendMove
                                         pendingSendIds = null
+                                        pendingSendMove = false
                                         selectedFileIds.clear()
                                         selectedFolderPaths.clear()
                                         selectionMode = false
-                                        model.beginInboxUpload(ids, connection)
+                                        model.beginInboxUpload(ids, connection, move)
                                     }.padding(vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
@@ -7392,16 +7643,12 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                 dismissButton = {
                     TextButton(onClick = {
                         pendingSendIds = null
-                        if (selectionMode) {
-                            selectedFileIds.clear()
-                            selectedFolderPaths.clear()
-                            selectionMode = false
-                        }
+                        pendingSendMove = false
                     }) { Text("취소") }
                 },
                 confirmButton = {
                     if (connections.isEmpty()) {
-                        TextButton(onClick = { pendingSendIds = null; model.show(Screen.AddConnection()) }) { Text("연결 추가") }
+                        TextButton(onClick = { pendingSendIds = null; pendingSendMove = false; model.show(Screen.AddConnection()) }) { Text("연결 추가") }
                     }
                 },
             )

@@ -72,6 +72,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
@@ -96,6 +97,8 @@ data class AppState(
     val pendingLauncherIcon: LauncherIconVariant? = null,
     val isBusy: Boolean = false,
     val message: String? = null,
+    /** 확인 버튼 없이 잠깐 보이는 성공 안내(NAS 폴더 작업). 실패·부분 성공은 계속 [message] 대화상자로 알린다. */
+    val notice: String? = null,
     val inboxErrorMessage: String? = null,
     val inboxFiles: List<InboxDisplayItem> = emptyList(),
     val download: RemoteDownloadState? = null,
@@ -110,6 +113,10 @@ data class AppState(
     val browserFavorites: List<BrowserFavorite> = emptyList(),
     val pendingTransfer: PendingRemoteTransfer? = null,
     val pendingInboxUpload: PendingInboxUpload? = null,
+    // 휴대폰 폴더(SAF)로 보내는 복사/이동 진행 상태. null이면 진행 중인 전송이 없다.
+    val phoneHardTransferProgress: PhoneHardTransferProgress? = null,
+    // NAS 전송이 끝나거나 취소돼 폰하드로 돌아왔을 때 다시 선택해 둘 파일(실패·미처리분). 화면이 소비하면 비운다.
+    val inboxRetrySelectIds: List<UUID> = emptyList(),
     val pendingLocalUpload: PendingLocalUpload? = null,
     val downloadCacheBytes: Long? = null,
     val appVersion: String = "",
@@ -294,7 +301,67 @@ data class PendingInboxUpload(
     val items: List<InboxDisplayItem>,
     val connectionId: String,
     val isUploading: Boolean = false,
+    // true면 이동: 파일마다 업로드 뒤 대상 목록에서 이름·크기를 확인한 경우에만 폰하드 원본을 지운다.
+    val deleteSourceAfterUpload: Boolean = false,
+    // 선택 시점의 원본 길이·수정 시각. 삭제 직전에 같은 파일인지 다시 대조한다.
+    val sourceSignatures: Map<UUID, PhoneHardSourceSignature> = emptyMap(),
+    // 돌아왔을 때 보여 줄 폰하드 폴더(루트는 null).
+    val sourceSubpath: String? = null,
 )
+
+data class PhoneHardSourceSignature(val length: Long, val lastModified: Long)
+
+data class PhoneHardTransferProgress(val move: Boolean, val current: Int, val total: Int)
+
+/** 휴대폰 폴더로 보낸 파일 단위 결과. 이동에서 [copiedKept]는 복사는 끝났지만 원본을 지우지 않은 파일이다. */
+data class PhoneHardFileTransferResult(
+    val move: Boolean,
+    val total: Int,
+    val completed: List<UUID> = emptyList(),
+    val copiedKept: List<Pair<UUID, String>> = emptyList(),
+    val failed: List<Pair<UUID, String>> = emptyList(),
+    val renamedOnCollision: Int = 0,
+    val cancelled: Boolean = false,
+    val destinationError: String? = null,
+) {
+    val verb: String get() = if (move) "이동" else "복사"
+
+    /** 다시 시도할 파일: 실패했거나 아직 처리하지 못한 파일. 완료·복사만 끝난 파일은 다시 보내지 않는다. */
+    fun retryIds(all: List<UUID>): List<UUID> {
+        val done = (completed + copiedKept.map { it.first }).toSet()
+        return all.filterNot { it in done }
+    }
+
+    val message: String
+        get() {
+            destinationError?.let { return it }
+            val done = completed.size
+            val parts = mutableListOf<String>()
+            if (done > 0) {
+                parts += if (move) {
+                    "${done}개 파일을 휴대폰 폴더로 이동했습니다."
+                } else {
+                    "${done}개 파일을 휴대폰 폴더로 복사했습니다. 폰하드 파일은 기기에 유지됩니다."
+                }
+            }
+            if (renamedOnCollision > 0) {
+                parts += "같은 이름이 있던 ${renamedOnCollision}개는 덮어쓰지 않고 이름 뒤에 번호를 붙여 저장했습니다."
+            }
+            if (copiedKept.isNotEmpty()) {
+                parts += "${copiedKept.size}개는 복사했지만 원본을 지우지 않았습니다: ${copiedKept.first().second}"
+            }
+            if (failed.isNotEmpty()) {
+                parts += "${failed.size}개는 ${verb}하지 못했습니다: ${failed.first().second}"
+            }
+            val untouched = total - done - copiedKept.size - failed.size
+            if (cancelled) {
+                parts += "${if (move) "이동을" else "복사를"} 취소했습니다.${if (untouched > 0) " 아직 처리하지 않은 ${untouched}개는 그대로입니다." else ""}"
+            }
+            return parts.joinToString(" ").ifBlank { "${verb}할 파일이 없습니다." }
+        }
+
+    val isFullSuccess: Boolean get() = !cancelled && failed.isEmpty() && copiedKept.isEmpty() && destinationError == null && completed.size == total
+}
 
 data class PendingLocalUpload(
     val file: File,
@@ -842,6 +909,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * navigation, viewer and browser state is dropped; connections, credentials, settings,
      * downloads, caches and files are untouched so the next foreground return starts on the dashboard.
      */
+    /** NAS 폴더 화면이 시스템 선택기(OpenDocument/OpenDocumentTree)를 여는 동안만 true. 결과·취소 콜백에서 해제한다. */
+    @Volatile private var browserSystemPickerOpen = false
+    fun setBrowserSystemPickerOpen(open: Boolean) { browserSystemPickerOpen = open }
+
     fun returnToDashboardAfterBackground() {
         stopInlineAudio()
         // System media pickers and editor interruptions must retain the shared selection.
@@ -849,7 +920,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.screen == Screen.PhotoSelection ||
             _state.value.screen == Screen.PhotoTransfer || _state.value.trailer != null || _state.value.mediaPick != null ||
             // 작업대도 시스템 파일·폴더 선택기를 연다. 다녀와도 고른 포켓과 선택을 유지한다.
-            (_state.value.screen == Screen.Dashboard && _state.value.activeMainTab == MainNavigationDestination.WORKBENCH)
+            (_state.value.screen == Screen.Dashboard && _state.value.activeMainTab == MainNavigationDestination.WORKBENCH) ||
+            // 휴대폰 폴더 선택기(OpenDocumentTree)를 열었거나 전송이 끝나지 않았으면 폰하드 화면과 선택을 유지한다.
+            stagedDeviceTransfer != null || phoneHardTransferJob?.isCompleted == false ||
+            // NAS 폴더에서 연 시스템 파일·폴더 선택기: 다녀온 뒤에도 그 폴더에서 업로드·다운로드를 이어 간다.
+            browserSystemPickerOpen
         ) return
         connectionOpenJob?.cancel()
         connectionOpenJob = null
@@ -865,6 +940,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
     fun dismissMessage() { _state.update { it.copy(message = null) } }
+    fun consumeNotice() { _state.update { it.copy(notice = null) } }
     fun showMessage(text: String) { _state.update { it.copy(message = text) } }
     fun dismissInboxError() { _state.update { it.copy(inboxErrorMessage = null) } }
     fun showInboxErrorMessage(message: String) { _state.update { it.copy(inboxErrorMessage = message) } }
@@ -2989,7 +3065,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(pendingTransfer = null) }
     }
 
-    fun beginInboxUpload(ids: Iterable<UUID>, connection: RemoteConnection) {
+    fun beginInboxUpload(ids: Iterable<UUID>, connection: RemoteConnection, move: Boolean = false) {
+        // 이전 업로드(취소 뒤 정리 포함)가 끝나기 전에는 대기 상태를 덮어쓰거나 새 연결을 열지 않는다.
+        if (inboxUploadStillFinishing()) {
+            _state.update { it.copy(message = "이전 NAS 전송을 정리하는 중입니다. 잠시 뒤 다시 시도해 주세요.") }
+            return
+        }
         if (_state.value.connections.none { it.id == connection.id }) {
             _state.update { it.copy(message = "선택한 저장 연결을 찾을 수 없습니다.") }
             return
@@ -3004,7 +3085,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         _state.update {
             it.copy(
-                pendingInboxUpload = PendingInboxUpload(items, connection.id),
+                pendingInboxUpload = PendingInboxUpload(
+                    items = items,
+                    connectionId = connection.id,
+                    deleteSourceAfterUpload = move,
+                    sourceSignatures = items.associate { item ->
+                        item.id to PhoneHardSourceSignature(item.file.length(), item.file.lastModified())
+                    },
+                    sourceSubpath = items.first().relativePath.substringBeforeLast('/', "").takeIf { it.isNotEmpty() },
+                ),
                 pendingTransfer = null,
                 message = null,
             )
@@ -3176,13 +3265,39 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    // NAS 업로드(와 이동 시 원본 삭제)를 소유하는 Job. 실행 중에는 새 업로드를 시작하지 않고, 취소하면 다음 삭제 전에 멈춘다.
+    private var inboxUploadJob: Job? = null
+
+    // 취소되어도 NonCancellable 정리가 끝나기 전(isCompleted=false)에는 새 NAS 전송을 시작하지 않는다.
+    private fun inboxUploadStillFinishing(): Boolean = inboxUploadJob?.isCompleted == false
+
     fun cancelInboxUpload() {
-        _state.update { it.copy(pendingInboxUpload = null, screen = Screen.Inbox, message = null) }
+        val running = inboxUploadJob?.takeIf { it.isActive }
+        running?.cancel()
+        _state.update {
+            val pending = it.pendingInboxUpload
+            // 취소하면 폰하드의 같은 폴더로 돌아가 방금 고른 파일을 그대로 다시 선택해 둔다.
+            // 실행 중이던 업로드를 멈춘 경우에는 마무리 단계가 실제 결과로 재선택 대상을 정하므로 여기서 덮어쓰지 않는다.
+            it.copy(
+                pendingInboxUpload = null,
+                screen = Screen.Inbox,
+                message = null,
+                isBusy = if (running != null) false else it.isBusy,
+                initialInboxSubpath = pending?.sourceSubpath ?: it.initialInboxSubpath,
+                inboxRetrySelectIds = if (running != null) it.inboxRetrySelectIds else pending?.items?.map(InboxDisplayItem::id).orEmpty(),
+            )
+        }
+    }
+
+    fun consumeInboxRetrySelection() {
+        _state.update { if (it.inboxRetrySelectIds.isEmpty()) it else it.copy(inboxRetrySelectIds = emptyList()) }
     }
 
     fun applyInboxUploadDestination() {
         val browser = _state.value.screen as? Screen.Browser ?: return
         val pending = _state.value.pendingInboxUpload ?: return
+        // 이미 진행 중이거나 취소 뒤 정리 중이면 두 번째 업로드를 시작하지 않는다.
+        if (pending.isUploading || inboxUploadStillFinishing()) return
         if (pending.connectionId != browser.connection.id) {
             _state.update { it.copy(message = "선택한 연결과 업로드 대상 폴더의 연결이 다릅니다.") }
             return
@@ -3192,60 +3307,188 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(message = "원격 연결을 다시 연 뒤 시도해 주세요.") }
             return
         }
-        viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    isBusy = true,
-                    message = null,
-                    pendingInboxUpload = pending.copy(isUploading = true),
-                )
-            }
+        val uploading = pending.copy(isUploading = true)
+        _state.update { it.copy(isBusy = true, message = null, pendingInboxUpload = uploading) }
+        // Job을 먼저 필드에 담은 뒤 시작해, 빠르게 끝나도 소유 확인이 어긋나지 않게 한다.
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val outcomes = mutableListOf<InboxUploadOutcome>()
-            for (item in pending.items) {
-                var stagedDirectory: File? = null
-                val uploaded = runCatching {
-                    require(item.file.isFile) { "보낼 폰하드 파일을 찾을 수 없습니다." }
-                    val stagedFile = withContext(Dispatchers.IO) {
-                        val uploadsRoot = File(application.cacheDir, "inbox-uploads").canonicalFile
-                        check(uploadsRoot.mkdirs() || uploadsRoot.isDirectory) { "업로드 준비 공간을 만들 수 없습니다." }
-                        val directory = File(uploadsRoot, item.id.toString()).canonicalFile
-                        check(directory.parentFile == uploadsRoot) { "안전하지 않은 업로드 준비 경로입니다." }
-                        check(directory.mkdirs() || directory.isDirectory) { "업로드 준비 폴더를 만들 수 없습니다." }
-                        stagedDirectory = directory
-                        val file = File(directory, item.originalFilename).canonicalFile
-                        check(file.parentFile == directory) { "안전하지 않은 폰하드 파일 이름입니다." }
-                        item.file.inputStream().buffered().use { input ->
-                            file.outputStream().buffered().use(input::copyTo)
+            val move = pending.deleteSourceAfterUpload
+            // 이동에서 NAS 복사는 끝났지만 원본은 지우지 않은 파일의 사유. 다시 보내면 중복되므로 재시도 대상이 아니다.
+            val keptAfterCopy = mutableListOf<String>()
+            var cancelled = false
+            try {
+                for (item in pending.items) {
+                    // 취소되었다면 다음 파일을 시작하지 않는다(그 파일의 원본도 건드리지 않는다).
+                    ensureActive()
+                    var stagedDirectory: File? = null
+                    var namesBefore: Set<String> = emptySet()
+                    val signature = pending.sourceSignatures[item.id]
+                    val uploaded = try {
+                        runCatching {
+                            require(item.file.isFile) { "보낼 폰하드 파일을 찾을 수 없습니다." }
+                            if (move) {
+                                // 이동은 선택한 그 파일일 때만 진행한다. 선택 뒤 바뀌었으면 보내지 않는다.
+                                require(
+                                    signature != null && item.file.length() == signature.length &&
+                                        item.file.lastModified() == signature.lastModified,
+                                ) { "선택한 뒤 ${item.originalFilename} 파일이 바뀌어 이동하지 않았습니다. 다시 선택해 주세요." }
+                                // 업로드가 만든 파일을 가려내기 위해 업로드 전 이름 목록을 잡아 둔다. 목록을 못 읽으면 보내지 않는다.
+                                namesBefore = activeService.list(browser.path).map { it.name }.toSet()
+                            }
+                            val stagedFile = withContext(Dispatchers.IO) {
+                                val uploadsRoot = File(application.cacheDir, "inbox-uploads").canonicalFile
+                                check(uploadsRoot.mkdirs() || uploadsRoot.isDirectory) { "업로드 준비 공간을 만들 수 없습니다." }
+                                val directory = File(uploadsRoot, item.id.toString()).canonicalFile
+                                check(directory.parentFile == uploadsRoot) { "안전하지 않은 업로드 준비 경로입니다." }
+                                check(directory.mkdirs() || directory.isDirectory) { "업로드 준비 폴더를 만들 수 없습니다." }
+                                stagedDirectory = directory
+                                val file = File(directory, item.originalFilename).canonicalFile
+                                check(file.parentFile == directory) { "안전하지 않은 폰하드 파일 이름입니다." }
+                                item.file.inputStream().buffered().use { input ->
+                                    file.outputStream().buffered().use(input::copyTo)
+                                }
+                                file
+                            }
+                            activeService.upload(browser.path, stagedFile)
                         }
-                        file
+                    } finally {
+                        // 취소돼도 임시 복사본은 반드시 지운다.
+                        withContext(NonCancellable + Dispatchers.IO) { runCatching { stagedDirectory?.deleteRecursively() } }
                     }
-                    activeService.upload(browser.path, stagedFile)
+                    // 업로드 도중 취소: 이 파일은 완료로 세지 않고(재선택 대상), 원본은 지우지 않는다.
+                    uploaded.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                    outcomes += uploaded.fold(
+                        onSuccess = { InboxUploadOutcome(item.id, succeeded = true) },
+                        onFailure = { error ->
+                            InboxUploadOutcome(
+                                item.id,
+                                succeeded = false,
+                                failureMessage = error.message?.takeIf(String::isNotBlank)
+                                    ?: "${item.originalFilename} 업로드 실패",
+                            )
+                        },
+                    )
+                    if (uploaded.isSuccess && move && signature != null) {
+                        try {
+                            verifyUploadAndDeleteSource(activeService, browser.path, item, signature, namesBefore)
+                                ?.let { keptAfterCopy += "${item.originalFilename}: $it" }
+                        } catch (e: CancellationException) {
+                            // NAS에는 이미 복사됐으므로 다시 보내지 않도록 완료로 남기고 원본은 지우지 않는다.
+                            keptAfterCopy += "${item.originalFilename}: $PHONE_HARD_MOVE_CANCELLED_KEPT"
+                            throw e
+                        }
+                    }
                 }
-                withContext(Dispatchers.IO) { runCatching { stagedDirectory?.deleteRecursively() } }
-                uploaded.exceptionOrNull()?.let { if (it is CancellationException) throw it }
-                outcomes += uploaded.fold(
-                    onSuccess = { InboxUploadOutcome(item.id, succeeded = true) },
-                    onFailure = { error ->
-                        InboxUploadOutcome(
-                            item.id,
-                            succeeded = false,
-                            failureMessage = error.message?.takeIf(String::isNotBlank)
-                                ?: "${item.originalFilename} 업로드 실패",
-                        )
-                    },
-                )
-            }
-            val summary = InboxBatchContracts.summarizeSequential(outcomes)
-            _state.update {
-                it.copy(
-                    isBusy = false,
-                    pendingInboxUpload = null,
-                    screen = Screen.Inbox,
-                    inboxFiles = inboxFiles(),
-                    message = summary.message,
-                )
+            } catch (e: CancellationException) {
+                cancelled = true
+                throw e
+            } finally {
+                // 취소돼도 지금까지의 결과(성공·미삭제·실패·미처리)를 정확히 반영한다.
+                val succeededIds = outcomes.filter(InboxUploadOutcome::succeeded).map(InboxUploadOutcome::id).toSet()
+                // 실패한 파일과 아직 시작하지 못한 파일만 다시 선택한다. 성공(복사만 끝난 것 포함)은 중복되지 않게 제외한다.
+                val retryIds = pending.items.map(InboxDisplayItem::id).filterNot { it in succeededIds }
+                val summary = InboxBatchContracts.summarizeSequential(outcomes)
+                val untouched = pending.items.size - outcomes.size
+                val baseMessage = when {
+                    move -> nasMoveMessage(summary.successCount - keptAfterCopy.size, keptAfterCopy, summary.failedItems)
+                    outcomes.isEmpty() -> ""
+                    else -> summary.message
+                }
+                val finalMessage = if (cancelled) {
+                    listOf(
+                        baseMessage,
+                        "업로드를 취소했습니다.${if (untouched > 0) " 아직 처리하지 않은 ${untouched}개는 그대로이며 선택해 두었습니다." else ""}",
+                    ).filter(String::isNotBlank).joinToString(" ")
+                } else baseMessage
+                val hasProblem = move && (keptAfterCopy.isNotEmpty() || summary.failureCount > 0)
+                withContext(NonCancellable) {
+                    val files = withContext(Dispatchers.IO) { runCatching { inboxFiles() }.getOrNull() }
+                    _state.update {
+                        // 아직 이 업로드의 대기 상태이거나, 취소로 돌아온 Inbox에 더 새로운 대기 작업이 없을 때만
+                        // 결과(메시지·재시도 선택·진행 표시)를 반영한다. 다른 화면·작업이 이어받았다면 파일 목록만 새로 읽는다.
+                        val samePending = !cancelled && it.pendingInboxUpload?.items === uploading.items
+                        val cancelledInbox = cancelled && it.pendingInboxUpload == null && it.screen == Screen.Inbox
+                        if (!samePending && !cancelledInbox) {
+                            it.copy(inboxFiles = files ?: it.inboxFiles)
+                        } else {
+                            it.copy(
+                                isBusy = false,
+                                pendingInboxUpload = null,
+                                screen = Screen.Inbox,
+                                inboxFiles = files ?: it.inboxFiles,
+                                message = if (hasProblem) null else finalMessage,
+                                inboxErrorMessage = if (hasProblem) finalMessage else it.inboxErrorMessage,
+                                // 실패·미처리 파일은 같은 폰하드 폴더에서 선택된 채로 남겨 바로 다시 시도할 수 있게 한다.
+                                initialInboxSubpath = pending.sourceSubpath ?: it.initialInboxSubpath,
+                                inboxRetrySelectIds = retryIds,
+                            )
+                        }
+                    }
+                }
             }
         }
+        inboxUploadJob = job
+        job.start()
+    }
+
+    /**
+     * 이동: NAS 업로드가 끝난 뒤 대상 폴더를 다시 읽어 이번 업로드가 만든 파일을 이름·크기로 확인하고,
+     * 확인된 경우에만 선택 시점과 같은 원본을 지운다. 지우지 않았다면 그 사유를, 지웠다면 null을 돌려준다.
+     */
+    private suspend fun verifyUploadAndDeleteSource(
+        remote: RemoteFileService,
+        parent: String,
+        item: InboxDisplayItem,
+        signature: PhoneHardSourceSignature,
+        namesBefore: Set<String>,
+    ): String? {
+        val afterFiles = try {
+            remote.list(parent).filterNot { it.isDirectory }.map { it.name to it.size }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return "업로드 뒤 NAS 폴더를 확인하지 못해 원본을 지우지 않았습니다(${e.message ?: "알 수 없는 오류"})."
+        }
+        if (InboxBatchContracts.findUploadedCopy(item.originalFilename, signature.length, namesBefore, afterFiles) == null) {
+            return "NAS 폴더에서 같은 크기의 업로드 파일을 확인하지 못해 원본을 지우지 않았습니다."
+        }
+        return deletePhoneHardSourceIfUnchanged(item, signature)
+    }
+
+    /** 이동 마무리: 신원이 그대로인 폰하드 원본 한 개를 지우고 즐겨찾기·위젯을 정리한다. 실패 사유 또는 성공이면 null. */
+    private suspend fun deletePhoneHardSourceIfUnchanged(item: InboxDisplayItem, signature: PhoneHardSourceSignature): String? {
+        // 취소된 뒤에는 원본을 지우지 않는다. 확인과 삭제 사이에 취소가 끼어들어도 삭제 직전에 한 번 더 본다.
+        val owner = kotlinx.coroutines.currentCoroutineContext()[Job]
+        if (owner?.isActive == false) return PHONE_HARD_MOVE_CANCELLED_KEPT
+        // 삭제가 시작되면 취소로 중간에 끊겨 결과(삭제 여부)를 잃지 않도록 NonCancellable로 끝까지 마친다.
+        return withContext(NonCancellable + Dispatchers.IO) {
+            if (owner?.isActive == false) return@withContext PHONE_HARD_MOVE_CANCELLED_KEPT
+            val error = try {
+                inboxStore.deleteFileIfUnchanged(item.id, item.relativePath, signature.length, signature.lastModified)
+            } catch (e: Exception) {
+                e.message ?: "원본을 삭제하지 못했습니다."
+            }
+            if (error == null) {
+                val norm = item.relativePath.trim().removePrefix("/").removeSuffix("/")
+                val remaining = _state.value.remoteFavorites.filterNot { it.connectionId == "phonehard" && it.path == norm }
+                if (remaining.size != _state.value.remoteFavorites.size) {
+                    favoriteRepository.saveRemote(remaining)
+                    _state.update { it.copy(remoteFavorites = remaining) }
+                }
+                NasFinderAppWidgetProvider.updateAll(application)
+            }
+            error
+        }
+    }
+
+    private fun nasMoveMessage(moved: Int, kept: List<String>, failed: List<InboxUploadOutcome>): String {
+        val parts = mutableListOf<String>()
+        if (moved > 0) parts += "${moved}개 파일을 NAS로 이동했습니다."
+        if (kept.isNotEmpty()) parts += "${kept.size}개는 NAS로 복사했지만 폰하드 원본을 지우지 않았습니다: ${kept.first()}"
+        if (failed.isNotEmpty()) {
+            parts += "${failed.size}개는 NAS로 보내지 못했고 폰하드 원본은 그대로입니다: ${failed.first().failureMessage}. 실패한 파일은 선택해 두었습니다."
+        }
+        return parts.joinToString(" ")
     }
 
     fun applyTransferDestination() {
@@ -3334,7 +3577,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     pendingTransfer = if (clearTransfer) null else it.pendingTransfer,
                     folderCountCache = emptyMap(),
                     folderCountGeneration = countGen,
-                    message = successMessage,
+                    notice = successMessage,
                 )
             }
         }.onFailure { error ->
@@ -3808,6 +4051,80 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return File(cacheRoot, "shares").canonicalFile.also { directory ->
             check(directory.parentFile == cacheRoot) { "안전하지 않은 캐시 경로입니다." }
             check(directory.mkdirs() || directory.isDirectory) { "다운로드 캐시 경로를 만들 수 없습니다." }
+        }
+    }
+
+    /**
+     * Copies an app-owned video into the share factory's prepared cache/shares root (the factory deliberately refuses
+     * every other location) so the chooser can grant read access to the copy only. Reuses an identical earlier copy.
+     * Must run off the main thread; cancellation stops the copy and removes the partial file.
+     */
+    private suspend fun stageVideoForShare(source: File, stagedName: String): File {
+        val target = File(downloadCacheDirectory(), stagedName)
+        target.parentFile?.mkdirs()
+        if (target.isFile && target.length() == source.length() && target.length() > 0L) return target
+        val partial = File(target.parentFile, "${target.name}.part")
+        try {
+            source.inputStream().use { input ->
+                java.io.FileOutputStream(partial).use { out ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        kotlin.coroutines.coroutineContext.ensureActive()
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        out.write(buffer, 0, read)
+                    }
+                    out.fd.sync()
+                }
+            }
+            check(partial.length() > 0L && partial.length() == source.length()) { "공유할 영상을 준비하지 못했습니다." }
+            check(partial.renameTo(target)) { "공유할 영상을 준비하지 못했습니다." }
+            return target
+        } catch (failure: Throwable) {
+            partial.delete()
+            throw failure
+        }
+    }
+
+    private var trailerShareJob: Job? = null
+
+    /** Shares the current, up-to-date rendered output of the open project through a prepared copy. */
+    fun shareTrailerOutput() {
+        if (trailerShareJob?.isActive == true) return
+        val session = _state.value.trailer ?: return
+        val source = session.output
+        val directory = session.directory
+        val revision = session.revision
+        if (source == null || session.outputRevision != revision) {
+            _state.update { it.copy(message = "최신 편집 내용으로 다시 내보낸 뒤 공유해 주세요.") }
+            return
+        }
+        trailerShareJob = viewModelScope.launch {
+            val self = coroutineContext[Job]
+            try {
+                _state.update { it.copy(message = "공유할 영상을 준비하는 중입니다…") }
+                val staged = withContext(Dispatchers.IO) {
+                    check(source.isFile && source.length() > 0L) { "내보낸 영상 파일을 찾을 수 없습니다. 다시 내보내 주세요." }
+                    stageVideoForShare(source, "trailer_${directory.absolutePath.hashCode().toUInt()}_r${revision}_${source.length()}/${trailerTimestampName(session.isMusicOverlayMode, source.lastModified())}.mp4")
+                }
+                val live = _state.value.trailer
+                if (live == null || live.directory != directory || live.revision != revision ||
+                    live.outputRevision != revision || live.output != source
+                ) {
+                    _state.update { it.copy(message = "편집 내용이 바뀌어 공유를 취소했습니다. 다시 내보낸 뒤 공유해 주세요.") }
+                    return@launch
+                }
+                val chooser = Intent.createChooser(NasFinderShareIntentFactory.create(application, listOf(staged)), "영상 공유")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                application.startActivity(chooser)
+                _state.update { it.copy(message = null) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _state.update { it.copy(message = failure.message ?: "영상을 공유하지 못했습니다. 저장 공간을 확인해 주세요.") }
+            } finally {
+                if (trailerShareJob === self) trailerShareJob = null
+            }
         }
     }
 
@@ -5675,7 +5992,18 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun editorRename(title: String) {
-        editProject { it.copy(title = title.trim().takeIf(String::isNotBlank)) }
+        // The title is not part of the rendered pixels: a current render stays current across a rename.
+        // 이름만 바꿨을 때도 폰하드 저장 영수증이 새 리비전을 따라가야 다시 열어도 ‘저장됨’이 유지된다.
+        _state.value.trailer?.takeIf { it.outputRevision != null && it.outputRevision == it.revision }?.let { current ->
+            runCatching {
+                val receipt = File(current.directory, PHONEHARD_SAVE_RECEIPT)
+                val lines = receipt.takeIf { it.isFile }?.readLines()
+                if (lines != null && lines.getOrNull(0)?.trim()?.toLongOrNull() == current.outputRevision) {
+                    receipt.writeText("${current.revision + 1}\n${lines.getOrNull(1).orEmpty()}\n${lines.getOrNull(2).orEmpty()}\n")
+                }
+            }
+        }
+        editProject { it.copy(title = title.trim().takeIf(String::isNotBlank), outputRevision = if (it.outputRevision == it.revision) it.revision + 1 else it.outputRevision) }
     }
 
     /** Intentionally uses an already-present source as one more scene (no hash/duplicate inference). */
@@ -6141,12 +6469,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val output = session.output ?: return
         val directory = session.directory
         if (session.busy || session.saved) return
+        if (session.editor != null && session.outputRevision != session.revision) return
         _state.update { it.copy(trailer = session.copy(busy = true, status = "폰하드에 저장하는 중…", error = null)) }
         trailerJob = viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    output.inputStream().buffered().use {
-                        inboxStore.import("예고편-${System.currentTimeMillis()}.mp4", "video/mp4", it, isPrivate = session.originPrivate)
+                    val record = output.inputStream().buffered().use {
+                        inboxStore.import("${trailerTimestampName(session.isMusicOverlayMode)}.mp4", "video/mp4", it, isPrivate = session.originPrivate)
+                    }
+                    // 다시 열었을 때 같은 완성본을 또 저장하지 않도록, 저장한 완성본 리비전·폰하드 레코드 ID·완성본 파일 이름을 편집본 폴더에 남긴다.
+                    session.outputRevision?.let { revision ->
+                        runCatching { File(directory, PHONEHARD_SAVE_RECEIPT).writeText("$revision\n${record.id}\n${output.name}\n") }
                     }
                 }
                 val files = inboxFiles()
@@ -6168,6 +6501,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val output = session.output ?: return
         val directory = session.directory
         if (session.busy || session.export?.running == true || !output.exists() || output.length() <= 0L) return
+        if (session.editor != null && session.outputRevision != session.revision) return
 
         updateTrailer(directory) { it.copy(busy = true, status = "컬렉션에 보관하는 중…", error = null) }
         viewModelScope.launch {
@@ -6359,6 +6693,19 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         migrateEphemeralProjectData()
     }
 
+    /**
+     * 이 편집본의 현재 완성본(같은 리비전, 같은 렌더 파일 이름)이 폰하드에 저장됐고 그 레코드가 아직 있을 때만 true.
+     * 같은 리비전을 다시 렌더하면 파일 이름이 바뀌므로 저장 전 상태가 된다. 파일 이름이 없는 예전 영수증은 저장 전으로 본다.
+     */
+    private fun phoneHardSaveReceiptMatches(draft: TrailerDraft): Boolean = runCatching {
+        val revision = draft.outputRevision ?: return@runCatching false
+        val outputName = draft.output?.name ?: return@runCatching false
+        val lines = File(draft.directory, PHONEHARD_SAVE_RECEIPT).takeIf { it.isFile }?.readLines() ?: return@runCatching false
+        val savedId = UUID.fromString(lines.getOrNull(1)?.trim() ?: return@runCatching false)
+        lines.getOrNull(0)?.trim()?.toLongOrNull() == revision && lines.getOrNull(2)?.trim() == outputName &&
+            inboxStore.records().any { it.id == savedId }
+    }.getOrDefault(false)
+
     fun resumeTrailerDraft(requested: TrailerDraft) {
         // The list a user tapped may predate a migration: always open the latest stored record.
         val draft = TrailerDraftStore.draft(requested.id) ?: requested
@@ -6407,7 +6754,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             status = if (availableOutput != null) "예고편을 불러왔습니다." else "편집을 이어갑니다.",
             progress = null,
             error = null,
-            saved = false,
+            saved = availableOutput != null && phoneHardSaveReceiptMatches(draft),
             isMusicOverlayMode = draft.isMusicOverlayMode,
             musicTrack = draft.musicTrack?.takeIf { musicAvailable == true },
             // Kept, displayed as unavailable and saved back unchanged until the user reconnects, replaces or removes it.
@@ -6455,7 +6802,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update {
                 it.copy(
                     trailerDraftCount = remaining.size,
-                    trailerDraftPicker = remaining,
+                    trailerDraftsVersion = it.trailerDraftsVersion + 1,
+                    // The picker overlay is refreshed only when already open; the embedded 편집본 list follows the version.
+                    trailerDraftPicker = it.trailerDraftPicker?.let { remaining },
                     message = "‘${draft.displayTitle}’ 사본을 만들었습니다."
                 )
             }
@@ -6469,8 +6818,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val remaining = TrailerDraftStore.getAllDrafts()
         _state.update {
             it.copy(
-                trailerDraftPicker = remaining,
-                trailerDraftCount = remaining.size
+                trailerDraftPicker = it.trailerDraftPicker?.let { remaining },
+                trailerDraftCount = remaining.size,
+                trailerDraftsVersion = it.trailerDraftsVersion + 1,
             )
         }
     }
@@ -6489,7 +6839,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             it.copy(
                 trailerDraftCount = remaining.size,
                 trailerDraftsVersion = it.trailerDraftsVersion + 1,
-                trailerDraftPicker = remaining,
+                trailerDraftPicker = it.trailerDraftPicker?.let { remaining },
                 message = if (!removed) "편집본 정보를 저장하지 못해 삭제하지 않았습니다. 프로젝트 파일도 그대로입니다." else it.message,
             )
         }
@@ -8051,16 +8401,27 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun shareCollectionVideo(item: CollectionItem) {
         viewModelScope.launch {
-            val file = withContext(Dispatchers.IO) { collectionReadableFile(item) }
-            if (file == null) {
-                _state.update { it.copy(message = collectionUnavailableMessage) }
-                return@launch
+            try {
+                val staged = withContext(Dispatchers.IO) {
+                    collectionReadableFile(item)?.let { file ->
+                        val safeId = item.id.filter { it.isLetterOrDigit() || it == '-' }.take(64)
+                        stageVideoForShare(file, "collection_${safeId}_${file.length()}.mp4")
+                    }
+                }
+                if (staged == null) {
+                    _state.update { it.copy(message = collectionUnavailableMessage) }
+                    return@launch
+                }
+                val sendIntent = NasFinderShareIntentFactory.create(application, listOf(staged))
+                application.startActivity(
+                    Intent.createChooser(sendIntent, "${item.title} 공유")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _state.update { it.copy(message = failure.message ?: "영상을 공유하지 못했습니다. 저장 공간을 확인해 주세요.") }
             }
-            val sendIntent = NasFinderShareIntentFactory.create(application, listOf(file))
-            application.startActivity(
-                Intent.createChooser(sendIntent, "${item.title} 공유")
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
         }
     }
 
@@ -9111,6 +9472,172 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    private var phoneHardTransferJob: Job? = null
+
+    // 폴더 선택기를 열어 둔 동안 요청을 기억한다. 접기/펼치기로 화면이 다시 만들어져도 ViewModel은 남는다.
+    private var stagedDeviceTransfer: Pair<List<UUID>, Boolean>? = null
+
+    fun stageDeviceTransfer(ids: List<UUID>, move: Boolean) {
+        stagedDeviceTransfer = ids to move
+    }
+
+    fun takeStagedDeviceTransfer(): Pair<List<UUID>, Boolean>? = stagedDeviceTransfer.also { stagedDeviceTransfer = null }
+
+    fun cancelPhoneHardTransfer() {
+        phoneHardTransferJob?.cancel()
+    }
+
+    /** 결과 안내와 재선택 대상은 화면이 다시 만들어져도 잃지 않도록 상태에 둔다. 전부 성공이면 안내만, 아니면 오류 대화상자로 알린다. */
+    private fun publishPhoneHardTransferResult(result: PhoneHardFileTransferResult, allIds: List<UUID>) {
+        _state.update {
+            it.copy(
+                phoneHardTransferProgress = null,
+                message = if (result.isFullSuccess) result.message else null,
+                inboxErrorMessage = if (result.isFullSuccess) it.inboxErrorMessage else result.message,
+                inboxRetrySelectIds = result.retryIds(allIds),
+            )
+        }
+    }
+
+    /**
+     * 폰하드 파일을 ZIP 없이 한 개씩 휴대폰 폴더(SAF 트리)로 복사하거나 이동한다.
+     * 파일마다 기존 코디네이터 내보내기를 따로 호출하므로 원래 이름으로 저장되고, 같은 이름이 있으면 덮어쓰지 않고
+     * 코디네이터가 번호를 붙인다. 쓸 수 없는 폴더는 시작 전에 막는다.
+     *
+     * 이동은 파일마다 복사 → 만들어진 문서의 크기가 원본 길이와 같음을 확인 → 선택 시점과 같은 원본일 때만 삭제 순서다.
+     * 크기를 확인하지 못하거나(제공자가 크기를 주지 않음) 다르면, 실패·취소·원본 변경이면 원본은 지우지 않는다.
+     * 확인 수준은 제공자가 알려 준 크기 비교이며 내용 해시 비교는 아니다. 완료된 파일은 되돌리지 않고 다시 보내지 않는다.
+     */
+    fun transferPhoneHardFilesToExternalTree(
+        ids: List<UUID>,
+        treeUri: Uri,
+        move: Boolean,
+        onResult: (PhoneHardFileTransferResult) -> Unit,
+    ) {
+        fun rejected(reason: String) {
+            val result = PhoneHardFileTransferResult(move, ids.size, destinationError = reason)
+            publishPhoneHardTransferResult(result, ids)
+            onResult(result)
+        }
+        if (phoneHardTransferJob?.isActive == true) {
+            // 진행 중인 전송의 진행 표시는 건드리지 않는다.
+            val busy = "이미 진행 중인 전송이 있습니다. 끝난 뒤 다시 시도해 주세요."
+            _state.update { it.copy(message = busy) }
+            onResult(PhoneHardFileTransferResult(move, ids.size, destinationError = busy))
+            return
+        }
+        val items = runCatching { selectedInboxItems(ids) }.getOrElse { error ->
+            return rejected(error.message ?: "선택한 파일이 올바르지 않습니다.")
+        }
+        if (items.isEmpty() || items.any { !it.file.isFile }) return rejected("보낼 폰하드 파일을 찾을 수 없습니다.")
+        // 요청 순간의 보기 범위와 원본 신원을 고정한다.
+        val privateVisible = PrivacyMode.isActive
+        val signatures = items.associate { it.id to PhoneHardSourceSignature(it.file.length(), it.file.lastModified()) }
+        phoneHardTransferJob = viewModelScope.launch(Dispatchers.IO) {
+            val completed = mutableListOf<UUID>()
+            val copiedKept = mutableListOf<Pair<UUID, String>>()
+            val failed = mutableListOf<Pair<UUID, String>>()
+            var renamed = 0
+            var cancelled = false
+            val destinationError = externalTreeWriteError(treeUri)
+            try {
+                if (destinationError == null) {
+                    for ((index, item) in items.withIndex()) {
+                        try {
+                            ensureActive()
+                        } catch (e: CancellationException) {
+                            cancelled = true
+                            break
+                        }
+                        _state.update { it.copy(phoneHardTransferProgress = PhoneHardTransferProgress(move, index + 1, items.size)) }
+                        val signature = signatures.getValue(item.id)
+                        val target = com.armsone.nasfinder.data.PhoneHardTarget(item.id, item.relativePath, isDirectory = false)
+                        val exported = runCatching {
+                            networkDownloadCoordinator.exportPhoneHardTargetsToExternalTree(listOf(target), treeUri, privateVisible = privateVisible)
+                        }.getOrElse { e ->
+                            if (e is CancellationException) NetworkDownloadResult.Cancelled(0, 0L)
+                            else NetworkDownloadResult.Failure(e.message ?: "휴대폰 폴더에 저장하지 못했습니다.", e)
+                        }
+                        when (exported) {
+                            is NetworkDownloadResult.Cancelled -> {
+                                cancelled = true
+                                break
+                            }
+                            is NetworkDownloadResult.Failure -> failed += item.id to "${item.originalFilename}: ${exported.message}"
+                            is NetworkDownloadResult.Skipped -> failed += item.id to "${item.originalFilename}: ${exported.reason}"
+                            is NetworkDownloadResult.Success -> {
+                                val saved = exported.savedPaths.firstOrNull()?.let { runCatching { Uri.parse(it) }.getOrNull() }
+                                val (savedName, savedSize) = saved?.let { querySafDocument(it) } ?: (null to null)
+                                if (savedSize != null && savedSize != signature.length) {
+                                    failed += item.id to "${item.originalFilename}: 저장된 파일 크기(${savedSize}B)가 원본(${signature.length}B)과 달라 완료로 보지 않았습니다. 대상 폴더의 파일을 확인해 주세요."
+                                    continue
+                                }
+                                if (savedName != null && savedName != item.originalFilename) renamed++
+                                if (!move) {
+                                    completed += item.id
+                                } else if (savedSize == null) {
+                                    copiedKept += item.id to "${item.originalFilename}: 저장 위치가 파일 크기를 알려 주지 않아 확인하지 못했고, 원본은 지우지 않았습니다."
+                                } else {
+                                    val deleteError = deletePhoneHardSourceIfUnchanged(item, signature)
+                                    if (deleteError == null) completed += item.id
+                                    else copiedKept += item.id to "${item.originalFilename}: $deleteError"
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                val result = PhoneHardFileTransferResult(
+                    move = move,
+                    total = items.size,
+                    completed = completed,
+                    copiedKept = copiedKept,
+                    failed = failed,
+                    renamedOnCollision = renamed,
+                    cancelled = cancelled,
+                    destinationError = destinationError,
+                )
+                withContext(NonCancellable + Dispatchers.Main) {
+                    // refreshInbox()가 inboxErrorMessage를 덮어쓰므로 목록을 먼저 갱신하고 결과를 마지막에 게시한다.
+                    refreshInbox()
+                    publishPhoneHardTransferResult(result, items.map { it.id })
+                    onResult(result)
+                }
+            }
+        }
+    }
+
+    /** 선택한 폴더에 파일을 만들 수 있는지 시작 전에 확인한다. 쓸 수 있으면 null, 아니면 사용자에게 보일 사유. */
+    private fun externalTreeWriteError(treeUri: Uri): String? = try {
+        val rootDoc = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+        val flags = application.contentResolver.query(rootDoc, arrayOf(DocumentsContract.Document.COLUMN_FLAGS), null, null, null)
+            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else null }
+        when {
+            flags == null -> "선택한 폴더 정보를 읽을 수 없어 시작하지 않았습니다. 다른 폴더를 선택해 주세요."
+            flags and DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE == 0 ->
+                "선택한 폴더는 파일을 만들 수 없는 읽기 전용 위치입니다. 쓸 수 있는 다른 폴더를 선택해 주세요."
+            else -> null
+        }
+    } catch (e: Exception) {
+        "선택한 폴더에 접근할 수 없습니다: ${e.message ?: e.javaClass.simpleName}"
+    }
+
+    /** 만들어진 문서의 (표시 이름, 크기). 제공자가 알려 주지 않는 값은 null. */
+    private fun querySafDocument(documentUri: Uri): Pair<String?, Long?> = runCatching {
+        application.contentResolver.query(
+            documentUri,
+            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_SIZE),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null to null
+            val name = if (cursor.isNull(0)) null else cursor.getString(0)
+            val size = if (cursor.isNull(1)) null else cursor.getLong(1)
+            name to size
+        } ?: (null to null)
+    }.getOrDefault(null to null)
+
     fun clearInitialInboxSubpath() {
         _state.update { it.copy(initialInboxSubpath = null) }
     }
@@ -9703,6 +10230,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     private companion object {
+        const val PHONEHARD_SAVE_RECEIPT = "phonehard-save.receipt"
         // Access-type material failures; only these clear by themselves when the original becomes readable again.
         const val LOCAL_MATERIAL_ACCESS_ERROR = "미디어에 접근할 수 없습니다 (권한 필요)"
         const val LOCAL_MATERIAL_GRANT_ERROR = "미디어 접근 권한이 확인되지 않았습니다."
@@ -9721,6 +10249,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         const val KEY_SUPER_THUMBNAIL_VAULT_ENABLED = "vault_enabled_v1"
         const val KEY_SUPER_THUMBNAIL_VAULT_TIMING = "vault_timing_v1"
         const val MAX_SUPER_THUMBNAIL_HISTORY = 10
+        const val PHONE_HARD_MOVE_CANCELLED_KEPT = "작업이 중단되어 폰하드 원본을 지우지 않았습니다."
     }
 }
 

@@ -58,6 +58,30 @@ object InboxBatchContracts {
         return normalized.toList()
     }
 
+    /**
+     * 이동(NAS로 보낸 뒤 원본 삭제) 전 확인용. 업로드 직후 대상 폴더 목록([afterFiles]: 파일 이름 to 크기)에서
+     * 이번 업로드가 새로 만든 파일을 찾는다. 업로드 전에 없던 이름이어야 하고, 이름은 원래 이름이거나
+     * 같은 이름 충돌 때 서비스가 붙이는 "이름 (n).확장자" 형태여야 하며, 크기가 원본과 같아야 한다.
+     * 찾지 못하면 null — 호출자는 원본을 지우지 않는다. 내용 해시 비교가 아니라 이름·크기 확인이다.
+     */
+    fun findUploadedCopy(
+        originalName: String,
+        expectedSize: Long,
+        namesBefore: Set<String>,
+        afterFiles: List<Pair<String, Long>>,
+    ): String? {
+        val dot = originalName.lastIndexOf('.').takeIf { it > 0 } ?: -1
+        val extension = if (dot >= 0) originalName.substring(dot) else ""
+        val stem = if (dot >= 0) originalName.substring(0, dot) else originalName
+        val strippedStem = stem.replace(Regex(" \\(\\d+\\)$"), "")
+        val numbered = Regex(
+            "^(?:${Regex.escape(stem)}|${Regex.escape(strippedStem)}) \\(\\d+\\)${Regex.escape(extension)}$",
+        )
+        return afterFiles.firstOrNull { (name, size) ->
+            name !in namesBefore && size == expectedSize && (name == originalName || numbered.matches(name))
+        }?.first
+    }
+
     /** Outcomes must be appended in upload order; aggregation preserves that order. */
     fun summarizeSequential(outcomes: Iterable<InboxUploadOutcome>): InboxUploadSummary {
         val values = outcomes.toList()

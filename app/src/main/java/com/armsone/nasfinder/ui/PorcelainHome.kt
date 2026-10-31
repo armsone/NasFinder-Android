@@ -1101,7 +1101,8 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
     )
     val toCreate = { model.selectVideoDestination(VideoNavigationDestination.CREATE) }
     // Wide windows pick the destination in the sidebar; the underline picker is the phone-width form of the same choice.
-    val destinationPicker = !rememberWideShell()
+    // 펼친 세로(<960dp)는 사이드바가 72dp 레일로 접혀 있어 영상 제작/편집본/컬렉션을 고를 수 없으므로 같은 탭 바를 쓴다.
+    val destinationPicker = !rememberWideShell() || LocalConfiguration.current.screenWidthDp < 960
     Column(modifier.fillMaxSize()) {
         if (destinationPicker) Box(Modifier.fillMaxWidth()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).selectableGroup()) {
@@ -1138,6 +1139,22 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
                         item {
                             Column(Modifier.widthIn(max = 640.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                                 Text("새 영상을 만들 때만 편집본이 생깁니다. 작업대 항목은 그대로 남습니다.", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                // 가장 최근 편집본으로 바로 돌아가는 길: 새 저장소 없이 기존 편집본 목록(TrailerDraftStore)을 쓴다.
+                                // 파일 존재 확인이 편집본 수만큼 돌 수 있으므로 구성 중이 아니라 IO 디스패처에서 읽는다(같은 갱신 키).
+                                val latestDraft by produceState<TrailerDraft?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
+                                    value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                        TrailerDraftStore.getAllDrafts().firstOrNull { it.unavailableDetails().isEmpty() }
+                                    }
+                                }
+                                latestDraft?.let { draft ->
+                                    PorcelainPanel(Modifier.fillMaxWidth()) {
+                                        PorcelainRow(
+                                            "최근 편집본 이어서 편집",
+                                            PackGlyph.VIDEO,
+                                            subtitle = "${draft.displayTitle} · ${draft.sources.size}개 미디어",
+                                        ) { model.resumeTrailerDraft(draft) }
+                                    }
+                                }
                                 PorcelainPanel(Modifier.fillMaxWidth()) {
                                     PorcelainRow(
                                         "작업대에서 시작",

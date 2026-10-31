@@ -8,6 +8,7 @@ import android.graphics.Matrix as AndroidMatrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.media.MediaCodecInfo
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Handler
@@ -106,6 +107,8 @@ internal fun sceneFramingVideoEffects(
 @androidx.annotation.OptIn(UnstableApi::class)
 internal object TrailerExporter {
     private const val MAX_GROUP_SIZE = 8
+    // H.264 레벨 4.1이 허용하는 최대 프레임 크기(8192 매크로블록 = 2,097,152 화소). 1920x1080/1080x1920 모두 이 안에 든다.
+    private const val H264_LEVEL_41_MAX_PIXELS = 2_097_152L
 
     private class ImageDecodeException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
@@ -589,85 +592,53 @@ internal object TrailerExporter {
         destinationParent: File,
     ): EditedMediaItem {
         return if (scene.source.isImage) {
-            val isManual = scene.fit == SceneFit.FIT || scene.focusX != 0f || scene.focusY != 0f
-            if (isManual) {
-                val framingKey = "${scene.source.id}:${scene.fit}:${scene.focusX}:${scene.focusY}"
-                val preprocessedFile = preprocessedBySource.getOrPut(framingKey) {
-                    val tempFile = File(destinationParent, "preprocessed-${scene.source.id}-${UUID.randomUUID()}.jpg")
-                    tempFiles.add(tempFile)
-                    val usedFallback = try {
-                        preprocessImageOrFallback(scene.source, targetWidth, targetHeight, tempFile, scene.fit, scene.focusX, scene.focusY)
-                    } catch (t: Throwable) {
-                        tempFile.delete()
-                        tempFiles.remove(tempFile)
-                        throw t
-                    }
-                    if (usedFallback) {
-                        thumbnailFallbackKeys.add(framingKey)
-                    }
-                    tempFile
+            val plan = TrailerPhotoMotionPlanner.planMotion(
+                source = scene.source,
+                fit = scene.fit,
+                focusX = scene.focusX,
+                focusY = scene.focusY,
+                outputWidth = exportWidth,
+                outputHeight = exportHeight,
+                durationSeconds = scene.length,
+            )
+            // Every photo (FIT, FILL and manual focus) renders the full photo through the planned camera path, the same
+            // path the editor preview draws; FILL frames are clamped to the photo so no frame can letterbox.
+            val fullPhotoKey = "full:${scene.source.id}"
+            val preprocessedFile = preprocessedBySource.getOrPut(fullPhotoKey) {
+                val tempFile = File(destinationParent, "preprocessed-full-${scene.source.id}-${UUID.randomUUID()}.jpg")
+                tempFiles.add(tempFile)
+                val usedFallback = try {
+                    preprocessFullPhotoOrFallback(scene.source, tempFile)
+                } catch (t: Throwable) {
+                    tempFile.delete()
+                    tempFiles.remove(tempFile)
+                    throw t
                 }
-                val inputUri = Uri.fromFile(preprocessedFile)
-                val durationUs = (scene.length * 1_000_000).toLong()
-                val manualPresentation = if (scene.fit == SceneFit.FIT) {
-                    Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT)
-                } else {
-                    presentation
+                if (usedFallback) {
+                    thumbnailFallbackKeys.add(fullPhotoKey)
                 }
-                val input = MediaItem.Builder()
-                    .setUri(inputUri)
-                    .setImageDurationMs((scene.length * 1000).toLong())
-                    .build()
-                EditedMediaItem.Builder(input)
-                    .setDurationUs(durationUs)
-                    .setFrameRate(30)
-                    .setEffects(Effects(emptyList(), listOf(manualPresentation)))
-                    .build()
-            } else {
-                val fullPhotoKey = "full:${scene.source.id}"
-                val preprocessedFile = preprocessedBySource.getOrPut(fullPhotoKey) {
-                    val tempFile = File(destinationParent, "preprocessed-full-${scene.source.id}-${UUID.randomUUID()}.jpg")
-                    tempFiles.add(tempFile)
-                    val usedFallback = try {
-                        preprocessFullPhotoOrFallback(scene.source, tempFile)
-                    } catch (t: Throwable) {
-                        tempFile.delete()
-                        tempFiles.remove(tempFile)
-                        throw t
-                    }
-                    if (usedFallback) {
-                        thumbnailFallbackKeys.add(fullPhotoKey)
-                    }
-                    tempFile
-                }
-                val inputUri = Uri.fromFile(preprocessedFile)
-                val durationUs = (scene.length * 1_000_000).toLong()
-                val plan = TrailerPhotoMotionPlanner.planMotion(
-                    source = scene.source,
-                    fit = scene.fit,
-                    focusX = scene.focusX,
-                    focusY = scene.focusY,
-                    outputWidth = exportWidth,
-                    outputHeight = exportHeight,
-                    durationSeconds = scene.length,
-                )
-                val effectsList = mutableListOf<androidx.media3.common.Effect>()
-                if (plan.isFit) {
-                    effectsList.add(Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT))
-                } else {
-                    effectsList.add(PhotoMotionGlTransformation(plan, durationUs))
-                    effectsList.add(presentation)
-                }
-                val input = MediaItem.Builder()
-                    .setUri(inputUri)
-                    .setImageDurationMs((scene.length * 1000).toLong())
-                    .build()
-                EditedMediaItem.Builder(input)
-                    .setDurationUs(durationUs)
-                    .setFrameRate(30)
-                    .setEffects(Effects(emptyList(), effectsList))
-                    .build()
+                tempFile
             }
+            val inputUri = Uri.fromFile(preprocessedFile)
+            val durationUs = (scene.length * 1_000_000).toLong()
+            val plannedAspect = if (scene.source.width > 0 && scene.source.height > 0) {
+                scene.source.width.toFloat() / scene.source.height
+            } else {
+                exportWidth.toFloat() / exportHeight
+            }
+            // The camera path renders straight into the export size (zoom/pan in photo coordinates, no later crop).
+            val effectsList = listOf<androidx.media3.common.Effect>(
+                PhotoMotionGlTransformation(plan, durationUs, exportWidth, exportHeight, plannedAspect),
+            )
+            val input = MediaItem.Builder()
+                .setUri(inputUri)
+                .setImageDurationMs((scene.length * 1000).toLong())
+                .build()
+            EditedMediaItem.Builder(input)
+                .setDurationUs(durationUs)
+                .setFrameRate(30)
+                .setEffects(Effects(emptyList(), effectsList))
+                .build()
         } else {
             val inputUri = Uri.fromFile(scene.source.file)
             val input = MediaItem.Builder().setUri(inputUri)
@@ -814,11 +785,29 @@ internal object TrailerExporter {
         progressStart: Float,
         progressEnd: Float,
         onTransformerCreated: (Transformer) -> Unit = {},
+        outputPixels: Long = 0L,
     ) {
         val scope = CoroutineScope(currentCoroutineContext())
         var poll: Job? = null
         suspendCancellableCoroutine<Unit> { continuation ->
-            val instance = Transformer.Builder(context)
+            val transformerBuilder = Transformer.Builder(context)
+            // 일부 기기(예: Fold6)의 H.264 인코더는 1080p 출력에 레벨 6.0을 기록하고, 같은 기기의 내장 플레이어가 그 영상을
+            // 디코드하지 못해 외부 플레이어로 넘어간다. 1080p 이하는 레벨 4.1을 요청하고, 인코더가 지원하지 않으면 기본 폴백을 따른다.
+            if (outputPixels in 1..H264_LEVEL_41_MAX_PIXELS) {
+                transformerBuilder.setEncoderFactory(
+                    DefaultEncoderFactory.Builder(context)
+                        .setRequestedVideoEncoderSettings(
+                            VideoEncoderSettings.Builder()
+                                .setEncodingProfileLevel(
+                                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+                                    MediaCodecInfo.CodecProfileLevel.AVCLevel41,
+                                )
+                                .build(),
+                        )
+                        .build(),
+                )
+            }
+            val instance = transformerBuilder
                 .setVideoMimeType(MimeTypes.VIDEO_H264)
                 .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .addListener(object : Transformer.Listener {
@@ -931,6 +920,7 @@ internal object TrailerExporter {
             progressStart = progressStart,
             progressEnd = progressEnd,
             onTransformerCreated = onTransformerCreated,
+            outputPixels = exportWidth.toLong() * exportHeight,
         )
     }
 
@@ -1312,6 +1302,7 @@ internal object TrailerExporter {
                     progressStart = 0.85f,
                     progressEnd = 1.0f,
                     onTransformerCreated = { currentTransformer = it },
+                    outputPixels = exportWidth.toLong() * exportHeight,
                 )
             }
 

@@ -3,11 +3,10 @@ package com.armsone.nasfinder.ui
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix as AndroidMatrix
-import android.graphics.RectF
-import android.opengl.Matrix
 import android.util.LruCache
 import androidx.annotation.OptIn
 import androidx.exifinterface.media.ExifInterface
+import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.GlMatrixTransformation
 import com.google.mlkit.vision.common.InputImage
@@ -27,70 +26,149 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
+import kotlin.math.ln
+
 
 enum class PhotoMotionMode {
-    FIT_STATIC,
-    MANUAL_FILL,
+    /** Explicit 맞추기: whole photo always visible; gentle zoom and drift inside the letterbox margin. */
+    FIT_MOTION,
+    /** 채우기 camera path on a photo wider than the output: mostly horizontal travel plus push/pull zoom. */
     PAN_HORIZONTAL,
+    /** 채우기 camera path on a photo taller than the output: mostly vertical travel plus push/pull zoom. */
     PAN_VERTICAL,
-    STATIC_FILL,
+    /** 채우기 camera path on a near-output-aspect photo: travel comes from zooming in. */
+    ZOOM,
+    /** 채우기 camera path that ends on the user's chosen focus frame. */
+    MANUAL_FILL,
+    /** No motion; [PhotoMotionPlan.reason] says why. */
+    STILL,
 }
 
+/** Normalized photo rectangle (0..1, y down). */
+data class PhotoNormRect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
+    val width: Float get() = right - left
+    val height: Float get() = bottom - top
+    val centerX: Float get() = (left + right) / 2f
+    val centerY: Float get() = (top + bottom) / 2f
+
+    fun union(other: PhotoNormRect) = PhotoNormRect(
+        minOf(left, other.left), minOf(top, other.top), maxOf(right, other.right), maxOf(bottom, other.bottom),
+    )
+
+    companion object {
+        val WHOLE = PhotoNormRect(0f, 0f, 1f, 1f)
+    }
+}
+
+/**
+ * Visible window of the photo in normalized photo coordinates: center ([centerX], [centerY]) and extent
+ * ([width] x [height]) in photo-width / photo-height units. Extents above 1 mean letterbox around the photo.
+ */
+data class PhotoViewport(val centerX: Float, val centerY: Float, val width: Float, val height: Float) {
+    val left: Float get() = centerX - width / 2f
+    val right: Float get() = centerX + width / 2f
+    val top: Float get() = centerY - height / 2f
+    val bottom: Float get() = centerY + height / 2f
+
+    fun contains(rect: PhotoNormRect, eps: Float = 1e-4f): Boolean =
+        left <= rect.left + eps && right >= rect.right - eps && top <= rect.top + eps && bottom >= rect.bottom - eps
+
+    /**
+     * Column-major GL matrix that maps the photo frame's NDC to the output frame's NDC so this viewport fills
+     * the output exactly (photo NDC y is up, normalized y is down).
+     */
+    fun toGlMatrix(): FloatArray {
+        val m = FloatArray(16)
+        m[0] = 1f / width
+        m[5] = 1f / height
+        m[10] = 1f
+        m[15] = 1f
+        m[12] = (1f - 2f * centerX) / width
+        m[13] = (2f * centerY - 1f) / height
+        return m
+    }
+}
+
+/**
+ * One camera stop: at [time] (0..1 of the scene) the viewport is centered at ([centerX], [centerY]) with [width]
+ * (photo-width units; height follows the aspect at render time). [pull] (0..1) pulls the camera back toward the
+ * cover baseline in the middle of the move that arrives here, so long moves read as pull-back, travel, push-in.
+ */
+data class PhotoKeyframe(val time: Float, val centerX: Float, val centerY: Float, val width: Float, val pull: Float = 0f)
+
+/**
+ * Photo camera path shared by export ([PhotoMotionGlTransformation]) and the editor preview: keyframes joined by
+ * smoothstep moves. With [cover] (채우기) every rendered frame is clamped to the photo itself at render time — the
+ * width never exceeds the cover baseline and the center stays inside the half extents — so no frame can show
+ * anything outside the photo (no letterbox), whatever the keyframes, aspect rounding or pull-back say.
+ */
 data class PhotoMotionPlan(
     val mode: PhotoMotionMode,
-    val isFit: Boolean,
-    val cropWidthNorm: Float = 1f,
-    val cropHeightNorm: Float = 1f,
-    val startXNorm: Float = 0f,
-    val startYNorm: Float = 0f,
-    val endXNorm: Float = 0f,
-    val endYNorm: Float = 0f,
-    val startTranslateX: Float = 0f,
-    val startTranslateY: Float = 0f,
-    val endTranslateX: Float = 0f,
-    val endTranslateY: Float = 0f,
+    val keyframes: List<PhotoKeyframe>,
+    val cover: Boolean,
+    val reason: String = "",
 ) {
-    fun progress(fraction: Float): Pair<Float, Float> {
+    val isMoving: Boolean
+        get() = keyframes.any { key ->
+            val first = keyframes.first()
+            abs(key.centerX - first.centerX) > 1e-4f || abs(key.centerY - first.centerY) > 1e-4f ||
+                abs(key.width - first.width) > 1e-4f
+        }
+
+    fun viewportAt(fraction: Float, photoAspect: Float, outputAspect: Float): PhotoViewport {
+        val k = if (photoAspect > 0f && outputAspect > 0f) photoAspect / outputAspect else 1f
         val p = fraction.coerceIn(0f, 1f)
-        val eased = p * p * (3f - 2f * p)
-        val x = startXNorm + (endXNorm - startXNorm) * eased
-        val y = startYNorm + (endYNorm - startYNorm) * eased
-        return x to y
+        if (keyframes.isEmpty()) return PhotoViewport(0.5f, 0.5f, 1f, k)
+        var i = 0
+        while (i < keyframes.size - 2 && p > keyframes[i + 1].time) i++
+        val a = keyframes[i]
+        val b = keyframes.getOrElse(i + 1) { a }
+        val span = b.time - a.time
+        val u = if (span > 1e-6f) ((p - a.time) / span).coerceIn(0f, 1f) else 1f
+        val e = u * u * (3f - 2f * u)
+        var width = a.width + (b.width - a.width) * e
+        var cx = a.centerX + (b.centerX - a.centerX) * e
+        var cy = a.centerY + (b.centerY - a.centerY) * e
+        if (cover) {
+            val coverW = minOf(1f, 1f / k)
+            if (b.pull > 0f) width += (coverW - width).coerceAtLeast(0f) * b.pull * 4f * e * (1f - e)
+            width = width.coerceIn(1e-3f, coverW)
+            val height = width * k
+            cx = cx.coerceIn(width / 2f, 1f - width / 2f)
+            cy = cy.coerceIn(height / 2f, 1f - height / 2f)
+        }
+        return PhotoViewport(cx, cy, width, width * k)
     }
 
-    fun glTranslation(fraction: Float): Pair<Float, Float> {
-        val p = fraction.coerceIn(0f, 1f)
-        val eased = p * p * (3f - 2f * p)
-        val tx = startTranslateX + (endTranslateX - startTranslateX) * eased
-        val ty = startTranslateY + (endTranslateY - startTranslateY) * eased
-        return tx to ty
-    }
-
-    fun computeBiasAlignment(fraction: Float): Pair<Float, Float> {
-        if (isFit) return 0f to 0f
-        val (x, y) = progress(fraction)
-        val biasX = if (cropWidthNorm < 0.9999f) {
-            val xc = x + cropWidthNorm / 2f
-            ((2f * xc - 1f) / (1f - cropWidthNorm)).coerceIn(-1f, 1f)
-        } else {
-            0f
+    companion object {
+        /** Whole photo, centered, no motion: only for unknown geometry or a too-short 맞추기 scene. */
+        fun still(photoAspect: Float, outputAspect: Float, reason: String): PhotoMotionPlan {
+            val k = if (photoAspect > 0f && outputAspect > 0f) photoAspect / outputAspect else 1f
+            return PhotoMotionPlan(PhotoMotionMode.STILL, listOf(PhotoKeyframe(0f, 0.5f, 0.5f, maxOf(1f, 1f / k))), cover = false, reason = reason)
         }
-        val biasY = if (cropHeightNorm < 0.9999f) {
-            val yc = y + cropHeightNorm / 2f
-            ((2f * yc - 1f) / (1f - cropHeightNorm)).coerceIn(-1f, 1f)
-        } else {
-            0f
-        }
-        return biasX to biasY
     }
 }
 
+/**
+ * Renders a full (orientation-applied) photo directly into the output size following [plan]. Replaces the
+ * Presentation step for photo scenes, so zoom and pan are applied in photo coordinates before any crop.
+ */
 @OptIn(UnstableApi::class)
 class PhotoMotionGlTransformation(
     private val plan: PhotoMotionPlan,
     private val durationUs: Long,
+    private val outputWidth: Int,
+    private val outputHeight: Int,
+    plannedPhotoAspect: Float,
 ) : GlMatrixTransformation {
     private var baseTimeUs: Long = -1L
+    private var photoAspect: Float = plannedPhotoAspect
+    private val outputAspect: Float = outputWidth.toFloat() / outputHeight.coerceAtLeast(1)
+
+    override fun configure(inputWidth: Int, inputHeight: Int): Size {
+        if (inputWidth > 0 && inputHeight > 0) photoAspect = inputWidth.toFloat() / inputHeight
+        return Size(outputWidth, outputHeight)
+    }
 
     override fun getGlMatrixArray(presentationTimeUs: Long): FloatArray {
         if (baseTimeUs < 0L) {
@@ -98,19 +176,379 @@ class PhotoMotionGlTransformation(
         }
         val elapsedUs = (presentationTimeUs - baseTimeUs).coerceAtLeast(0L)
         val progress = if (durationUs > 0) (elapsedUs.toFloat() / durationUs).coerceIn(0f, 1f) else 0f
-        val (tx, ty) = plan.glTranslation(progress)
-
-        val glMatrix = FloatArray(16)
-        Matrix.setIdentityM(glMatrix, 0)
-        Matrix.translateM(glMatrix, 0, tx, ty, 0f)
-        return glMatrix
+        return plan.viewportAt(progress, photoAspect, outputAspect).toGlMatrix()
     }
 }
 
+/** Pure camera-path geometry (no Android types) so it can be checked in JVM unit tests. */
+internal object PhotoMotionGeometry {
+    private const val MIN_MOTION_SECONDS = 0.5
+    /** Tightest end framing (cover / 1.5) so the final person stays sharp and legible. */
+    private const val MAX_END_ZOOM = 1.5f
+    private const val MAX_STOP_ZOOM = 1.3f
+    private const val MAX_START_ZOOM = 1.3f
+    private const val START_HOLD_SECONDS = 0.15
+    private const val STOP_HOLD_SECONDS = 0.35
+    /** Other people/points the camera may pass before the primary one, when the scene is long enough. */
+    private const val MAX_STOPS = 4
+    /** Scenes at least this long get a start hold and a slow final push-in. */
+    private const val LONG_SCENE_SECONDS = 2.0
+    private const val RATE_SAMPLES = 120
+
+    /**
+     * Fastest camera travel at any instant of a 채우기 move, in viewport widths (horizontal) or heights (vertical)
+     * per second: a point crosses the frame in no less than 2.5 s, a calm pan rather than a whip.
+     */
+    const val MAX_PAN_SPEED = 0.4f
+    /** Fastest push/pull at any instant: |d ln(viewport width)/dt| — about 12% zoom per second at the peak. */
+    const val MAX_ZOOM_RATE = 0.12f
+
+    /** Gentle zoom amount for explicit 맞추기: ~4% for very short scenes up to 10%. */
+    private fun zoomAmount(durationSeconds: Double, cap: Float): Float =
+        (0.035f * durationSeconds.toFloat()).coerceIn(0.04f, cap)
+
+    private fun PhotoNormRect.isValid(): Boolean =
+        left.isFinite() && top.isFinite() && right.isFinite() && bottom.isFinite() &&
+            left >= 0f && top >= 0f && right <= 1f && bottom <= 1f && left < right && top < bottom
+
+    /** Face box widened to a head-and-shoulders frame so the focused person is never cut at the hairline/chin. */
+    private fun headFrame(face: PhotoNormRect) = PhotoNormRect(
+        (face.left - face.width * 0.35f).coerceAtLeast(0f),
+        (face.top - face.height * 0.45f).coerceAtLeast(0f),
+        (face.right + face.width * 0.35f).coerceAtMost(1f),
+        (face.bottom + face.height * 0.35f).coerceAtMost(1f),
+    )
+
+    /**
+     * @param faces individual detected faces; @param objects individual detected subjects (normalized, oriented photo).
+     * @param analysisReliable false when analysis failed/unavailable: 채우기 still covers, aiming at the photo center.
+     */
+    fun plan(
+        photoWidth: Int,
+        photoHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        fit: SceneFit,
+        focusX: Float,
+        focusY: Float,
+        durationSeconds: Double,
+        faces: List<PhotoNormRect>,
+        objects: List<PhotoNormRect>,
+        analysisReliable: Boolean,
+        seed: Int,
+    ): PhotoMotionPlan {
+        val photoAspect = if (photoWidth > 0 && photoHeight > 0) photoWidth.toFloat() / photoHeight else 0f
+        val outputAspect = if (outputWidth > 0 && outputHeight > 0) outputWidth.toFloat() / outputHeight else 0f
+        if (!photoAspect.isFinite() || !outputAspect.isFinite() || photoAspect <= 0f || outputAspect <= 0f) {
+            return PhotoMotionPlan.still(photoAspect, outputAspect, "사진 크기를 알 수 없음")
+        }
+        val shortScene = !durationSeconds.isFinite() || durationSeconds < MIN_MOTION_SECONDS
+        val k = photoAspect / outputAspect
+        if (fit == SceneFit.FIT) {
+            return if (shortScene) PhotoMotionPlan.still(photoAspect, outputAspect, "장면이 너무 짧음")
+            else fitMotion(k, durationSeconds, seed, "맞추기 선택")
+        }
+        return CoverPlanner(k, durationSeconds, seed).plan(
+            focusX, focusY, shortScene,
+            faces.filter { it.isValid() },
+            objects.filter { it.isValid() },
+            analysisReliable,
+        )
+    }
+
+    private fun fitMotion(k: Float, durationSeconds: Double, seed: Int, reason: String): PhotoMotionPlan {
+        val fitW = maxOf(1f, 1f / k)
+        val outW = fitW * (1f + zoomAmount(durationSeconds, 0.10f))
+        val zoomIn = (seed ushr 1) and 1 == 0
+        val forward = seed and 1 == 0
+        val dir = if (forward) 1f else -1f
+        // Drift along the photo's long axis inside the margin opened by the zoomed-out window.
+        val horizontal = k >= 1f
+        fun containRange(extent: Float) = (1f - extent / 2f) to maxOf(1f - extent / 2f, extent / 2f)
+        fun at(range: Pair<Float, Float>, q: Float) = range.first + (range.second - range.first) * q.coerceIn(0f, 1f)
+        fun key(time: Float, width: Float, drift: Float): PhotoKeyframe {
+            val xr = containRange(width)
+            val yr = containRange(width * k)
+            return if (horizontal) PhotoKeyframe(time, at(xr, 0.5f + drift), at(yr, 0.5f), width)
+            else PhotoKeyframe(time, at(xr, 0.5f), at(yr, 0.5f + drift), width)
+        }
+        val fitKey = key(if (zoomIn) 1f else 0f, fitW, -0.35f * dir)
+        val outKey = key(if (zoomIn) 0f else 1f, outW, 0.35f * dir)
+        return PhotoMotionPlan(PhotoMotionMode.FIT_MOTION, listOf(fitKey, outKey).sortedBy { it.time }, cover = false, reason = reason)
+    }
+
+    /** One stop of the camera: where it looks and how tight. */
+    private data class Frame(val cx: Float, val cy: Float, val w: Float)
+
+    /**
+     * 채우기 camera path: random legal start (stable per-photo seed) → other people / major points → the primary
+     * person (else main subject, else photo center). All frames lie inside the photo; zoom-out stops at cover.
+     * Time-aware: no instant pans faster than [MAX_PAN_SPEED] or zooms faster than [MAX_ZOOM_RATE]; stops that do
+     * not fit the scene at that pace are skipped, and the start is only as far from the first target as time allows.
+     */
+    private class CoverPlanner(private val k: Float, private val duration: Double, seed: Int) {
+        private val coverW = minOf(1f, 1f / k)
+        private val coverH = coverW * k
+        private val random = kotlin.random.Random(seed)
+
+        /** Frame containing [target] when it fits (head room above faces), else centered on it; inside the photo. */
+        fun frameFor(target: PhotoNormRect, preferredW: Float, minW: Float): Frame {
+            val w = preferredW.coerceIn(minW, coverW)
+            val h = w * k
+            fun axis(lo: Float, hi: Float, extent: Float, wanted: Float): Float {
+                val inLo = maxOf(extent / 2f, hi - extent / 2f)
+                val inHi = minOf(1f - extent / 2f, lo + extent / 2f)
+                return if (inLo <= inHi) wanted.coerceIn(inLo, inHi) else wanted.coerceIn(extent / 2f, 1f - extent / 2f)
+            }
+            return Frame(
+                axis(target.left, target.right, w, target.centerX),
+                axis(target.top, target.bottom, h, target.centerY + 0.08f * h),
+                w,
+            )
+        }
+
+        /** Width that frames [target] with breathing room, between cover/[maxZoom] and cover. */
+        fun fitWidth(target: PhotoNormRect, maxZoom: Float): Float =
+            (maxOf(target.width, target.height / k) * 1.15f).coerceIn(coverW / maxZoom, coverW)
+
+        fun fits(target: PhotoNormRect): Boolean = target.width <= coverW * 0.98f && target.height <= coverH * 0.98f
+
+        /** Groups head frames greedily (largest face first) into clusters that still fit one cover frame. */
+        fun faceClusters(faces: List<PhotoNormRect>): List<PhotoNormRect> {
+            val biggest = faces.maxOf { it.height }
+            // Tiny background faces are not "main people".
+            val main = faces.filter { it.height >= biggest * 0.35f }.sortedByDescending { it.width * it.height }
+            val clusters = mutableListOf<PhotoNormRect>()
+            for (face in main) {
+                val head = headFrame(face)
+                val index = clusters.indices
+                    .filter { fits(clusters[it].union(head)) }
+                    .minByOrNull { abs(clusters[it].centerX - head.centerX) + abs(clusters[it].centerY - head.centerY) }
+                if (index != null) clusters[index] = clusters[index].union(head) else clusters.add(head)
+            }
+            return clusters
+        }
+
+        fun stopFrame(target: PhotoNormRect) = frameFor(target, fitWidth(target, MAX_STOP_ZOOM), coverW / MAX_STOP_ZOOM)
+
+        /** [f] with its center moved inside the photo for its width. */
+        fun legal(f: Frame): Frame {
+            val h = f.w * k
+            return Frame(f.cx.coerceIn(f.w / 2f, 1f - f.w / 2f), f.cy.coerceIn(h / 2f, 1f - h / 2f), f.w)
+        }
+
+        fun lerp(a: Frame, b: Frame, f: Float) = Frame(a.cx + (b.cx - a.cx) * f, a.cy + (b.cy - a.cy) * f, a.w + (b.w - a.w) * f)
+
+        /** A smoothstep move to the next frame taking [seconds], pulling back mid-way by [pull]. */
+        class Move(val seconds: Double, val pull: Float)
+
+        /**
+         * Shortest time for the rendered move a→b — sampled through the same [PhotoMotionPlan.viewportAt] the preview
+         * and the exporter use, cover clamp included — that keeps every instant under [MAX_PAN_SPEED] and
+         * [MAX_ZOOM_RATE]. Of no / some / strong pull-back, the one needing the least time is used.
+         */
+        fun move(a: Frame, b: Frame): Move {
+            if (a == b) return Move(0.0, 0f)
+            return listOf(0f, 0.5f, 0.85f).map { pull ->
+                val leg = PhotoMotionPlan(
+                    PhotoMotionMode.ZOOM,
+                    listOf(PhotoKeyframe(0f, a.cx, a.cy, a.w), PhotoKeyframe(1f, b.cx, b.cy, b.w, pull)),
+                    cover = true,
+                )
+                var prev = leg.viewportAt(0f, k, 1f)
+                var worst = 0.0
+                for (i in 1..RATE_SAMPLES) {
+                    val v = leg.viewportAt(i.toFloat() / RATE_SAMPLES, k, 1f)
+                    val pan = maxOf(
+                        abs(v.centerX - prev.centerX) / minOf(v.width, prev.width),
+                        abs(v.centerY - prev.centerY) / minOf(v.height, prev.height),
+                    )
+                    val zoom = abs(ln(v.width / prev.width))
+                    worst = maxOf(worst, pan.toDouble() / MAX_PAN_SPEED, zoom.toDouble() / MAX_ZOOM_RATE)
+                    prev = v
+                }
+                // Small margin over the sampled peak so the rendered peak stays under the limits.
+                Move(worst * RATE_SAMPLES * 1.03, pull)
+            }.minBy { it.seconds }
+        }
+
+        fun orders(items: List<Int>): List<List<Int>> =
+            if (items.size <= 1) listOf(items) else items.flatMap { first -> orders(items - first).map { listOf(first) + it } }
+
+        fun plan(
+            focusX: Float,
+            focusY: Float,
+            shortScene: Boolean,
+            faces: List<PhotoNormRect>,
+            objects: List<PhotoNormRect>,
+            analysisReliable: Boolean,
+        ): PhotoMotionPlan {
+            val clusters = if (faces.isNotEmpty()) faceClusters(faces) else emptyList()
+            val majorObjects = objects.sortedByDescending { it.width * it.height }.let { sorted ->
+                val top = sorted.firstOrNull()?.let { it.width * it.height } ?: 0f
+                sorted.filter { it.width * it.height >= top * 0.25f }
+            }
+            val manual = focusX != 0f || focusY != 0f
+            val mode = when {
+                manual -> PhotoMotionMode.MANUAL_FILL
+                k > 1.02f -> PhotoMotionMode.PAN_HORIZONTAL
+                k < 0.98f -> PhotoMotionMode.PAN_VERTICAL
+                else -> PhotoMotionMode.ZOOM
+            }
+
+            // Final target: the user's frame, else the primary person, else the main subject, else the center.
+            // Other people/points (most important first) are optional stops on the way.
+            val end: Frame
+            val stops: List<Frame>
+            val describe: (visited: Int) -> String
+            when {
+                manual -> {
+                    val cx = 0.5f + focusX.coerceIn(-1f, 1f) * (1f - coverW) / 2f
+                    val cy = 0.5f + focusY.coerceIn(-1f, 1f) * (1f - coverH) / 2f
+                    val userFrame = PhotoViewport(cx, cy, coverW, coverH)
+                    val inside = clusters.filter { userFrame.contains(it) }
+                    // Face-safe push-in: only as far as every person inside the user's frame stays inside.
+                    val tight = legal(Frame(cx, cy, coverW / 1.12f))
+                    end = if (inside.all { PhotoViewport(tight.cx, tight.cy, tight.w, tight.w * k).contains(it) }) tight
+                    else Frame(cx, cy, coverW)
+                    stops = clusters.filter { !userFrame.contains(it) }.map { stopFrame(it) }
+                    describe = { n -> if (n == 0) "지정 구도로 이동" else "인물 ${n}곳 거쳐 지정 구도로" }
+                }
+                clusters.isNotEmpty() -> {
+                    val primary = clusters.first()
+                    end = frameFor(primary, fitWidth(primary, MAX_END_ZOOM), coverW / MAX_END_ZOOM)
+                    stops = clusters.drop(1).map { stopFrame(it) }
+                    describe = { n -> if (clusters.size == 1) "인물에 맞춰 이동" else "인물 ${n + 1}/${clusters.size}곳 · 마지막 주인공" }
+                }
+                majorObjects.isNotEmpty() -> {
+                    val primary = majorObjects.first()
+                    end = frameFor(primary, fitWidth(primary, MAX_END_ZOOM), coverW / MAX_END_ZOOM)
+                    stops = majorObjects.drop(1)
+                        .filter { abs(it.centerX - primary.centerX) + abs(it.centerY - primary.centerY) > 0.15f }
+                        .map { stopFrame(it) }
+                    describe = { _ -> "인물 없음 · 주요 피사체로 이동" }
+                }
+                else -> {
+                    end = frameFor(PhotoNormRect(0.5f, 0.5f, 0.5f, 0.5f), coverW / 1.15f, coverW / 1.15f)
+                    // Nothing detected but much of the photo is off screen: both far sides are optional stops.
+                    val w = end.w
+                    val sides = when {
+                        1f - coverW > 0.35f -> listOf(Frame(w / 2f, 0.5f, w), Frame(1f - w / 2f, 0.5f, w))
+                        1f - coverH > 0.35f -> listOf(Frame(0.5f, w * k / 2f, w), Frame(0.5f, 1f - w * k / 2f, w))
+                        else -> emptyList()
+                    }
+                    stops = if (random.nextBoolean()) sides else sides.reversed()
+                    describe = { _ -> if (analysisReliable) "인물·피사체 없음 · 가운데로 이동" else "분석 결과 없음 · 가운데로 이동" }
+                }
+            }
+            if (shortScene) {
+                return PhotoMotionPlan(
+                    PhotoMotionMode.STILL,
+                    listOf(PhotoKeyframe(0f, end.cx, end.cy, coverW)),
+                    cover = true,
+                    reason = "장면이 너무 짧음",
+                )
+            }
+
+            // Long scenes open with a brief hold and close with a slow push-in onto the final framing.
+            val longScene = duration >= LONG_SCENE_SECONDS
+            val arrive = if (longScene) legal(Frame(end.cx, end.cy, minOf(coverW, end.w * 1.06f))) else end
+            val startHold = if (longScene) START_HOLD_SECONDS else 0.0
+            val minFinalHold = if (longScene) maxOf(move(arrive, end).seconds, (0.2 * duration).coerceIn(0.6, 2.0)) else 0.25 * duration
+
+            // As many of the most important stops as fit at a calm pace (best order, ending on the primary); the rest
+            // are skipped rather than rushed. Each move takes at least its rate-limited time.
+            val candidates = stops.take(MAX_STOPS)
+            val frames = candidates + arrive
+            val moves = frames.map { a -> frames.map { b -> move(a, b) } }
+            fun routeSeconds(order: List<Int>) =
+                (order + candidates.size).zipWithNext { i, j -> moves[i][j].seconds }.sum() + order.size * STOP_HOLD_SECONDS
+            var route = emptyList<Int>()
+            for (n in candidates.size downTo 1) {
+                val best = orders((0 until n).toList()).minBy { routeSeconds(it) }
+                if (startHold + routeSeconds(best) + minFinalHold <= duration) {
+                    route = best
+                    break
+                }
+            }
+            val anchor = route.firstOrNull()?.let { candidates[it] } ?: arrive
+            val free = duration - startHold - routeSeconds(route) - minFinalHold
+
+            // Random legal start (stable per photo) away from the first target, then drawn back toward it until the
+            // opening move fits the time left: a short scene opens near its target, a long one may open far away.
+            fun spread(c: Float, extent: Float, target: Float): Float {
+                val lo = extent / 2f
+                val hi = 1f - extent / 2f
+                val room = hi - lo
+                if (room < 0.02f || abs(c - target) >= 0.3f * room) return c
+                val mirrored = lo + hi - c
+                return if (abs(mirrored - target) >= 0.3f * room) mirrored else if (target < 0.5f) hi else lo
+            }
+            var w0 = coverW / (1f + random.nextFloat() * (MAX_START_ZOOM - 1f))
+            if (abs(w0 - anchor.w) < 0.1f * coverW) w0 = if (anchor.w < 0.88f * coverW) coverW else coverW / MAX_START_ZOOM
+            val h0 = w0 * k
+            val far = Frame(
+                spread(w0 / 2f + (1f - w0) * random.nextFloat(), w0, anchor.cx),
+                spread(h0 / 2f + (1f - h0) * random.nextFloat(), h0, anchor.cy),
+                w0,
+            )
+            var reach = 0f
+            if (free > 0.0) {
+                if (move(far, anchor).seconds <= free) {
+                    reach = 1f
+                } else {
+                    var hi = 1f
+                    repeat(12) {
+                        val mid = (reach + hi) / 2f
+                        if (move(lerp(anchor, far, mid), anchor).seconds <= free) reach = mid else hi = mid
+                    }
+                }
+            }
+            val start = lerp(anchor, far, reach)
+
+            // Legs: start → stops → arrival at the primary. Spare time slows them further (up to 1.6x), the rest
+            // lengthens the final push-in hold.
+            val legs = mutableListOf(anchor to move(start, anchor))
+            (route + candidates.size).zipWithNext { i, j -> legs.add(frames[j] to moves[i][j]) }
+            val moveSeconds = legs.sumOf { it.second.seconds }
+            val spare = (duration - startHold - moveSeconds - route.size * STOP_HOLD_SECONDS - minFinalHold).coerceAtLeast(0.0)
+            val stretch = if (moveSeconds > 0.0) 1.0 + minOf(0.6, spare * 0.6 / moveSeconds) else 1.0
+
+            val keys = mutableListOf(PhotoKeyframe(0f, start.cx, start.cy, start.w))
+            var t = 0.0
+            fun add(frame: Frame, pull: Float = 0f) {
+                keys.add(PhotoKeyframe((t / duration).toFloat().coerceIn(0f, 1f), frame.cx, frame.cy, frame.w, pull))
+            }
+            if (startHold > 0.0) {
+                t += startHold
+                add(start)
+            }
+            legs.forEachIndexed { index, (to, leg) ->
+                if (leg.seconds > 0.0) {
+                    t += leg.seconds * stretch
+                    add(to, leg.pull)
+                }
+                if (index < legs.lastIndex) {
+                    t += STOP_HOLD_SECONDS
+                    add(to)
+                }
+            }
+            keys.add(PhotoKeyframe(1f, end.cx, end.cy, end.w))
+            return PhotoMotionPlan(mode, keys, cover = true, reason = describe(route.size))
+        }
+    }
+}
+
+/** Individual detected faces and subjects (normalized, orientation applied); [failed] when analysis did not run. */
 internal data class PhotoAnalysisData(
-    val protectedBounds: RectF?,
-    val treatAsFitSafe: Boolean,
-)
+    val faces: List<PhotoNormRect>,
+    val objects: List<PhotoNormRect>,
+    val failed: Boolean,
+) {
+    companion object {
+        val FAILED = PhotoAnalysisData(emptyList(), emptyList(), failed = true)
+    }
+}
 
 object TrailerPhotoMotionPlanner {
     private val analysisCache = LruCache<String, PhotoAnalysisData>(128)
@@ -239,7 +677,7 @@ object TrailerPhotoMotionPlanner {
 
     private suspend fun analyzePhoto(file: File): PhotoAnalysisData = withContext(Dispatchers.Default) {
         val bitmap = decodeOrientedBitmapForAnalysis(file)
-            ?: return@withContext PhotoAnalysisData(protectedBounds = null, treatAsFitSafe = true)
+            ?: return@withContext PhotoAnalysisData.FAILED
 
         var faceDetector: com.google.mlkit.vision.face.FaceDetector? = null
         var objectDetector: com.google.mlkit.vision.objects.ObjectDetector? = null
@@ -261,7 +699,8 @@ object TrailerPhotoMotionPlanner {
             resources = res
 
             val inputImage = InputImage.fromBitmap(bitmap, 0)
-            val subjectRects = mutableListOf<RectF>()
+            val faceRects = mutableListOf<PhotoNormRect>()
+            val objectRects = mutableListOf<PhotoNormRect>()
             var detectionFailed = false
 
             try {
@@ -280,8 +719,8 @@ object TrailerPhotoMotionPlanner {
                         detectionFailed = true
                         break
                     }
-                    subjectRects.add(
-                        RectF(
+                    faceRects.add(
+                        PhotoNormRect(
                             left.coerceIn(0f, 1f),
                             top.coerceIn(0f, 1f),
                             right.coerceIn(0f, 1f),
@@ -311,8 +750,8 @@ object TrailerPhotoMotionPlanner {
                             detectionFailed = true
                             break
                         }
-                        subjectRects.add(
-                            RectF(
+                        objectRects.add(
+                            PhotoNormRect(
                                 left.coerceIn(0f, 1f),
                                 top.coerceIn(0f, 1f),
                                 right.coerceIn(0f, 1f),
@@ -327,34 +766,13 @@ object TrailerPhotoMotionPlanner {
             }
 
             if (detectionFailed) {
-                return@withContext PhotoAnalysisData(protectedBounds = null, treatAsFitSafe = true)
+                return@withContext PhotoAnalysisData.FAILED
             }
 
-            if (subjectRects.isNotEmpty()) {
-                var minL = 1f
-                var minT = 1f
-                var maxR = 0f
-                var maxB = 0f
-                for (rect in subjectRects) {
-                    minL = minOf(minL, rect.left)
-                    minT = minOf(minT, rect.top)
-                    maxR = maxOf(maxR, rect.right)
-                    maxB = maxOf(maxB, rect.bottom)
-                }
-                val padX = maxOf(0.04f, (maxR - minL) * 0.10f)
-                val padY = maxOf(0.04f, (maxB - minT) * 0.10f)
-                val protectedLeft = (minL - padX).coerceIn(0f, 1f)
-                val protectedTop = (minT - padY).coerceIn(0f, 1f)
-                val protectedRight = (maxR + padX).coerceIn(0f, 1f)
-                val protectedBottom = (maxB + padY).coerceIn(0f, 1f)
-                val bounds = RectF(protectedLeft, protectedTop, protectedRight, protectedBottom)
-                PhotoAnalysisData(protectedBounds = bounds, treatAsFitSafe = false)
-            } else {
-                PhotoAnalysisData(protectedBounds = null, treatAsFitSafe = false)
-            }
+            PhotoAnalysisData(faceRects, objectRects, failed = false)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            PhotoAnalysisData(protectedBounds = null, treatAsFitSafe = true)
+            PhotoAnalysisData.FAILED
         } finally {
             if (resources != null) {
                 resources.release()
@@ -372,11 +790,14 @@ object TrailerPhotoMotionPlanner {
         if (cached != null) return cached
 
         val fresh = analyzePhoto(file)
-        if (!fresh.treatAsFitSafe) {
+        if (!fresh.failed) {
             synchronized(analysisCache) { analysisCache.put(cacheKey, fresh) }
         }
         return fresh
     }
+
+
+    private fun seedOf(source: TrailerSource): Int = source.id * 31 + source.name.hashCode()
 
     suspend fun planMotion(
         source: TrailerSource,
@@ -387,183 +808,56 @@ object TrailerPhotoMotionPlanner {
         outputHeight: Int,
         durationSeconds: Double,
     ): PhotoMotionPlan = withContext(Dispatchers.Default) {
-        if (fit == SceneFit.FIT) {
-            return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-        }
-        if (focusX != 0f || focusY != 0f) {
-            return@withContext PhotoMotionPlan(mode = PhotoMotionMode.MANUAL_FILL, isFit = false)
-        }
-        if (source.width <= 0 || source.height <= 0 || outputWidth <= 0 || outputHeight <= 0) {
-            return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-        }
-
-        val photoAspect = source.width.toDouble() / source.height
-        val outputAspect = outputWidth.toDouble() / outputHeight
-        if (!photoAspect.isFinite() || !outputAspect.isFinite() || photoAspect <= 0.0 || outputAspect <= 0.0) {
-            return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-        }
-
-        val analysis = try {
-            getOrAnalyzePhoto(source.file)
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            PhotoAnalysisData(protectedBounds = null, treatAsFitSafe = true)
-        }
-
-        if (analysis.treatAsFitSafe) {
-            return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-        }
-
-        val protected = analysis.protectedBounds
-        if (protected != null) {
-            if (!protected.left.isFinite() || !protected.right.isFinite() ||
-                !protected.top.isFinite() || !protected.bottom.isFinite() ||
-                protected.left >= protected.right || protected.top >= protected.bottom ||
-                protected.left < 0f || protected.right > 1f ||
-                protected.top < 0f || protected.bottom > 1f
-            ) {
-                return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
+        // FIT keeps the whole photo, so it needs no analysis; FILL and manual focus aim the camera at people/subjects.
+        val needsAnalysis = fit == SceneFit.FILL && source.width > 0 && source.height > 0 &&
+            outputWidth > 0 && outputHeight > 0
+        val analysis = if (needsAnalysis) {
+            try {
+                getOrAnalyzePhoto(source.file)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                PhotoAnalysisData.FAILED
             }
-        }
-
-        if (photoAspect >= outputAspect) {
-            val cropW = (outputAspect / photoAspect).toFloat()
-            if (!cropW.isFinite() || cropW <= 0f || cropW > 1f) {
-                return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-            }
-            if (protected != null) {
-                val subjectW = protected.right - protected.left
-                if (subjectW > cropW) {
-                    return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-                }
-            }
-
-            val xMin = if (protected != null) maxOf(0f, protected.right - cropW) else 0f
-            val xMax = if (protected != null) minOf(1f - cropW, protected.left) else 1f - cropW
-            if (xMin > xMax) {
-                return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-            }
-            val delta = xMax - xMin
-
-            val maxViewportRate = 0.15f
-            val maxTravel = cropW * maxViewportRate * durationSeconds.toFloat()
-            val travel = minOf(delta, maxTravel)
-
-            if (durationSeconds <= 1.0 || delta < 0.005f || travel < 0.005f) {
-                val x = (xMin + xMax) / 2f
-                val xc = x + cropW / 2f
-                val tx = 1f - 2f * xc
-                return@withContext PhotoMotionPlan(
-                    mode = PhotoMotionMode.STATIC_FILL,
-                    isFit = false,
-                    cropWidthNorm = cropW,
-                    cropHeightNorm = 1f,
-                    startXNorm = x,
-                    startYNorm = 0f,
-                    endXNorm = x,
-                    endYNorm = 0f,
-                    startTranslateX = tx,
-                    startTranslateY = 0f,
-                    endTranslateX = tx,
-                    endTranslateY = 0f,
-                )
-            }
-
-            val center = (xMin + xMax) / 2f
-            val x0 = (center - travel / 2f).coerceIn(xMin, xMax)
-            val x1 = (center + travel / 2f).coerceIn(xMin, xMax)
-
-            val seed = source.id * 31 + source.name.hashCode()
-            val forward = (seed and 1) == 0
-            val (startX, endX) = if (forward) x0 to x1 else x1 to x0
-            val startXc = startX + cropW / 2f
-            val endXc = endX + cropW / 2f
-            val startTx = 1f - 2f * startXc
-            val endTx = 1f - 2f * endXc
-
-            PhotoMotionPlan(
-                mode = PhotoMotionMode.PAN_HORIZONTAL,
-                isFit = false,
-                cropWidthNorm = cropW,
-                cropHeightNorm = 1f,
-                startXNorm = startX,
-                startYNorm = 0f,
-                endXNorm = endX,
-                endYNorm = 0f,
-                startTranslateX = startTx,
-                startTranslateY = 0f,
-                endTranslateX = endTx,
-                endTranslateY = 0f,
-            )
         } else {
-            val cropH = (photoAspect / outputAspect).toFloat()
-            if (!cropH.isFinite() || cropH <= 0f || cropH > 1f) {
-                return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-            }
-            if (protected != null) {
-                val subjectH = protected.bottom - protected.top
-                if (subjectH > cropH) {
-                    return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-                }
-            }
-
-            val yMin = if (protected != null) maxOf(0f, protected.bottom - cropH) else 0f
-            val yMax = if (protected != null) minOf(1f - cropH, protected.top) else 1f - cropH
-            if (yMin > yMax) {
-                return@withContext PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-            }
-            val delta = yMax - yMin
-
-            val maxViewportRate = 0.15f
-            val maxTravel = cropH * maxViewportRate * durationSeconds.toFloat()
-            val travel = minOf(delta, maxTravel)
-
-            if (durationSeconds <= 1.0 || delta < 0.005f || travel < 0.005f) {
-                val y = (yMin + yMax) / 2f
-                val yc = y + cropH / 2f
-                val ty = 2f * yc - 1f
-                return@withContext PhotoMotionPlan(
-                    mode = PhotoMotionMode.STATIC_FILL,
-                    isFit = false,
-                    cropWidthNorm = 1f,
-                    cropHeightNorm = cropH,
-                    startXNorm = 0f,
-                    startYNorm = y,
-                    endXNorm = 0f,
-                    endYNorm = y,
-                    startTranslateX = 0f,
-                    startTranslateY = ty,
-                    endTranslateX = 0f,
-                    endTranslateY = ty,
-                )
-            }
-
-            val center = (yMin + yMax) / 2f
-            val y0 = (center - travel / 2f).coerceIn(yMin, yMax)
-            val y1 = (center + travel / 2f).coerceIn(yMin, yMax)
-
-            val seed = source.id * 31 + source.name.hashCode()
-            val forward = (seed and 1) == 0
-            val (startY, endY) = if (forward) y0 to y1 else y1 to y0
-            val startYc = startY + cropH / 2f
-            val endYc = endY + cropH / 2f
-            val startTy = 2f * startYc - 1f
-            val endTy = 2f * endYc - 1f
-
-            PhotoMotionPlan(
-                mode = PhotoMotionMode.PAN_VERTICAL,
-                isFit = false,
-                cropWidthNorm = 1f,
-                cropHeightNorm = cropH,
-                startXNorm = 0f,
-                startYNorm = startY,
-                endXNorm = 0f,
-                endYNorm = endY,
-                startTranslateX = 0f,
-                startTranslateY = startTy,
-                endTranslateX = 0f,
-                endTranslateY = endTy,
-            )
+            null
         }
+        PhotoMotionGeometry.plan(
+            photoWidth = source.width,
+            photoHeight = source.height,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            fit = fit,
+            focusX = focusX,
+            focusY = focusY,
+            durationSeconds = durationSeconds,
+            faces = analysis?.faces.orEmpty(),
+            objects = analysis?.objects.orEmpty(),
+            analysisReliable = analysis != null && !analysis.failed,
+            seed = seedOf(source),
+        )
     }
+
+    /** Plan before analysis finishes (preview placeholder): covers the frame and aims at the center until people are known. */
+    fun pendingPlan(
+        source: TrailerSource,
+        fit: SceneFit,
+        focusX: Float,
+        focusY: Float,
+        outputWidth: Int,
+        outputHeight: Int,
+        durationSeconds: Double,
+    ): PhotoMotionPlan = PhotoMotionGeometry.plan(
+        photoWidth = source.width,
+        photoHeight = source.height,
+        outputWidth = outputWidth,
+        outputHeight = outputHeight,
+        fit = fit,
+        focusX = focusX,
+        focusY = focusY,
+        durationSeconds = durationSeconds,
+        faces = emptyList(),
+        objects = emptyList(),
+        analysisReliable = false,
+        seed = seedOf(source),
+    ).let { if (it.cover && it.mode != PhotoMotionMode.STILL) it.copy(reason = "인물 찾는 중") else it }
 }

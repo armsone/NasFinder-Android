@@ -402,6 +402,34 @@ class SharedInboxStore private constructor(
     }
 
     /**
+     * 이동(복사 후 원본 삭제)용: 전송을 시작할 때 본 파일과 지금 파일이 같을 때만 지운다.
+     * 레코드 ID·저장 경로·실제 길이·수정 시각 중 하나라도 다르면 아무것도 지우지 않고 사유를 돌려준다.
+     * 확인과 삭제는 같은 락 안에서 이뤄지므로 그 사이에 다른 작업이 끼어들지 않는다. 성공이면 null.
+     */
+    fun deleteFileIfUnchanged(
+        id: UUID,
+        storedFilename: String,
+        expectedLength: Long,
+        expectedLastModified: Long,
+    ): String? = synchronized(PROCESS_LOCK) {
+        val record = readManifest().firstOrNull { it.id == id }
+            ?: return@synchronized "원본이 폰하드에서 이미 사라졌거나 이동되어 삭제하지 않았습니다."
+        if (record.storedFilename != storedFilename) {
+            return@synchronized "원본 위치가 바뀌어 삭제하지 않았습니다."
+        }
+        val file = runCatching { payloadFile(record.storedFilename) }.getOrNull()
+            ?: return@synchronized "원본 경로를 확인할 수 없어 삭제하지 않았습니다."
+        if (!file.isFile || Files.isSymbolicLink(file.toPath())) {
+            return@synchronized "원본이 일반 파일이 아니어서 삭제하지 않았습니다."
+        }
+        if (file.length() != expectedLength || file.lastModified() != expectedLastModified) {
+            return@synchronized "전송하는 동안 원본이 바뀌어 삭제하지 않았습니다."
+        }
+        val result = deleteTargets(listOf(PhoneHardTarget(id = id, relativePath = storedFilename, isDirectory = false)))
+        result.failed.firstOrNull()?.second
+    }
+
+    /**
      * Lists immediate entries (files and directories) inside a given subfolder.
      * [relativeSubdirectory] null or empty means root directory.
      */

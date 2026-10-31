@@ -433,58 +433,104 @@ internal fun LocalPhotoLibraryScreen(
         },
         bottomBar = {
             if (selected.isNotEmpty() || copying) {
-                Column(
-                    Modifier.fillMaxWidth().systemBarsPadding().padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    if (copying) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Text("폰하드에 복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                    BasketTray(
-                        selected = selected,
-                        items = deviceItems,
-                        enabled = !copying,
-                        onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
-                    )
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            "선택됨 ${selected.size}개",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(end = 4.dp),
-                        )
-                        Spacer(Modifier.weight(1f))
-                        val actionsEnabled = !loading && !copying && selected.isNotEmpty()
-                        fun selectedUris() = selected.map(Uri::parse)
-                        if (onCopyToPhoneHard != null) {
-                            LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier, isSecondary = true) {
-                                val uris = selectedUris()
-                                if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+                BoxWithConstraints(Modifier.fillMaxWidth()) {
+                    val compactActions = maxWidth < 600.dp
+                    if (maxWidth < 840.dp) {
+                        Column(
+                            Modifier.fillMaxWidth().systemBarsPadding().padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            if (copying) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    Text("폰하드에 복사 중 · $copyCurrent/${copyTotal}개", style = MaterialTheme.typography.bodySmall)
+                                }
                             }
-                        }
-                        LocalMediaActionButton("작업대에 담기", actionsEnabled, Modifier, isSecondary = true) {
-                            val uris = selectedUris()
-                            if (uris.isNotEmpty()) {
-                                model.requestWorkbenchAddLocal(uris, deviceItems)
+                            BasketTray(
+                                selected = selected,
+                                items = deviceItems,
+                                enabled = !copying,
+                                onRemove = { raw -> val key = canonicalKeyFor(raw); selected = selected.filterNot { canonicalKeyFor(it) == key } },
+                            )
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    "선택됨 ${selected.size}개",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(end = 4.dp),
+                                )
+                                Spacer(Modifier.weight(1f))
+                                val actionsEnabled = !loading && !copying && selected.isNotEmpty()
+                                fun selectedUris() = selected.map(Uri::parse)
+                                var showSecondaryMenu by remember { mutableStateOf(false) }
+                                if (compactActions) {
+                                    Box {
+                                        LocalMediaActionButton("더 보기", actionsEnabled, Modifier, isSecondary = true) {
+                                            showSecondaryMenu = true
+                                        }
+                                        DropdownMenu(
+                                            expanded = showSecondaryMenu,
+                                            onDismissRequest = { showSecondaryMenu = false },
+                                        ) {
+                                            if (onCopyToPhoneHard != null) {
+                                                DropdownMenuItem(
+                                                    text = { Text("폰하드 복사") },
+                                                    onClick = {
+                                                        showSecondaryMenu = false
+                                                        val uris = selectedUris()
+                                                        if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+                                                    },
+                                                )
+                                            }
+                                            DropdownMenuItem(
+                                                text = { Text("작업대에 담기") },
+                                                onClick = {
+                                                    showSecondaryMenu = false
+                                                    val uris = selectedUris()
+                                                    if (uris.isNotEmpty()) {
+                                                        model.requestWorkbenchAddLocal(uris, deviceItems)
+                                                    }
+                                                },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("컬렉션에 추가") },
+                                                onClick = {
+                                                    showSecondaryMenu = false
+                                                    model.stageCollectionImport(selectedUris().map { it to null })
+                                                },
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    if (onCopyToPhoneHard != null) {
+                                        LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier, isSecondary = true) {
+                                            val uris = selectedUris()
+                                            if (uris.isNotEmpty()) pendingCopyUris = uris.toList()
+                                        }
+                                    }
+                                    LocalMediaActionButton("작업대에 담기", actionsEnabled, Modifier, isSecondary = true) {
+                                        val uris = selectedUris()
+                                        if (uris.isNotEmpty()) {
+                                            model.requestWorkbenchAddLocal(uris, deviceItems)
+                                        }
+                                    }
+                                    LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier, isSecondary = true) {
+                                        // Opens the 사본/참조 confirmation; the selection itself is kept either way.
+                                        model.stageCollectionImport(selectedUris().map { it to null })
+                                    }
+                                }
+                                LocalMediaActionButton("영상 만들기", actionsEnabled, Modifier, isSecondary = false) {
+                                    // Unified entry starts as a trailer; the editor switches modes inline.
+                                    // An explicit music route keeps its original music-video start.
+                                    if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
+                                    else onCreateTrailer(selectedUris())
+                                }
                             }
-                        }
-                        LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier, isSecondary = true) {
-                            // Opens the 사본/참조 confirmation; the selection itself is kept either way.
-                            model.stageCollectionImport(selectedUris().map { it to null })
-                        }
-                        LocalMediaActionButton("영상 만들기", actionsEnabled, Modifier, isSecondary = false) {
-                            // Unified entry starts as a trailer; the editor switches modes inline.
-                            // An explicit music route keeps its original music-video start.
-                            if (initialIntent == LocalMediaEditIntent.MUSIC && onMusicOverlay != null) onMusicOverlay(selectedUris())
-                            else onCreateTrailer(selectedUris())
                         }
                     }
                 }

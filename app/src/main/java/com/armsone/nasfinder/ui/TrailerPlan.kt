@@ -10,6 +10,9 @@ import kotlin.math.*
 const val DEFAULT_PHOTO_DURATION_RATIO: Double = .55
 const val MIN_PHOTO_DURATION_RATIO: Double = .01
 internal const val MIN_PHOTO_SCENE_DURATION: Double = 1.0 / 30.0
+// Automatic photo scenes get at least this long so the 채우기 camera can start somewhere, visit the people and settle
+// on the main person. Explicit per-scene lengths (editor slider, manual trims) are never raised by it.
+internal const val MIN_AUTO_PHOTO_SCENE_SECONDS: Double = 3.0
 
 fun migratePhotoDurationRatio(r: Double): Double {
     if (!r.isFinite() || r <= 0.0) return DEFAULT_PHOTO_DURATION_RATIO
@@ -37,9 +40,13 @@ data class TrailerSource(
         return if (ratio.isFinite() && ratio > 0.0) ratio else DEFAULT_PHOTO_DURATION_RATIO
     }
 
-    // Actual scene duration for this photo given the configured video-clip ("base clip") length.
-    // Uses raw stored ratio (clamped frame...30s) so opening legacy drafts does not silently change durations.
-    fun weightedPhotoLength(clipLength: Double): Double {
+    // Actual automatic scene duration for this photo given the configured video-clip ("base clip") length: the
+    // weighted share, but never shorter than the camera-move minimum. Stored editor scenes keep their own lengths.
+    fun weightedPhotoLength(clipLength: Double): Double =
+        unflooredPhotoLength(clipLength).coerceIn(MIN_AUTO_PHOTO_SCENE_SECONDS, MAX_EDITOR_PHOTO_SCENE_SECONDS)
+
+    // The pre-3s-floor weighted length (raw stored ratio, clamped frame...30s); only used to recognize legacy totals.
+    internal fun unflooredPhotoLength(clipLength: Double): Double {
         val raw = if (photoDurationRatio.isFinite() && photoDurationRatio > 0.0) photoDurationRatio else DEFAULT_PHOTO_DURATION_RATIO
         return (clipLength * raw).coerceIn(MIN_PHOTO_SCENE_DURATION, MAX_EDITOR_PHOTO_SCENE_SECONDS)
     }
@@ -185,9 +192,11 @@ internal fun automaticTrailerPlan(sources: List<TrailerSource>, total: Double, c
     if (!total.isFinite() || !clipLength.isFinite()) return null
     val plan = recommendTrailerPlan(sources, explicitClip = clipLength) ?: return null
     val planTotal = plan.total
+    // A draft saved before the photo camera-move floor stored the unfloored automatic total; it is still automatic.
+    val legacyTotal = plan.scenes.sumOf { if (it.source.isImage) it.source.unflooredPhotoLength(plan.clipLength) else it.length }
     return plan.takeIf {
         planTotal in 0.0..MAX_TRAILER_TOTAL_SECONDS &&
-            abs(total - planTotal) < AUTOMATIC_TOTAL_TOLERANCE
+            (abs(total - planTotal) < AUTOMATIC_TOTAL_TOLERANCE || abs(total - legacyTotal) < AUTOMATIC_TOTAL_TOLERANCE)
     }
 }
 

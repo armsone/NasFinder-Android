@@ -241,6 +241,7 @@ class DefaultNetworkDownloadCoordinator(
         var stagedFilesCount = 0
         var stagedBytesDownloaded = 0L
         var committedDestinationFiles = 0
+        val collisionRenames = mutableListOf<String>()
         var committedDestinationBytes = 0L
         val savedTargetPaths = mutableListOf<String>()
         val skippedBranches = mutableListOf<SkippedBranch>()
@@ -437,6 +438,9 @@ class DefaultNetworkDownloadCoordinator(
                             isPrivate = jobPrivate,
                         )
                         savedTargetPaths.add(importResult.targetFile.absolutePath)
+                        if (importResult.targetFile.name != plan.sanitizedName) {
+                            collisionRenames += "‘${plan.sanitizedName}’ → ‘${importResult.targetFile.name}’"
+                        }
                         committedDestinationFiles += importResult.records.size
                         committedDestinationBytes += importResult.records.sumOf { it.byteCount }
                     }
@@ -465,16 +469,33 @@ class DefaultNetworkDownloadCoordinator(
                             },
                         )
                         savedTargetPaths.add(savedUri.toString())
+                        val savedName = runCatching {
+                            contentResolver.query(savedUri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+                                ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+                        }.getOrNull()
+                        if (savedName != null && savedName != plan.sanitizedName) {
+                            collisionRenames += "‘${plan.sanitizedName}’ → ‘$savedName’"
+                        }
                     }
                 }
             }
 
             val formattedSize = formatByteSize(committedDestinationBytes)
             val skippedSummary = if (skippedBranches.isNotEmpty()) " (건너뛴 항목 ${skippedBranches.size}개 제외됨)" else ""
+            val destinationLabel = when (destination) {
+                is NetworkDownloadDestination.PhoneHard ->
+                    "폰하드" + (destination.subdirectory?.takeIf { it.isNotBlank() }?.let { "/$it" } ?: "")
+                is NetworkDownloadDestination.ExternalTree ->
+                    runCatching { DocumentsContract.getTreeDocumentId(destination.treeUri).substringAfter(':') }
+                        .getOrNull()?.takeIf { it.isNotBlank() }?.let { "기기 폴더 $it" } ?: "선택한 기기 폴더"
+            }
+            val renameSummary = if (collisionRenames.isEmpty()) "" else
+                " 같은 이름이 있어 새 이름으로 저장: ${collisionRenames.take(3).joinToString(", ")}" +
+                    if (collisionRenames.size > 3) " 외 ${collisionRenames.size - 3}개" else ""
             val successMessage = if (filesToDownload.isEmpty()) {
-                "다운로드가 완료되었습니다. (폴더 구조 생성 완료)$skippedSummary"
+                "다운로드가 완료되었습니다. (폴더 구조 생성 완료) 저장 위치: $destinationLabel$skippedSummary$renameSummary"
             } else {
-                "다운로드가 완료되었습니다. (${committedDestinationFiles}개 파일, $formattedSize)$skippedSummary"
+                "다운로드가 완료되었습니다. (${committedDestinationFiles}개 파일, $formattedSize) 저장 위치: $destinationLabel$skippedSummary$renameSummary"
             }
 
             NetworkDownloadResult.Success(

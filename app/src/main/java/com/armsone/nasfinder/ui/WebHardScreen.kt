@@ -7,6 +7,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -441,6 +443,41 @@ private fun PhoneHardPasswordButton(
     }
 }
 
+private const val LOCAL_NETWORK_PERMISSION = "android.permission.ACCESS_LOCAL_NETWORK"
+
+/**
+ * Android 17+ 에서 같은 네트워크(LAN) 통신 전에 필요한 로컬 네트워크 권한을 확인한다.
+ * 이미 허용됐거나 해당 없는 기기에서는 바로 [action]을 실행하고, 아니면 시스템 권한 창에서 허용됐을 때만 실행한다.
+ * 거부되거나 권한 창을 띄우지 못하면 작업을 시작하지 않고 안내만 보여 준다.
+ */
+@Composable
+internal fun rememberLocalNetworkGate(): (action: () -> Unit) -> Unit {
+    val context = LocalContext.current
+    var pending by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val denied = {
+        android.widget.Toast.makeText(context, "로컬 네트워크 권한이 없어 같은 네트워크 기기에 연결하지 않았습니다. 설정에서 허용한 뒤 다시 시도하세요.", android.widget.Toast.LENGTH_LONG).show()
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val action = pending
+        pending = null
+        if (granted) action?.invoke() else if (action != null) denied()
+    }
+    return { action ->
+        val needed = android.os.Build.VERSION.SDK_INT >= 37 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(context, LOCAL_NETWORK_PERMISSION) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (needed) {
+            pending = action
+            try {
+                launcher.launch(LOCAL_NETWORK_PERMISSION)
+            } catch (_: Exception) {
+                pending = null
+                denied()
+            }
+        } else action()
+    }
+}
+
 @Composable
 private fun PhoneHardConnectionButton(
     connection: WebHardConnectionState,
@@ -450,12 +487,14 @@ private fun PhoneHardConnectionButton(
     val enabled = connection.server != null || connection.selectedAddress != null
     val isRunning = connection.server != null
     val label = if (connection.server == null) "열기" else "닫기"
+    val localNetworkGate = rememberLocalNetworkGate()
+    val toggle = { if (connection.server != null) connection.toggle() else localNetworkGate { connection.toggle() } }
     if (!enamel) {
-        Button(onClick = connection::toggle, enabled = enabled, modifier = modifier) { Text(label) }
+        Button(onClick = toggle, enabled = enabled, modifier = modifier) { Text(label) }
         return
     }
     Surface(
-        onClick = connection::toggle,
+        onClick = toggle,
         enabled = enabled,
         modifier = modifier.defaultMinSize(minWidth = 80.dp, minHeight = 40.dp)
             .shadow(4.dp, RoundedCornerShape(10.dp)),

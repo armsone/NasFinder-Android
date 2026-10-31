@@ -1,4 +1,4 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 
 package com.armsone.nasfinder.ui
 
@@ -13,6 +13,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -43,6 +44,7 @@ import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -63,6 +65,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -74,7 +78,6 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
-import com.armsone.nasfinder.platform.NasFinderShareIntentFactory
 import com.armsone.nasfinder.ui.theme.themePalette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -101,7 +104,8 @@ private fun editorTier(width: Dp): EditorTier = when {
 
 private enum class InspectorTab(val title: String) { SCENE("장면"), SOUND("소리·음악"), SCREEN("화면"), PLAN("구성") }
 
-private fun seconds1(value: Double): String = "%.1f초".format(value)
+// Very short scenes (e.g. near-duplicate photos at 1% weight) would otherwise all read "0.0초".
+private fun seconds1(value: Double): String = if (value > 0.0 && value < 0.095) "%.2f초".format(value) else "%.1f초".format(value)
 
 /**
  * The current-project editing workspace: 64dp rail, Finder panel that adds into THIS project, editor stage with the
@@ -135,11 +139,28 @@ internal fun AdaptiveEditorWorkspace(
     // Finder selections are held in the view model so route changes, web roundtrips and minimization preserve them.
     val finderSelection = remember(directoryKey) { model.editorFinderSelection(directoryKey) }
 
+    var knownSceneKeys by remember(directoryKey) { mutableStateOf(project.scenes.map { it.key }) }
     LaunchedEffect(project.scenes.map { it.key }) {
-        if (selectedSceneKey == null || project.scene(selectedSceneKey!!) == null) selectedSceneKey = project.scenes.firstOrNull()?.key
+        val keys = project.scenes.map { it.key }
+        if (selectedSceneKey == null || project.scene(selectedSceneKey!!) == null) {
+            // A removed scene hands the selection to the scene that took its place, not back to scene 1.
+            val oldIndex = knownSceneKeys.indexOf(selectedSceneKey).takeIf { it >= 0 }
+            selectedSceneKey = if (oldIndex == null) keys.firstOrNull() else (keys.getOrNull(oldIndex) ?: keys.lastOrNull())
+        }
+        knownSceneKeys = keys
     }
     LaunchedEffect(session.output, session.outputRevision) {
         if (session.output != null && session.outputRevision == session.revision) showOutput = true
+    }
+    // An actual edit (revision change) that leaves the render stale returns to the live scene preview, so the
+    // edit screen never keeps showing old pixels while trim/framing moves. Recomposition, rotation and play/pause
+    // keep the last seen revision, so the user's explicit choice of the previous output stays until the next edit.
+    var seenRevision by rememberSaveable(directoryKey) { mutableStateOf(session.revision) }
+    LaunchedEffect(session.revision) {
+        if (session.revision != seenRevision) {
+            seenRevision = session.revision
+            if (session.output != null && session.outputRevision != session.revision) showOutput = false
+        }
     }
     val selectedScene = selectedSceneKey?.let(project::scene)
     val selectedSource = selectedScene?.let { scene -> session.sources.firstOrNull { it.id == scene.sourceId } }
@@ -150,13 +171,10 @@ internal fun AdaptiveEditorWorkspace(
     val originToSource = session.sources.filter { it.originKey != null }.associateBy { it.originKey!! }
 
     fun shareOutput() {
-        val target = output ?: return
-        runCatching {
-            context.startActivity(
-                android.content.Intent.createChooser(NasFinderShareIntentFactory.create(context, listOf(target)), "영상 공유")
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
-        }
+        // A render of an older edit is never shared as if it were the current project.
+        if (output == null || !outputCurrent) return
+        // The model stages a copy in the share-only cache root off the main thread and reports failures.
+        model.shareTrailerOutput()
     }
 
     BackHandler(enabled = !fullscreenPlayback) {
@@ -184,6 +202,14 @@ internal fun AdaptiveEditorWorkspace(
     ) {
         val tier = editorTier(maxWidth)
         val panelFinderInline = finderOpen && (tier == EditorTier.WIDE || tier == EditorTier.MEDIUM)
+        // 펼친 TriFold(~792dp)처럼 760..919dp에서는 Finder를 오버레이로 두고 우측 300dp 인스펙터를 쓴다(미리보기 >= 360dp).
+        // 패널 토글은 이 우측 인스펙터를 접고 펼치는 데 쓰인다.
+        // MEDIUM(펼친 가로 1080x792dp 등)도 Finder가 인라인으로 열려 있지 않을 때만 우측 인스펙터를 쓰고, 열려 있으면 하단 인스펙터로 폴백한다.
+        // 펼친 세로(~792x1080dp)는 폭이 760..919dp여도 세로가 넉넉하므로 미리보기-장면-편집 패널을 전체 폭으로 쌓는다(우측 패널 없음).
+        val stackedPortrait = tier == EditorTier.RAIL_ONLY && maxHeight > maxWidth
+        val sideInspector = !stackedPortrait && (tier == EditorTier.WIDE ||
+            ((tier == EditorTier.RAIL_ONLY || tier == EditorTier.MEDIUM) && lowerPanelOpen && !panelFinderInline))
+        val sideInspectorWidth = if (tier == EditorTier.WIDE) 340.dp else 300.dp
 
         // Insets are consumed exactly once here: rail, header, stage controls and footer stay in the safe area.
         Row(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -213,7 +239,7 @@ internal fun AdaptiveEditorWorkspace(
                 )
                 VerticalHairline()
             }
-            val unifiedScroll = tier == EditorTier.FOCUSED || (tier != EditorTier.WIDE && this@BoxWithConstraints.maxHeight < 680.dp)
+            val unifiedScroll = tier == EditorTier.FOCUSED || (!sideInspector && tier != EditorTier.WIDE && tier != EditorTier.RAIL_ONLY && this@BoxWithConstraints.maxHeight < 680.dp)
             Column(Modifier.weight(1f).fillMaxHeight()) {
                 EditorHeader(
                     session = session,
@@ -225,7 +251,7 @@ internal fun AdaptiveEditorWorkspace(
                     onRedo = model::editorRedo,
                     onExport = model::exportEditorProject,
                     onRetrySave = model::retryEditorAutosave,
-                    showPanelToggle = tier == EditorTier.MEDIUM || tier == EditorTier.RAIL_ONLY,
+                    showPanelToggle = (tier == EditorTier.MEDIUM || tier == EditorTier.RAIL_ONLY) && !stackedPortrait,
                     panelOpen = lowerPanelOpen,
                     onTogglePanel = { lowerPanelOpen = !lowerPanelOpen },
                 )
@@ -246,7 +272,12 @@ internal fun AdaptiveEditorWorkspace(
                             .weight(1f)
                             .verticalScroll(mainScrollState)
                     ) {
-                        val stageMax = (this@BoxWithConstraints.maxHeight * 0.45f).coerceAtLeast(160.dp)
+                        val stageCeiling = (this@BoxWithConstraints.maxHeight * 0.45f).coerceAtLeast(160.dp)
+                        // 가로 영상처럼 납작한 출력은 폭 기준 높이(+컨트롤 행 여유)만 쓰고, 세로/짧은 화면은 기존 상한을 유지한다.
+                        val stageContentWidth = this@BoxWithConstraints.maxWidth - 24.dp
+                        val stageControlsHeight = if (output != null) 108.dp else 0.dp
+                        val stageWanted = stageContentWidth / outputAspect(session).coerceIn(0.4f, 3f) + stageControlsHeight
+                        val stageMax = stageWanted.coerceIn(160.dp, stageCeiling)
                         val stageModifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 140.dp, max = stageMax)
@@ -292,6 +323,52 @@ internal fun AdaptiveEditorWorkspace(
                         }
                     }
                 } else {
+                    if (stackedPortrait) {
+                        // 가로 영상은 폭 기준 높이만, 세로 영상은 화면 높이의 46%까지만 쓰고 나머지는 장면 스트립과 편집 패널이 쓴다.
+                        val stageWidth = this@BoxWithConstraints.maxWidth - 24.dp
+                        val controlsHeight = if (output != null) 108.dp else 0.dp
+                        val wantedHeight = stageWidth / outputAspect(session).coerceIn(0.4f, 3f) + controlsHeight + 12.dp
+                        val stageHeight = wantedHeight.coerceIn(200.dp, (this@BoxWithConstraints.maxHeight * 0.46f).coerceAtLeast(200.dp))
+                        EditorStage(
+                            session = session,
+                            scene = selectedScene,
+                            source = selectedSource,
+                            output = output,
+                            outputCurrent = outputCurrent,
+                            showOutput = showOutput && output != null,
+                            onShowOutput = { showOutput = it },
+                            onFullscreen = { onFullscreenChange(true) },
+                            onShare = ::shareOutput,
+                            onSaveToPhoneHard = model::saveTrailer,
+                            onCollection = { collectionDialog = true },
+                            onExport = model::exportEditorProject,
+                            modifier = Modifier.fillMaxWidth().height(stageHeight).padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    } else if (sideInspector && tier == EditorTier.RAIL_ONLY) {
+                        // 펼친 세로(~792dp): 우측 인스펙터를 뺀 실제 중앙 폭 기준으로 스테이지 높이를 제한해 검은 빈 공간과 장면 스트립 사이 간격을 없앤다.
+                        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f, fill = false), contentAlignment = Alignment.TopCenter) {
+                            val availableHeight = maxHeight
+                            val centerContentWidth = maxWidth - 24.dp
+                            val controlsHeight = if (output != null) 108.dp else 0.dp
+                            val wantedHeight = centerContentWidth / outputAspect(session).coerceIn(0.4f, 3f) + controlsHeight + 12.dp
+                            val stageHeight = wantedHeight.coerceAtLeast(160.dp).coerceAtMost(availableHeight)
+                            EditorStage(
+                                session = session,
+                                scene = selectedScene,
+                                source = selectedSource,
+                                output = output,
+                                outputCurrent = outputCurrent,
+                                showOutput = showOutput && output != null,
+                                onShowOutput = { showOutput = it },
+                                onFullscreen = { onFullscreenChange(true) },
+                                onShare = ::shareOutput,
+                                onSaveToPhoneHard = model::saveTrailer,
+                                onCollection = { collectionDialog = true },
+                                onExport = model::exportEditorProject,
+                                modifier = Modifier.fillMaxWidth().height(stageHeight).padding(horizontal = 12.dp, vertical = 6.dp),
+                            )
+                        }
+                    } else {
                     EditorStage(
                         session = session,
                         scene = selectedScene,
@@ -307,6 +384,7 @@ internal fun AdaptiveEditorWorkspace(
                         onExport = model::exportEditorProject,
                         modifier = Modifier.fillMaxWidth().weight(1f, fill = true).padding(horizontal = 12.dp, vertical = 6.dp),
                     )
+                    }
                     SceneStrip(
                         session = session,
                         selectedKey = selectedSceneKey,
@@ -317,7 +395,7 @@ internal fun AdaptiveEditorWorkspace(
                         onRemove = model::editorRemoveScene,
                         onAddMaterial = { finderOpen = true },
                     )
-                    if (tier != EditorTier.WIDE && lowerPanelOpen) {
+                    if (stackedPortrait || (!sideInspector && tier != EditorTier.WIDE && tier != EditorTier.RAIL_ONLY && lowerPanelOpen)) {
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                         EditorInspector(
                             session = session,
@@ -329,7 +407,7 @@ internal fun AdaptiveEditorWorkspace(
                             onSelectScene = { selectedSceneKey = it },
                             onOpenMusicPicker = { showMusicPicker = true },
                             scrollable = true,
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                            modifier = if (stackedPortrait) Modifier.fillMaxWidth().weight(1f) else Modifier.fillMaxWidth().heightIn(max = 320.dp),
                         )
                     }
                 }
@@ -342,7 +420,7 @@ internal fun AdaptiveEditorWorkspace(
                     )
                 }
             }
-            if (tier == EditorTier.WIDE) {
+            if (sideInspector) {
                 VerticalHairline()
                 EditorInspector(
                     session = session,
@@ -354,7 +432,7 @@ internal fun AdaptiveEditorWorkspace(
                     onSelectScene = { selectedSceneKey = it },
                     onOpenMusicPicker = { showMusicPicker = true },
                     scrollable = true,
-                    modifier = Modifier.width(340.dp).fillMaxHeight(),
+                    modifier = Modifier.width(sideInspectorWidth).fillMaxHeight(),
                 )
             }
         }
@@ -402,7 +480,7 @@ internal fun AdaptiveEditorWorkspace(
                 onPlaybackFailure = null,
                 showShare = false,
                 accessoryControls = {
-                    IconButton(onClick = ::shareOutput) { Icon(Icons.Default.Share, "공유", tint = Color.White) }
+                    if (outputCurrent) IconButton(onClick = ::shareOutput) { Icon(Icons.Default.Share, "공유", tint = Color.White) }
                     IconButton(onClick = { onFullscreenChange(false) }) { Icon(Icons.Default.FullscreenExit, "전체화면 종료", tint = Color.White) }
                 },
             )
@@ -674,7 +752,8 @@ private fun EditorStage(
             }
         }
         if (showOutput && output != null) {
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            // 폰 폭에서도 칩이 잘리지 않고 다음 줄로 이어진다(가로 스크롤로 숨기지 않음).
+            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 if (!outputCurrent) {
                     val palette = themePalette()
                     Button(
@@ -687,9 +766,9 @@ private fun EditorStage(
                     }
                 }
                 AssistChip(onClick = onFullscreen, label = { Text("전체화면") }, leadingIcon = { Icon(Icons.Default.Fullscreen, null, Modifier.size(18.dp)) })
-                AssistChip(onClick = onShare, label = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null, Modifier.size(18.dp)) })
-                AssistChip(onClick = onSaveToPhoneHard, enabled = !session.saved && !session.busy, label = { Text(if (session.saved) "폰하드에 저장됨" else "폰하드에 저장") }, leadingIcon = { Icon(Icons.Default.SaveAlt, null, Modifier.size(18.dp)) })
-                AssistChip(onClick = onCollection, enabled = !session.busy && session.export?.running != true, label = { Text("컬렉션에 보관") }, leadingIcon = { Icon(Icons.Default.VideoLibrary, null, Modifier.size(18.dp)) })
+                AssistChip(onClick = onShare, enabled = outputCurrent, label = { Text("공유") }, leadingIcon = { Icon(Icons.Default.Share, null, Modifier.size(18.dp)) })
+                AssistChip(onClick = onSaveToPhoneHard, enabled = outputCurrent && !session.saved && !session.busy, label = { Text(if (session.saved) "폰하드에 저장됨" else "폰하드에 저장") }, leadingIcon = { Icon(Icons.Default.SaveAlt, null, Modifier.size(18.dp)) })
+                AssistChip(onClick = onCollection, enabled = outputCurrent && !session.busy && session.export?.running != true, label = { Text("컬렉션에 보관") }, leadingIcon = { Icon(Icons.Default.VideoLibrary, null, Modifier.size(18.dp)) })
             }
         }
     }
@@ -752,11 +831,9 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
             duration = scene.length,
         )
     } else null
-    val pendingPlan = when {
-        planKey == null -> null
-        scene.fit == SceneFit.FIT -> PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
-        scene.focusX != 0f || scene.focusY != 0f -> PhotoMotionPlan(mode = PhotoMotionMode.MANUAL_FILL, isFit = false)
-        else -> PhotoMotionPlan(mode = PhotoMotionMode.FIT_STATIC, isFit = true)
+    // Until analysis answers, the preview uses the center-aimed plan (FILL still covers the frame, FIT stays whole).
+    val pendingPlan = if (planKey == null) null else {
+        TrailerPhotoMotionPlanner.pendingPlan(source, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight, scene.length)
     }
     val photoPlanEntry by produceState<Pair<PhotoPlanKey, PhotoMotionPlan>?>(
         initialValue = planKey?.let { k -> pendingPlan?.let { p -> k to p } },
@@ -794,7 +871,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
         }
     }
     val frame by produceState<Bitmap?>(null, source.file, scene.start, source.isImage) {
-        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 960) }
+        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 960, exact = true) }
     }
     BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
         val boxWidth = minOf(maxWidth, maxHeight * aspect)
@@ -860,42 +937,58 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
-            } else {
+            } else if (source.isImage) {
+                // Same camera path, easing and timing as the exporter's PhotoMotionGlTransformation: the viewport
+                // (photo coordinates) is mapped onto this output-aspect box, so zoom and pan preview exactly.
                 val plan = photoPlan
-                val isFit = scene.fit == SceneFit.FIT || plan?.isFit == true
-                val contentScale = if (isFit) ContentScale.Fit else ContentScale.Crop
-                val alignment = if (isFit) {
-                    Alignment.Center
-                } else if (scene.focusX != 0f || scene.focusY != 0f) {
-                    BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f))
-                } else if (plan != null) {
-                    val (bx, by) = plan.computeBiasAlignment(photoPlayProgress)
-                    BiasAlignment(bx, by)
+                val bitmap = frame
+                if (bitmap != null && plan != null) {
+                    val image = remember(bitmap) { bitmap.asImageBitmap() }
+                    Canvas(Modifier.fillMaxSize()) {
+                        if (size.width <= 0f || size.height <= 0f) return@Canvas
+                        val viewport = plan.viewportAt(
+                            photoPlayProgress,
+                            bitmap.width.toFloat() / bitmap.height.coerceAtLeast(1),
+                            size.width / size.height,
+                        )
+                        val drawWidth = size.width / viewport.width
+                        val drawHeight = size.height / viewport.height
+                        drawImage(
+                            image = image,
+                            dstOffset = IntOffset((-viewport.left * drawWidth).roundToInt(), (-viewport.top * drawHeight).roundToInt()),
+                            dstSize = IntSize(drawWidth.roundToInt().coerceAtLeast(1), drawHeight.roundToInt().coerceAtLeast(1)),
+                            filterQuality = FilterQuality.Medium,
+                        )
+                    }
                 } else {
-                    BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f))
+                    CircularProgressIndicator(Modifier.size(28.dp))
                 }
+                val statusText = when (plan?.mode) {
+                    PhotoMotionMode.PAN_HORIZONTAL -> "가로 무빙·확대축소 · ${plan.reason}"
+                    PhotoMotionMode.PAN_VERTICAL -> "세로 무빙·확대축소 · ${plan.reason}"
+                    PhotoMotionMode.ZOOM -> "확대축소 무빙 · ${plan.reason}"
+                    PhotoMotionMode.FIT_MOTION -> "맞추기 · 사진 전체 · 확대·축소"
+                    PhotoMotionMode.MANUAL_FILL -> "지정 구도 · ${plan.reason}"
+                    PhotoMotionMode.STILL -> "사진 고정 · ${plan.reason}"
+                    null -> "사진 미리보기"
+                }
+                Text(
+                    statusText,
+                    Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            } else {
+                val isFit = scene.fit == SceneFit.FIT
                 frame?.let {
                     Image(
                         it.asImageBitmap(),
                         contentDescription = "${source.name} 장면 화면",
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = contentScale,
-                        alignment = alignment,
+                        contentScale = if (isFit) ContentScale.Fit else ContentScale.Crop,
+                        alignment = if (isFit) Alignment.Center else BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f)),
                     )
                 } ?: CircularProgressIndicator(Modifier.size(28.dp))
-                if (source.isImage) {
-                    val statusText = when {
-                        isFit -> "사진 전체 보기"
-                        plan?.mode == PhotoMotionMode.PAN_HORIZONTAL || plan?.mode == PhotoMotionMode.PAN_VERTICAL -> "사진 움직임 미리보기"
-                        else -> "사진 미리보기"
-                    }
-                    Text(
-                        statusText,
-                        Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
             }
             FilledIconButton(
                 onClick = { playing = !playing },
@@ -914,7 +1007,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
 }
 
 /** Decodes a downscaled frame: the photo itself, or the video frame nearest [atSeconds]. */
-internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimension: Int): Bitmap? = runCatching {
+internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimension: Int, exact: Boolean = false): Bitmap? = runCatching {
     if (isImage) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -958,8 +1051,10 @@ internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimen
         try {
             retriever.setDataSource(file.absolutePath)
             val timeUs = (atSeconds.coerceAtLeast(0.0) * 1_000_000).toLong()
-            if (Build.VERSION.SDK_INT >= 27) retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, maxDimension, maxDimension)
-            else retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            // exact=true는 선택 장면 미리보기용: 키프레임이 드문 영상에서도 실제 자르는 지점의 프레임을 보여준다.
+            val option = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            if (Build.VERSION.SDK_INT >= 27) retriever.getScaledFrameAtTime(timeUs, option, maxDimension, maxDimension)
+            else retriever.getFrameAtTime(timeUs, option)
         } finally {
             runCatching { retriever.release() }
         }
@@ -994,7 +1089,9 @@ private fun SceneStrip(
 
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("장면 ${project.scenes.size}개", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            val selectedIndex = project.scenes.indexOfFirst { it.key == selectedKey }
+            val selectedLabel = if (selectedIndex >= 0) " · 선택 ${selectedIndex + 1}번" else ""
+            Text("장면 ${project.scenes.size}개$selectedLabel · ${trailerLengthTitle(project.scenes.sumOf { it.length })}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
             Text("길게 눌러 옮기기 · ⋮ 메뉴", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         LazyRow(
@@ -1158,7 +1255,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
     }
     val project = session.editor ?: return
     val index = project.scenes.indexOfFirst { it.key == scene.key }
-    TrailerSectionTitle("${index + 1}번 장면 · ${if (source.isImage) "사진" else "영상"}")
+    TrailerSectionTitle("${index + 1}번 장면 / 전체 ${project.scenes.size}개 · ${if (source.isImage) "사진" else "영상"} ${seconds1(scene.length)}")
     Text(source.name, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
     if (source.isImage) {
         var length by remember(scene.key, scene.length) { mutableFloatStateOf(scene.length.toFloat()) }
@@ -1183,12 +1280,21 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
             valueRange = 0f..duration,
             modifier = Modifier.semantics { contentDescription = "영상 장면 시작과 끝" },
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf(-0.5 to "시작 −0.5초", 0.5 to "시작 +0.5초").forEach { (delta, label) ->
-                OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start + delta, scene.length) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp) }
-            }
-            listOf(-0.5 to "끝 −0.5초", 0.5 to "끝 +0.5초").forEach { (delta, label) ->
-                OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start, scene.length + delta) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp) }
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            // 폭이 좁은 인스펙터(300dp)에서는 2x2, 접힌 폭(~387dp) 등에서는 기존처럼 한 줄 4개.
+            val trimItemsPerRow = if (maxWidth < 340.dp) 2 else 4
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                maxItemsInEachRow = trimItemsPerRow,
+            ) {
+                val trimButtonModifier = if (trimItemsPerRow == 2) Modifier.weight(1f) else Modifier
+                listOf(-0.5 to "시작 −0.5초", 0.5 to "시작 +0.5초").forEach { (delta, label) ->
+                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start + delta, scene.length) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1) }
+                }
+                listOf(-0.5 to "끝 −0.5초", 0.5 to "끝 +0.5초").forEach { (delta, label) ->
+                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start, scene.length + delta) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1) }
+                }
             }
         }
     }
@@ -1396,6 +1502,9 @@ private fun ScreenSection(session: TrailerSession, scene: EditorScene?, source: 
     }
     val (w, h) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
     Text("내보내기 크기 ${w}×${h}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    if (session.format == TrailerFormat.ORIGINAL) {
+        Text("'원본'은 첫 번째 영상의 비율을 따릅니다. 첫 영상의 순서를 바꾸면 내보내기 방향이 바뀔 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
 
 private fun formatClipDuration(seconds: Double): String = formatAdaptiveDurationTitle(seconds)
@@ -1824,7 +1933,7 @@ private fun EditorFinderPanel(
                 originToSource[origin]?.let { src -> model.editorUseSourceAgain(src.id, selectedSceneKey)?.let(onUsedAgain) }
             }
             when (source) {
-                FinderSource.PHONEHARD -> PhoneHardFinder(appState, itemState, ::toggle, onUsedItem)
+                FinderSource.PHONEHARD -> PhoneHardFinder(appState, model, itemState, ::toggle, onUsedItem)
                 FinderSource.PHOTOS -> PhotosFinder(itemState, ::toggle, onUsedItem, selection)
                 FinderSource.NETWORK -> NetworkFinder(appState, model, itemState, ::toggle, onUsedItem)
                 FinderSource.WEB -> WebFinder(appState, model, itemState, ::toggle, onUsedItem)
@@ -1965,10 +2074,13 @@ private fun FileThumb(file: File, isVideo: Boolean) {
 @Composable
 private fun PhoneHardFinder(
     appState: AppState,
+    model: NasFinderViewModel,
     itemState: (String) -> FinderItemState,
     toggle: (EditorAddCandidate) -> Unit,
     onUsed: (String) -> Unit,
 ) {
+    // 다른 화면에서 옮기거나 가져온 파일이 오래된 목록 때문에 비어 보이지 않도록, 열 때마다 폰하드 목록을 다시 읽는다.
+    LaunchedEffect(Unit) { model.refreshInbox() }
     val media = remember(appState.inboxFiles) {
         appState.inboxFiles.mapNotNull { item ->
             when (BuiltInPreviewPolicy.kind(item.originalFilename, item.mimeType)) {
@@ -1979,7 +2091,7 @@ private fun PhoneHardFinder(
         }
     }
     if (media.isEmpty()) {
-        FinderEmpty("폰하드에 사진이나 영상이 없습니다.")
+        FinderEmpty("폰하드에 사진이나 영상이 없습니다. 폰하드 탭에서 파일을 가져오면 이곳에 나타납니다.")
         return
     }
     LazyVerticalGrid(GridCells.Adaptive(96.dp), contentPadding = PaddingValues(12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -2203,7 +2315,7 @@ private fun CompleteToCollectionDialog(
     onDismiss: () -> Unit,
     onConfirm: (String, File?) -> Unit,
 ) {
-    var title by remember { mutableStateOf(session.title ?: if (session.isMusicOverlayMode) "뮤직비디오-${java.time.LocalDate.now()}" else "예고편-${java.time.LocalDate.now()}") }
+    var title by remember { mutableStateOf(session.title ?: trailerTimestampName(session.isMusicOverlayMode)) }
     var chosen by remember { mutableStateOf<Bitmap?>(null) }
     var writing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()

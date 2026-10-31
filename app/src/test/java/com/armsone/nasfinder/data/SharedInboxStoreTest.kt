@@ -215,6 +215,67 @@ class SharedInboxStoreTest {
         assertTrue(store.records().single().storedFilename == "same.txt")
     }
 
+    private fun importWithFixedTime(store: SharedInboxStore, name: String, content: String): Triple<SharedInboxRecord, Long, Long> {
+        val record = store.import(name, "text/plain", ByteArrayInputStream(content.toByteArray()))
+        val file = store.file(record)
+        assertTrue(file.setLastModified(1_700_000_000_000L))
+        return Triple(record, file.length(), file.lastModified())
+    }
+
+    @Test fun deleteFileIfUnchangedRemovesExactlyTheUnchangedFile() {
+        val files = temporary.newFolder("files")
+        val store = SharedInboxStore(files)
+        val (record, length, modified) = importWithFixedTime(store, "move.txt", "payload")
+        val (other, _, _) = importWithFixedTime(store, "stay.txt", "other")
+
+        assertNull(store.deleteFileIfUnchanged(record.id, record.storedFilename, length, modified))
+
+        assertFalse(File(SharedInboxStore.phoneHardRoot(files), "move.txt").exists())
+        assertEquals(listOf(other.id), store.records().map { it.id })
+        assertTrue(store.file(other).isFile)
+    }
+
+    @Test fun deleteFileIfUnchangedPreservesWhenSizeOrModifiedTimeDiffers() {
+        val store = SharedInboxStore(temporary.newFolder("files"))
+        val (record, length, modified) = importWithFixedTime(store, "move.txt", "payload")
+
+        assertTrue(store.deleteFileIfUnchanged(record.id, record.storedFilename, length + 1, modified) != null)
+        assertTrue(store.deleteFileIfUnchanged(record.id, record.storedFilename, length - 1, modified) != null)
+        assertTrue(store.deleteFileIfUnchanged(record.id, record.storedFilename, length, modified + 1) != null)
+
+        assertTrue(store.file(record).isFile)
+        assertEquals("payload", store.file(record).readText())
+        assertEquals(listOf(record.id), store.records().map { it.id })
+    }
+
+    @Test fun deleteFileIfUnchangedPreservesWhenContentChangedAfterSelection() {
+        val store = SharedInboxStore(temporary.newFolder("files"))
+        val (record, length, modified) = importWithFixedTime(store, "move.txt", "payload")
+        store.file(record).writeText("payload edited later")
+
+        assertTrue(store.deleteFileIfUnchanged(record.id, record.storedFilename, length, modified) != null)
+
+        assertEquals("payload edited later", store.file(record).readText())
+        assertEquals(1, store.records().size)
+    }
+
+    @Test fun deleteFileIfUnchangedPreservesWhenPathOrIdDoesNotMatch() {
+        val store = SharedInboxStore(temporary.newFolder("files"))
+        val (first, firstLength, firstModified) = importWithFixedTime(store, "a.txt", "aaaaaaa")
+        val (second, _, _) = importWithFixedTime(store, "b.txt", "bbbbbbb")
+
+        // 같은 ID라도 선택 시점과 다른 저장 경로면 지우지 않는다.
+        assertTrue(store.deleteFileIfUnchanged(first.id, second.storedFilename, firstLength, firstModified) != null)
+        // 매니페스트에 없는 ID는 어떤 파일도 지우지 않는다.
+        assertTrue(store.deleteFileIfUnchanged(UUID.randomUUID(), first.storedFilename, firstLength, firstModified) != null)
+        // 경로 이탈 이름은 지우지 않는다.
+        assertTrue(store.deleteFileIfUnchanged(first.id, "../a.txt", firstLength, firstModified) != null)
+
+        assertTrue(store.file(first).isFile)
+        assertTrue(store.file(second).isFile)
+        assertEquals(setOf(first.id, second.id), store.records().map { it.id }.toSet())
+    }
+
     private inline fun <reified T : Throwable> assertFails(block: () -> Unit) {
         try {
             block()
@@ -222,5 +283,12 @@ class SharedInboxStoreTest {
         } catch (error: Throwable) {
             if (error !is T) throw error
         }
+    }
+
+    @Test fun trailerAndMusicVideoNamesUseTwoDigitYearTimestamp() {
+        val zone = java.time.ZoneId.of("Asia/Seoul")
+        val at = java.time.ZonedDateTime.of(2026, 10, 31, 10, 43, 0, 0, zone).toInstant().toEpochMilli()
+        assertEquals("261031-104300-예고편", com.armsone.nasfinder.ui.trailerTimestampName(false, at, zone))
+        assertEquals("261031-104300-뮤비", com.armsone.nasfinder.ui.trailerTimestampName(true, at, zone))
     }
 }
