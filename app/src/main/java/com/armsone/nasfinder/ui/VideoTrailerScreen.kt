@@ -46,19 +46,19 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
 
     if (browsingForMusic) return
     val context = LocalContext.current
-    DisposableEffect(context) {
+    DisposableEffect(context, fullscreenPlayback) {
         val window = context.findHostActivity()?.window
-        val priorVisible = window?.let { w -> ViewCompat.getRootWindowInsets(w.decorView)?.isVisible(WindowInsetsCompat.Type.statusBars()) } ?: true
-        if (window != null) {
-            WindowInsetsControllerCompat(window, window.decorView).run {
-                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                hide(WindowInsetsCompat.Type.statusBars())
+        val controller = window?.let { WindowInsetsControllerCompat(it, it.decorView) }
+        if (controller != null) {
+            if (fullscreenPlayback) {
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller.show(WindowInsetsCompat.Type.statusBars())
             }
         }
         onDispose {
-            if (window != null && priorVisible) {
-                WindowInsetsControllerCompat(window, window.decorView).show(WindowInsetsCompat.Type.statusBars())
-            }
+            controller?.show(WindowInsetsCompat.Type.statusBars())
         }
     }
 

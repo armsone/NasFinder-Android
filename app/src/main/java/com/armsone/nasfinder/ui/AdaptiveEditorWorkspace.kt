@@ -207,6 +207,7 @@ internal fun AdaptiveEditorWorkspace(
         // MEDIUM(펼친 가로 1080x792dp 등)도 Finder가 인라인으로 열려 있지 않을 때만 우측 인스펙터를 쓰고, 열려 있으면 하단 인스펙터로 폴백한다.
         // 펼친 세로(~792x1080dp)는 폭이 760..919dp여도 세로가 넉넉하므로 미리보기-장면-편집 패널을 전체 폭으로 쌓는다(우측 패널 없음).
         val stackedPortrait = tier == EditorTier.RAIL_ONLY && maxHeight > maxWidth
+        val isLandscape = maxWidth > maxHeight
         val sideInspector = !stackedPortrait && (tier == EditorTier.WIDE ||
             ((tier == EditorTier.RAIL_ONLY || tier == EditorTier.MEDIUM) && lowerPanelOpen && !panelFinderInline))
         val sideInspectorWidth = if (tier == EditorTier.WIDE) 340.dp else 300.dp
@@ -344,8 +345,8 @@ internal fun AdaptiveEditorWorkspace(
                             onExport = model::exportEditorProject,
                             modifier = Modifier.fillMaxWidth().height(stageHeight).padding(horizontal = 12.dp, vertical = 6.dp),
                         )
-                    } else if (sideInspector && tier == EditorTier.RAIL_ONLY) {
-                        // 펼친 세로(~792dp): 우측 인스펙터를 뺀 실제 중앙 폭 기준으로 스테이지 높이를 제한해 검은 빈 공간과 장면 스트립 사이 간격을 없앤다.
+                    } else if (sideInspector) {
+                        // 우측 인스펙터를 뺀 실제 중앙 폭 기준으로 스테이지 높이를 제한해 검은 빈 공간과 장면 스트립 사이 간격을 없앤다.
                         BoxWithConstraints(Modifier.fillMaxWidth().weight(1f, fill = false), contentAlignment = Alignment.TopCenter) {
                             val availableHeight = maxHeight
                             val centerContentWidth = maxWidth - 24.dp
@@ -422,6 +423,7 @@ internal fun AdaptiveEditorWorkspace(
             }
             if (sideInspector) {
                 VerticalHairline()
+                val inspectorModifier = if (isLandscape) Modifier.weight(1f).fillMaxHeight() else Modifier.width(sideInspectorWidth).fillMaxHeight()
                 EditorInspector(
                     session = session,
                     scene = selectedScene,
@@ -432,7 +434,7 @@ internal fun AdaptiveEditorWorkspace(
                     onSelectScene = { selectedSceneKey = it },
                     onOpenMusicPicker = { showMusicPicker = true },
                     scrollable = true,
-                    modifier = Modifier.width(sideInspectorWidth).fillMaxHeight(),
+                    modifier = inspectorModifier,
                 )
             }
         }
@@ -1288,12 +1290,12 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 maxItemsInEachRow = trimItemsPerRow,
             ) {
-                val trimButtonModifier = if (trimItemsPerRow == 2) Modifier.weight(1f) else Modifier
+                val trimButtonModifier = Modifier.weight(1f)
                 listOf(-0.5 to "시작 −0.5초", 0.5 to "시작 +0.5초").forEach { (delta, label) ->
-                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start + delta, scene.length) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1) }
+                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start + delta, scene.length) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 }
                 listOf(-0.5 to "끝 −0.5초", 0.5 to "끝 +0.5초").forEach { (delta, label) ->
-                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start, scene.length + delta) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1) }
+                    OutlinedButton(onClick = { model.editorTrimScene(scene.key, scene.start, scene.length + delta) }, modifier = trimButtonModifier, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 }
             }
         }
