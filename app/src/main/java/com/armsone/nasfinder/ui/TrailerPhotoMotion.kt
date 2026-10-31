@@ -141,7 +141,7 @@ data class PhotoMotionPlan(
     }
 
     companion object {
-        /** Whole photo, centered, no motion: only for unknown geometry or a too-short 맞추기 scene. */
+        /** Whole photo, centered, no motion: only for unknown geometry or an invalid (non-positive/non-finite) length. */
         fun still(photoAspect: Float, outputAspect: Float, reason: String): PhotoMotionPlan {
             val k = if (photoAspect > 0f && outputAspect > 0f) photoAspect / outputAspect else 1f
             return PhotoMotionPlan(PhotoMotionMode.STILL, listOf(PhotoKeyframe(0f, 0.5f, 0.5f, maxOf(1f, 1f / k))), cover = false, reason = reason)
@@ -182,7 +182,6 @@ class PhotoMotionGlTransformation(
 
 /** Pure camera-path geometry (no Android types) so it can be checked in JVM unit tests. */
 internal object PhotoMotionGeometry {
-    private const val MIN_MOTION_SECONDS = 0.5
     /** Tightest end framing (cover / 1.5) so the final person stays sharp and legible. */
     private const val MAX_END_ZOOM = 1.5f
     private const val MAX_STOP_ZOOM = 1.3f
@@ -196,7 +195,10 @@ internal object PhotoMotionGeometry {
     private const val RATE_SAMPLES = 120
     /** Scenes up to this long never pan: one fixed center, at most a gentle push-in (pans felt nauseating). */
     private const val GENTLE_SCENE_SECONDS = 3.0
-    /** Total push-in of a [GENTLE_SCENE_SECONDS] scene; shorter scenes get proportionally less. */
+    /**
+     * Total push-in of a [GENTLE_SCENE_SECONDS] scene; shorter scenes get proportionally less (same rate, so a 0.3 s
+     * scene zooms 0.4%, never 4% squeezed into a blink). Every positive finite length keeps this zoom; none pans.
+     */
     private const val GENTLE_MAX_ZOOM = 0.04f
 
     private fun gentleZoom(durationSeconds: Double): Float =
@@ -249,11 +251,13 @@ internal object PhotoMotionGeometry {
         if (!photoAspect.isFinite() || !outputAspect.isFinite() || photoAspect <= 0f || outputAspect <= 0f) {
             return PhotoMotionPlan.still(photoAspect, outputAspect, "사진 크기를 알 수 없음")
         }
-        val shortScene = !durationSeconds.isFinite() || durationSeconds < MIN_MOTION_SECONDS
+        // Only an invalid length is still; any positive finite length keeps the (time-scaled) gentle zoom.
+        if (!durationSeconds.isFinite() || durationSeconds <= 0.0) {
+            return PhotoMotionPlan.still(photoAspect, outputAspect, "장면 길이를 알 수 없음")
+        }
         val k = photoAspect / outputAspect
         if (fit == SceneFit.FIT) {
             return when {
-                shortScene -> PhotoMotionPlan.still(photoAspect, outputAspect, "장면이 너무 짧음")
                 durationSeconds <= GENTLE_SCENE_SECONDS -> {
                     // Whole photo stays visible: centered, no drift, zooming in from slightly wide to exactly fit.
                     val fitW = maxOf(1f, 1f / k)
@@ -271,7 +275,7 @@ internal object PhotoMotionGeometry {
             }
         }
         return CoverPlanner(k, durationSeconds, seed).plan(
-            focusX, focusY, shortScene,
+            focusX, focusY,
             faces.filter { it.isValid() },
             objects.filter { it.isValid() },
             analysisReliable,
@@ -398,14 +402,14 @@ internal object PhotoMotionGeometry {
          * Scenes up to [GENTLE_SCENE_SECONDS]: no pan, no travelling start, no pull-back. The widest (cover) frame
          * centered on the user's frame, else the primary head group, else the main subject, else the photo center;
          * that center is legal at cover width so it stays legal (no clamp drift) for every narrower keyframe. Then a
-         * monotonic push-in of at most [gentleZoom], only as far as the kept people/subject stay fully inside;
-         * none when they do not fit tighter than cover. Under [MIN_MOTION_SECONDS]: the same frame, still.
+         * monotonic push-in of at most [gentleZoom], only as far as the kept people/subject stay fully inside. Any
+         * nonzero face-safe amount is kept, however small (very short scenes); the frame is still only when the kept
+         * people/subject leave no room tighter than cover — a safety reason, never the scene length.
          */
         fun gentlePlan(
             manual: Boolean,
             focusX: Float,
             focusY: Float,
-            still: Boolean,
             clusters: List<PhotoNormRect>,
             majorObjects: List<PhotoNormRect>,
             analysisReliable: Boolean,
@@ -438,16 +442,19 @@ internal object PhotoMotionGeometry {
                 }
             }
             var endW = coverW / (1f + gentleZoom(duration))
+            var faceLimited = false
             if (keep != null) {
                 val need = maxOf(2f * maxOf(cx - keep.left, keep.right - cx), 2f * maxOf(cy - keep.top, keep.bottom - cy) / k)
-                endW = if (need >= coverW) coverW else maxOf(endW, need)
+                faceLimited = need >= coverW
+                endW = if (faceLimited) coverW else maxOf(endW, need)
             }
-            if (still || endW >= coverW - 1e-4f) {
+            if (!(endW < coverW)) {
                 return PhotoMotionPlan(
                     PhotoMotionMode.STILL,
                     listOf(PhotoKeyframe(0f, cx, cy, coverW)),
                     cover = true,
-                    reason = if (still) "장면이 너무 짧음" else "짧은 장면 · $label 고정",
+                    // Safety (the kept people/subject would be cut), or a length below float resolution of the zoom.
+                    reason = if (faceLimited) "짧은 장면 · $label 고정 (확대하면 잘림)" else "짧은 장면 · $label 고정",
                 )
             }
             return PhotoMotionPlan(
@@ -464,7 +471,6 @@ internal object PhotoMotionGeometry {
         fun plan(
             focusX: Float,
             focusY: Float,
-            shortScene: Boolean,
             faces: List<PhotoNormRect>,
             objects: List<PhotoNormRect>,
             analysisReliable: Boolean,
@@ -481,8 +487,8 @@ internal object PhotoMotionGeometry {
                 k < 0.98f -> PhotoMotionMode.PAN_VERTICAL
                 else -> PhotoMotionMode.ZOOM
             }
-            if (shortScene || duration <= GENTLE_SCENE_SECONDS) {
-                return gentlePlan(manual, focusX, focusY, shortScene, clusters, majorObjects, analysisReliable)
+            if (duration <= GENTLE_SCENE_SECONDS) {
+                return gentlePlan(manual, focusX, focusY, clusters, majorObjects, analysisReliable)
             }
 
             // Final target: the user's frame, else the primary person, else the main subject, else the center.

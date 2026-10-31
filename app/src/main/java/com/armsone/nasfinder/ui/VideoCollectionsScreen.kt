@@ -686,8 +686,8 @@ private fun CollectionPosterCard(
                         modifier = Modifier.weight(1f)
                     )
                     Box {
-                        IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(24.dp)) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "메뉴", modifier = Modifier.size(18.dp))
+                        IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(IconHitTarget)) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "메뉴")
                         }
                         DropdownMenu(
                             expanded = menuExpanded,

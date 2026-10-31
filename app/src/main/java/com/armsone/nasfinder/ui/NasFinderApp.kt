@@ -1930,7 +1930,7 @@ private fun TrailerDraftCoverCard(draft: TrailerDraft, onResume: () -> Unit, onD
                 maxLines = 1
             )
         }
-        IconButton(onClick = onDelete, modifier = Modifier.size(44.dp)) {
+        IconButton(onClick = onDelete, modifier = Modifier.size(IconHitTarget)) {
             Icon(Icons.Default.Delete, "지우기", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
         }
         Icon(Icons.Default.ChevronRight, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2008,7 +2008,7 @@ private fun TrailerDraftRow(draft: TrailerDraft, rowColor: Color, onResume: () -
                 maxLines = 1
             )
         }
-        IconButton(onClick = onDelete, modifier = Modifier.size(44.dp)) {
+        IconButton(onClick = onDelete, modifier = Modifier.size(IconHitTarget)) {
             Icon(Icons.Default.Delete, "지우기", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
         }
         Icon(Icons.Default.ChevronRight, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2235,16 +2235,24 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
         }, actions = {
             // iOS porcelainTrailingItems: 네트워크 추가(+) leads the trailing toolbar group.
             val settingsButton: @Composable () -> Unit = {
-                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Settings, "설정", Modifier.size(28.dp)) }
+                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.Default.Settings, "설정", Modifier.size(ToolbarActionIcon)) }
             }
             if (usesUnifiedLayout(state.theme) && (finderTab || homeRoot)) {
                 val workbenchCount = state.materials.size
+                // 바깥 48(IconHitTarget) 높이가 실제 클릭 영역, 안쪽 32 pill은 모양만 유지.
+                Box(
+                    Modifier
+                        .padding(end = 4.dp)
+                        .height(IconHitTarget)
+                        .clip(RoundedCornerShape(99.dp))
+                        .clickable(role = Role.Button) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
+                    contentAlignment = Alignment.Center,
+                ) {
                 Surface(
-                    onClick = { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
                     shape = RoundedCornerShape(99.dp),
                     color = if (workbenchTab) themePalette().accent.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                     border = BorderStroke(1.dp, if (workbenchTab) themePalette().accent else MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier.padding(end = 4.dp).height(32.dp),
+                    modifier = Modifier.height(32.dp),
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 8.dp),
@@ -2263,12 +2271,13 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                         }
                     }
                 }
-                // Compact, independent actions: glyph 24 in a 44 hit; order (추가 · 설정 · 테마) unchanged.
-                IconButton(onClick = { addingNetwork = true }, modifier = Modifier.size(44.dp)) {
-                    PackIcon(PackGlyph.ADD, "네트워크 추가", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground)
                 }
-                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(44.dp)) {
-                    PackIcon(PackGlyph.SETTINGS, "설정", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground)
+                // Compact, independent actions: glyph 24 in a 44 hit; order (추가 · 설정 · 테마) unchanged.
+                IconButton(onClick = { addingNetwork = true }, modifier = Modifier.size(IconHitTarget)) {
+                    PackIcon(PackGlyph.ADD, "네트워크 추가", Modifier.size(ToolbarActionIcon), tint = MaterialTheme.colorScheme.onBackground)
+                }
+                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(IconHitTarget)) {
+                    PackIcon(PackGlyph.SETTINGS, "설정", Modifier.size(ToolbarActionIcon), tint = MaterialTheme.colorScheme.onBackground)
                 }
             }
             // The small theme capsule keeps its look but gets a full 44 hit target with tap cycle and 500ms longpress menu.
@@ -2282,7 +2291,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 Box(
                     Modifier
                         .padding(end = 4.dp)
-                        .size(44.dp)
+                        .size(IconHitTarget)
                         .semantics {
                             contentDescription = "병기스타일 테마: ${themeTitle(state.theme)} (누르면 ${themeTitle(state.theme.next)}, 길게 누르면 목록)"
                         }
@@ -2301,14 +2310,14 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                             durationMillis = 200,
                             easing = androidx.compose.animation.core.CubicBezierEasing(.42f, 0f, .58f, 1f),
                         ),
-                        modifier = Modifier.size(24.dp),
+                        modifier = Modifier.size(ToolbarActionIcon),
                         label = "themeBadge",
                     ) { theme ->
-                        Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(ToolbarActionIcon), contentAlignment = Alignment.Center) {
                             ThemePackIcon(
                                 theme,
                                 contentDescription = null,
-                                modifier = Modifier.size(24.dp),
+                                modifier = Modifier.size(ToolbarActionIcon),
                                 tint = paletteFor(theme).accent,
                             )
                         }
@@ -2354,7 +2363,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                                             maxLines = 1,
                                         )
                                         Box(
-                                            modifier = Modifier.padding(end = 12.dp).width(20.dp),
+                                            modifier = Modifier.padding(end = 12.dp).width(IconGlyphMin),
                                             contentAlignment = Alignment.Center,
                                         ) {
                                             if (isCurrent) {
@@ -3681,7 +3690,7 @@ private fun ConnectionRow(connection: RemoteConnection, preferred: Boolean, them
             }
         }
         var menu by remember { mutableStateOf(false) }
-        IconButton(onClick = { menu = true }, modifier = Modifier.size(width = 44.dp, height = 54.dp)) { Icon(Icons.Default.MoreHoriz, "더 보기") }
+        IconButton(onClick = { menu = true }, modifier = Modifier.size(width = IconHitTarget, height = 54.dp)) { Icon(Icons.Default.MoreHoriz, "더 보기") }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             if (supportsOrdering) {
             DropdownMenuItem(text = { Text(if (preferred) "기본 연결 해제" else "기본 연결") }, leadingIcon = { Icon(Icons.Default.Star, null) }, onClick = { menu = false; onPreferred() })
@@ -5419,7 +5428,7 @@ internal fun RemoteBrowserCoverFlow(
             CompositionLocalProvider(LocalViewConfiguration provides longPress450Configuration()) {
                 Surface(
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(IconHitTarget)
                         .semantics(mergeDescendants = true) {
                             contentDescription = "플로잉 닫기"
                             customActions = listOf(
@@ -5445,7 +5454,7 @@ internal fun RemoteBrowserCoverFlow(
             }
             Text(title, color = chromeForeground, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             Box {
-                Surface(onClick = { backgroundMenu = true }, modifier = Modifier.size(44.dp), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
+                Surface(onClick = { backgroundMenu = true }, modifier = Modifier.size(IconHitTarget), shape = CircleShape, color = chromeBackground, border = BorderStroke(1.dp, chromeBorder), shadowElevation = 2.dp) {
                     Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MoreHoriz, "플로잉 배경", tint = MaterialTheme.colorScheme.primary) }
                 }
                 DropdownMenu(backgroundMenu, onDismissRequest = { backgroundMenu = false }) {
@@ -5742,7 +5751,7 @@ private fun FileTile(
                 // No per-item duration exists in the remote listing, so videos keep a small play mark instead of a time badge.
                 if (porcelain && item.isVideo && thumbnail != null) PackIcon(
                     PackGlyph.PLAY, null,
-                    Modifier.align(Alignment.BottomEnd).padding(5.dp).size(20.dp).background(Color.Black.copy(alpha = .55f), RoundedCornerShape(4.dp)).padding(3.dp),
+                    Modifier.align(Alignment.BottomEnd).padding(5.dp).size(IconGlyphMin + 6.dp).background(Color.Black.copy(alpha = .55f), RoundedCornerShape(4.dp)).padding(3.dp),
                     tint = Color.White,
                 )
                 if (selectionMode) SelectionIndicator(selected, Modifier.align(Alignment.TopEnd).padding(if (poster) 8.dp else 4.dp))
@@ -6154,9 +6163,9 @@ private fun BrowserSelectionBar(
                             FilledTonalButton(
                                 onClick = action.onClick,
                                 enabled = action.enabled && count > 0,
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                modifier = Modifier.weight(1f).heightIn(min = IconHitTarget),
                             ) {
-                                Icon(action.icon, null, Modifier.size(18.dp))
+                                Icon(action.icon, null, Modifier.size(ToolbarActionIcon))
                                 Spacer(Modifier.width(6.dp))
                                 Text(action.title, maxLines = 1)
                             }
@@ -6172,13 +6181,13 @@ private fun BrowserSelectionBar(
                         val tint = (if (action.destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                             .let { if (enabled) it else MaterialTheme.colorScheme.onSurface.copy(alpha = .38f) }
                         Column(
-                            Modifier.widthIn(min = 58.dp).clip(RoundedCornerShape(8.dp))
+                            Modifier.widthIn(min = 58.dp).heightIn(min = IconHitTarget).clip(RoundedCornerShape(8.dp))
                                 .clickable(enabled = enabled, role = Role.Button, onClickLabel = action.title, onClick = action.onClick)
                                 .padding(vertical = 2.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(2.dp),
                         ) {
-                            Icon(action.icon, null, tint = tint, modifier = Modifier.size(22.dp))
+                            Icon(action.icon, null, tint = tint, modifier = Modifier.size(ToolbarActionIcon))
                             Text(action.title, fontSize = 11.sp, color = tint, maxLines = 1)
                         }
                     }
@@ -6213,12 +6222,17 @@ private fun BrowserPathBar(
             horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             if (onParent != null) {
+                // 48 hit target around the unchanged 36×28 capsule; the glyph follows the shared 24 floor.
                 Box(
-                    Modifier.size(36.dp, 28.dp).clip(RoundedCornerShape(7.dp)).background(accent.copy(alpha = .12f))
+                    Modifier.size(IconHitTarget).clip(RoundedCornerShape(7.dp))
                         .clickable(onClickLabel = "상위 폴더", role = Role.Button, onClick = onParent)
                         .semantics { contentDescription = "상위 폴더" },
                     contentAlignment = Alignment.Center,
-                ) { Icon(Icons.Default.ArrowUpward, null, tint = accent, modifier = Modifier.size(14.dp)) }
+                ) {
+                    Box(Modifier.size(36.dp, 28.dp).clip(RoundedCornerShape(7.dp)).background(accent.copy(alpha = .12f)), contentAlignment = Alignment.Center) {
+                        Icon(Icons.Default.ArrowUpward, null, tint = accent)
+                    }
+                }
             }
             Icon(Icons.Default.Storage, null, tint = accent, modifier = Modifier.size(14.dp))
             Text(
@@ -7030,7 +7044,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                     if (!selectionMode) {
                                         IconButton(
                                             onClick = { model.shareInboxFile(file) },
-                                            modifier = Modifier.size(38.dp),
+                                            modifier = Modifier.size(IconHitTarget),
                                         ) { Icon(Icons.Default.Share, "${file.originalFilename} 공유") }
                                     }
                                 }

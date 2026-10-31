@@ -218,9 +218,9 @@ internal fun LocalPhotoLibraryCalendarScreen(
         }
         val monthHeaderHeight = maxOf(44f, 24f * androidx.compose.ui.platform.LocalDensity.current.fontScale + 8f).dp
         Row(Modifier.fillMaxWidth().height(monthHeaderHeight), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            IconButton(modifier = Modifier.size(44.dp), onClick = { currentYearMonth = currentYearMonth.minusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "이전 달") }
+            IconButton(modifier = Modifier.size(IconHitTarget), onClick = { currentYearMonth = currentYearMonth.minusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "이전 달") }
             androidx.compose.material3.TextButton(modifier = Modifier.height(monthHeaderHeight), onClick = { draftYear = currentYearMonth.year; draftMonth = currentYearMonth.monthValue; pickerVisible = true }) { Text("${currentYearMonth.year}년 ${currentYearMonth.monthValue}월", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
-            IconButton(modifier = Modifier.size(44.dp), onClick = { currentYearMonth = currentYearMonth.plusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "다음 달") }
+            IconButton(modifier = Modifier.size(IconHitTarget), onClick = { currentYearMonth = currentYearMonth.plusMonths(1) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "다음 달") }
         }
         CalendarMonthGrid(currentYearMonth, selectedDates, dateCounts, holidays, enabled = !selectionLoading, onSelectDate = ::toggleDate)
         Row(Modifier.fillMaxWidth().height(44.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -487,7 +487,7 @@ private fun CalendarMediaThumbnailCell(
                 contentDescription = if (isSelected) "선택 해제" else "선택",
                 tint = Color.White,
                 modifier = Modifier
-                    .size(24.dp)
+                    .size(IconGlyphMin + 6.dp)
                     .background(Color.Black.copy(alpha = 0.65f), CircleShape)
                     .padding(3.dp),
             )

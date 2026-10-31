@@ -276,7 +276,23 @@ class PhotoMotionGeometryTest {
             assertCoversEveryFrame(p, wideAspect, storyAspect)
             assertTrue(visibleAt(p, 1f, wideAspect, storyAspect, middle))
         }
-        assertEquals(PhotoMotionMode.STILL, plan(wideW, wideH, 1080, 1920, faces = listOf(middle), duration = 0.2).mode)
+        // Every positive short length keeps a face-safe, time-scaled push-in (<= 4% per 3 s) and never pans.
+        for (fit in listOf(SceneFit.FILL, SceneFit.FIT)) for (d in listOf(0.04, 0.2, 0.4)) {
+            val p = plan(wideW, wideH, 1080, 1920, faces = listOf(middle), fit = fit, duration = d)
+            assertNotEquals("short $fit ${d}s ${p.reason}", PhotoMotionMode.STILL, p.mode)
+            val start = p.viewportAt(0f, wideAspect, storyAspect)
+            val end = p.viewportAt(1f, wideAspect, storyAspect)
+            assertEquals("no pan x $fit ${d}s", start.centerX, end.centerX, 1e-6f)
+            assertEquals("no pan y $fit ${d}s", start.centerY, end.centerY, 1e-6f)
+            val zoom = zoomRange(p, wideAspect, storyAspect)
+            assertTrue("zooms at $fit ${d}s", zoom > 0f)
+            assertTrue("zoom $zoom scaled to ${d}s", zoom <= 0.04f * (d / 3.0).toFloat() + 1e-5f)
+            if (fit == SceneFit.FILL) {
+                assertCoversEveryFrame(p, wideAspect, storyAspect)
+                for (s in samples) assertTrue("face kept at s=$s ${d}s", visibleAt(p, s, wideAspect, storyAspect, middle))
+            }
+        }
+        assertEquals(PhotoMotionMode.STILL, plan(wideW, wideH, 1080, 1920, faces = listOf(middle), duration = 0.0).mode)
         // Explicit 맞추기 is the only mode that keeps the whole photo (with letterbox) — never chosen automatically.
         val fit = plan(wideW, wideH, 1080, 1920, faces = listOf(left, middle, right), fit = SceneFit.FIT)
         assertEquals(PhotoMotionMode.FIT_MOTION, fit.mode)

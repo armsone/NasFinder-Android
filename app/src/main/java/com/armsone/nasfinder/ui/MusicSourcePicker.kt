@@ -617,7 +617,7 @@ private fun RemoteFolderView(
                 .padding(bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onBack, modifier = Modifier.size(IconHitTarget)) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, "상위 폴더")
             }
             Spacer(Modifier.width(4.dp))
@@ -629,7 +629,7 @@ private fun RemoteFolderView(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            IconButton(onClick = onRefresh, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onRefresh, modifier = Modifier.size(IconHitTarget)) {
                 Icon(Icons.Default.Refresh, "새로고침")
             }
         }
@@ -756,7 +756,7 @@ private fun RemoteAudioRow(
                         if (isDownloading) onCancelDownload() else onAuditionClick()
                     },
                     enabled = !isImporting,
-                    modifier = Modifier.size(36.dp)
+                    modifier = Modifier.size(IconHitTarget)
                 ) {
                     when {
                         isDownloading -> CircularProgressIndicator(

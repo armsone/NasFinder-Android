@@ -914,7 +914,7 @@ private fun EditorHeader(
         Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(onClick = onClose) { PackIcon(PackGlyph.BACK, "편집 닫기 (자동 저장됨)", Modifier.size(22.dp)) }
+        IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.BACK, "편집 닫기 (자동 저장됨)", Modifier.size(ToolbarActionIcon)) }
         Column(
             Modifier.weight(1f).clickable(onClickLabel = "프로젝트 이름 바꾸기", onClick = onRename).padding(vertical = 4.dp),
         ) {
@@ -937,10 +937,10 @@ private fun EditorHeader(
         if (session.saveState == EditorSaveState.FAILED) {
             TextButton(onClick = onRetrySave) { Text("다시 저장", color = palette.danger) }
         }
-        IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy) { Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소") }
-        IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy) { Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행") }
+        IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon)) }
+        IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon)) }
         if (showPanelToggle) {
-            IconButton(onClick = onTogglePanel) { Icon(if (panelOpen) Icons.Default.ExpandMore else Icons.Default.Tune, if (panelOpen) "편집 패널 접기" else "편집 패널 열기") }
+            IconButton(onClick = onTogglePanel, modifier = Modifier.size(IconHitTarget)) { Icon(if (panelOpen) Icons.Default.ExpandMore else Icons.Default.Tune, if (panelOpen) "편집 패널 접기" else "편집 패널 열기", Modifier.size(ToolbarActionIcon)) }
         }
         val exportLabel = if (session.output != null) "다시 내보내기" else "내보내기"
         val exportEnabled = session.export?.running != true && !session.busy && project?.scenes?.isNotEmpty() == true
@@ -1520,11 +1520,11 @@ private fun SceneBoard(
                         onValueChange = onSearchQueryChange,
                         modifier = Modifier.weight(1f).heightIn(min = 44.dp),
                         placeholder = { Text("장면 번호 또는 파일명", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        leadingIcon = { Icon(Icons.Default.Search, null, Modifier.size(18.dp)) },
+                        leadingIcon = { Icon(Icons.Default.Search, null) },
                         trailingIcon = {
                             if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { onSearchQueryChange("") }, modifier = Modifier.size(24.dp)) {
-                                    Icon(Icons.Default.Clear, "검색 지우기", Modifier.size(16.dp))
+                                IconButton(onClick = { onSearchQueryChange("") }, modifier = Modifier.size(IconHitTarget)) {
+                                    Icon(Icons.Default.Clear, "검색 지우기")
                                 }
                             }
                         },
@@ -1550,7 +1550,7 @@ private fun SceneBoard(
                             Text("${jumpTarget}번 이동", fontSize = 12.sp)
                         }
                     }
-                    IconButton(onClick = onToggleCompact, modifier = Modifier.size(40.dp)) {
+                    IconButton(onClick = onToggleCompact, modifier = Modifier.size(IconHitTarget)) {
                         Icon(
                             if (compact) Icons.Default.ViewModule else Icons.Default.GridView,
                             contentDescription = if (compact) "보통 크기로 보기" else "작은 크기로 보기",
@@ -1563,7 +1563,7 @@ private fun SceneBoard(
                                 onClearSelection()
                             }
                         },
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(IconHitTarget),
                     ) {
                         Icon(
                             Icons.Default.CheckBox,
@@ -1575,12 +1575,12 @@ private fun SceneBoard(
 
                 // Active filter summary or selection bar
                 val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
+                // Summary + selection count own one row; the selection actions wrap below it instead of shrinking.
                 Row(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    // The summary yields width (one line, ellipsis) so the selection actions always fit on a phone.
                     if (trimmedQuery.isNotEmpty()) {
                         Text(
                             "검색 결과 ${filteredScenes.size}개 / 전체 ${project.scenes.size}개",
@@ -1608,35 +1608,11 @@ private fun SceneBoard(
                             } else {
                                 "${effectiveSelectedKeys.size}개 선택됨"
                             },
-                            style = MaterialTheme.typography.labelSmall,
+                            style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary,
                             maxLines = 1,
                         )
-                        if (isPhone) {
-                            // Phone: card tap opens the detail editor; this keeps it reachable for multi-selection.
-                            IconButton(onClick = onOpenDetail, modifier = Modifier.size(32.dp)) {
-                                Icon(Icons.Default.Tune, "상세 편집", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                        IconButton(
-                            onClick = { onRequestMoveDialog(effectiveSelectedKeys) },
-                            modifier = Modifier.size(32.dp),
-                        ) {
-                            Icon(Icons.Default.DriveFileMove, "위치 지정 이동", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
-                        }
-                        IconButton(
-                            onClick = { onDuplicate(effectiveSelectedKeys) },
-                            modifier = Modifier.size(32.dp),
-                        ) {
-                            Icon(Icons.Default.ContentCopy, "장면 복제", Modifier.size(18.dp))
-                        }
-                        IconButton(
-                            onClick = { onRemove(effectiveSelectedKeys) },
-                            modifier = Modifier.size(32.dp),
-                        ) {
-                            Icon(Icons.Default.DeleteOutline, "장면 삭제 (원본 파일은 유지)", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
-                        }
                         if (multiSelectMode || effectiveSelectedKeys.size > 1) {
                             TextButton(
                                 onClick = {
@@ -1644,10 +1620,32 @@ private fun SceneBoard(
                                     else onSelectAll()
                                 },
                                 contentPadding = PaddingValues(horizontal = 6.dp),
+                                modifier = Modifier.heightIn(min = IconHitTarget),
                             ) {
-                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택", fontSize = 11.sp)
+                                Text(if (effectiveSelectedKeys.size == project.scenes.size) "선택 해제" else "전체 선택", fontSize = 12.sp)
                             }
                         }
+                    }
+                }
+                if (effectiveSelectedKeys.isNotEmpty()) {
+                    FlowRow(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        if (isPhone) {
+                            // Phone: card tap opens the detail editor; this keeps it reachable for multi-selection.
+                            SceneSelectionAction(PackGlyph.SLIDERS, "상세 편집", onClick = onOpenDetail)
+                        }
+                        SceneSelectionAction(PackGlyph.MOVE, "위치 이동", onClick = { onRequestMoveDialog(effectiveSelectedKeys) })
+                        SceneSelectionAction(PackGlyph.DUPLICATE, "복제", description = "장면 복제", onClick = { onDuplicate(effectiveSelectedKeys) })
+                        SceneSelectionAction(
+                            PackGlyph.TRASH,
+                            "삭제",
+                            description = "장면 삭제 (원본 파일은 유지)",
+                            tint = MaterialTheme.colorScheme.error,
+                            onClick = { onRemove(effectiveSelectedKeys) },
+                        )
                     }
                 }
             }
@@ -1733,13 +1731,13 @@ private fun SceneBoard(
                                 Checkbox(
                                     checked = isSelected,
                                     onCheckedChange = { onToggleSelectKey(scene.key) },
-                                    modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(28.dp),
+                                    modifier = Modifier.align(Alignment.TopEnd).size(IconHitTarget),
                                 )
                             } else {
                                 Box(Modifier.align(Alignment.TopEnd)) {
                                     IconButton(
                                         onClick = { menuSceneKey = scene.key },
-                                        modifier = Modifier.size(32.dp),
+                                        modifier = Modifier.size(IconHitTarget),
                                     ) {
                                         Icon(
                                             Icons.Default.MoreVert,
@@ -1837,6 +1835,20 @@ private fun SceneBoard(
 }
 
 private fun Modifier.graphicsOffset(x: Float): Modifier = this.then(Modifier.offset { androidx.compose.ui.unit.IntOffset(x.roundToInt(), 0) })
+
+/** Labelled scene-selection action: themed pack glyph at toolbar size plus text in a 48 tall target. */
+@Composable
+private fun SceneSelectionAction(glyph: PackGlyph, label: String, description: String = label, tint: Color = Color.Unspecified, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.heightIn(min = IconHitTarget).semantics(mergeDescendants = true) { contentDescription = description },
+        contentPadding = PaddingValues(start = 10.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
+    ) {
+        PackIcon(glyph, null, Modifier.size(ToolbarActionIcon), tint = tint)
+        Spacer(Modifier.width(6.dp))
+        Text(label, style = MaterialTheme.typography.labelLarge, color = if (tint == Color.Unspecified) Color.Unspecified else tint, maxLines = 1)
+    }
+}
 
 @Composable
 private fun EditorInspector(
@@ -2559,7 +2571,7 @@ private fun EditorFinderPanel(
     Column(modifier.background(MaterialTheme.colorScheme.background)) {
         Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("현재 편집에 사용할 재료 찾기", fontWeight = FontWeight.SemiBold, fontSize = 15.sp, modifier = Modifier.weight(1f))
-            IconButton(onClick = onClose) { PackIcon(PackGlyph.CLOSE, "재료 찾기 닫기", Modifier.size(20.dp)) }
+            IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.CLOSE, "재료 찾기 닫기") }
         }
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             FinderSource.entries.forEach { entry ->

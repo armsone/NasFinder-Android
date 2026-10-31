@@ -168,7 +168,7 @@ fun MusicPickerRow(
             // Distinct Play/Stop button for auditioning
             IconButton(
                 onClick = { auditionController.toggleAudition(track) },
-                modifier = Modifier.size(36.dp),
+                modifier = Modifier.size(IconHitTarget),
             ) {
                 when {
                     isPreparingThis -> CircularProgressIndicator(

@@ -93,7 +93,7 @@ internal fun VideoTrailerScreen(session: TrailerSession, model: NasFinderViewMod
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = ::requestClose) { PackIcon(PackGlyph.BACK, "뒤로", Modifier.size(22.dp)) }
+                    IconButton(onClick = ::requestClose, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.BACK, "뒤로", Modifier.size(ToolbarActionIcon)) }
                     Text(
                         if (session.isMusicOverlayMode) "뮤직비디오 준비" else "영상 편집 준비",
                         style = MaterialTheme.typography.titleMedium,

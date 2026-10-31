@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.runtime.Composable
@@ -89,8 +90,8 @@ private fun packDrawable(pack: InterfaceIconPack, glyph: PackGlyph): Int = when 
         PackGlyph.GRID -> R.drawable.pk_solid_grid
         PackGlyph.TRASH -> R.drawable.pk_solid_trash
         PackGlyph.POCKET -> R.drawable.pk_solid_phonehard
-        PackGlyph.PRIVACY -> R.drawable.pk_solid_settings
-        else -> R.drawable.pk_solid_settings
+        // No legacy solid artwork: 0 lets PackIcon draw the glyph's own complete-pack shape (never a settings gear).
+        else -> 0
     }
     InterfaceIconPack.DIMENSION -> when (glyph) {
         PackGlyph.HOME -> R.drawable.pk_dimension_home
@@ -197,6 +198,7 @@ private val materialGlyphs: Map<String, PackGlyph> = mapOf(
     "Filled.GridOn" to PackGlyph.GRID,
     "Filled.ViewModule" to PackGlyph.GRID,
     "Filled.Delete" to PackGlyph.TRASH,
+    "Filled.DeleteOutline" to PackGlyph.TRASH,
     "Filled.Star" to PackGlyph.FAVORITES,
 )
 
@@ -238,6 +240,10 @@ private val designGlyphs: Map<String, PackGlyph> = mapOf(
     "Filled.ContentPaste" to PackGlyph.PASTE,
     "Filled.CreateNewFolder" to PackGlyph.FOLDER_ADD,
     "Filled.Delete" to PackGlyph.TRASH,
+    "Filled.DeleteOutline" to PackGlyph.TRASH,
+    "Filled.Clear" to PackGlyph.CLOSE,
+    "Filled.CheckBox" to PackGlyph.SELECT_ALL,
+    "Filled.AddToDrive" to PackGlyph.CLOUD,
     "Filled.Description" to PackGlyph.FILE_TEXT,
     "Filled.Dns" to PackGlyph.NAS,
     "Filled.Download" to PackGlyph.DOWNLOAD,
@@ -331,6 +337,17 @@ private val designGlyphs: Map<String, PackGlyph> = mapOf(
     "Filled.WifiTethering" to PackGlyph.NETWORK,
 )
 
+/**
+ * App-wide icon standards. Every meaningful glyph (pack, Material fallback, brand, Google Photos, decorative badges and
+ * status marks) renders at least [IconGlyphMin]; primary action toolbars use [ToolbarActionIcon]; anything tappable
+ * offers at least [IconHitTarget]. The floor is applied ahead of the caller's modifier so legacy `.size(12..22.dp)` callers
+ * are lifted to 24 instead of shrinking the glyph; containers that hold an icon must therefore be at least 24 themselves.
+ */
+val IconGlyphMin = 24.dp
+val ToolbarActionIcon = 28.dp
+val IconHitTarget = 48.dp
+private val IconFloor = Modifier.sizeIn(minWidth = IconGlyphMin, minHeight = IconGlyphMin)
+
 private fun canonicalName(glyph: PackGlyph): String = if (glyph == PackGlyph.SAVE) "workbench" else glyph.name.lowercase()
 
 @Composable
@@ -340,6 +357,16 @@ private fun designDrawable(pack: InterfaceIconPack, glyph: PackGlyph): Int {
     val key = canonicalName(glyph)
     return androidx.compose.runtime.remember(pack, key, context) {
         context.resources.getIdentifier("cp_${pack.name.lowercase()}_$key", "drawable", context.packageName)
+    }
+}
+
+/** Solid has legacy artwork for the core glyphs only; the rest reuse the matching simple-pack shape, tinted as solid. */
+@Composable
+private fun solidFallbackDrawable(glyph: PackGlyph): Int {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val key = canonicalName(glyph)
+    return androidx.compose.runtime.remember(key, context) {
+        context.resources.getIdentifier("cp_simple_$key", "drawable", context.packageName)
     }
 }
 
@@ -357,7 +384,7 @@ private fun keepsPackColours(tint: Color): Boolean {
 @Composable
 fun NasFinderBrandMark(modifier: Modifier = Modifier) {
     Box(
-        modifier = modifier
+        modifier = IconFloor.then(modifier)
             .size(24.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(LocalThemePalette.current.accent),
@@ -388,7 +415,7 @@ fun PackIcon(
 ) {
     val completePackDrawable = designDrawable(pack, glyph)
     val semanticsModifier = if (contentDescription != null) Modifier.semantics { this.contentDescription = contentDescription } else Modifier
-    val sized = modifier.then(Modifier.size(24.dp)).then(semanticsModifier)
+    val sized = IconFloor.then(modifier).then(Modifier.size(24.dp)).then(semanticsModifier)
     if (glyph == PackGlyph.BRAND && completePackDrawable == 0) {
         NasFinderBrandMark(sized)
         return
@@ -406,9 +433,11 @@ fun PackIcon(
         PackGlyph.FOLDER -> PackGlyph.PHONEHARD
         else -> glyph
     }
-    val painter = painterResource(if (completePackDrawable != 0) completePackDrawable else packDrawable(pack, legacyGlyph))
+    val legacyDrawable = if (completePackDrawable != 0) 0 else packDrawable(pack, legacyGlyph)
+    val solidFallback = if (completePackDrawable == 0 && legacyDrawable == 0) solidFallbackDrawable(glyph) else 0
+    val painter = painterResource(if (completePackDrawable != 0) completePackDrawable else if (legacyDrawable != 0) legacyDrawable else solidFallback)
     val bitmapPack = pack == InterfaceIconPack.DIMENSION || pack == InterfaceIconPack.REALISTIC
-    val keep = bitmapPack || (pack != InterfaceIconPack.SIMPLE && !LocalThemePalette.current.isDark && keepsPackColours(effective))
+    val keep = bitmapPack || (solidFallback == 0 && pack != InterfaceIconPack.SIMPLE && !LocalThemePalette.current.isDark && keepsPackColours(effective))
     val finalSized = sized.then(if (bitmapPack && tint != Color.Unspecified) Modifier.alpha(tint.alpha) else Modifier)
     if (keep) Image(painter, null, finalSized, contentScale = ContentScale.Fit)
     else Image(painter, null, finalSized, contentScale = ContentScale.Fit, colorFilter = ColorFilter.tint(effective))
@@ -430,12 +459,12 @@ fun Icon(
     if (glyph != null && (fullPack || (glyph != PackGlyph.POCKET && glyph != PackGlyph.PRIVACY))) {
         PackIcon(glyph, contentDescription, modifier, tint)
     } else {
-        MaterialIcon(imageVector, contentDescription, modifier, if (tint == Color.Unspecified) LocalContentColor.current else tint)
+        MaterialIcon(imageVector, contentDescription, IconFloor.then(modifier), if (tint == Color.Unspecified) LocalContentColor.current else tint)
     }
 }
 
 /** The same unmodified Google Photos asset as Apple; no platform-only card or inset. */
 @Composable
 fun GooglePhotosMark(modifier: Modifier = Modifier) {
-    Image(painterResource(R.drawable.google_photos_mark), null, modifier.then(Modifier.size(24.dp)), contentScale = ContentScale.Fit)
+    Image(painterResource(R.drawable.google_photos_mark), null, IconFloor.then(modifier).then(Modifier.size(24.dp)), contentScale = ContentScale.Fit)
 }

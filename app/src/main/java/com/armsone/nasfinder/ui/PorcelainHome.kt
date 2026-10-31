@@ -376,7 +376,7 @@ internal fun PorcelainFavoritesDestination(
 ) {
     Column(modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { PackIcon(PackGlyph.BACK, "뒤로", Modifier.size(22.dp)) }
+            IconButton(onClick = onBack, modifier = Modifier.size(IconHitTarget)) { PackIcon(PackGlyph.BACK, "뒤로", Modifier.size(ToolbarActionIcon)) }
             Text("즐겨찾기", style = HomeType.Section, color = MaterialTheme.colorScheme.onBackground)
         }
         LazyColumn(
@@ -460,8 +460,8 @@ internal fun PorcelainWideHost(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text("내비게이션", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    IconButton(onClick = { navExpanded = false }, modifier = Modifier.size(32.dp)) {
-                                        PackIcon(PackGlyph.ARROW_LEFT, "사이드바 접기", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    IconButton(onClick = { navExpanded = false }, modifier = Modifier.size(IconHitTarget)) {
+                                        PackIcon(PackGlyph.ARROW_LEFT, "사이드바 접기", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
                             }
@@ -497,8 +497,8 @@ internal fun PorcelainWideHost(
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
                                         Text("작업대", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        IconButton(onClick = { wideWorkbenchExpanded = false }, modifier = Modifier.size(32.dp)) {
-                                            PackIcon(PackGlyph.CLOSE, "작업대 접기", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        IconButton(onClick = { wideWorkbenchExpanded = false }, modifier = Modifier.size(IconHitTarget)) {
+                                            PackIcon(PackGlyph.CLOSE, "작업대 접기", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                     }
                                     Box(Modifier.weight(1f)) {
@@ -556,8 +556,8 @@ internal fun PorcelainWideHost(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text("작업대", style = HomeType.Section, color = MaterialTheme.colorScheme.onSurface)
-                                    IconButton(onClick = { portraitWorkbenchOverlay = false }, modifier = Modifier.size(36.dp)) {
-                                        PackIcon(PackGlyph.CLOSE, "닫기", Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurface)
+                                    IconButton(onClick = { portraitWorkbenchOverlay = false }, modifier = Modifier.size(IconHitTarget)) {
+                                        PackIcon(PackGlyph.CLOSE, "닫기", tint = MaterialTheme.colorScheme.onSurface)
                                     }
                                 }
                                 HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
@@ -1241,7 +1241,7 @@ private fun PorcelainSavedConnections(state: AppState, model: NasFinderViewModel
                         trailing = {
                             if (preferred) PackIcon(PackGlyph.FAVORITES, "기본 위치", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                             Box(
-                                Modifier.size(36.dp).clickable(onClickLabel = "${connection.name} 연결 메뉴", role = Role.Button) { menuOpen = true },
+                                Modifier.size(IconHitTarget).clickable(onClickLabel = "${connection.name} 연결 메뉴", role = Role.Button) { menuOpen = true },
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Icon(Icons.Default.MoreHoriz, "${connection.name} 연결 메뉴", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurface)
@@ -1537,7 +1537,7 @@ private fun PorcelainCompactRail(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        IconButton(onClick = onExpand, modifier = Modifier.size(44.dp)) {
+        IconButton(onClick = onExpand, modifier = Modifier.size(IconHitTarget)) {
             PackIcon(PackGlyph.MENU, "사이드바 펼치기", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurface)
         }
         Spacer(Modifier.height(4.dp))

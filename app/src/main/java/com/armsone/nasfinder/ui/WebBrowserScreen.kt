@@ -40,6 +40,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -252,15 +253,18 @@ private fun BrowserCircleButton(
         else -> MaterialTheme.colorScheme.surfaceVariant
     }
     val tint = if (emphasized) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    // 48 hit target around the unchanged circle; the glyph follows the shared 24 floor.
     Box(
-        Modifier.size(side).background(background, CircleShape).combinedClickable(
+        Modifier.size(IconHitTarget).clip(CircleShape).combinedClickable(
             onClick = onClick,
             onLongClick = onLongClick,
             onLongClickLabel = onLongClick?.let { "길게 누르기" },
         ),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, description, Modifier.size(if (side > 32.dp) 20.dp else 18.dp), tint = tint)
+        Box(Modifier.size(side).background(background, CircleShape), contentAlignment = Alignment.Center) {
+            Icon(icon, description, tint = tint)
+        }
     }
 }
 
@@ -747,9 +751,9 @@ fun WebBrowserScreen(
             Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface, tonalElevation = 3.dp) {
                 Column {
                     Row(
-                        Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 9.dp),
+                        Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 8.dp, vertical = 1.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(7.dp),
+                        horizontalArrangement = Arrangement.spacedBy(1.dp),
                     ) {
                         BrowserCircleButton(
                             icon = if (canGoBack) Icons.Default.ArrowBack else Icons.Default.Close,
@@ -757,8 +761,11 @@ fun WebBrowserScreen(
                             onClick = { if (webView?.canGoBack() == true) webView?.goBack() else onClose() },
                             onLongClick = onClose,
                         )
+                        // 바깥 48 높이(IconHitTarget) 안에 32/40 캡슐 모양만 그려 주소 지우기 48 터치가 부모에 잘리지 않게 함.
+                        Box(Modifier.weight(1f).height(IconHitTarget), contentAlignment = Alignment.Center) {
+                        Box(Modifier.fillMaxWidth().height(browserControlHeight).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(browserControlHeight / 2)))
                         Row(
-                            Modifier.weight(1f).height(browserControlHeight).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(browserControlHeight / 2)).padding(horizontal = 10.dp),
+                            Modifier.fillMaxSize().padding(horizontal = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             BasicTextField(
@@ -777,8 +784,9 @@ fun WebBrowserScreen(
                                 },
                             )
                             if (address.isNotEmpty()) {
-                                IconButton(onClick = { address = "" }, modifier = Modifier.size(28.dp)) { Icon(Icons.Default.Cancel, "주소 지우기", Modifier.size(16.dp)) }
+                                IconButton(onClick = { address = "" }, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.Default.Cancel, "주소 지우기") }
                             }
+                        }
                         }
                         BrowserCircleButton(
                             icon = if (loading) Icons.Default.Close else Icons.Default.ArrowForward,
@@ -965,12 +973,9 @@ fun WebBrowserScreen(
                     Spacer(Modifier.width(6.dp))
                     Text("음악 다운로드", color = MaterialTheme.colorScheme.onPrimary)
                     Spacer(Modifier.width(8.dp))
-                    Icon(
-                        Icons.Default.Close,
-                        "음악 알림 닫기",
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.size(24.dp).clickable { closeMusicNotice() },
-                    )
+                    Box(Modifier.size(IconHitTarget).clip(CircleShape).clickable { closeMusicNotice() }, contentAlignment = Alignment.Center) {
+                        Icon(Icons.Default.Close, "음악 알림 닫기", tint = MaterialTheme.colorScheme.onPrimary)
+                    }
                 }
             }
         }

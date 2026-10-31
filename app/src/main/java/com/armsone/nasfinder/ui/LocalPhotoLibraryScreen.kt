@@ -892,7 +892,7 @@ internal fun LocalMediaThumbnail(
                 .background(selectionTint.copy(alpha = .18f), RoundedCornerShape(9.dp))
                 .border(2.4.dp, selectionTint, RoundedCornerShape(9.dp)),
         )
-        if (displayedItem.isMotionPhoto) Icon(Icons.Default.MotionPhotosOn, contentDescription = "모션 포토", modifier = Modifier.align(Alignment.BottomStart).background(Color.Black.copy(alpha = .6f), androidx.compose.foundation.shape.CircleShape).padding(3.dp).size(18.dp), tint = Color.White)
+        if (displayedItem.isMotionPhoto) Icon(Icons.Default.MotionPhotosOn, contentDescription = "모션 포토", modifier = Modifier.align(Alignment.BottomStart).background(Color.Black.copy(alpha = .6f), androidx.compose.foundation.shape.CircleShape).padding(3.dp).size(IconGlyphMin), tint = Color.White)
         if (displayedItem.isVideo) {
             Icon(
                 Icons.Default.PlayCircle,
@@ -1559,7 +1559,7 @@ private fun SourceRow(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f),
                     )
                 }
-                if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(2.dp).size(16.dp), tint = Color.White)
+                if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(2.dp).size(IconGlyphMin), tint = Color.White)
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1617,7 +1617,7 @@ private fun SourceTile(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f),
                 )
             }
-            if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(if (poster) 6.dp else 4.dp).size(if (poster) 24.dp else 20.dp), tint = Color.White)
+            if (isVideo && bitmap != null) Icon(Icons.Default.PlayCircle, null, Modifier.align(Alignment.BottomStart).padding(if (poster) 6.dp else 4.dp).size(IconGlyphMin), tint = Color.White)
             if (selectable) Icon(
                 if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
                 null,

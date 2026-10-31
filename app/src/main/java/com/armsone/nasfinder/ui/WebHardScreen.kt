@@ -316,7 +316,7 @@ internal fun PhoneHardConnectionPanel(
 @Composable
 private fun PhoneHardRefreshButton(onClick: () -> Unit, enabled: Boolean) {
     Box(
-        Modifier.size(44.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick),
+        Modifier.size(IconHitTarget).clickable(enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
