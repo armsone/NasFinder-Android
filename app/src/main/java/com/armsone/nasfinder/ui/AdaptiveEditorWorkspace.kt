@@ -1099,14 +1099,12 @@ private fun EditorStage(
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .heightIn(min = 24.dp)
                     .draggable(dragState, Orientation.Vertical, onDragStarted = { dragHeight = currentVisual }),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(
-                    Modifier.weight(1f).heightIn(min = 48.dp).semantics {
+                    Modifier.weight(1f).heightIn(min = 24.dp).semantics {
                         contentDescription = "미리보기 크기 조절, 위아래로 드래그"
                         customActions = listOf(
                             CustomAccessibilityAction("미리보기 크게") { dragHeight = currentVisual; applyHeight(currentVisual + step); true },
@@ -1116,8 +1114,7 @@ private fun EditorStage(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    Box(Modifier.size(width = 48.dp, height = 5.dp).clip(CircleShape).background(MaterialTheme.colorScheme.onSurfaceVariant))
-                    Text("위아래로 드래그해 크기 조절", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
+                    Box(Modifier.size(width = 36.dp, height = 3.dp).clip(CircleShape).background(MaterialTheme.colorScheme.onSurfaceVariant))
                 }
             }
         }

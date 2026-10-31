@@ -20,6 +20,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -1130,6 +1131,13 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
             when (state.activeVideoTab) {
                 VideoNavigationDestination.CREATE -> {
                     val workbenchCount = state.materials.size
+                    // 편집본 목록: 새 저장소 없이 기존 TrailerDraftStore.getAllDrafts()(비공개 모드 필터·최신순)를 IO에서 읽는다.
+                    // 읽기 실패(metadataProblem)는 빈 목록으로 숨기지 않고 그대로 보여 준다. 이름 변경·삭제는 편집본 탭이 맡는다.
+                    val draftList by produceState<Pair<List<TrailerDraft>, String?>?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
+                        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            TrailerDraftStore.getAllDrafts() to TrailerDraftStore.metadataProblem()
+                        }
+                    }
                     LazyColumn(
                         Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(PhoneOuter),
@@ -1139,22 +1147,6 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
                         item {
                             Column(Modifier.widthIn(max = 640.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                                 Text("새 영상을 만들 때만 편집본이 생깁니다. 작업대 항목은 그대로 남습니다.", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                // 가장 최근 편집본으로 바로 돌아가는 길: 새 저장소 없이 기존 편집본 목록(TrailerDraftStore)을 쓴다.
-                                // 파일 존재 확인이 편집본 수만큼 돌 수 있으므로 구성 중이 아니라 IO 디스패처에서 읽는다(같은 갱신 키).
-                                val latestDraft by produceState<TrailerDraft?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
-                                    value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                        TrailerDraftStore.getAllDrafts().firstOrNull { it.unavailableDetails().isEmpty() }
-                                    }
-                                }
-                                latestDraft?.let { draft ->
-                                    PorcelainPanel(Modifier.fillMaxWidth()) {
-                                        PorcelainRow(
-                                            "최근 편집본 이어서 편집",
-                                            PackGlyph.VIDEO,
-                                            subtitle = "${draft.displayTitle} · ${draft.sources.size}개 미디어",
-                                        ) { model.resumeTrailerDraft(draft) }
-                                    }
-                                }
                                 PorcelainPanel(Modifier.fillMaxWidth()) {
                                     PorcelainRow(
                                         "작업대에서 시작",
@@ -1166,12 +1158,62 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
                                 }
                             }
                         }
+                        draftList?.let { (drafts, metadataProblem) ->
+                            item(key = "create-drafts-header") {
+                                Column(Modifier.widthIn(max = 640.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    PorcelainHeader("편집본", "${drafts.size}개")
+                                    if (metadataProblem != null) {
+                                        Text(metadataProblem, style = HomeType.Tertiary, color = MaterialTheme.colorScheme.error)
+                                    } else if (drafts.isEmpty()) {
+                                        Text("보관된 편집본이 없습니다", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                            }
+                            items(drafts, key = { it.id }) { draft ->
+                                CreateDraftRow(draft, Modifier.widthIn(max = 640.dp).fillMaxWidth()) { model.resumeTrailerDraft(draft) }
+                            }
+                        }
                     }
                 }
                 VideoNavigationDestination.MATERIALS -> WorkbenchScreen(state, model, embedded = true, onBack = toCreate)
                 VideoNavigationDestination.DRAFTS -> VideoDraftsScreen(state, model, onBack = toCreate, embedded = true)
                 VideoNavigationDestination.COLLECTIONS -> VideoCollectionsScreen(state, model, onBack = toCreate, embedded = true)
             }
+        }
+    }
+}
+
+/** Compact draft row on the create screen: 64x48 cover, two-line title, mode · media count. Opens via the existing resume path. */
+@Composable
+private fun CreateDraftRow(draft: TrailerDraft, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val cover = rememberTrailerDraftCover(draft, maxPixelSize = 160)
+    PorcelainPanel(modifier) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(
+                Modifier.size(width = 64.dp, height = 48.dp).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (cover != null) {
+                    Image(cover.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+                } else {
+                    PackIcon(PackGlyph.VIDEO, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(draft.displayTitle, style = HomeType.Source, color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${if (draft.isMusicOverlayMode) "뮤직비디오" else "예고편"} · ${draft.sources.size}개 미디어",
+                    style = HomeType.Description,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Icon(Icons.Default.ChevronRight, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
