@@ -539,6 +539,9 @@ sealed interface Screen {
     data object VideoCollections : Screen
 }
 
+/** Status of an editor export while its draft is being saved, before the renderer starts. */
+internal const val EDITOR_EXPORT_SAVING_STATUS = "편집본을 저장하는 중…"
+
 class NasFinderViewModel(private val application: NasFinderApplication) : ViewModel() {
     private val repository = application.connections
     private val favoriteRepository = application.favorites
@@ -692,6 +695,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             selectMainDestination(MainNavigationDestination.WORKBENCH)
             return
         }
+        // 컬렉션 기능은 없어졌다: 예전 경로는 폰하드로 열고, 폰하드를 열 때마다 아직 옮기지 못한 예전 컬렉션 영상을 다시 복사한다.
+        if (screen == Screen.VideoCollections) {
+            show(Screen.Inbox)
+            return
+        }
+        if (screen == Screen.Inbox) migrateLegacyCollectionsToPhoneHard()
         stopInlineAudio()
         invalidateImagePreviewRequests()
         if (screen == Screen.Dashboard) {
@@ -5631,9 +5640,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /** Writes the project now (main-thread callers that are about to close it). */
-    private fun saveEditorDraftNow(session: TrailerSession): Boolean {
-        val draft = draftFromSession(session) ?: return false
-        return TrailerDraftStore.saveDraft(draft)
+    private fun saveEditorDraftNow(session: TrailerSession): Boolean =
+        captureEditorDraft(session)?.let(::writeEditorDraft) == true
+
+    // Every editor draft write is numbered when its snapshot is taken from _state on the main thread, so a later
+    // number always holds a newer (or equal) project state, including a newly completed output of the same revision.
+    private val editorDraftCaptures = java.util.concurrent.atomic.AtomicLong()
+    // Per project (directory): newest capture written, and the capture number at which it was closed. Kept after
+    // close, so a still in-flight older write can never replace the close save or recreate a closed project.
+    private val editorWrittenCaptures = mutableMapOf<String, Long>()
+    private val editorClosedCaptures = mutableMapOf<String, Long>()
+
+    /** Main-thread snapshot of [session] as a draft with its capture number. */
+    private fun captureEditorDraft(session: TrailerSession, showingSettings: Boolean = false): Pair<TrailerDraft, Long>? =
+        draftFromSession(session, showingSettings)?.let { it to editorDraftCaptures.incrementAndGet() }
+
+    /**
+     * The one ordered writer of open-project drafts (sync and IO callers). A capture older than the newest one
+     * written is skipped as already saved; one taken before the project was closed is dropped as not saved.
+     */
+    private fun writeEditorDraft(captured: Pair<TrailerDraft, Long>): Boolean = synchronized(editorWrittenCaptures) {
+        val (draft, capture) = captured
+        val key = draft.directory.absolutePath
+        if (capture < (editorClosedCaptures[key] ?: Long.MIN_VALUE)) return@synchronized false
+        if (capture < (editorWrittenCaptures[key] ?: Long.MIN_VALUE)) return@synchronized true
+        TrailerDraftStore.saveDraft(draft).also { saved -> if (saved) editorWrittenCaptures[key] = capture }
     }
 
     /** Debounced autosave of the CURRENT project with saving/saved/failed state. */
@@ -5644,8 +5675,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (!immediate) kotlinx.coroutines.delay(700)
             val session = _state.value.trailer?.takeIf { it.directory == directory } ?: return@launch
             val revision = session.revision
-            val draft = draftFromSession(session)
-            val saved = draft != null && withContext(Dispatchers.IO) { TrailerDraftStore.saveDraft(draft) }
+            val draft = captureEditorDraft(session)
+            val saved = draft != null && withContext(Dispatchers.IO) { writeEditorDraft(draft) }
             _state.update { current ->
                 val live = current.trailer?.takeIf { it.directory == directory } ?: return@update current
                 current.copy(
@@ -5937,9 +5968,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /** Explicit one-time choice from the export prompt: render without the unavailable music; the stored choice stays saved. */
-    fun exportEditorProjectWithoutUnavailableMusic() {
+    fun exportEditorProjectWithoutUnavailableMusic(onStarted: (() -> Unit)? = null) {
         dismissMusicExportPrompt()
-        exportEditorProjectInternal(skipUnavailableMusic = true)
+        exportEditorProjectInternal(skipUnavailableMusic = true, onStarted = onStarted)
     }
 
     /** Plan parameters regenerate scenes while automatic; manual mode proportionally retimes or adjusts existing scenes. */
@@ -6300,12 +6331,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /**
-     * Exports a FIXED snapshot of the current project. Editing continues; the running composition is never mutated,
-     * and a later edit simply makes the result outdated (next export reflects it).
+     * Exports a FIXED snapshot of the current project. The same captured project/revision is first written as the
+     * editable draft; only after that save succeeds does the renderer start (and [onStarted] run, for this job and
+     * project only). A failed save marks the draft FAILED and renders nothing. Editing continues; the running
+     * composition is never mutated, and a later edit simply makes the result outdated (next export reflects it).
      */
-    fun exportEditorProject() = exportEditorProjectInternal(skipUnavailableMusic = false)
+    fun exportEditorProject(onStarted: (() -> Unit)? = null) = exportEditorProjectInternal(skipUnavailableMusic = false, onStarted = onStarted)
 
-    private fun exportEditorProjectInternal(skipUnavailableMusic: Boolean) {
+    private fun exportEditorProjectInternal(skipUnavailableMusic: Boolean, onStarted: (() -> Unit)? = null) {
         val session = _state.value.trailer ?: return
         if (!session.prepared || session.busy || session.export?.running == true) return
         val scenes = session.scenes
@@ -6331,11 +6364,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val musicFitCount = session.musicFitCount
         val autoDucking = session.autoDucking
         val musicVolume = session.editor?.musicVolume ?: 1f
-        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, "장면을 준비하는 중…", scenes = scenes)) }
+        val draft = captureEditorDraft(session)
+        // Marked running right away, so repeated taps and retries never start a second job while the draft saves.
+        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, EDITOR_EXPORT_SAVING_STATUS, scenes = scenes), saveState = EditorSaveState.SAVING, saveError = null) }
         editorExportJob = viewModelScope.launch {
             val self = coroutineContext[Job]
             val output = File(directory, "trailer-${UUID.randomUUID()}.mp4")
+            // Once published to the session the output may already be referenced (close save, player): never deleted here.
+            var published = false
             try {
+                val draftSaved = draft != null && withContext(Dispatchers.IO) { runCatching { writeEditorDraft(draft) }.getOrDefault(false) }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!draftSaved) {
+                    updateTrailer(directory) {
+                        it.copy(export = null, saveState = EditorSaveState.FAILED, saveError = "편집본을 저장하지 못해 영상을 만들지 않았습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요.")
+                    }
+                    _state.update { it.copy(message = "편집본을 저장하지 못해 영상을 만들지 않았습니다. 저장 공간을 확인해 주세요.") }
+                    return@launch
+                }
+                updateTrailer(directory) { live ->
+                    live.copy(
+                        export = live.export?.copy(status = "장면을 준비하는 중…"),
+                        saveState = if (live.revision == revision) EditorSaveState.SAVED else live.saveState,
+                    )
+                }
+                if (editorExportJob === self && _state.value.trailer?.directory == directory) onStarted?.invoke()
                 var exportRecoveredScenes = 0
                 var exportExcludedScenes = 0
                 TrailerExporter.export(
@@ -6354,9 +6407,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         exportExcludedScenes = excluded
                     },
                 ) { status, progress ->
-                    updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
+                    // A cancelled job's late progress never lands on a newer job's state.
+                    if (editorExportJob === self) updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
                 }
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                // Only the current job of the still-open project publishes; otherwise its unpublished file is removed below.
+                if (editorExportJob !== self || _state.value.trailer?.directory != directory) throw CancellationException("superseded export")
                 val previous = _state.value.trailer?.takeIf { it.directory == directory }?.output
                 val finishedExportState = if (exportRecoveredScenes > 0 || exportExcludedScenes > 0) {
                     val summary = buildString {
@@ -6375,19 +6431,24 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     )
                 } else null
                 updateTrailer(directory) { it.copy(output = output, outputRevision = revision, export = finishedExportState, saved = false) }
-                val live = _state.value.trailer?.takeIf { it.directory == directory }
-                val saved = live != null && withContext(Dispatchers.IO) { draftFromSession(live)?.let(TrailerDraftStore::saveDraft) == true }
+                published = true
+                val live = _state.value.trailer?.takeIf { it.directory == directory }?.let { captureEditorDraft(it) }
+                val saved = live != null && withContext(Dispatchers.IO) { runCatching { writeEditorDraft(live) }.getOrDefault(false) }
                 // The superseded render of this same project is removed only after the new one is recorded.
                 if (saved && previous != null && previous != output && previous.parentFile == directory && previous.name.startsWith("trailer-")) {
                     withContext(Dispatchers.IO) { previous.delete() }
                 }
                 updateTrailer(directory) { it.copy(saveState = if (saved) it.saveState else EditorSaveState.FAILED) }
             } catch (cancelled: CancellationException) {
-                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                if (!published) withContext(NonCancellable + Dispatchers.IO) { output.delete() }
                 throw cancelled
             } catch (failure: Exception) {
-                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
-                updateTrailer(directory) { it.copy(export = EditorExportState(false, revision, "", error = failure.message ?: "내보내지 못했습니다. 다시 시도해 주세요.")) }
+                if (published) {
+                    if (editorExportJob === self) updateTrailer(directory) { it.copy(saveState = EditorSaveState.FAILED) }
+                } else {
+                    withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                    if (editorExportJob === self) updateTrailer(directory) { it.copy(export = EditorExportState(false, revision, "", error = failure.message ?: "내보내지 못했습니다. 다시 시도해 주세요.")) }
+                }
             } finally {
                 if (editorExportJob === self) editorExportJob = null
             }
@@ -6399,6 +6460,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (session.export?.running != true) return
         editorExportJob?.cancel()
         updateTrailer(session.directory) { it.copy(export = null) }
+        // Cancelled while its draft was saving: the current state is saved again through the ordered writer.
+        if (session.saveState == EditorSaveState.SAVING) scheduleEditorAutosave(session.directory, immediate = true)
     }
 
     fun dismissEditorExportError() {
@@ -6656,6 +6719,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         editorExportJob?.cancel(); editorExportJob = null
         editorAddJob?.cancel(); editorAddJob = null
         editorAutosaveJob?.cancel(); editorAutosaveJob = null
+        // Writes captured before this point (cancelled autosave/export still in IO) can no longer land.
+        session?.let { synchronized(editorWrittenCaptures) { editorClosedCaptures[it.directory.absolutePath] = editorDraftCaptures.incrementAndGet() } }
         session?.pendingAdds?.forEach { pendingAddCandidates.remove(it.id); pendingAddPrivate.remove(it.id) }
         pendingAddAnchor = null
         session?.let {
@@ -6674,7 +6739,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             // Save BEFORE stopping anything, so a failed save can keep the project (and its running work) open.
             val sessionWithId = if (session.draftId == null) session.copy(draftId = UUID.randomUUID().toString()) else session
             val saved = sessionWithId.sources.isNotEmpty() &&
-                draftFromSession(sessionWithId, showingSettings)?.let(TrailerDraftStore::saveDraft) == true
+                captureEditorDraft(sessionWithId, showingSettings)?.let(::writeEditorDraft) == true
             if (!saved && !wasCancelled) {
                 // Never drop unsaved edits of a prepared project silently: keep the editor open with a visible failure.
                 // (An explicit "멈추고 닫기" closes without deleting anything; the project files stay on disk.)
@@ -6925,6 +6990,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         // The former 영상 재료 tab is the 작업대 now; the old destination keeps working as an alias.
         if (destination == VideoNavigationDestination.MATERIALS) {
             selectMainDestination(MainNavigationDestination.WORKBENCH)
+            return
+        }
+        // The former 컬렉션 tab: its videos are copied into 폰하드, so the old destination opens 폰하드.
+        if (destination == VideoNavigationDestination.COLLECTIONS) {
+            show(Screen.Inbox)
             return
         }
         _state.update {
@@ -8268,6 +8338,131 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(collections = DurableCollectionStore.getItems()) }
     }
 
+    // ---- 예전 컬렉션 → 폰하드 ---------------------------------------------------------------------------------------
+    // 컬렉션 기능을 없앤 뒤에도 예전 영상은 폰하드 '이전 보관 영상' 폴더의 사본으로 볼 수 있다. 컬렉션 파일·목록 JSON·읽기
+    // 권한은 그대로 두고(지우거나 옮기거나 덮어쓰지 않는다) 사본만 만든다. 항목마다 저장된 출처(파일 경로·제목·비공개 표시·
+    // 연결·편집본)에서 만든 고정 UUID로 가져온다. id가 없는 예전 기록은 불러올 때마다 새 id를 받으므로 id는 쓰지 않는다.
+    // 같은 UUID는 SharedInboxStore.import가 같은 락 안에서 거부하므로 겹치지 않고, 같은 파일이라도 제목·비공개가 다른 기록은
+    // 따로 옮긴다. 읽을 수 있는 사본이 확인된 항목만 같은 UUID 영수증을 남기고, 실패한 항목은 영수증 없이 남아 다음에 폰하드를
+    // 열 때 다시 시도한다. 전체 '완료' 표시는 두지 않는다.
+    private val legacyCollectionReceipts =
+        application.getSharedPreferences("legacy_collection_phonehard", android.content.Context.MODE_PRIVATE)
+    private val legacyCollectionMigrating = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun migrateLegacyCollectionsToPhoneHard() {
+        if (!legacyCollectionMigrating.compareAndSet(false, true)) return
+        viewModelScope.launch {
+            try {
+                val (copied, failures, anyCopied) = withContext(Dispatchers.IO) { copyLegacyCollectionsToPhoneHard() }
+                if (anyCopied) {
+                    withContext(Dispatchers.IO) { runCatching { inboxFiles() }.getOrNull() }?.let { files ->
+                        _state.update { it.copy(inboxFiles = files) }
+                    }
+                }
+                val problem = DurableCollectionStore.loadProblem()
+                val note = when {
+                    failures.isNotEmpty() -> "예전 컬렉션 영상 ${failures.size}개를 폰하드로 복사하지 못했습니다(${failures.first()}). 원본은 그대로 두었고, 폰하드를 다시 열면 다시 시도합니다." +
+                        (if (copied > 0) " ${copied}개는 폰하드 ‘$LEGACY_COLLECTION_FOLDER’ 폴더로 복사했습니다." else "")
+                    copied > 0 -> "예전 컬렉션 영상 ${copied}개를 폰하드 ‘$LEGACY_COLLECTION_FOLDER’ 폴더로 복사했습니다. 원본은 그대로 보관합니다."
+                    problem != null -> problem
+                    else -> null
+                }
+                if (note != null) _state.update { it.copy(message = note) }
+            } finally {
+                legacyCollectionMigrating.set(false)
+            }
+        }
+    }
+
+    /**
+     * 지금 모드에서 보이는 항목의 복사 개수·실패 사유(비공개 항목은 일반 모드 안내에 제목도 개수도 넣지 않는다)와, 하나라도
+     * 복사했는지. 영수증이 있는 항목(이미 옮긴 항목)은 다시 읽지 않는다.
+     */
+    private fun copyLegacyCollectionsToPhoneHard(): Triple<Int, List<String>, Boolean> {
+        // 비공개를 포함한 전체 기록: 모드와 관계없이 옮기고, 각 사본은 원래 비공개 표시를 그대로 갖는다.
+        val pending = DurableCollectionStore.getAllItems()
+            .map { item -> item to legacyCollectionSourceId(item) }
+            .distinctBy { it.second }
+            .filter { (_, sourceId) -> !legacyCollectionReceipts.contains("src:$sourceId") }
+        var copied = 0
+        var anyCopied = false
+        val failures = mutableListOf<String>()
+        for ((item, stableId) in pending) {
+            // 원래 비공개 출처(자기 표시·비공개 연결·비공개 편집본)는 사본도 비공개로 둔다. 지금 모드는 따르지 않는다.
+            val recordPrivate = item.isPrivate || PrivacyMode.isPrivateConnection(item.connectionId) ||
+                (item.sourceDraftId?.let(TrailerDraftStore::isDraftPrivate) == true)
+            val reported = PrivacyMode.isVisible(recordPrivate)
+            runCatching {
+                // 앞선 실행이 복사를 마치고 영수증만 남기지 못했으면 같은 UUID 기록이 이미 있다. 그 사본이 실제로 읽히고 길이가
+                // 맞을 때만 옮긴 것으로 본다. 없거나 깨졌으면 그 기록·파일은 건드리지 않고 영수증 없이 실패로 남긴다.
+                val existing = inboxStore.allRecords().firstOrNull { it.id == stableId }
+                if (existing == null) {
+                    importLegacyCollectionItem(item, stableId, recordPrivate)
+                } else {
+                    val payloadBytes = runCatching { inboxStore.file(existing).takeIf { it.isFile }?.length() }.getOrNull()
+                    check(existing.byteCount > 0L && payloadBytes == existing.byteCount) {
+                        "앞서 만든 폰하드 사본을 읽을 수 없습니다 · 원본은 그대로 두었습니다"
+                    }
+                }
+                check(legacyCollectionReceipts.edit().putBoolean("src:$stableId", true).commit()) {
+                    "복사 기록을 저장하지 못했습니다"
+                }
+                existing != null
+            }.onSuccess { alreadyCopied ->
+                if (!alreadyCopied) { anyCopied = true; if (reported) copied++ }
+            }.onFailure { if (reported) failures += it.message ?: "알 수 없는 오류" }
+        }
+        return Triple(copied, failures, anyCopied)
+    }
+
+    /** 예전 컬렉션 기록 하나의 고정 출처 UUID: 목록 JSON에 저장된 값만 쓴다(불러올 때 새로 붙는 id·시각은 쓰지 않는다). */
+    private fun legacyCollectionSourceId(item: CollectionItem): UUID = UUID.nameUUIDFromBytes(
+        listOf(
+            "nasfinder-legacy-collection-v1", item.localFilePath, item.title, item.isPrivate.toString(),
+            item.connectionId.orEmpty(), item.sourceDraftId.orEmpty(),
+        ).joinToString("\u0000").toByteArray(Charsets.UTF_8),
+    )
+
+    /** 한 항목을 폰하드에 복사하고 길이를 확인한다. 확인하지 못하면 방금 만든 사본만 지우고 실패를 던진다. */
+    private fun importLegacyCollectionItem(item: CollectionItem, stableId: UUID, recordPrivate: Boolean) {
+        val uri = item.localFilePath.takeIf { it.startsWith("content://") }?.let(Uri::parse)
+        val local = if (uri == null) File(item.localFilePath) else null
+        if (uri != null) {
+            check(DurableCollectionStore.hasPersistedReadGrant(item.localFilePath)) { "읽기 권한 없음 · 원본 앱에서 다시 가져와 주세요" }
+        } else {
+            check(local != null && local.isFile && local.length() > 0L) { "파일 없음" }
+        }
+        val expectedBytes = local?.length() ?: uri?.let { contentUri ->
+            runCatching {
+                application.contentResolver.query(contentUri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+                }
+            }.getOrNull()?.takeIf { it > 0L }
+        }
+        val contentType = uri?.let { runCatching { application.contentResolver.getType(it) }.getOrNull() }
+        val extension = (local?.extension ?: uri?.let(::queryName)?.substringAfterLast('.', "").orEmpty())
+            .ifBlank { contentType?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }.orEmpty() }
+            .ifBlank { "mp4" }
+        val title = item.title.ifBlank { "이전 보관 영상" }
+        val name = if (title.endsWith(".$extension", ignoreCase = true)) title else "$title.$extension"
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase()) ?: contentType ?: "video/mp4"
+        val input = local?.inputStream() ?: application.contentResolver.openInputStream(uri!!) ?: error("원본을 열 수 없습니다")
+        val record = input.use {
+            inboxStore.import(
+                name, mime, it,
+                id = stableId,
+                importedAt = java.time.Instant.ofEpochMilli(item.timestamp),
+                destinationSubdirectory = LEGACY_COLLECTION_FOLDER,
+                isPrivate = recordPrivate,
+            )
+        }
+        val storedBytes = runCatching { inboxStore.file(record).length() }.getOrDefault(-1L)
+        if (record.byteCount <= 0L || storedBytes != record.byteCount || (expectedBytes != null && record.byteCount != expectedBytes)) {
+            runCatching { inboxStore.delete(record.id) }
+            error("복사한 크기가 원본과 달라 사본을 지웠습니다")
+        }
+    }
+
     fun addExportedVideoToCollection(
         title: String,
         file: File,
@@ -8581,57 +8776,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /**
-     * Collection import entry for picked content: stages the items for the 사본/참조 confirmation dialog (copy is the
-     * default). [picked] pairs each uri with the flags its picker result actually returned, or null when the caller
-     * only has the uri (then a reference is offered only if a persisted read grant is already held).
+     * 예전 '컬렉션에 추가' 진입점. 컬렉션 기능은 없어졌으므로 컬렉션 기록을 만들지 않고, 고른 항목을 기존 폰하드 복사
+     * ([copyLocalMediaToInbox], 폰하드 맨 위 폴더·지금 모드의 비공개 분류)로 실제로 복사한다.
      */
     fun stageCollectionImport(picked: List<Pair<Uri, Int?>>) {
         if (picked.isEmpty()) return
-        if (_state.value.pendingCollectionImport?.working == true) {
-            _state.update { it.copy(message = "이전 컬렉션 추가가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.") }
-            return
-        }
-        viewModelScope.launch {
-            var skippedImages = 0
-            val entries = withContext(Dispatchers.IO) {
-                picked.distinctBy { it.first.toString() }.mapNotNull { (uri, flags) ->
-                    val mime = runCatching { application.contentResolver.getType(uri) }.getOrNull()
-                    if (mime?.startsWith("image/") == true) {
-                        skippedImages++
-                        return@mapNotNull null
-                    }
-                    val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "가져온 영상"
-                    val size = if (uri.scheme == "content") runCatching {
-                        application.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else 0L
-                        }
-                    }.getOrNull() ?: 0L else runCatching { uri.path?.let(::File)?.length() }.getOrNull() ?: 0L
-                    val persistableRead = if (flags != null && flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
-                        flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    } else 0
-                    val blocker = when {
-                        uri.scheme != "content" ->
-                            "앱 안의 임시 파일이나 기기 경로는 앱을 다시 열었을 때 계속 읽을 수 있다고 보장되지 않습니다."
-                        flags != null && persistableRead == 0 ->
-                            "이 영상을 제공한 앱이 재시작 뒤에도 유지되는 읽기 권한을 주지 않았습니다."
-                        flags == null && !DurableCollectionStore.hasPersistedReadGrant(uri.toString()) ->
-                            "이 항목은 지금만 읽을 수 있는 임시 권한으로 선택되었습니다."
-                        else -> null
-                    }
-                    PendingImportEntry(uri.toString(), name.substringBeforeLast('.').ifBlank { name }, size, persistableRead, blocker)
-                }
-            }
-            if (entries.isEmpty()) {
-                _state.update { it.copy(message = if (skippedImages > 0) "컬렉션에는 영상만 추가할 수 있습니다. 선택한 사진은 제외했습니다." else "추가할 영상을 읽지 못했습니다.") }
-                return@launch
-            }
-            _state.update {
-                it.copy(pendingCollectionImport = PendingCollectionImport(
-                    entries = entries,
-                    excludedNote = if (skippedImages > 0) "사진 ${skippedImages}개는 컬렉션 대상이 아니라 제외했습니다." else null,
-                ))
-            }
-        }
+        copyLocalMediaToInbox(picked.map { it.first })
     }
 
     fun cancelCollectionImport() {
@@ -10293,6 +10443,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     private companion object {
         const val PHONEHARD_SAVE_RECEIPT = "phonehard-save.receipt"
+        // 예전 컬렉션 영상의 사본이 들어가는 폰하드 폴더(맨 위). 없어진 컬렉션 기능으로 보이지 않게 일반 폴더 이름을 쓴다.
+        const val LEGACY_COLLECTION_FOLDER = "이전 보관 영상"
         // Access-type material failures; only these clear by themselves when the original becomes readable again.
         const val LOCAL_MATERIAL_ACCESS_ERROR = "미디어에 접근할 수 없습니다 (권한 필요)"
         const val LOCAL_MATERIAL_GRANT_ERROR = "미디어 접근 권한이 확인되지 않았습니다."

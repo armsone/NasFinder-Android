@@ -393,7 +393,8 @@ fun NasFinderApp(
                 ) }
                 Screen.MaterialBasket -> PorcelainWideHost(state, model) { WorkbenchScreen(state, model, embedded = false, onBack = { model.show(Screen.Dashboard) }) }
                 Screen.VideoDrafts -> PorcelainWideHost(state, model) { VideoDraftsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
-                Screen.VideoCollections -> PorcelainWideHost(state, model) { VideoCollectionsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
+                // 예전 컬렉션 경로(복원된 상태 등)는 빈 화면 대신 폰하드를 연다. 기존 컬렉션 영상은 폰하드로 복사된다.
+                Screen.VideoCollections -> PorcelainWideHost(state, model, phoneHardSelected = true) { InboxScreen(state, model) }
             }
             }
 
@@ -495,18 +496,6 @@ fun NasFinderApp(
                 confirmButton = {
                     TextButton(onClick = model::dismissTrailerDraftStaleNotice) { Text("확인") }
                 }
-            )
-        }
-        state.pendingCollectionImport?.let { pending ->
-            PendingCollectionImportDialog(pending, model)
-        }
-        state.collectionCopyOffer?.let { offer ->
-            AlertDialog(
-                onDismissRequest = model::dismissCollectionCopyOffer,
-                title = { Text("외부 참조로 보관할 수 없습니다") },
-                text = { Text(offer.message) },
-                confirmButton = { Button(onClick = model::acceptCollectionCopyOffer) { Text("앱 안에 사본 보관") } },
-                dismissButton = { TextButton(onClick = model::dismissCollectionCopyOffer) { Text("취소") } },
             )
         }
         state.trailerConflict?.let { conflict ->
@@ -4627,8 +4616,6 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     BrowserSelectionAction("삭제", Icons.Default.Delete, selectedItems.isNotEmpty() && capabilities.delete, destructive = true) { confirmBatchDelete = true },
                     // Files AND folders of any kind become references only; nothing is downloaded or listed here.
                     BrowserSelectionAction("작업대에 담기", Icons.Default.Inbox, selectedItems.isNotEmpty()) { model.requestWorkbenchAddRemote(browser.connection, selectedItems.toList()); selectedIds.clear(); selectionMode = false },
-                    // NAS/cloud paths are never durable references: this always stores an app-owned copy.
-                    BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, selectedItems.any { it.isVideo }) { model.importRemoteFilesToCollection(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("뮤직비디오", Icons.Default.MusicNote, canMusic) { model.startRemoteMusicOverlay(selectedItems.toList(), null); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("다운로드", Icons.Default.Download, selectedItems.isNotEmpty()) { pendingDownloadItems = selectedItems.toList(); showDownloadDestDialog = true },
@@ -6733,16 +6720,6 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 selectedFolderPaths.clear()
                                 selectionMode = false
                                 model.requestWorkbenchAddPhoneHard(targets, folders)
-                            },
-                            // PhoneHard files are app-private storage, not a durable external reference: always copied.
-                            BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, displayedFiles.any { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }) {
-                                val targets = displayedFiles.filter { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }
-                                selectedFileIds.clear()
-                                selectedFolderPaths.clear()
-                                selectionMode = false
-                                targets.forEach { target ->
-                                    model.importVideoUriToCollection(android.net.Uri.fromFile(target.file), copyToStorage = true)
-                                }
                             },
                             BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) {
                                 val ids = selectedFileIds.toList()

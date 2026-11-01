@@ -153,7 +153,6 @@ internal fun PorcelainHome(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainFavorites(state, model, onRemoveFavorite) } }
-                    item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeCollection(state, model) } }
                     item {
                         Box(Modifier.widthIn(max = 640.dp)) {
                             PorcelainFileOpen(state, model, onAddNetwork, onEditGooglePhotos, onDeleteGooglePhotos, onDeleteConnection, allConnections = false)
@@ -171,7 +170,6 @@ internal fun PorcelainHome(
                     verticalArrangement = Arrangement.spacedBy(SectionGap),
                 ) {
                     item { PorcelainFavorites(state, model, onRemoveFavorite) }
-                    item { PorcelainHomeCollection(state, model) }
                     if (split) {
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(WideColumnGap)) {
@@ -248,11 +246,6 @@ internal fun PorcelainPhoneHome(
         }
         item {
             Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainHomeCollection(state, model)
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
                 PorcelainFileOpen(
                     state = state,
                     model = model,
@@ -280,22 +273,6 @@ internal fun PorcelainPhoneHome(
         }
         item {
             Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeTools(model) }
-        }
-    }
-}
-
-/** 컬렉션 location on the 홈 screen: opens the saved finished videos collection destination. */
-@Composable
-private fun PorcelainHomeCollection(state: AppState, model: NasFinderViewModel) {
-    PorcelainSection("컬렉션") {
-        PorcelainPanel(Modifier.fillMaxWidth()) {
-            PorcelainRow(
-                "컬렉션",
-                PackGlyph.COLLECTION,
-                subtitle = "완성된 영상 및 재생 보관소",
-                trailing = { Text("${state.collections.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                onClick = { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
-            )
         }
     }
 }
@@ -1038,13 +1015,12 @@ private fun PorcelainDeviceStorageRows(onImportFiles: (() -> Unit)?) {
 }
 
 /**
- * iOS ToolsView.toolsList (도구 tab): 전송 → 저장공간 (device storage, 작업대 참조 수, 컬렉션) → 앱 (설정 row + version caption).
+ * iOS ToolsView.toolsList (도구 tab): 전송 → 저장공간 (device storage, 작업대 참조 수) → 앱 (설정 row + version caption).
  * Every row is an existing destination or read-only count; 설정 stays a row here instead of being the tab itself.
  */
 @Composable
 internal fun PorcelainTools(state: AppState, model: NasFinderViewModel, modifier: Modifier = Modifier) {
     val materialBytes = state.materials.sumOf { if (it.localFilePath != null) it.fileSize ?: 0L else 0L }
-    val collectionBytes = state.collections.sumOf { it.fileSizeBytes }
     LazyColumn(
         modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = PhoneOuter, top = 4.dp, end = PhoneOuter, bottom = 16.dp),
@@ -1069,8 +1045,6 @@ internal fun PorcelainTools(state: AppState, model: NasFinderViewModel, modifier
                         PorcelainDeviceStorageRows(null)
                         PorcelainDivider()
                         PorcelainRow("작업대 참조 ${state.materials.size}개", PackGlyph.SAVE, subtitle = "기존 재료 앱 안 복사본 ${porcelainBytes(materialBytes)} (새로 담은 항목은 복사하지 않음)", showsChevron = false, onClick = null)
-                        PorcelainDivider()
-                        PorcelainRow("컬렉션 ${state.collections.size}편", PackGlyph.COLLECTION, subtitle = "앱 안 복사본 ${porcelainBytes(collectionBytes)}", showsChevron = false, onClick = null)
                     }
                 }
             }
@@ -1089,8 +1063,8 @@ internal fun PorcelainTools(state: AppState, model: NasFinderViewModel, modifier
 }
 
 /**
- * iOS VideoHubView (영상 tab): inline title is the shell's, then the three destinations as a picker bar (accent + 3 capsule when selected)
- * over the selected destination. 영상 제작 is the explicit entry into the existing media picker; 편집본/컬렉션 reuse the existing screens.
+ * iOS VideoHubView (영상 tab): inline title is the shell's, then the two destinations as a picker bar (accent + 3 capsule when selected)
+ * over the selected destination. 영상 제작 is the explicit entry into the existing media picker; 편집본 reuses the existing screen.
  * The former 영상 재료 tab is the 작업대 (own top-level destination); its old destination only redirects there.
  */
 @Composable
@@ -1098,11 +1072,10 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
     val destinations = listOf(
         VideoNavigationDestination.CREATE to "영상 제작",
         VideoNavigationDestination.DRAFTS to "편집본",
-        VideoNavigationDestination.COLLECTIONS to "컬렉션",
     )
     val toCreate = { model.selectVideoDestination(VideoNavigationDestination.CREATE) }
     // Wide windows pick the destination in the sidebar; the underline picker is the phone-width form of the same choice.
-    // 펼친 세로(<960dp)는 사이드바가 72dp 레일로 접혀 있어 영상 제작/편집본/컬렉션을 고를 수 없으므로 같은 탭 바를 쓴다.
+    // 펼친 세로(<960dp)는 사이드바가 72dp 레일로 접혀 있어 영상 제작/편집본을 고를 수 없으므로 같은 탭 바를 쓴다.
     val destinationPicker = !rememberWideShell() || LocalConfiguration.current.screenWidthDp < 960
     Column(modifier.fillMaxSize()) {
         if (destinationPicker) Box(Modifier.fillMaxWidth()) {
@@ -1177,7 +1150,8 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
                 }
                 VideoNavigationDestination.MATERIALS -> WorkbenchScreen(state, model, embedded = true, onBack = toCreate)
                 VideoNavigationDestination.DRAFTS -> VideoDraftsScreen(state, model, onBack = toCreate, embedded = true)
-                VideoNavigationDestination.COLLECTIONS -> VideoCollectionsScreen(state, model, onBack = toCreate, embedded = true)
+                // 예전 컬렉션 탭 값: selectVideoDestination이 폰하드로 보내므로 여기 남지 않지만, 남아도 빈 화면 대신 폰하드를 연다.
+                VideoNavigationDestination.COLLECTIONS -> LaunchedEffect(Unit) { model.show(Screen.Inbox) }
             }
         }
     }
@@ -1346,7 +1320,6 @@ private fun PorcelainSidebar(
             listOf(
                 SidebarEntry("video-create", "영상 제작", PackGlyph.VIDEO, onVideo && state.activeVideoTab == VideoNavigationDestination.CREATE) { model.selectVideoDestination(VideoNavigationDestination.CREATE) },
                 SidebarEntry("video-drafts", "편집본", PackGlyph.DRAFTS, onVideo && state.activeVideoTab == VideoNavigationDestination.DRAFTS) { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) },
-                SidebarEntry("video-collections", "컬렉션", PackGlyph.COLLECTION, onVideo && state.activeVideoTab == VideoNavigationDestination.COLLECTIONS) { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
             ),
         )
         SidebarDivider()

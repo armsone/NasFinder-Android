@@ -3,6 +3,7 @@ package com.armsone.nasfinder.ui
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
@@ -157,7 +158,6 @@ private val materialGlyphs: Map<String, PackGlyph> = mapOf(
     "Filled.Home" to PackGlyph.HOME,
     "Filled.Folder" to PackGlyph.POCKET,
     "Filled.FolderOpen" to PackGlyph.POCKET,
-    "Filled.VisibilityOff" to PackGlyph.PRIVACY,
     "Filled.Dns" to PackGlyph.NAS,
     "Filled.PhotoLibrary" to PackGlyph.PHOTOS,
     "Filled.Photo" to PackGlyph.PHOTOS,
@@ -330,7 +330,6 @@ private val designGlyphs: Map<String, PackGlyph> = mapOf(
     "Filled.ViewList" to PackGlyph.LIST,
     "Filled.ViewModule" to PackGlyph.GRID,
     "Filled.Visibility" to PackGlyph.VISIBILITY,
-    "Filled.VisibilityOff" to PackGlyph.PRIVACY,
     "Filled.Warning" to PackGlyph.WARNING,
     "Filled.Wifi" to PackGlyph.WIFI,
     "Filled.WifiOff" to PackGlyph.WIFI_ERROR,
@@ -338,15 +337,77 @@ private val designGlyphs: Map<String, PackGlyph> = mapOf(
 )
 
 /**
- * App-wide icon standards. Every meaningful glyph (pack, Material fallback, brand, Google Photos, decorative badges and
- * status marks) renders at least [IconGlyphMin]; primary action toolbars use [ToolbarActionIcon]; anything tappable
- * offers at least [IconHitTarget]. The floor is applied ahead of the caller's modifier so legacy `.size(12..22.dp)` callers
- * are lifted to 24 instead of shrinking the glyph; containers that hold an icon must therefore be at least 24 themselves.
+ * App-wide icon standards. Meaningful action glyphs use [IconGlyphMin] by default (24dp); primary action
+ * toolbars use [ToolbarActionIcon] (28dp); interactive controls offer at least [IconHitTarget] (48dp).
  */
 val IconGlyphMin = 24.dp
 val ToolbarActionIcon = 28.dp
 val IconHitTarget = 48.dp
 private val IconFloor = Modifier.sizeIn(minWidth = IconGlyphMin, minHeight = IconGlyphMin)
+
+/** Central action glyphs rendered as flat single-colour vectors, keeping service/brand illustrations separate. */
+fun isActionGlyph(glyph: PackGlyph): Boolean = when (glyph) {
+    PackGlyph.BACK,
+    PackGlyph.CLOSE,
+    PackGlyph.PLAY,
+    PackGlyph.PAUSE,
+    PackGlyph.SHARE,
+    PackGlyph.SAVE,
+    PackGlyph.UNDO,
+    PackGlyph.REDO,
+    PackGlyph.CHECK,
+    PackGlyph.TRASH,
+    PackGlyph.COPY,
+    PackGlyph.MOVE,
+    PackGlyph.MORE,
+    PackGlyph.SEARCH,
+    PackGlyph.SEARCH_FILE,
+    PackGlyph.FULLSCREEN,
+    PackGlyph.FULLSCREEN_EXIT,
+    PackGlyph.FORWARD,
+    PackGlyph.PREVIOUS,
+    PackGlyph.NEXT,
+    PackGlyph.STOP,
+    PackGlyph.REFRESH,
+    PackGlyph.ADD,
+    PackGlyph.EDIT,
+    PackGlyph.SELECT_ALL,
+    PackGlyph.DESELECT_ALL,
+    PackGlyph.EXPAND_DOWN,
+    PackGlyph.COLLAPSE_UP,
+    PackGlyph.EXPAND_COLLAPSE,
+    PackGlyph.PASTE,
+    PackGlyph.PIN,
+    PackGlyph.SHUFFLE,
+    PackGlyph.REPEAT,
+    PackGlyph.REPEAT_ONE,
+    PackGlyph.MUTE,
+    PackGlyph.VOLUME,
+    PackGlyph.SORT,
+    PackGlyph.GRID,
+    PackGlyph.LIST,
+    PackGlyph.DOWNLOAD,
+    PackGlyph.UPLOAD,
+    PackGlyph.EXPORT,
+    PackGlyph.IMPORT,
+    PackGlyph.DUPLICATE,
+    PackGlyph.SLIDERS,
+    PackGlyph.SELECTED,
+    PackGlyph.UNSELECTED,
+    PackGlyph.SEND,
+    PackGlyph.RECEIVE,
+    PackGlyph.ARROW_LEFT,
+    PackGlyph.ARROW_RIGHT,
+    PackGlyph.BROWSER_BACK,
+    PackGlyph.MENU,
+    PackGlyph.VISIBILITY,
+    PackGlyph.COMPRESS,
+    PackGlyph.FILE_ADD,
+    PackGlyph.FOLDER_ADD,
+    PackGlyph.FOLDER_UPLOAD,
+    PackGlyph.UNFAVORITE -> true
+    else -> false
+}
 
 private fun canonicalName(glyph: PackGlyph): String = if (glyph == PackGlyph.SAVE) "workbench" else glyph.name.lowercase()
 
@@ -401,9 +462,9 @@ fun NasFinderBrandMark(modifier: Modifier = Modifier) {
 }
 
 /**
- * Draws one glyph of the selected interface icon pack. Dimension and realistic packs are baked bitmaps and always render
- * their original artwork (never tinted). Simple uses only white or black according to its background theme.
- * Solid retains its existing content-colour treatment.
+ * Draws one glyph of the selected interface icon pack. Functional action glyphs (play, back, check, etc.)
+ * render as clean, flat single-colour vectors from SIMPLE or Material with explicit tint contrast (including
+ * pure white on video players), while branded service and destination icons preserve the pack's artwork.
  */
 @Composable
 fun PackIcon(
@@ -413,16 +474,23 @@ fun PackIcon(
     tint: Color = Color.Unspecified,
     pack: InterfaceIconPack = LocalInterfaceIconPack.current,
 ) {
-    val completePackDrawable = designDrawable(pack, glyph)
+    val isAction = isActionGlyph(glyph)
+    val effectivePack = if (isAction) InterfaceIconPack.SIMPLE else pack
+    val completePackDrawable = designDrawable(effectivePack, glyph)
     val semanticsModifier = if (contentDescription != null) Modifier.semantics { this.contentDescription = contentDescription } else Modifier
-    val sized = IconFloor.then(modifier).then(Modifier.size(24.dp)).then(semanticsModifier)
+    // Caller modifier comes first so explicit caller sizes take precedence over the 24dp default; un-sized callers default to 24dp.
+    val sized = modifier.then(Modifier.size(24.dp)).then(semanticsModifier)
     if (glyph == PackGlyph.BRAND && completePackDrawable == 0) {
         NasFinderBrandMark(sized)
         return
     }
-    val effective = if (pack == InterfaceIconPack.SIMPLE) {
-        if (LocalThemePalette.current.isDark) Color.White else Color.Black
-    } else if (tint == Color.Unspecified) LocalContentColor.current else tint
+    val effective = if (tint != Color.Unspecified) {
+        tint
+    } else {
+        val content = LocalContentColor.current
+        if (content != Color.Unspecified) content
+        else if (LocalThemePalette.current.isDark) Color.White else Color.Black
+    }
     val legacyGlyph = when (glyph) {
         PackGlyph.BRAND -> PackGlyph.HOME
         PackGlyph.CONNECTIONS -> PackGlyph.TRANSFER
@@ -433,11 +501,13 @@ fun PackIcon(
         PackGlyph.FOLDER -> PackGlyph.PHONEHARD
         else -> glyph
     }
-    val legacyDrawable = if (completePackDrawable != 0) 0 else packDrawable(pack, legacyGlyph)
+    val legacyDrawable = if (completePackDrawable != 0) 0 else packDrawable(effectivePack, legacyGlyph)
     val solidFallback = if (completePackDrawable == 0 && legacyDrawable == 0) solidFallbackDrawable(glyph) else 0
-    val painter = painterResource(if (completePackDrawable != 0) completePackDrawable else if (legacyDrawable != 0) legacyDrawable else solidFallback)
-    val bitmapPack = pack == InterfaceIconPack.DIMENSION || pack == InterfaceIconPack.REALISTIC
-    val keep = bitmapPack || (solidFallback == 0 && pack != InterfaceIconPack.SIMPLE && !LocalThemePalette.current.isDark && keepsPackColours(effective))
+    val resId = if (completePackDrawable != 0) completePackDrawable else if (legacyDrawable != 0) legacyDrawable else solidFallback
+    if (resId == 0) return
+    val painter = painterResource(resId)
+    val bitmapPack = !isAction && (pack == InterfaceIconPack.DIMENSION || pack == InterfaceIconPack.REALISTIC)
+    val keep = bitmapPack || (solidFallback == 0 && !isAction && pack != InterfaceIconPack.SIMPLE && !LocalThemePalette.current.isDark && keepsPackColours(effective))
     val finalSized = sized.then(if (bitmapPack && tint != Color.Unspecified) Modifier.alpha(tint.alpha) else Modifier)
     if (keep) Image(painter, null, finalSized, contentScale = ContentScale.Fit)
     else Image(painter, null, finalSized, contentScale = ContentScale.Fit, colorFilter = ColorFilter.tint(effective))
@@ -452,14 +522,13 @@ fun Icon(
     tint: Color = Color.Unspecified,
     design: PackGlyph? = null,
 ) {
-    // Complete packs cover disabled/decorative glyphs too; alpha preserves their state. Legacy packs keep their existing mapping.
     val fullPack = designDrawable(LocalInterfaceIconPack.current, PackGlyph.HOME) != 0
     val glyph = if (fullPack) design ?: designGlyphs[imageVector.name] ?: materialGlyphs[imageVector.name]
                 else materialGlyphs[imageVector.name]?.takeIf { tint == Color.Unspecified || tint.alpha >= .9f }
     if (glyph != null && (fullPack || (glyph != PackGlyph.POCKET && glyph != PackGlyph.PRIVACY))) {
         PackIcon(glyph, contentDescription, modifier, tint)
     } else {
-        MaterialIcon(imageVector, contentDescription, IconFloor.then(modifier), if (tint == Color.Unspecified) LocalContentColor.current else tint)
+        MaterialIcon(imageVector, contentDescription, modifier.then(Modifier.size(24.dp)), if (tint == Color.Unspecified) LocalContentColor.current else tint)
     }
 }
 

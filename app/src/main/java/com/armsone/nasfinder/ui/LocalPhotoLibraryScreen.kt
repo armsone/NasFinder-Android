@@ -497,13 +497,6 @@ internal fun LocalPhotoLibraryScreen(
                                                     }
                                                 },
                                             )
-                                            DropdownMenuItem(
-                                                text = { Text("컬렉션에 추가") },
-                                                onClick = {
-                                                    showSecondaryMenu = false
-                                                    model.stageCollectionImport(selectedUris().map { it to null })
-                                                },
-                                            )
                                         }
                                     }
                                 } else {
@@ -518,10 +511,6 @@ internal fun LocalPhotoLibraryScreen(
                                         if (uris.isNotEmpty()) {
                                             model.requestWorkbenchAddLocal(uris, deviceItems)
                                         }
-                                    }
-                                    LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier, isSecondary = true) {
-                                        // Opens the 사본/참조 confirmation; the selection itself is kept either way.
-                                        model.stageCollectionImport(selectedUris().map { it to null })
                                     }
                                 }
                                 LocalMediaActionButton("영상 만들기", actionsEnabled, Modifier, isSecondary = false) {
@@ -719,9 +708,6 @@ internal fun LocalPhotoLibraryScreen(
                                 if (uris.isNotEmpty()) {
                                     model.requestWorkbenchAddLocal(uris, deviceItems)
                                 }
-                            }
-                            LocalMediaActionButton("컬렉션에 추가", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
-                                model.stageCollectionImport(selectedUris().map { it to null })
                             }
                             if (onCopyToPhoneHard != null) {
                                 LocalMediaActionButton("폰하드 복사", actionsEnabled, Modifier.fillMaxWidth(), isSecondary = true) {
