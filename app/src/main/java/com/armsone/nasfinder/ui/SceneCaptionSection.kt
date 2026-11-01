@@ -588,7 +588,9 @@ internal fun sceneCaptionColumns(
                 label = { Text("자막 내용") },
                 placeholder = { Text("여러 줄로 입력할 수 있습니다") },
                 minLines = 2,
-                maxLines = 4,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(
+                    lineHeight = MaterialTheme.typography.bodyLarge.lineHeight * form.lineSpacing,
+                ),
                 supportingText = captionSupportingText,
                 modifier = Modifier.fillMaxWidth(),
             )
