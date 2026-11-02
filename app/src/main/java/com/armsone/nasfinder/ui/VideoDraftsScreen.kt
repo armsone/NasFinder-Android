@@ -248,7 +248,7 @@ internal fun VideoDraftsScreen(
             AlertDialog(
                 onDismissRequest = { draftToDelete = null },
                 title = { Text("이 편집본을 지울까요?") },
-                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어, 컬렉션에 보관된 영상은 지워지지 않습니다.") },
+                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어와 폰하드에 저장한 영상은 지워지지 않습니다.") },
                 confirmButton = {
                     TextButton(onClick = {
                         model.discardTrailerDraft(draft)

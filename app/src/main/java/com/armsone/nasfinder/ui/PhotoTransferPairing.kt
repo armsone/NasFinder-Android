@@ -441,8 +441,8 @@ internal class PhotoPairingReceiver : Closeable {
 
 /**
  * Items a `ready` receipt tells the sender not to send again on this transferId: committed with inputs equal to the plan,
- * or failed because the receiver's earlier output is missing/modified/unverifiable (outmissing/outmodified/outunverified).
- * The latter are never resent here: a new copy only goes out through the user's explicit "새로 보내기" (new transferId).
+ * or failed because the receiver's earlier output is missing/modified/unverifiable (outmissing/outmodified/outunverified)
+ * or its earlier save could not be settled (conflict). The latter are never resent here: a new copy only goes out through the user's explicit "새로 보내기" (new transferId).
  */
 internal fun itemsNotToResend(ready: List<PhotoTransferReceiptItem>, plannedInputs: (String) -> Map<Int, String>?): Set<String> =
     ready.filter {
@@ -539,9 +539,7 @@ internal class PhotoTransferSenderSession(
                     receiverId = ready.first().receiverId
                     check(ready.all { it.receiverId == receiverId }) { "수신 기기 식별자가 일치하지 않습니다." }
                     // A retry of the same transfer must reach the same receiving app installation.
-                    check(expectedReceiverId == null || expectedReceiverId == receiverId) {
-                        "처음 보낸 기기와 다른 기기입니다. 같은 기기에서 새 QR 코드로 다시 연결하세요."
-                    }
+                    if (expectedReceiverId != null && expectedReceiverId != receiverId) throw PhotoTransferReceiverMismatchException()
                     checkReceiptItems(ready, plans.keys)
                     // Items the receiver reports as failed because its earlier output cannot be confirmed are not resent on
                     // the same transfer: a new copy is only sent by the user's explicit "새로 보내기" under a new transferId.
@@ -738,6 +736,10 @@ internal const val TAINTED_QR_MESSAGE =
 
 /** The QR secret is (or must be treated as) exposed; only a freshly generated QR can be used. Never auto-downgrades. */
 internal class PhotoTransferTaintedTokenException : IllegalStateException(TAINTED_QR_MESSAGE)
+
+/** An authenticated `ready` came from another receiving app than this transfer's. No item bytes were sent; only the user's explicit new transfer gets past it. */
+internal class PhotoTransferReceiverMismatchException :
+    IllegalStateException("처음 보낸 기기와 다른 기기입니다. 같은 기기에서 새 QR 코드로 다시 연결하거나, 이 기기로 받으려면 새 전송으로 보내세요.")
 
 /** Challenge/proof or receipt authentication failed after the peer spoke v4: not "unsupported", never downgraded. */
 internal class PhotoTransferPeerAuthException(message: String) : IllegalStateException(message)

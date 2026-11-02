@@ -1,6 +1,7 @@
 package com.armsone.nasfinder.platform
 
 import android.content.Context
+import com.armsone.nasfinder.data.CloudTransportCredential
 import com.armsone.nasfinder.data.ConnectionRepository
 import com.armsone.nasfinder.data.OAuthClientConfigurationStore
 import com.armsone.nasfinder.data.OAuthSessionStore
@@ -8,7 +9,13 @@ import com.armsone.nasfinder.data.OAuthTokenStore
 import com.armsone.nasfinder.model.CloudOAuthProvider
 import com.armsone.nasfinder.model.OAuthSecurityPolicy
 import com.armsone.nasfinder.model.OAuthTokenSet
+import com.armsone.nasfinder.model.RemoteConnection
+import com.armsone.nasfinder.network.CloudAccessTokenSource
+import com.armsone.nasfinder.network.RemoteServiceException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -20,6 +27,9 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+
+/** 토큰 서버가 요청 자체를 거부했다(만료·폐기된 갱신 토큰 등). 재시도가 아니라 다시 로그인이 필요하다. */
+class OAuthTokenRejectedException : IOException("OAuth token 요청을 완료하지 못했습니다.")
 
 class OAuthTokenEndpointClient(
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -83,6 +93,7 @@ class OAuthTokenEndpointClient(
             .post(form)
             .build()
         client.newCall(request).execute().use { response ->
+            if (response.code == 400 || response.code == 401) throw OAuthTokenRejectedException()
             if (!response.isSuccessful) throw IOException("OAuth token 요청을 완료하지 못했습니다.")
             val body = response.body ?: throw IOException("OAuth token 응답이 비어 있습니다.")
             val length = body.contentLength()
@@ -170,7 +181,7 @@ class OAuthCoordinator(context: Context) {
     }
 }
 
-class OAuthAccessTokenProvider(context: Context) {
+class OAuthAccessTokenProvider(context: Context) : CloudAccessTokenSource {
     private val clients = OAuthClientConfigurationStore(context.applicationContext)
     private val tokens = OAuthTokenStore(context.applicationContext)
     private val endpointClient = OAuthTokenEndpointClient()
@@ -182,7 +193,7 @@ class OAuthAccessTokenProvider(context: Context) {
         nowMillis: Long = System.currentTimeMillis(),
         persistRefresh: Boolean = true,
     ): String? = refreshLock.withLock {
-        val current = tokens.read(connectionId)?.takeIf { it.provider == provider } ?: return@withLock null
+        val current = automaticTokens(connectionId)?.takeIf { it.provider == provider } ?: return@withLock null
         current.usableAccessToken(nowMillis)?.let { return@withLock it }
         val refreshToken = current.refreshToken ?: return@withLock null
         val clientId = clients.clientId(provider) ?: return@withLock null
@@ -192,11 +203,78 @@ class OAuthAccessTokenProvider(context: Context) {
         if (clients.clientId(provider) != clientId) return@withLock null
         if (persistRefresh) {
             if (!tokens.saveIfUnchanged(connectionId, current, refreshed)) return@withLock null
-        } else if (tokens.read(connectionId) != current) {
+        } else if (automaticTokens(connectionId) != current) {
             return@withLock null
         }
         refreshed.accessToken
     }
 
-    private companion object { val refreshLock = Mutex() }
+    private fun automaticTokens(connectionId: String): OAuthTokenSet? =
+        (tokens.transportCredential(connectionId) as? CloudTransportCredential.Automatic)?.tokens
+
+    /**
+     * 일반 전송 경로: 수동 토큰 연결은 지금 저장된 수동 토큰을, 자동 OAuth 연결은 유효하거나 갱신한 토큰을 돌려준다.
+     * 자동 연결을 갱신할 수 없으면 수동 키에 함께 저장된 만료 토큰으로 넘어가지 않고 실패시킨다.
+     */
+    override suspend fun currentAccessToken(connection: RemoteConnection): String? {
+        currentCoroutineContext().ensureActive()
+        val provider = CloudOAuthProvider.from(connection.kind) ?: return null
+        when (val credential = tokens.transportCredential(connection.id)) {
+            is CloudTransportCredential.Manual -> return credential.token
+            CloudTransportCredential.Unreadable -> throw loginRequired()
+            is CloudTransportCredential.Automatic -> {
+                if (credential.tokens.provider != provider) throw loginRequired()
+                credential.tokens.usableAccessToken(System.currentTimeMillis())?.let { return it }
+            }
+        }
+        return refreshedTransportToken(connection.id, provider)
+    }
+
+    private suspend fun refreshedTransportToken(connectionId: String, provider: CloudOAuthProvider): String? =
+        refreshLock.withLock {
+            // 락을 기다리거나 조건부 저장에 실패한 사이 값이 바뀌었을 수 있으므로 매번 저장된 값을 다시 읽는다.
+            repeat(MAX_TRANSPORT_REFRESH_ATTEMPTS) {
+                val current = when (val credential = tokens.transportCredential(connectionId)) {
+                    is CloudTransportCredential.Manual -> return@withLock credential.token
+                    CloudTransportCredential.Unreadable -> throw loginRequired()
+                    is CloudTransportCredential.Automatic -> credential.tokens
+                }
+                if (current.provider != provider) throw loginRequired()
+                val nowMillis = System.currentTimeMillis()
+                current.usableAccessToken(nowMillis)?.let { return@withLock it }
+                val refreshToken = current.refreshToken ?: throw loginRequired()
+                val clientId = clients.clientId(provider) ?: throw loginRequired()
+                // 서버가 갱신 토큰을 바꿔 줬다면 호출자가 취소되어도 결과를 저장해야 다음 갱신이 실패하지 않는다.
+                // 취소는 이 구간이 끝난 직후(토큰 요청 제한 시간 이내)에 반영된다.
+                val saved = withContext(NonCancellable) {
+                    val refreshed = try {
+                        endpointClient.refresh(provider, clientId, refreshToken, refreshToken, nowMillis)
+                    } catch (_: OAuthTokenRejectedException) {
+                        throw loginRequired()
+                    } catch (error: IOException) {
+                        throw RemoteServiceException.Connection("클라우드 로그인을 갱신하지 못했습니다.", error)
+                    } catch (_: IllegalArgumentException) {
+                        throw loginRequired()
+                    }
+                    val merged = if (refreshed.scope == null && current.scope != null) {
+                        refreshed.copy(scope = current.scope)
+                    } else {
+                        refreshed
+                    }
+                    if (clients.clientId(provider) != clientId) throw loginRequired()
+                    merged.accessToken.takeIf { tokens.saveIfUnchanged(connectionId, current, merged) }
+                }
+                currentCoroutineContext().ensureActive()
+                saved?.let { return@withLock it }
+            }
+            throw loginRequired()
+        }
+
+    private fun loginRequired() =
+        RemoteServiceException.Authentication("클라우드 로그인이 만료되었습니다. 다시 로그인해 주세요.")
+
+    private companion object {
+        val refreshLock = Mutex()
+        const val MAX_TRANSPORT_REFRESH_ATTEMPTS = 2
+    }
 }

@@ -20,6 +20,11 @@ import java.io.File
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.Base64
+import java.util.UUID
+
+private const val HARDLINK_EXTENSION = "hardlink@openssh.com"
+private const val POSIX_RENAME_EXTENSION = "posix-rename@openssh.com"
+private const val MAX_UPLOAD_PUBLISH_ATTEMPTS = 5
 
 /** Information needed to approve a first SFTP host key or investigate a change. */
 class SftpHostKeyTrustRequired(
@@ -138,17 +143,77 @@ class SftpFileService(
         val safeParent = normalizeInsideRoot(parent)
         requireDirectoryInsideRoot(channel, safeParent)
         validateName(source.name)
-        val finalName = keepBothName(source.name, childNames(channel, safeParent))
-        val destination = appendName(safeParent, finalName)
+        val expectedSize = source.length()
+        // JSch의 put은 배타적 생성을 열지 못하므로, 취소나 실패가 최종 이름에 흔적을 남기지 않도록 이번 업로드 전용 이름에 먼저 쓴다.
+        val staged = appendName(safeParent, ".nasfinder-upload-${UUID.randomUUID()}.tmp")
+        if (entryExists(channel, staged)) {
+            throw RemoteServiceException.Server("업로드 임시 파일 이름이 이미 사용 중입니다.")
+        }
         val job = currentCoroutineContext()[Job]
         val monitor = CancellationProgressMonitor(job)
-        source.inputStream().buffered().use { input ->
-            channel.put(input, destination, monitor, ChannelSftp.OVERWRITE)
+        try {
+            source.inputStream().buffered().use { input ->
+                channel.put(input, staged, monitor, ChannelSftp.OVERWRITE)
+            }
+            currentCoroutineContext().ensureActive()
+            if (channel.lstat(staged).size != expectedSize || source.length() != expectedSize) {
+                throw RemoteServiceException.Server("업로드한 파일 크기를 확인할 수 없습니다.")
+            }
+            val published = publishStagedUpload(channel, staged, safeParent, source.name)
+            // 게시된 이름은 이미 사용자에게 보이는 파일일 수 있으므로 검증에 실패해도 지우지 않는다.
+            if (channel.lstat(published).size != expectedSize) {
+                throw RemoteServiceException.Server("업로드한 파일 크기를 확인할 수 없습니다. 서버에 올라간 파일을 확인해 주세요.")
+            }
+        } finally {
+            // 지우는 대상은 위에서 없음을 확인하고 만든 임시 이름뿐이다. 연결이 끊겼으면 숨김 임시 파일이 서버에 남을 수 있다.
+            runCatching { channel.rm(staged) }
         }
-        currentCoroutineContext().ensureActive()
-        if (channel.lstat(destination).size != source.length()) {
-            runCatching { channel.rm(destination) }
-            throw RemoteServiceException.Server("업로드한 파일 크기를 확인할 수 없습니다.")
+        Unit
+    }
+
+    /** Publishes [staged] under a keep-both name, re-listing when another writer takes the chosen name first. */
+    private suspend fun publishStagedUpload(
+        channel: ChannelSftp,
+        staged: String,
+        parent: String,
+        originalName: String,
+    ): String {
+        val collisions = mutableSetOf<String>()
+        repeat(MAX_UPLOAD_PUBLISH_ATTEMPTS) {
+            currentCoroutineContext().ensureActive()
+            val finalName = keepBothName(originalName, childNames(channel, parent) + collisions)
+            val target = appendName(parent, finalName)
+            if (publishWithoutReplacing(channel, staged, target)) return target
+            collisions += finalName
+        }
+        throw RemoteServiceException.Server("같은 이름의 파일이 계속 생겨 업로드를 완료하지 못했습니다.")
+    }
+
+    /**
+     * Returns false when [target] is taken. Hard links never replace an existing name. A plain v3
+     * rename must fail on an existing name too, but a server advertising posix-rename may replace
+     * it, so that combination fails closed instead of falling back to rename.
+     */
+    private fun publishWithoutReplacing(channel: ChannelSftp, staged: String, target: String): Boolean {
+        if (channel.getExtension(HARDLINK_EXTENSION) != null) {
+            try {
+                channel.hardlink(staged, target)
+                return true
+            } catch (_: SftpException) {
+                if (entryExists(channel, target)) return false
+            }
+        }
+        if (channel.getExtension(POSIX_RENAME_EXTENSION) != null) {
+            throw RemoteServiceException.Unsupported(
+                "이 SFTP 서버에서는 같은 이름의 파일을 덮어쓰지 않고 업로드를 마칠 수 없습니다. 기존 파일은 변경되지 않았습니다.",
+            )
+        }
+        if (entryExists(channel, target)) return false
+        return try {
+            channel.rename(staged, target)
+            true
+        } catch (error: SftpException) {
+            if (entryExists(channel, target)) false else throw error
         }
     }
 

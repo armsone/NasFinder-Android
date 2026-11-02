@@ -34,6 +34,7 @@ import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFavorite
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.model.sortedWith
+import com.armsone.nasfinder.data.ConnectionStoreReadException
 import com.armsone.nasfinder.data.DownloadCache
 import com.armsone.nasfinder.data.FavoriteItemResolver
 import com.armsone.nasfinder.data.PrivacyMode
@@ -59,6 +60,7 @@ import com.armsone.nasfinder.platform.InboxUploadOutcome
 import com.armsone.nasfinder.platform.AppIconChangeResult
 import com.armsone.nasfinder.platform.LauncherIconVariant
 import com.armsone.nasfinder.platform.OAuthCallbackActivity
+import com.armsone.nasfinder.platform.OAuthAccessTokenProvider
 import com.armsone.nasfinder.platform.OAuthCoordinator
 import com.armsone.nasfinder.googlephotos.GooglePhotosAccountController
 import com.armsone.nasfinder.googlephotos.GooglePhotosContentDownloader
@@ -68,7 +70,10 @@ import com.armsone.nasfinder.googlephotos.GooglePhotosPickerFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -91,6 +96,9 @@ data class AppState(
     val connections: List<RemoteConnection> = emptyList(),
     val preferredId: String? = null,
     val screen: Screen = Screen.Dashboard,
+    val mediaTransferActive: Boolean = false,
+    val mediaTransferFailure: Boolean = false,
+    val mediaTransferOriginPrivate: Boolean = false,
     val theme: AppTheme = AppTheme.SYSTEM,
     val iconPack: InterfaceIconPack = InterfaceIconPack.REALISTIC,
     val launcherIcon: LauncherIconVariant = LauncherIconVariant.DEFAULT,
@@ -157,6 +165,8 @@ data class AppState(
     val mediaPickDelivery: MediaPickDelivery? = null,
     val folderCountCache: Map<String, FolderChildCountState> = emptyMap(),
     val folderCountGeneration: Long = 0L,
+    val folderActionSize: FolderActionSizeState? = null,
+    val folderActionTargetKey: String? = null,
     val trailerDraftCount: Int = 0,
     val trailerDraftPicker: List<TrailerDraft>? = null,
     val trailerDraftStaleNotice: String? = null,
@@ -189,6 +199,10 @@ data class AppState(
     val deferredShareIds: Set<String> = emptySet(),
     // Shares being copied right now (the share arrived, copies are not finished yet).
     val shareIntakeInProgress: Int = 0,
+    // RAM only: tablet left sidebar expanded (true) or collapsed to the 72dp rail; survives root/child route changes.
+    val sidebarExpanded: Boolean = true,
+    // RAM only: width (dp) the user dragged the expanded sidebar to; null = measured natural width. Clamped when drawn, never rewritten by window changes.
+    val sidebarWidthDp: Float? = null,
 )
 
 enum class MainNavigationDestination {
@@ -197,7 +211,8 @@ enum class MainNavigationDestination {
     WORKBENCH,
     FINDER,
     VIDEO,
-    TOOLS
+    TOOLS,
+    SETTINGS
 }
 
 enum class VideoNavigationDestination {
@@ -258,6 +273,12 @@ sealed interface FolderChildCountState {
     data object Loading : FolderChildCountState
     data class Ready(val folderCount: Int, val fileCount: Int) : FolderChildCountState
     data object Error : FolderChildCountState
+}
+
+sealed interface FolderActionSizeState {
+    data object Loading : FolderActionSizeState
+    data class Ready(val totalBytes: Long, val folderCount: Int, val fileCount: Int) : FolderActionSizeState
+    data object Error : FolderActionSizeState
 }
 
 enum class GooglePhotosPhase { IDLE, AUTHORIZING, PREPARING, WAITING_FOR_SELECTION, IMPORTING, FINISHED, CANCELLED, ERROR }
@@ -539,6 +560,9 @@ sealed interface Screen {
     data object VideoCollections : Screen
 }
 
+/** Status of an editor export while its draft is being saved, before the renderer starts. */
+internal const val EDITOR_EXPORT_SAVING_STATUS = "편집본을 저장하는 중…"
+
 class NasFinderViewModel(private val application: NasFinderApplication) : ViewModel() {
     private val repository = application.connections
     private val favoriteRepository = application.favorites
@@ -570,10 +594,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val folderCountSemaphore = kotlinx.coroutines.sync.Semaphore(2)
     private var folderCountGeneration = 0L
     private val folderCountRequests = mutableSetOf<String>()
+    private var folderActionSizeJob: Job? = null
+    private var folderActionSizeGeneration = 0L
     private var connectionOpenJob: Job? = null
     private val dropboxAccountRequests = mutableSetOf<String>()
     private var googlePhotosJob: Job? = null
     private val googlePhotosAccount = GooglePhotosAccountController(application)
+    private val cloudAccessTokens = OAuthAccessTokenProvider(application)
     private var thumbnailTrafficObservation: Job? = null
     private var superThumbnailObservation: Job? = null
     private var superThumbnailStartJob: Job? = null
@@ -586,6 +613,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val _state = MutableStateFlow(
         AppState(
             connections = repository.load(),
+            message = ConnectionStoreReadException().message.takeIf { repository.isStoreUnreadable() },
             preferredId = repository.preferredId(),
             theme = settingsRepository.theme(),
             iconPack = settingsRepository.iconPack(),
@@ -647,6 +675,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         migrateEphemeralProjectData()
         runCatching(::cleanupOrphanedWebDownloads)
         refreshDownloadCacheSize()
+        downloadCache.guardAutomaticTrim { protectedWork(_state.value, includeBusy = true) }
+        viewModelScope.launch {
+            // resolve skips cleanup during protected work, so run the deferred cleanup once the app has stayed idle.
+            _state.map { protectedWork(it, includeBusy = true) }
+                .distinctUntilChanged()
+                .collectLatest { isProtected ->
+                    if (isProtected) return@collectLatest
+                    kotlinx.coroutines.delay(DOWNLOAD_CACHE_IDLE_TRIM_DELAY_MILLIS)
+                    downloadCache.trimIfIdle()
+                }
+        }
         refreshThumbnailCacheStatistics()
         thumbnailTrafficObservation = viewModelScope.launch {
             thumbnailRepository.trafficSnapshot.collect { snapshot ->
@@ -676,7 +715,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     workPath,
                     superThumbnailPreferences.getString(KEY_SUPER_THUMBNAIL_WORK_TITLE, null)
                         ?.takeIf(String::isNotBlank)
-                        ?: pathTitle(workPath, "Super Thumbnail"),
+                        ?: pathTitle(workPath, "수퍼 썸네일"),
                 )
                 it.copy(
                     superThumbnailWorkLocation = legacy,
@@ -687,12 +726,50 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun show(screen: Screen) {
+        val section = when (screen) {
+            Screen.Settings -> MainNavigationDestination.SETTINGS
+            Screen.PhotoSelection,
+            Screen.PhotoTransfer,
+            Screen.SuperThumbnail,
+            Screen.SuperThumbnailFolderPicker,
+            Screen.SuperThumbnailProgress,
+            Screen.SuperThumbnailReport,
+            Screen.ThumbnailCache -> MainNavigationDestination.TOOLS
+            Screen.MaterialBasket,
+            Screen.VideoDrafts -> MainNavigationDestination.VIDEO
+            is Screen.LocalPhotoLibrary -> if (screen.initialIntent == LocalMediaEditIntent.TRAILER ||
+                screen.initialIntent == LocalMediaEditIntent.MUSIC
+            ) {
+                MainNavigationDestination.VIDEO
+            } else {
+                MainNavigationDestination.FINDER
+            }
+            is Screen.Browser,
+            is Screen.AddConnection,
+            Screen.Favorites,
+            Screen.Inbox,
+            Screen.WebHard,
+            Screen.WebBrowser,
+            Screen.GooglePhotos -> MainNavigationDestination.FINDER
+            else -> _state.value.activeMainTab
+        }
+        if (screen == Screen.Settings) {
+            selectMainDestination(MainNavigationDestination.SETTINGS)
+            return
+        }
         // Old route: the standalone 영상 재료 screen is the 작업대 now.
         if (screen == Screen.MaterialBasket) {
             selectMainDestination(MainNavigationDestination.WORKBENCH)
             return
         }
+        // 컬렉션 기능은 없어졌다: 예전 경로는 폰하드로 열고, 폰하드를 열 때마다 아직 옮기지 못한 예전 컬렉션 영상을 다시 복사한다.
+        if (screen == Screen.VideoCollections) {
+            show(Screen.Inbox)
+            return
+        }
+        if (screen == Screen.Inbox) migrateLegacyCollectionsToPhoneHard()
         stopInlineAudio()
+        clearFolderActionSize()
         invalidateImagePreviewRequests()
         if (screen == Screen.Dashboard) {
             if (_state.value.screen != Screen.Dashboard) {
@@ -721,10 +798,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
         if (screen !is Screen.Browser && _state.value.mediaPick != null) {
             mediaPickJob?.cancel(); mediaPickJob = null
-            _state.update { it.copy(screen = screen, message = null, mediaPick = null, mediaPickStaging = null, browserSelectRequest = null) }
+            _state.update { it.copy(screen = screen, activeMainTab = section, message = null, mediaPick = null, mediaPickStaging = null, browserSelectRequest = null) }
             return
         }
-        _state.update { it.copy(screen = screen, message = null, browserSelectRequest = null) }
+        _state.update { it.copy(screen = screen, activeMainTab = section, message = null, browserSelectRequest = null) }
+    }
+
+    /** RAM only: remembers the dragged expanded-sidebar width (dp) across root switches/collapse; null returns to the measured natural width. */
+    fun setSidebarWidthDp(widthDp: Float?) {
+        _state.update { if (it.sidebarWidthDp == widthDp) it else it.copy(sidebarWidthDp = widthDp) }
     }
 
     private var mediaPickJob: Job? = null
@@ -751,7 +833,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val favoriteService = try {
                 withContext(Dispatchers.IO) {
                     val credential = repository.credentials.read(connection.id).orEmpty()
-                    RemoteFileServiceFactory.create(connection, credential)
+                    RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens)
                 }
             } catch (cancelled: CancellationException) {
                 _state.update { it.copy(mediaPickStaging = null) }; throw cancelled
@@ -879,7 +961,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             try {
                 val (favoriteService, items) = withContext(Dispatchers.IO) {
                     val credential = repository.credentials.read(connection.id).orEmpty()
-                    val created = RemoteFileServiceFactory.create(connection, credential)
+                    val created = RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens)
                     created to favorites.mapNotNull { favorite ->
                         runCatching { FavoriteItemResolver.resolve(favorite, connection, created) }.getOrNull()
                             ?.takeIf { !it.isDirectory && (it.isVideo || it.isImage) }
@@ -914,18 +996,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun setBrowserSystemPickerOpen(open: Boolean) { browserSystemPickerOpen = open }
 
     fun returnToDashboardAfterBackground() {
+        // 외부 파일 선택기를 이용 중일 때만 복귀를 보류한다.
+        if (browserSystemPickerOpen) return
+        setPrivacyMode(false)
         stopInlineAudio()
-        // System media pickers and editor interruptions must retain the shared selection.
-        // 사진 선별 and 사진·영상 전송 launch full-screen pickers/scanners and own staged state, so they stay open too.
-        if (_state.value.screen is Screen.LocalPhotoLibrary || _state.value.screen == Screen.PhotoSelection ||
-            _state.value.screen == Screen.PhotoTransfer || _state.value.trailer != null || _state.value.mediaPick != null ||
-            // 작업대도 시스템 파일·폴더 선택기를 연다. 다녀와도 고른 포켓과 선택을 유지한다.
-            (_state.value.screen == Screen.Dashboard && _state.value.activeMainTab == MainNavigationDestination.WORKBENCH) ||
-            // 휴대폰 폴더 선택기(OpenDocumentTree)를 열었거나 전송이 끝나지 않았으면 폰하드 화면과 선택을 유지한다.
-            stagedDeviceTransfer != null || phoneHardTransferJob?.isCompleted == false ||
-            // NAS 폴더에서 연 시스템 파일·폴더 선택기: 다녀온 뒤에도 그 폴더에서 업로드·다운로드를 이어 간다.
-            browserSystemPickerOpen
-        ) return
         connectionOpenJob?.cancel()
         connectionOpenJob = null
         thumbnailGeneration++
@@ -936,9 +1010,20 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 screen = Screen.Dashboard,
                 activeMainTab = MainNavigationDestination.HOME,
                 isBusy = false,
+                trailerMinimized = it.trailer != null || it.trailerMinimized,
             )
         }
     }
+    fun updateMediaTransferActivity(active: Boolean, failure: Boolean, originPrivate: Boolean) {
+        _state.update {
+            it.copy(
+                mediaTransferActive = active,
+                mediaTransferFailure = failure,
+                mediaTransferOriginPrivate = originPrivate,
+            )
+        }
+    }
+
     fun dismissMessage() { _state.update { it.copy(message = null) } }
     fun consumeNotice() { _state.update { it.copy(notice = null) } }
     fun showMessage(text: String) { _state.update { it.copy(message = text) } }
@@ -1164,13 +1249,29 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update { it.copy(browserFavorites = values, message = "즐겨찾기를 삭제했습니다.") }
     }
 
+    /** 저장된 연결 목록을 읽지 못한 상태면 원본을 덮어쓰지 않고 오류를 알린다. 저장했을 때만 true다. */
+    private fun saveConnectionsOrReport(connections: List<RemoteConnection>): Boolean = try {
+        repository.save(connections)
+        true
+    } catch (error: ConnectionStoreReadException) {
+        _state.update { it.copy(message = error.message) }
+        false
+    }
+
     fun saveConnection(connection: RemoteConnection, password: String) {
         val current = _state.value.connections.toMutableList()
         val index = current.indexOfFirst { it.id == connection.id }
         if (index >= 0) current[index] = connection else current += connection
-        repository.save(current)
-        if (password.isNotBlank()) repository.credentials.save(connection.id, password)
-        _state.update { it.copy(connections = current, screen = Screen.Dashboard) }
+        if (!saveConnectionsOrReport(current)) return
+        val credentialSaved = password.isBlank() ||
+            runCatching { repository.oauthTokens.saveManualCredential(connection.id, password) }.isSuccess
+        _state.update {
+            it.copy(
+                connections = current,
+                screen = if (credentialSaved) Screen.Dashboard else it.screen,
+                message = if (credentialSaved) it.message else "연결 정보는 저장했지만 로그인 정보를 저장하지 못했습니다. 다시 저장해 주세요.",
+            )
+        }
         refreshDropboxAccountLabels(connection)
         invalidateFavoriteThumbnails()
         if (_state.value.superThumbnailConnectionId == null) selectSuperThumbnailConnection(connection.id)
@@ -1182,7 +1283,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val remainingFavorites = _state.value.remoteFavorites.filterNot {
             it.connectionId == connection.id
         }
-        repository.save(remaining); repository.credentials.delete(connection.id)
+        if (!saveConnectionsOrReport(remaining)) return
+        repository.oauthTokens.delete(connection.id)
         favoriteRepository.saveRemote(remainingFavorites)
         favoriteRepository.removeFavoritesOf(connection.id)
         if (_state.value.preferredId == connection.id) repository.setPreferred(null)
@@ -1335,7 +1437,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     )
                 }
                 SuperThumbnailCacheResetStatus.BLOCKED_RUNNING_WORK -> _state.update {
-                    it.copy(isBusy = false, message = "실행 중인 Super Thumbnail 작업이 있어 초기화할 수 없습니다.")
+                    it.copy(isBusy = false, message = "실행 중인 수퍼 썸네일 작업이 있어 초기화할 수 없습니다.")
                 }
                 SuperThumbnailCacheResetStatus.BLOCKED_RESET_IN_PROGRESS -> _state.update {
                     it.copy(isBusy = false, message = "Super Cache를 이미 초기화하고 있습니다.")
@@ -1355,7 +1457,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         resumeExisting: Boolean = false,
     ) {
         val connectionId = _state.value.superThumbnailConnectionId ?: run {
-            _state.update { it.copy(message = "Super Thumbnail을 만들 연결을 선택해 주세요.") }
+            _state.update { it.copy(message = "수퍼 썸네일을 만들 연결을 선택해 주세요.") }
             return
         }
         val connection = _state.value.connections.firstOrNull { it.id == connectionId } ?: return
@@ -1418,7 +1520,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         _state.update {
                             it.copy(
                                 superThumbnailWork = emptySuperThumbnailSnapshot(SuperThumbnailWorkStatus.FAILED),
-                                message = "Super Thumbnail 작업을 시작하지 못했습니다.",
+                                message = "수퍼 썸네일 작업을 시작하지 못했습니다.",
                             )
                         }
                     }
@@ -1437,7 +1539,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(superThumbnailWork = emptySuperThumbnailSnapshot(SuperThumbnailWorkStatus.CANCELLED)) }
         }
         runCatching { SuperThumbnailWorkController.cancel(application, connectionId) }
-            .onFailure { _state.update { it.copy(message = "Super Thumbnail 작업을 취소하지 못했습니다.") } }
+            .onFailure { _state.update { it.copy(message = "수퍼 썸네일 작업을 취소하지 못했습니다.") } }
     }
 
     private fun emptySuperThumbnailSnapshot(status: SuperThumbnailWorkStatus) =
@@ -1463,7 +1565,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                 SuperThumbnailLocation(
                                     connectionId,
                                     path,
-                                    current.superThumbnailTitle ?: pathTitle(path, "Super Thumbnail"),
+                                    current.superThumbnailTitle ?: pathTitle(path, "수퍼 썸네일"),
                                 )
                             )
                         }
@@ -1568,7 +1670,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                                 connectionId,
                                 path,
                                 value.optString("title").takeIf(String::isNotBlank)
-                                    ?: pathTitle(path, "Super Thumbnail"),
+                                    ?: pathTitle(path, "수퍼 썸네일"),
                             )
                         )
                     }
@@ -1631,6 +1733,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     RemoteFileServiceFactory.create(
                         connection,
                         repository.credentials.read(connection.id).orEmpty(),
+                        cloudAccessTokens,
                     ).also {
                         candidate = it
                         if (generation == superThumbnailPickerGeneration) superThumbnailPickerService = it
@@ -1718,7 +1821,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val connectionId = state.superThumbnailConnectionId ?: return
         val path = state.superThumbnailPath ?: return
         refreshSuperThumbnailSessionReport(
-            SuperThumbnailLocation(connectionId, path, state.superThumbnailTitle ?: pathTitle(path, "Super Thumbnail"))
+            SuperThumbnailLocation(connectionId, path, state.superThumbnailTitle ?: pathTitle(path, "수퍼 썸네일"))
         )
     }
 
@@ -1840,7 +1943,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val from = values.indexOfFirst { it.id == connection.id }
         val to = (from + offset).coerceIn(0, values.lastIndex)
         if (from < 0 || from == to) return
-        values.add(to, values.removeAt(from)); repository.save(values)
+        values.add(to, values.removeAt(from))
+        if (!saveConnectionsOrReport(values)) return
         _state.update { it.copy(connections = values) }
     }
 
@@ -1874,7 +1978,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     } else {
                         credential
                     }
-                    RemoteFileServiceFactory.create(connection, requestCredential).use { it.testConnection() }
+                    // 입력한 토큰은 저장 전에 그 값 그대로 시험한다. 입력이 없을 때만 저장된 로그인을 따른다.
+                    RemoteFileServiceFactory.create(
+                        connection,
+                        requestCredential,
+                        cloudAccessTokens.takeIf { password.isBlank() },
+                    ).use { it.testConnection() }
                 }
             }
             result.onSuccess {
@@ -1936,6 +2045,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     oauthPendingConnectionId = null,
                     message = when (error) {
                         is ActivityNotFoundException -> "로그인 브라우저를 열 수 없습니다. 브라우저 앱을 확인해 주세요."
+                        is ConnectionStoreReadException -> error.message
                         else -> "OAuth 로그인을 시작하지 못했습니다. client ID와 연결 이름을 확인해 주세요."
                     },
                 )
@@ -1953,12 +2063,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     fun deleteOAuthToken(connection: RemoteConnection) {
-        repository.oauthTokens.delete(connection.id)
+        val deleted = repository.oauthTokens.delete(connection.id)
         _state.update {
             it.copy(
                 oauthConnectedConnectionIds = it.oauthConnectedConnectionIds - connection.id,
                 oauthPendingConnectionId = null,
-                message = "${connection.kind.title} 로그인 토큰을 삭제했습니다.",
+                message = if (deleted) {
+                    "${connection.kind.title} 로그인 토큰을 삭제했습니다."
+                } else {
+                    "${connection.kind.title} 로그인 토큰 삭제를 저장하지 못했습니다. 다시 시도해 주세요."
+                },
             )
         }
     }
@@ -1969,6 +2083,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         fallbackToRoot: Boolean = false,
     ) {
         stopInlineAudio()
+        clearFolderActionSize()
         invalidateImagePreviewRequests()
         connectionOpenJob?.cancel()
         val generation = ++thumbnailGeneration
@@ -1996,7 +2111,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 runCatching {
                     service?.close()
                     val credential = repository.credentials.read(connection.id).orEmpty()
-                    val newService = RemoteFileServiceFactory.create(connection, credential)
+                    val newService = RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens)
                     service = newService
                     newService.list(path)
                 }
@@ -2127,7 +2242,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     try {
                         val activeService = service ?: run {
                             val credential = repository.credentials.read(activeConnection.id).orEmpty()
-                            RemoteFileServiceFactory.create(activeConnection, credential).also { service = it }
+                            RemoteFileServiceFactory.create(activeConnection, credential, cloudAccessTokens).also { service = it }
                         }
                         val rawEntries = activeService.list(item.path)
                         val visibleEntries = rawEntries.filter { entry ->
@@ -2160,6 +2275,126 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         folderCountCache = current.folderCountCache + (item.id to countState)
                     )
                 }
+            }
+        }
+    }
+
+    fun clearFolderActionSize() {
+        folderActionSizeJob?.cancel()
+        folderActionSizeJob = null
+        folderActionSizeGeneration++
+        _state.update { current ->
+            if (current.folderActionSize == null && current.folderActionTargetKey == null) current
+            else current.copy(
+                folderActionSize = null,
+                folderActionTargetKey = null,
+            )
+        }
+    }
+
+    fun loadFolderActionSize(item: RemoteFileItem) {
+        if (!item.isDirectory) return
+        val browser = _state.value.screen as? Screen.Browser ?: return
+        if (browser.items.none { it.id == item.id && it.path == item.path }) return
+        val activeService = service
+        if (activeService == null) {
+            _state.update { current ->
+                val targetKey = "${browser.connection.id}\u0000${item.path}"
+                current.copy(
+                    folderActionSize = FolderActionSizeState.Error,
+                    folderActionTargetKey = targetKey,
+                )
+            }
+            return
+        }
+        val activeConnection = browser.connection
+        val capturedBrowserPath = browser.path
+        val capturedFolderCountGeneration = _state.value.folderCountGeneration
+        val preferencesSnapshot = browser.preferences
+        val targetKey = "${activeConnection.id}\u0000${item.path}"
+
+        folderActionSizeJob?.cancel()
+        val generation = ++folderActionSizeGeneration
+
+        _state.update { current ->
+            current.copy(
+                folderActionSize = FolderActionSizeState.Loading,
+                folderActionTargetKey = targetKey,
+            )
+        }
+
+        folderActionSizeJob = viewModelScope.launch {
+            val sizeState = withContext(Dispatchers.IO) {
+                try {
+                    var totalBytes = 0L
+                    var folderCount = 0
+                    var fileCount = 0
+
+                    val rootNormPath = item.path.trimEnd('/')
+                    val visitedDirs = mutableSetOf<String>()
+                    val visitedFiles = mutableSetOf<String>()
+                    val queue = ArrayDeque<String>()
+
+                    visitedDirs.add(rootNormPath)
+                    queue.add(item.path)
+
+                    while (queue.isNotEmpty()) {
+                        ensureActive()
+                        val currentPath = queue.removeFirst()
+                        val entries = activeService.list(currentPath)
+                        ensureActive()
+
+                        for (entry in entries) {
+                            ensureActive()
+                            if (entry.name.isBlank() || entry.name == "." || entry.name == "..") continue
+                            if (!preferencesSnapshot.showHiddenFiles && entry.name.startsWith('.')) continue
+
+                            val normEntryPath = entry.path.trimEnd('/')
+                            if (normEntryPath == rootNormPath) continue
+                            if (normEntryPath.startsWith('/')) {
+                                val requiredPrefix = if (rootNormPath.isEmpty() || rootNormPath == "/") "/" else "$rootNormPath/"
+                                if (!normEntryPath.startsWith(requiredPrefix)) continue
+                            }
+
+                            if (entry.isDirectory) {
+                                if (visitedDirs.add(normEntryPath)) {
+                                    folderCount++
+                                    queue.add(entry.path)
+                                }
+                            } else {
+                                if (visitedFiles.add(normEntryPath)) {
+                                    val s = entry.size
+                                    if (s < 0L) throw IllegalStateException("Negative file size encountered: $s")
+                                    totalBytes = Math.addExact(totalBytes, s)
+                                    fileCount++
+                                }
+                            }
+                        }
+                    }
+
+                    FolderActionSizeState.Ready(
+                        totalBytes = totalBytes,
+                        folderCount = folderCount,
+                        fileCount = fileCount,
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    FolderActionSizeState.Error
+                }
+            }
+
+            val nowBrowser = _state.value.screen as? Screen.Browser
+            if (generation != folderActionSizeGeneration || nowBrowser == null ||
+                nowBrowser.connection.id != activeConnection.id ||
+                nowBrowser.path != capturedBrowserPath ||
+                _state.value.folderCountGeneration != capturedFolderCountGeneration ||
+                nowBrowser.items.none { it.id == item.id && it.path == item.path }
+            ) return@launch
+
+            _state.update { current ->
+                if (current.folderActionTargetKey != targetKey) current
+                else current.copy(folderActionSize = sizeState)
             }
         }
     }
@@ -2371,7 +2606,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         check(!needsStoredToken || !credential.isNullOrBlank()) {
             "${connection.name}의 저장된 로그인 정보를 읽을 수 없습니다. 다시 로그인한 뒤 시도해 주세요."
         }
-        return FavoriteActionServiceOwner(connection, RemoteFileServiceFactory.create(connection, credential.orEmpty()))
+        return FavoriteActionServiceOwner(connection, RemoteFileServiceFactory.create(connection, credential.orEmpty(), cloudAccessTokens))
             .also { liveFavoriteOwners.add(it) }
     }
 
@@ -2736,7 +2971,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val resolved = withContext(Dispatchers.IO) {
                 runCatching {
                     val credential = repository.credentials.read(connection.id).orEmpty()
-                    RemoteFileServiceFactory.create(connection, credential).use { activeService ->
+                    RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens).use { activeService ->
                         val resolvedItem = FavoriteItemResolver.resolve(favorite, connection, activeService)
                         resolvedItem to thumbnailRepository.load(connection, resolvedItem, activeService)
                     }
@@ -2813,6 +3048,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val activeService = RemoteFileServiceFactory.create(
                         connection,
                         credential,
+                        cloudAccessTokens,
                     ).also { service = it }
                     val item = FavoriteItemResolver.resolve(favorite, connection, activeService)
                     val sequence = FavoriteItemResolver.resolveFavoritePreviewSequence(
@@ -2978,7 +3214,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         check(!needsStoredToken || !credential.isNullOrBlank()) {
             "${connection.name}의 저장된 로그인 정보를 읽을 수 없습니다. 다시 로그인한 뒤 시도해 주세요."
         }
-        return RemoteFileServiceFactory.create(connection, credential.orEmpty())
+        return RemoteFileServiceFactory.create(connection, credential.orEmpty(), cloudAccessTokens)
     }
 
     /** Reserves an entry name that is unique inside [parentPrefix]; folders and files share one namespace. */
@@ -4017,24 +4253,35 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    private fun protectedWork(current: AppState, includeBusy: Boolean): Boolean =
+        (includeBusy && current.isBusy) || current.download != null || current.networkDownloadProgress != null ||
+            current.isDownloadingNetwork || current.imagePreview != null || current.trailer != null ||
+            current.inlineAudioPlayback != null || current.compression != null || current.pendingTransfer != null ||
+            current.pendingInboxUpload != null || current.pendingLocalUpload != null ||
+            current.phoneHardTransferProgress != null || current.mediaTransferActive || current.workbenchRun != null ||
+            current.shareIntakeInProgress > 0 || current.mediaPickStaging != null || current.isLocalThumbnailRunning ||
+            current.mediaPick != null || current.mediaPickDelivery != null
+
     fun clearDownloadCache() {
-        if (_state.value.download != null) {
-            _state.update { it.copy(message = "파일을 준비하는 동안에는 다운로드 캐시를 지울 수 없습니다.") }
+        if (protectedWork(_state.value, includeBusy = true)) {
+            _state.update { it.copy(message = "작업 중이거나 편집·미리보기가 열려 있는 동안에는 다운로드 캐시를 비울 수 없습니다. 작업을 마친 뒤 다시 시도해 주세요.") }
             return
         }
+        _state.update { it.copy(isBusy = true, message = null) }
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, message = null) }
             runCatching {
-                withContext(Dispatchers.IO) {
-                    val root = downloadCacheDirectory()
-                    root.listFiles().orEmpty().forEach { entry ->
-                        check(entry.deleteRecursively()) { "캐시 항목을 삭제하지 못했습니다: ${entry.name}" }
-                    }
+                downloadCache.clearOwned { !protectedWork(_state.value, includeBusy = false) }
+                downloadCache.ownedSizeBytes()
+            }.onSuccess { remaining ->
+                _state.update {
+                    it.copy(
+                        isBusy = false,
+                        downloadCacheBytes = remaining,
+                        message = "NasFinder가 내려받아 둔 임시 파일을 비웠습니다. NAS의 원본은 바뀌지 않았습니다.",
+                    )
                 }
-            }.onSuccess {
-                _state.update { it.copy(isBusy = false, downloadCacheBytes = 0L, message = "다운로드 캐시를 모두 지웠습니다.") }
             }.onFailure { error ->
-                val remaining = withContext(Dispatchers.IO) { downloadCacheSize() }
+                val remaining = runCatching { downloadCache.ownedSizeBytes() }.getOrNull()
                 _state.update {
                     it.copy(
                         isBusy = false,
@@ -4128,10 +4375,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    private fun downloadCacheSize(): Long = downloadCacheDirectory()
-        .walkTopDown()
-        .filter(File::isFile)
-        .sumOf(File::length)
+    private suspend fun downloadCacheSize(): Long = downloadCache.ownedSizeBytes()
 
     fun handleEntryIntent(intent: Intent?) {
         val incoming = intent ?: return
@@ -4318,7 +4562,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }
         }
         if (others.isNotEmpty()) {
-            importInboxUris(others.take(50), successMessage = "받았습니다", partialMessage = "받았지만")
+            importInboxUris(others, successMessage = "받았습니다", partialMessage = "받았지만")
         }
     }
 
@@ -4471,7 +4715,19 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     fun importPickedFiles(uris: List<Uri>) {
         val selected = uris.distinct().take(InboxBatchContracts.MAX_SELECTED_ITEMS)
         if (selected.isEmpty()) return
-        importInboxUris(selected, successMessage = "가져왔습니다", partialMessage = "가져왔지만")
+        val distinctCount = uris.distinct().size
+        val excludedCount = distinctCount - selected.size
+        importInboxUris(
+            selected,
+            successMessage = "가져왔습니다",
+            partialMessage = "가져왔지만",
+            resultNotice = if (excludedCount > 0) {
+                "선택한 ${distinctCount}개 중 ${selected.size}개만 처리하고 ${excludedCount}개는 제외했습니다. " +
+                    "한 번에 최대 ${InboxBatchContracts.MAX_SELECTED_ITEMS}개까지 가져올 수 있으니 제외된 파일은 다시 선택해 주세요."
+            } else {
+                null
+            },
+        )
     }
 
     private var localMediaCopyJob: Job? = null
@@ -4523,8 +4779,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    private fun importInboxUris(uris: List<Uri>, successMessage: String, partialMessage: String) {
+    private fun importInboxUris(
+        uris: List<Uri>,
+        successMessage: String,
+        partialMessage: String,
+        resultNotice: String? = null,
+    ) {
         val jobPrivate = PrivacyMode.isActive
+        fun withNotice(text: String) = if (resultNotice == null) text else "$text $resultNotice"
         viewModelScope.launch {
             val (count, failed, files) = withContext(Dispatchers.IO) {
                 var importedCount = 0
@@ -4544,11 +4806,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 it.copy(
                     screen = Screen.Inbox,
                     inboxFiles = files,
-                    message = if (failed == 0) "${count}개 파일을 $successMessage." else null,
+                    message = if (failed == 0) withNotice("${count}개 파일을 $successMessage.") else null,
                     inboxErrorMessage = when {
                         failed == 0 -> null
-                        count == 0 -> "${failed}개 파일을 가져오지 못했습니다."
-                        else -> "${count}개 파일을 $partialMessage ${failed}개는 가져오지 못했습니다."
+                        count == 0 -> withNotice("${failed}개 파일을 가져오지 못했습니다.")
+                        else -> withNotice("${count}개 파일을 $partialMessage ${failed}개는 가져오지 못했습니다.")
                     },
                 )
             }
@@ -4602,7 +4864,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     /** The browser's own lazily reopened [service]; only browser-originated commands use it. */
     private fun browserServiceFor(connection: RemoteConnection): RemoteFileService = service ?: run {
         val credential = repository.credentials.read(connection.id).orEmpty()
-        RemoteFileServiceFactory.create(connection, credential).also { service = it }
+        RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens).also { service = it }
     }
 
     private fun checkRemoteFolderHasSubfolders(
@@ -4996,7 +5258,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     ): Result<List<RemoteFileItem>> = withContext(Dispatchers.IO) {
         runCatching {
             val credential = repository.credentials.read(connection.id).orEmpty()
-            RemoteFileServiceFactory.create(connection, credential).use { svc ->
+            RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens).use { svc ->
                 val allItems = svc.list(path)
                 allItems.filter { it.isDirectory || it.isAudio }
             }
@@ -5012,7 +5274,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         runCatching {
             destinationFile.parentFile?.mkdirs()
             val credential = repository.credentials.read(connection.id).orEmpty()
-            RemoteFileServiceFactory.create(connection, credential).use { svc ->
+            RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens).use { svc ->
                 svc.download(item, destinationFile, progress)
             }
             check(destinationFile.exists() && destinationFile.length() > 0L) { "오디오 파일을 내려받지 못했습니다." }
@@ -5631,9 +5893,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /** Writes the project now (main-thread callers that are about to close it). */
-    private fun saveEditorDraftNow(session: TrailerSession): Boolean {
-        val draft = draftFromSession(session) ?: return false
-        return TrailerDraftStore.saveDraft(draft)
+    private fun saveEditorDraftNow(session: TrailerSession): Boolean =
+        captureEditorDraft(session)?.let(::writeEditorDraft) == true
+
+    // Every editor draft write is numbered when its snapshot is taken from _state on the main thread, so a later
+    // number always holds a newer (or equal) project state, including a newly completed output of the same revision.
+    private val editorDraftCaptures = java.util.concurrent.atomic.AtomicLong()
+    // Per project (directory): newest capture written, and the capture number at which it was closed. Kept after
+    // close, so a still in-flight older write can never replace the close save or recreate a closed project.
+    private val editorWrittenCaptures = mutableMapOf<String, Long>()
+    private val editorClosedCaptures = mutableMapOf<String, Long>()
+
+    /** Main-thread snapshot of [session] as a draft with its capture number. */
+    private fun captureEditorDraft(session: TrailerSession, showingSettings: Boolean = false): Pair<TrailerDraft, Long>? =
+        draftFromSession(session, showingSettings)?.let { it to editorDraftCaptures.incrementAndGet() }
+
+    /**
+     * The one ordered writer of open-project drafts (sync and IO callers). A capture older than the newest one
+     * written is skipped as already saved; one taken before the project was closed is dropped as not saved.
+     */
+    private fun writeEditorDraft(captured: Pair<TrailerDraft, Long>): Boolean = synchronized(editorWrittenCaptures) {
+        val (draft, capture) = captured
+        val key = draft.directory.absolutePath
+        if (capture < (editorClosedCaptures[key] ?: Long.MIN_VALUE)) return@synchronized false
+        if (capture < (editorWrittenCaptures[key] ?: Long.MIN_VALUE)) return@synchronized true
+        TrailerDraftStore.saveDraft(draft).also { saved -> if (saved) editorWrittenCaptures[key] = capture }
     }
 
     /** Debounced autosave of the CURRENT project with saving/saved/failed state. */
@@ -5644,8 +5928,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (!immediate) kotlinx.coroutines.delay(700)
             val session = _state.value.trailer?.takeIf { it.directory == directory } ?: return@launch
             val revision = session.revision
-            val draft = draftFromSession(session)
-            val saved = draft != null && withContext(Dispatchers.IO) { TrailerDraftStore.saveDraft(draft) }
+            val draft = captureEditorDraft(session)
+            val saved = draft != null && withContext(Dispatchers.IO) { writeEditorDraft(draft) }
             _state.update { current ->
                 val live = current.trailer?.takeIf { it.directory == directory } ?: return@update current
                 current.copy(
@@ -5855,6 +6139,66 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    /** Marks selected photo scenes Important / Normal; mixed selection only changes photos. */
+    fun editorSetPhotosImportant(sceneKeys: Set<Long>, important: Boolean) {
+        if (sceneKeys.isEmpty()) return
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val targetScenes = project.scenes.filter { it.key in sceneKeys }
+            val targetSourceIds = targetScenes.map { it.sourceId }.toSet()
+            val photoSourceIds = session.sources.filter { it.id in targetSourceIds && it.isImage }.map { it.id }.toSet()
+            if (photoSourceIds.isEmpty()) return@editProject null
+
+            val newSources = session.sources.map {
+                if (it.id in photoSourceIds) it.copy(isImportant = important) else it
+            }
+
+            if (project.autoPlan) {
+                session.copy(sources = newSources).withRegeneratedPlan()
+            } else {
+                val sourcesById = newSources.associateBy { it.id }
+                val updatedScenes = project.scenes.map { scene ->
+                    if (scene.sourceId in photoSourceIds) {
+                        val src = sourcesById[scene.sourceId]
+                        if (src != null) {
+                            val targetLen = src.weightedPhotoLength(session.clipLength)
+                            val (safeStart, safeLen) = clampSceneWindow(src, scene.start, targetLen)
+                            scene.copy(start = safeStart, length = safeLen)
+                        } else scene
+                    } else scene
+                }
+                val (finalScenes, actualTotal) = if (session.isMusicOverlayMode && session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.musicTrack != null) {
+                    redistributeManualTotal(project.copy(scenes = updatedScenes), newSources, session.total)
+                } else {
+                    updatedScenes to updatedScenes.sumOf { it.length }
+                }
+                session.copy(
+                    sources = newSources,
+                    total = actualTotal,
+                    editor = project.copy(scenes = finalScenes, autoPlan = false),
+                )
+            }
+        }
+    }
+
+    fun editorTrimScenes(keys: Set<Long>, start: Double, length: Double) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val sourcesById = session.sources.associateBy { it.id }
+            val updated = project.scenes.map { scene ->
+                if (scene.key in keys) {
+                    val source = sourcesById[scene.sourceId]
+                    if (source != null) {
+                        val (safeStart, safeLength) = clampSceneWindow(source, start, length)
+                        scene.copy(start = safeStart, length = safeLength)
+                    } else scene
+                } else scene
+            }
+            session.withManualScenes(updated)
+        }
+    }
+
     fun editorSetSceneFraming(key: Long, fit: SceneFit, focusX: Float, focusY: Float) {
         editProject { session ->
             val project = session.editor ?: return@editProject null
@@ -5937,9 +6281,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /** Explicit one-time choice from the export prompt: render without the unavailable music; the stored choice stays saved. */
-    fun exportEditorProjectWithoutUnavailableMusic() {
+    fun exportEditorProjectWithoutUnavailableMusic(onStarted: (() -> Unit)? = null) {
         dismissMusicExportPrompt()
-        exportEditorProjectInternal(skipUnavailableMusic = true)
+        exportEditorProjectInternal(skipUnavailableMusic = true, onStarted = onStarted)
     }
 
     /** Plan parameters regenerate scenes while automatic; manual mode proportionally retimes or adjusts existing scenes. */
@@ -6300,12 +6644,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /**
-     * Exports a FIXED snapshot of the current project. Editing continues; the running composition is never mutated,
-     * and a later edit simply makes the result outdated (next export reflects it).
+     * Exports a FIXED snapshot of the current project. The same captured project/revision is first written as the
+     * editable draft; only after that save succeeds does the renderer start (and [onStarted] run, for this job and
+     * project only). A failed save marks the draft FAILED and renders nothing. Editing continues; the running
+     * composition is never mutated, and a later edit simply makes the result outdated (next export reflects it).
      */
-    fun exportEditorProject() = exportEditorProjectInternal(skipUnavailableMusic = false)
+    fun exportEditorProject(onStarted: (() -> Unit)? = null) = exportEditorProjectInternal(skipUnavailableMusic = false, onStarted = onStarted)
 
-    private fun exportEditorProjectInternal(skipUnavailableMusic: Boolean) {
+    private fun exportEditorProjectInternal(skipUnavailableMusic: Boolean, onStarted: (() -> Unit)? = null) {
         val session = _state.value.trailer ?: return
         if (!session.prepared || session.busy || session.export?.running == true) return
         val scenes = session.scenes
@@ -6331,11 +6677,31 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val musicFitCount = session.musicFitCount
         val autoDucking = session.autoDucking
         val musicVolume = session.editor?.musicVolume ?: 1f
-        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, "장면을 준비하는 중…", scenes = scenes)) }
+        val draft = captureEditorDraft(session)
+        // Marked running right away, so repeated taps and retries never start a second job while the draft saves.
+        updateTrailer(directory) { it.copy(export = EditorExportState(true, revision, EDITOR_EXPORT_SAVING_STATUS, scenes = scenes), saveState = EditorSaveState.SAVING, saveError = null) }
         editorExportJob = viewModelScope.launch {
             val self = coroutineContext[Job]
             val output = File(directory, "trailer-${UUID.randomUUID()}.mp4")
+            // Once published to the session the output may already be referenced (close save, player): never deleted here.
+            var published = false
             try {
+                val draftSaved = draft != null && withContext(Dispatchers.IO) { runCatching { writeEditorDraft(draft) }.getOrDefault(false) }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!draftSaved) {
+                    updateTrailer(directory) {
+                        it.copy(export = null, saveState = EditorSaveState.FAILED, saveError = "편집본을 저장하지 못해 영상을 만들지 않았습니다. 저장 공간을 확인한 뒤 다시 시도해 주세요.")
+                    }
+                    _state.update { it.copy(message = "편집본을 저장하지 못해 영상을 만들지 않았습니다. 저장 공간을 확인해 주세요.") }
+                    return@launch
+                }
+                updateTrailer(directory) { live ->
+                    live.copy(
+                        export = live.export?.copy(status = "장면을 준비하는 중…"),
+                        saveState = if (live.revision == revision) EditorSaveState.SAVED else live.saveState,
+                    )
+                }
+                if (editorExportJob === self && _state.value.trailer?.directory == directory) onStarted?.invoke()
                 var exportRecoveredScenes = 0
                 var exportExcludedScenes = 0
                 TrailerExporter.export(
@@ -6354,9 +6720,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         exportExcludedScenes = excluded
                     },
                 ) { status, progress ->
-                    updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
+                    // A cancelled job's late progress never lands on a newer job's state.
+                    if (editorExportJob === self) updateTrailer(directory) { live -> live.copy(export = live.export?.copy(status = status, progress = progress)) }
                 }
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                // Only the current job of the still-open project publishes; otherwise its unpublished file is removed below.
+                if (editorExportJob !== self || _state.value.trailer?.directory != directory) throw CancellationException("superseded export")
                 val previous = _state.value.trailer?.takeIf { it.directory == directory }?.output
                 val finishedExportState = if (exportRecoveredScenes > 0 || exportExcludedScenes > 0) {
                     val summary = buildString {
@@ -6375,19 +6744,24 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     )
                 } else null
                 updateTrailer(directory) { it.copy(output = output, outputRevision = revision, export = finishedExportState, saved = false) }
-                val live = _state.value.trailer?.takeIf { it.directory == directory }
-                val saved = live != null && withContext(Dispatchers.IO) { draftFromSession(live)?.let(TrailerDraftStore::saveDraft) == true }
+                published = true
+                val live = _state.value.trailer?.takeIf { it.directory == directory }?.let { captureEditorDraft(it) }
+                val saved = live != null && withContext(Dispatchers.IO) { runCatching { writeEditorDraft(live) }.getOrDefault(false) }
                 // The superseded render of this same project is removed only after the new one is recorded.
                 if (saved && previous != null && previous != output && previous.parentFile == directory && previous.name.startsWith("trailer-")) {
                     withContext(Dispatchers.IO) { previous.delete() }
                 }
                 updateTrailer(directory) { it.copy(saveState = if (saved) it.saveState else EditorSaveState.FAILED) }
             } catch (cancelled: CancellationException) {
-                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                if (!published) withContext(NonCancellable + Dispatchers.IO) { output.delete() }
                 throw cancelled
             } catch (failure: Exception) {
-                withContext(NonCancellable + Dispatchers.IO) { output.delete() }
-                updateTrailer(directory) { it.copy(export = EditorExportState(false, revision, "", error = failure.message ?: "내보내지 못했습니다. 다시 시도해 주세요.")) }
+                if (published) {
+                    if (editorExportJob === self) updateTrailer(directory) { it.copy(saveState = EditorSaveState.FAILED) }
+                } else {
+                    withContext(NonCancellable + Dispatchers.IO) { output.delete() }
+                    if (editorExportJob === self) updateTrailer(directory) { it.copy(export = EditorExportState(false, revision, "", error = failure.message ?: "내보내지 못했습니다. 다시 시도해 주세요.")) }
+                }
             } finally {
                 if (editorExportJob === self) editorExportJob = null
             }
@@ -6399,6 +6773,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (session.export?.running != true) return
         editorExportJob?.cancel()
         updateTrailer(session.directory) { it.copy(export = null) }
+        // Cancelled while its draft was saving: the current state is saved again through the ordered writer.
+        if (session.saveState == EditorSaveState.SAVING) scheduleEditorAutosave(session.directory, immediate = true)
     }
 
     fun dismissEditorExportError() {
@@ -6656,6 +7032,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         editorExportJob?.cancel(); editorExportJob = null
         editorAddJob?.cancel(); editorAddJob = null
         editorAutosaveJob?.cancel(); editorAutosaveJob = null
+        // Writes captured before this point (cancelled autosave/export still in IO) can no longer land.
+        session?.let { synchronized(editorWrittenCaptures) { editorClosedCaptures[it.directory.absolutePath] = editorDraftCaptures.incrementAndGet() } }
         session?.pendingAdds?.forEach { pendingAddCandidates.remove(it.id); pendingAddPrivate.remove(it.id) }
         pendingAddAnchor = null
         session?.let {
@@ -6674,7 +7052,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             // Save BEFORE stopping anything, so a failed save can keep the project (and its running work) open.
             val sessionWithId = if (session.draftId == null) session.copy(draftId = UUID.randomUUID().toString()) else session
             val saved = sessionWithId.sources.isNotEmpty() &&
-                draftFromSession(sessionWithId, showingSettings)?.let(TrailerDraftStore::saveDraft) == true
+                captureEditorDraft(sessionWithId, showingSettings)?.let(::writeEditorDraft) == true
             if (!saved && !wasCancelled) {
                 // Never drop unsaved edits of a prepared project silently: keep the editor open with a visible failure.
                 // (An explicit "멈추고 닫기" closes without deleting anything; the project files stay on disk.)
@@ -6907,7 +7285,57 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
+    // RAM only: the root the user came from when entering the 작업대, so Back returns there (null falls back to 홈).
+    private var workbenchReturnRoot: MainNavigationDestination? = null
+
+    /** Back from the 작업대: restores the root it was entered from, or 홈. */
+    fun closeWorkbench() {
+        val target = workbenchReturnRoot?.takeIf { it != MainNavigationDestination.WORKBENCH } ?: MainNavigationDestination.HOME
+        workbenchReturnRoot = null
+        selectMainDestination(target)
+    }
+
+    /**
+     * First-level Back of a Finder-owned screen: returns to the current main root (파인더, or 만들기 while picking media for
+     * a trailer/music) with the same transient cleanup as [show] for the dashboard, but without switching to 홈.
+     */
+    fun exitToMainRoot() {
+        val root = _state.value.activeMainTab.takeIf {
+            it == MainNavigationDestination.FINDER || it == MainNavigationDestination.VIDEO
+        } ?: MainNavigationDestination.FINDER
+        stopInlineAudio()
+        clearFolderActionSize()
+        invalidateImagePreviewRequests()
+        if (_state.value.screen != Screen.Dashboard) invalidateFavoriteThumbnails()
+        val hasOpenEditor = _state.value.trailer != null
+        if (hasOpenEditor) {
+            _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { scheduleEditorAutosave(it.directory, immediate = true) }
+        }
+        if (_state.value.mediaPick != null) {
+            mediaPickJob?.cancel()
+            mediaPickJob = null
+        }
+        _state.update {
+            it.copy(
+                screen = Screen.Dashboard,
+                activeMainTab = root,
+                trailerMinimized = if (hasOpenEditor) true else it.trailerMinimized,
+                message = null,
+                mediaPick = null,
+                mediaPickStaging = null,
+                browserSelectRequest = null,
+            )
+        }
+    }
+
+    fun setSidebarExpanded(expanded: Boolean) {
+        _state.update { it.copy(sidebarExpanded = expanded) }
+    }
+
     fun selectMainDestination(destination: MainNavigationDestination) {
+        if (destination == MainNavigationDestination.WORKBENCH && _state.value.activeMainTab != MainNavigationDestination.WORKBENCH) {
+            workbenchReturnRoot = _state.value.activeMainTab
+        }
         val hasOpenEditor = _state.value.trailer != null
         if (destination == MainNavigationDestination.HOME && hasOpenEditor) {
             _state.value.trailer?.takeIf { it.prepared && it.editor != null }?.let { scheduleEditorAutosave(it.directory, immediate = true) }
@@ -6915,16 +7343,26 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         _state.update {
             it.copy(
                 activeMainTab = destination,
-                screen = Screen.Dashboard,
+                activeVideoTab = if (destination == MainNavigationDestination.VIDEO) VideoNavigationDestination.CREATE else it.activeVideoTab,
+                screen = if (destination == MainNavigationDestination.SETTINGS) Screen.Settings else Screen.Dashboard,
                 trailerMinimized = if (destination == MainNavigationDestination.HOME && hasOpenEditor) true else it.trailerMinimized,
             )
         }
     }
 
     fun selectVideoDestination(destination: VideoNavigationDestination) {
+        if (destination == VideoNavigationDestination.DRAFTS) {
+            show(Screen.VideoDrafts)
+            return
+        }
         // The former 영상 재료 tab is the 작업대 now; the old destination keeps working as an alias.
         if (destination == VideoNavigationDestination.MATERIALS) {
             selectMainDestination(MainNavigationDestination.WORKBENCH)
+            return
+        }
+        // The former 컬렉션 tab: its videos are copied into 폰하드, so the old destination opens 폰하드.
+        if (destination == VideoNavigationDestination.COLLECTIONS) {
+            show(Screen.Inbox)
             return
         }
         _state.update {
@@ -8199,7 +8637,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val hidesOnPrivate: (Boolean) -> Boolean get() = { isPrivate -> isPrivate && !PrivacyMode.isActive }
 
     fun setConnectionPrivate(connection: RemoteConnection, isPrivate: Boolean) {
-        repository.setPrivate(connection.id, isPrivate)
+        try {
+            repository.setPrivate(connection.id, isPrivate)
+        } catch (error: ConnectionStoreReadException) {
+            _state.update { it.copy(message = error.message) }
+            return
+        }
         val hiding = hidesOnPrivate(isPrivate)
         _state.update { current ->
             val viewingIt = hiding && (current.screen as? Screen.Browser)?.connection?.id == connection.id
@@ -8266,6 +8709,131 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     fun refreshCollections() {
         _state.update { it.copy(collections = DurableCollectionStore.getItems()) }
+    }
+
+    // ---- 예전 컬렉션 → 폰하드 ---------------------------------------------------------------------------------------
+    // 컬렉션 기능을 없앤 뒤에도 예전 영상은 폰하드 '이전 보관 영상' 폴더의 사본으로 볼 수 있다. 컬렉션 파일·목록 JSON·읽기
+    // 권한은 그대로 두고(지우거나 옮기거나 덮어쓰지 않는다) 사본만 만든다. 항목마다 저장된 출처(파일 경로·제목·비공개 표시·
+    // 연결·편집본)에서 만든 고정 UUID로 가져온다. id가 없는 예전 기록은 불러올 때마다 새 id를 받으므로 id는 쓰지 않는다.
+    // 같은 UUID는 SharedInboxStore.import가 같은 락 안에서 거부하므로 겹치지 않고, 같은 파일이라도 제목·비공개가 다른 기록은
+    // 따로 옮긴다. 읽을 수 있는 사본이 확인된 항목만 같은 UUID 영수증을 남기고, 실패한 항목은 영수증 없이 남아 다음에 폰하드를
+    // 열 때 다시 시도한다. 전체 '완료' 표시는 두지 않는다.
+    private val legacyCollectionReceipts =
+        application.getSharedPreferences("legacy_collection_phonehard", android.content.Context.MODE_PRIVATE)
+    private val legacyCollectionMigrating = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun migrateLegacyCollectionsToPhoneHard() {
+        if (!legacyCollectionMigrating.compareAndSet(false, true)) return
+        viewModelScope.launch {
+            try {
+                val (copied, failures, anyCopied) = withContext(Dispatchers.IO) { copyLegacyCollectionsToPhoneHard() }
+                if (anyCopied) {
+                    withContext(Dispatchers.IO) { runCatching { inboxFiles() }.getOrNull() }?.let { files ->
+                        _state.update { it.copy(inboxFiles = files) }
+                    }
+                }
+                val problem = DurableCollectionStore.loadProblem()
+                val note = when {
+                    failures.isNotEmpty() -> "예전 보관 영상 ${failures.size}개를 폰하드로 복사하지 못했습니다(${failures.first()}). 원본은 그대로 두었고, 폰하드를 다시 열면 다시 시도합니다." +
+                        (if (copied > 0) " ${copied}개는 폰하드 ‘$LEGACY_COLLECTION_FOLDER’ 폴더로 복사했습니다." else "")
+                    copied > 0 -> null
+                    problem != null -> problem
+                    else -> null
+                }
+                if (note != null) _state.update { it.copy(message = note) }
+            } finally {
+                legacyCollectionMigrating.set(false)
+            }
+        }
+    }
+
+    /**
+     * 지금 모드에서 보이는 항목의 복사 개수·실패 사유(비공개 항목은 일반 모드 안내에 제목도 개수도 넣지 않는다)와, 하나라도
+     * 복사했는지. 영수증이 있는 항목(이미 옮긴 항목)은 다시 읽지 않는다.
+     */
+    private fun copyLegacyCollectionsToPhoneHard(): Triple<Int, List<String>, Boolean> {
+        // 비공개를 포함한 전체 기록: 모드와 관계없이 옮기고, 각 사본은 원래 비공개 표시를 그대로 갖는다.
+        val pending = DurableCollectionStore.getAllItems()
+            .map { item -> item to legacyCollectionSourceId(item) }
+            .distinctBy { it.second }
+            .filter { (_, sourceId) -> !legacyCollectionReceipts.contains("src:$sourceId") }
+        var copied = 0
+        var anyCopied = false
+        val failures = mutableListOf<String>()
+        for ((item, stableId) in pending) {
+            // 원래 비공개 출처(자기 표시·비공개 연결·비공개 편집본)는 사본도 비공개로 둔다. 지금 모드는 따르지 않는다.
+            val recordPrivate = item.isPrivate || PrivacyMode.isPrivateConnection(item.connectionId) ||
+                (item.sourceDraftId?.let(TrailerDraftStore::isDraftPrivate) == true)
+            val reported = PrivacyMode.isVisible(recordPrivate)
+            runCatching {
+                // 앞선 실행이 복사를 마치고 영수증만 남기지 못했으면 같은 UUID 기록이 이미 있다. 그 사본이 실제로 읽히고 길이가
+                // 맞을 때만 옮긴 것으로 본다. 없거나 깨졌으면 그 기록·파일은 건드리지 않고 영수증 없이 실패로 남긴다.
+                val existing = inboxStore.allRecords().firstOrNull { it.id == stableId }
+                if (existing == null) {
+                    importLegacyCollectionItem(item, stableId, recordPrivate)
+                } else {
+                    val payloadBytes = runCatching { inboxStore.file(existing).takeIf { it.isFile }?.length() }.getOrNull()
+                    check(existing.byteCount > 0L && payloadBytes == existing.byteCount) {
+                        "앞서 만든 폰하드 사본을 읽을 수 없습니다 · 원본은 그대로 두었습니다"
+                    }
+                }
+                check(legacyCollectionReceipts.edit().putBoolean("src:$stableId", true).commit()) {
+                    "복사 기록을 저장하지 못했습니다"
+                }
+                existing != null
+            }.onSuccess { alreadyCopied ->
+                if (!alreadyCopied) { anyCopied = true; if (reported) copied++ }
+            }.onFailure { if (reported) failures += it.message ?: "알 수 없는 오류" }
+        }
+        return Triple(copied, failures, anyCopied)
+    }
+
+    /** 예전 컬렉션 기록 하나의 고정 출처 UUID: 목록 JSON에 저장된 값만 쓴다(불러올 때 새로 붙는 id·시각은 쓰지 않는다). */
+    private fun legacyCollectionSourceId(item: CollectionItem): UUID = UUID.nameUUIDFromBytes(
+        listOf(
+            "nasfinder-legacy-collection-v1", item.localFilePath, item.title, item.isPrivate.toString(),
+            item.connectionId.orEmpty(), item.sourceDraftId.orEmpty(),
+        ).joinToString("\u0000").toByteArray(Charsets.UTF_8),
+    )
+
+    /** 한 항목을 폰하드에 복사하고 길이를 확인한다. 확인하지 못하면 방금 만든 사본만 지우고 실패를 던진다. */
+    private fun importLegacyCollectionItem(item: CollectionItem, stableId: UUID, recordPrivate: Boolean) {
+        val uri = item.localFilePath.takeIf { it.startsWith("content://") }?.let(Uri::parse)
+        val local = if (uri == null) File(item.localFilePath) else null
+        if (uri != null) {
+            check(DurableCollectionStore.hasPersistedReadGrant(item.localFilePath)) { "읽기 권한 없음 · 원본 앱에서 다시 가져와 주세요" }
+        } else {
+            check(local != null && local.isFile && local.length() > 0L) { "파일 없음" }
+        }
+        val expectedBytes = local?.length() ?: uri?.let { contentUri ->
+            runCatching {
+                application.contentResolver.query(contentUri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+                }
+            }.getOrNull()?.takeIf { it > 0L }
+        }
+        val contentType = uri?.let { runCatching { application.contentResolver.getType(it) }.getOrNull() }
+        val extension = (local?.extension ?: uri?.let(::queryName)?.substringAfterLast('.', "").orEmpty())
+            .ifBlank { contentType?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }.orEmpty() }
+            .ifBlank { "mp4" }
+        val title = item.title.ifBlank { "이전 보관 영상" }
+        val name = if (title.endsWith(".$extension", ignoreCase = true)) title else "$title.$extension"
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase()) ?: contentType ?: "video/mp4"
+        val input = local?.inputStream() ?: application.contentResolver.openInputStream(uri!!) ?: error("원본을 열 수 없습니다")
+        val record = input.use {
+            inboxStore.import(
+                name, mime, it,
+                id = stableId,
+                importedAt = java.time.Instant.ofEpochMilli(item.timestamp),
+                destinationSubdirectory = LEGACY_COLLECTION_FOLDER,
+                isPrivate = recordPrivate,
+            )
+        }
+        val storedBytes = runCatching { inboxStore.file(record).length() }.getOrDefault(-1L)
+        if (record.byteCount <= 0L || storedBytes != record.byteCount || (expectedBytes != null && record.byteCount != expectedBytes)) {
+            runCatching { inboxStore.delete(record.id) }
+            error("복사한 크기가 원본과 달라 사본을 지웠습니다")
+        }
     }
 
     fun addExportedVideoToCollection(
@@ -8581,57 +9149,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     }
 
     /**
-     * Collection import entry for picked content: stages the items for the 사본/참조 confirmation dialog (copy is the
-     * default). [picked] pairs each uri with the flags its picker result actually returned, or null when the caller
-     * only has the uri (then a reference is offered only if a persisted read grant is already held).
+     * 예전 '컬렉션에 추가' 진입점. 컬렉션 기능은 없어졌으므로 컬렉션 기록을 만들지 않고, 고른 항목을 기존 폰하드 복사
+     * ([copyLocalMediaToInbox], 폰하드 맨 위 폴더·지금 모드의 비공개 분류)로 실제로 복사한다.
      */
     fun stageCollectionImport(picked: List<Pair<Uri, Int?>>) {
         if (picked.isEmpty()) return
-        if (_state.value.pendingCollectionImport?.working == true) {
-            _state.update { it.copy(message = "이전 컬렉션 추가가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.") }
-            return
-        }
-        viewModelScope.launch {
-            var skippedImages = 0
-            val entries = withContext(Dispatchers.IO) {
-                picked.distinctBy { it.first.toString() }.mapNotNull { (uri, flags) ->
-                    val mime = runCatching { application.contentResolver.getType(uri) }.getOrNull()
-                    if (mime?.startsWith("image/") == true) {
-                        skippedImages++
-                        return@mapNotNull null
-                    }
-                    val name = queryName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "가져온 영상"
-                    val size = if (uri.scheme == "content") runCatching {
-                        application.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else 0L
-                        }
-                    }.getOrNull() ?: 0L else runCatching { uri.path?.let(::File)?.length() }.getOrNull() ?: 0L
-                    val persistableRead = if (flags != null && flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
-                        flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    } else 0
-                    val blocker = when {
-                        uri.scheme != "content" ->
-                            "앱 안의 임시 파일이나 기기 경로는 앱을 다시 열었을 때 계속 읽을 수 있다고 보장되지 않습니다."
-                        flags != null && persistableRead == 0 ->
-                            "이 영상을 제공한 앱이 재시작 뒤에도 유지되는 읽기 권한을 주지 않았습니다."
-                        flags == null && !DurableCollectionStore.hasPersistedReadGrant(uri.toString()) ->
-                            "이 항목은 지금만 읽을 수 있는 임시 권한으로 선택되었습니다."
-                        else -> null
-                    }
-                    PendingImportEntry(uri.toString(), name.substringBeforeLast('.').ifBlank { name }, size, persistableRead, blocker)
-                }
-            }
-            if (entries.isEmpty()) {
-                _state.update { it.copy(message = if (skippedImages > 0) "컬렉션에는 영상만 추가할 수 있습니다. 선택한 사진은 제외했습니다." else "추가할 영상을 읽지 못했습니다.") }
-                return@launch
-            }
-            _state.update {
-                it.copy(pendingCollectionImport = PendingCollectionImport(
-                    entries = entries,
-                    excludedNote = if (skippedImages > 0) "사진 ${skippedImages}개는 컬렉션 대상이 아니라 제외했습니다." else null,
-                ))
-            }
-        }
+        copyLocalMediaToInbox(picked.map { it.first })
     }
 
     fun cancelCollectionImport() {
@@ -10289,10 +10812,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         liveFavoriteOwners.clear()
         service?.close()
         thumbnailRepository.close()
+        downloadCache.releaseAutomaticTrimGuard()
     }
 
     private companion object {
+        const val DOWNLOAD_CACHE_IDLE_TRIM_DELAY_MILLIS = 30_000L
         const val PHONEHARD_SAVE_RECEIPT = "phonehard-save.receipt"
+        // 예전 컬렉션 영상의 사본이 들어가는 폰하드 폴더(맨 위). 없어진 컬렉션 기능으로 보이지 않게 일반 폴더 이름을 쓴다.
+        const val LEGACY_COLLECTION_FOLDER = "이전 보관 영상"
         // Access-type material failures; only these clear by themselves when the original becomes readable again.
         const val LOCAL_MATERIAL_ACCESS_ERROR = "미디어에 접근할 수 없습니다 (권한 필요)"
         const val LOCAL_MATERIAL_GRANT_ERROR = "미디어 접근 권한이 확인되지 않았습니다."

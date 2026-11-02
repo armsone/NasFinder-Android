@@ -65,6 +65,16 @@ object FolderSuperThumbnailComposer {
         return result
     }
 
+    /** Scales an unblurred sheet to the tile a parent sheet draws from it, so a parent can wait for it at 1/9 of the memory. */
+    fun rawTile(rawSheet: Bitmap): Bitmap {
+        val size = FolderSuperThumbnailPolicy.TILE_PIXEL_SIZE
+        val tile = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val srcRect = calculateCenterCropRect(rawSheet.width, rawSheet.height, size, size)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        Canvas(tile).drawBitmap(rawSheet, srcRect, Rect(0, 0, size, size), paint)
+        return tile
+    }
+
     fun applySkinToneBlurIfNeeded(bitmap: Bitmap): Bitmap {
         // Deterministic 12x12 sample for skin tone detection
         var skinCount = 0

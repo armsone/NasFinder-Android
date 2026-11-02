@@ -219,7 +219,7 @@ private class SmokeRun(private val inst: Instrumentation) {
 
     private fun back() { ua.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK); idle() }
 
-    private val tabLabels = listOf("홈", "파인더", "영상", "도구")
+    private val tabLabels = listOf("도구", "파인더", "홈", "만들기", "설정")
 
     private fun tabNode(label: String): AccessibilityNodeInfo? = findAll(label).maxByOrNull { bounds(it).top }
         ?.takeIf { bounds(it).top > target.resources.displayMetrics.heightPixels * 0.7 }
@@ -359,12 +359,12 @@ private class SmokeRun(private val inst: Instrumentation) {
             .put("fontScale", target.resources.configuration.fontScale)
             .put("runId", runId).put("outDir", outDir.absolutePath)
         ui.put("environment", env)
-        pass("env.version", "installed app is 2.23.0 / 423001 / 202610211443",
-            info.versionName == "2.23.0" && info.longVersionCode == 423001L && env.optString("buildNumber") == "202610211443", env.toString())
+        pass("env.version", "installed app is 2.38.1 / 439238 / 202611020936",
+            info.versionName == "2.38.1" && info.longVersionCode == 439238L && env.optString("buildNumber") == "202611020936", env.toString())
     }
 
     private fun homeRoots() {
-        check("ui.tabbar", "4 root tab bar is reachable", if (ensureTabBar()) "PASS" else "FAIL", "tabs=" + tabLabels.joinToString { it + "=" + (tabNode(it) != null) })
+        check("ui.tabbar", "5 root tab bar is reachable", if (ensureTabBar()) "PASS" else "FAIL", "tabs=" + tabLabels.joinToString { it + "=" + (tabNode(it) != null) })
         val signatures = LinkedHashMap<String, Set<String>>()
         val themeNode = nodes().firstOrNull { label(it).startsWith("병기스타일 테마:") }
         ui.put("themeDescription", themeNode?.let(::label))
@@ -401,29 +401,29 @@ private class SmokeRun(private val inst: Instrumentation) {
             detail.append("${names[i]}~${names[j]}=${"%.2f".format(jaccard)} ")
             if (a == b || jaccard > 0.8) distinct = false
         }
-        pass("roots.distinct", "홈/파인더/영상/도구 taps open distinct screens (visible-label Jaccard <= 0.8 for every pair)", distinct, detail.toString())
+        pass("roots.distinct", "도구/파인더/홈/만들기/설정 taps open distinct screens (visible-label Jaccard <= 0.8 for every pair)", distinct, detail.toString())
         // Finder: formal 즐겨찾기 section first, before the connection list. (Wide-window sidebar route is not a phone surface.)
-        tabNode("파인더")?.let { click(it) }; idle(); waitFor(4000) { "파일 열기" in labels() }
+        tabNode("파인더")?.let { click(it) }; idle(); waitFor(4000) { "내 기기" in labels() }
         val fav = findAll("즐겨찾기").minByOrNull { bounds(it).top }
-        val other = nodes().filter { label(it) in setOf("파일 열기", "저장된 연결", "NAS", "네트워크 추가") }.minByOrNull { bounds(it).top }
+        val other = nodes().filter { label(it) in setOf("내 기기", "네트워크", "저장된 연결", "NAS", "네트워크 추가") }.minByOrNull { bounds(it).top }
         pass("finder.favorites", "Finder root shows the formal 즐겨찾기 section above the source/connection list",
             fav != null && (other == null || bounds(fav).top <= bounds(other).top), "fav=${fav?.let { bounds(it) }} next=${other?.let { label(it) + bounds(it) }}")
         ui.put("finderFavoritesNote", "phone surface only; the sidebar 즐겨찾기 route belongs to wide windows (tablet slot, not run)")
         // Tools: each row opens its own destination; the 도구 tab itself never lands on 설정.
         tabNode("도구")?.let { click(it) }; idle(); waitFor(4000) { "사진 선별" in labels() }
         val toolsLabels = labels()
-        pass("tools.root", "도구 tab root lists 사진 선별 / 사진·영상 전송 / 설정 rows and is not the settings screen",
-            listOf("사진 선별", "사진·영상 전송", "설정").all { it in toolsLabels } && "테마" !in toolsLabels, toolsLabels.distinct().joinToString("|").take(600))
+        pass("tools.root", "도구 tab root lists 사진 선별 / 미디어 전송 / 수퍼 썸네일 / 썸네일 캐시 rows and is not the settings screen",
+            listOf("사진 선별", "미디어 전송", "수퍼 썸네일", "썸네일 캐시").all { it in toolsLabels } && "테마" !in toolsLabels, toolsLabels.distinct().joinToString("|").take(600))
         val toolsRoot = labels().toSet()
-        for ((row, marker) in listOf("사진·영상 전송" to "보내기", "설정" to "테마", "사진 선별" to "사진 보관함에서 고르기")) {
+        for ((row, marker) in listOf("미디어 전송" to "보내기", "수퍼 썸네일" to "선택한 폴더의 영상과 사진 썸네일을 미리 만듭니다.", "썸네일 캐시" to "자동 정리", "사진 선별" to "사진 보관함에서 고르기")) {
             val clicked = clickLabel(row)
             waitFor(4000) { labels().toSet() != toolsRoot }
             val screen = labels().toSet()
             val changed = screen != toolsRoot
             val markerOk = marker == null || waitFor(4000) { marker in labels() }
             capture("tools-$row".replace('·', '-').replace(' ', '_'), controls = listOf("뒤로"))
-            pass("tools.$row", "도구 → '$row' opens its own screen (marker=${marker ?: "n/a"}) distinct from the tools root and from settings unless it is 설정",
-                clicked && changed && markerOk && (row == "설정" || "테마" !in screen), "clicked=$clicked changed=$changed marker=$markerOk")
+            pass("tools.$row", "도구 → '$row' opens its own screen (marker=${marker ?: "n/a"}) distinct from the tools root and from settings",
+                clicked && changed && markerOk && "테마" !in screen, "clicked=$clicked changed=$changed marker=$markerOk")
             if (clicked) { if (!clickLabel("뒤로")) back() }
             if (!ensureTabBar()) check("tools.$row.return", "returned to a tab root", "FAIL", "tab bar missing after back")
             tabNode("도구")?.let { click(it) }; idle(); waitFor(4000) { "사진 선별" in labels() }
@@ -431,10 +431,8 @@ private class SmokeRun(private val inst: Instrumentation) {
     }
 
     private fun settingsOrder() {
-        tabNode("도구")?.let { click(it) }; idle(); waitFor(4000) { "사진 선별" in labels() }
-        clickLabel("설정")
-        waitFor(4000) { "테마" in labels() }
-        val wanted = listOf("테마", "아이콘 스타일", "화면 켜짐", "앱 아이콘", "저장공간 관리", "파일 선택기 연동", "앱 정보")
+        tabNode("설정")?.let { click(it) }; idle(); waitFor(4000) { "저장공간·캐시" in labels() }
+        val wanted = listOf("저장공간·캐시", "화면 켜짐", "앱 아이콘", "프라이버시", "화면·테마", "앱 정보·업데이트")
         val firstSeen = LinkedHashMap<String, Int>()
         val initial = ArrayList<Pair<String, Int>>()
         fun scan(initialScan: Boolean) {
@@ -457,14 +455,14 @@ private class SmokeRun(private val inst: Instrumentation) {
         val initialOrder = initial.sortedBy { it.second }.map { it.first }
         ui.put("settingsInitialVisible", JSONArray(initial.map { JSONObject().put("title", it.first).put("top", it.second) }))
         ui.put("settingsFullOrder", JSONArray(order))
-        pass("settings.initial", "Settings initial placement starts 테마 → 아이콘 스타일 → 화면 켜짐 (visible prefix in the requested order)",
-            initialOrder.isNotEmpty() && initialOrder.first() == "테마" && initialOrder == wanted.filter { it in initialOrder }, "initial=$initialOrder")
-        pass("settings.order", "Settings sections follow 테마 → 아이콘 스타일 → 화면 켜짐 → 앱 아이콘 → 저장공간 관리 → 파일 연동 → 정보 (scrolled)",
+        pass("settings.initial", "Settings root initial placement starts 저장공간·캐시 (visible prefix in the requested order)",
+            initialOrder.isNotEmpty() && initialOrder.first() == "저장공간·캐시" && initialOrder == wanted.filter { it in initialOrder }, "initial=$initialOrder")
+        pass("settings.order", "Settings sections follow 저장공간·캐시 → 화면 켜짐 → 앱 아이콘 → 프라이버시 → 화면·테마 → 앱 정보·업데이트 (scrolled)",
             order == wanted, "seen=$order")
         capture("settings-scrolled", controls = listOf("뒤로"))
         repeat(12) { nodes().firstOrNull { it.isScrollable && it.isVisibleToUser }?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD); }
         idle()
-        if (activity?.isFinishing == false) { back(); ensureTabBar() }
+        if (activity?.isFinishing == false) { ensureTabBar(); tabNode("홈")?.let { click(it) }; idle() }
     }
 
     // ---------------------------------------------------------------- photo selection

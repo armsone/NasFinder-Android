@@ -502,6 +502,7 @@ object TrailerDraftStore {
                 put("photoDurationRatio", src.photoDurationRatio)
                 put("photoPolicyVersion", src.photoPolicyVersion)
                 src.originKey?.let { put("originKey", it) }
+                if (src.isImportant) put("isImportant", true)
             })
         }
         put("sources", sourcesArr)
@@ -642,6 +643,7 @@ object TrailerDraftStore {
                     photoDurationRatio = sObj.optDouble("photoDurationRatio", DEFAULT_PHOTO_DURATION_RATIO),
                     photoPolicyVersion = sObj.optInt("photoPolicyVersion", 1),
                     originKey = sObj.optString("originKey").takeIf { it.isNotBlank() },
+                    isImportant = sObj.optBoolean("isImportant", false),
                 )
             )
         }

@@ -21,6 +21,7 @@ import android.graphics.Bitmap
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.network.RemoteFileServiceFactory
+import com.armsone.nasfinder.platform.OAuthAccessTokenProvider
 import com.armsone.nasfinder.platform.SuperThumbnailThermalDecision
 import com.armsone.nasfinder.platform.SuperThumbnailThermalPolicy
 import kotlinx.coroutines.CancellationException
@@ -134,6 +135,52 @@ object SuperThumbnailWorkController {
     private const val UNIQUE_PREFIX = "super-thumbnail-"
 }
 
+/** [order] lists each folder after its subfolders; [tileUsers] counts, per folder path, the parents that will composite its tile. */
+internal data class FolderSheetProductionPlan(
+    val order: List<RemoteFileItem>,
+    val tileUsers: Map<String, Int>,
+)
+
+/**
+ * Depth-first post-order, so a subtree's tiles are released before the next sibling starts and at most
+ * MAX_CHILDREN tiles per depth are alive (a level-by-level walk would hold a whole level). In a resume run
+ * ([pendingItemIds] non-null) a finished folder gets tile demand only through a selected chain up to a pending folder.
+ */
+internal fun folderSheetProductionPlan(
+    visitedDirectories: List<String>,
+    children: Map<String, List<RemoteFileItem>>,
+    pendingItemIds: Set<String>?,
+): FolderSheetProductionPlan {
+    fun childFolders(path: String) = children[path].orEmpty().filter { it.isDirectory }.iterator()
+    val order = mutableListOf<RemoteFileItem>()
+    val seen = hashSetOf<String>()
+    val stack = ArrayDeque<Pair<RemoteFileItem?, Iterator<RemoteFileItem>>>()
+    for (start in visitedDirectories) {
+        if (!seen.add(start)) continue
+        stack.addLast(null to childFolders(start))
+        while (stack.isNotEmpty()) {
+            val (folder, remaining) = stack.last()
+            if (remaining.hasNext()) {
+                val child = remaining.next()
+                if (seen.add(child.path)) stack.addLast(child to childFolders(child.path))
+            } else {
+                stack.removeLast()
+                folder?.let { order += it }
+            }
+        }
+    }
+    val tileUsers = hashMapOf<String, Int>()
+    for (folder in order.asReversed()) {
+        val publishes = pendingItemIds == null || folder.id in pendingItemIds
+        if (!publishes && (tileUsers[folder.path] ?: 0) == 0) continue
+        val listed = children[folder.path] ?: continue
+        FolderSuperThumbnailPolicy.selectChildren(listed).filter { it.isDirectory }.forEach { child ->
+            tileUsers[child.path] = (tileUsers[child.path] ?: 0) + 1
+        }
+    }
+    return FolderSheetProductionPlan(order, tileUsers)
+}
+
 class SuperThumbnailWorker(
     appContext: Context,
     parameters: WorkerParameters,
@@ -179,7 +226,11 @@ class SuperThumbnailWorker(
 
         return try {
             publish(SuperThumbnailWorkStatus.RUNNING, 0, 0, 0, 0L, false)
-            RemoteFileServiceFactory.create(connection, password).use { service ->
+            RemoteFileServiceFactory.create(
+                connection,
+                password,
+                OAuthAccessTokenProvider(applicationContext),
+            ).use { service ->
                 val cacheKeyStore = SuperThumbnailCacheKeyStore(
                     applicationContext.filesDir.resolve("super-thumbnail/cache-keys-v1.json")
                 )
@@ -414,39 +465,86 @@ class SuperThumbnailWorker(
                 }
         }
         // Bottom-up folder Super Thumbnail production
-        val unblurredFolderSheets = mutableMapOf<String, Bitmap>()
-        // Folders whose published sheet is fully backed by real tiles (or that are genuinely empty).
+        val folderPlan = folderSheetProductionPlan(visitedDirectoryNodes, dirChildrenMap, resumeItemIds)
+        val remainingTileUsers = folderPlan.tileUsers.toMutableMap()
+        // Bitmaps created and owned by this loop, held only while a parent that selected them has not composed yet.
+        // Never shared with the thumbnail cache, so recycling one cannot affect another user.
+        val unblurredFolderTiles = mutableMapOf<String, Bitmap>()
+        // Folders whose sheet is fully backed by real tiles (or that are genuinely empty).
         val completeFolderPaths = hashSetOf<String>()
+        fun releaseChildTiles(selected: List<RemoteFileItem>) {
+            selected.filter { it.isDirectory }.forEach { child ->
+                val users = (remainingTileUsers[child.path] ?: 0) - 1
+                remainingTileUsers[child.path] = users
+                if (users <= 0) unblurredFolderTiles.remove(child.path)?.recycle()
+            }
+        }
+        // A child this resume run skipped (already complete, or new since the session) has no tile when the cache evicted
+        // it: restore its Vault JPEG, else generate this one item within the normal budget. Items the resume traversal
+        // already attempted are excluded, so a real failure still leaves the parent partial. Size and mtime in the cache
+        // key and Vault name tie the tile to the current listing.
+        suspend fun restoreSkippedChildTile(child: RemoteFileItem): Bitmap? {
+            if (resumeItemIds == null || child.id in resumeItemIds || !(child.isImage || child.isVideo)) return null
+            return try {
+                val safeChild = child.copy(path = traversal.requireInsideRoot(child.path))
+                val restored = if (vaultOptions.enabled) vault.restoredData(safeChild, rootPath, service) else null
+                if (restored != null && thumbnails.storeJpegData(connection, safeChild, restored)) {
+                    thumbnails.load(connection, safeChild, service)
+                } else {
+                    val estimate = SuperThumbnailEligibility.estimatedBytes(safeChild, service.supportsRangeStreaming)
+                        ?: return null
+                    val budget = budgetProvider()
+                    if (!budget.acceptsItem(visited) || !budget.acceptsBytes(estimatedBytes, estimate)) {
+                        budgetReached = true
+                        return null
+                    }
+                    visited++
+                    estimatedBytes += estimate
+                    thumbnails.generateSuperThumbnail(connection, safeChild, service)?.also { generated++ }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                null
+            }
+        }
         try {
-            for (dirPath in visitedDirectoryNodes.asReversed()) {
-                val childFolders = dirChildrenMap[dirPath].orEmpty().filter { it.isDirectory }
-                for (folderItem in childFolders) {
-                    currentCoroutineContext().ensureActive()
-                    if (resumeItemIds != null && folderItem.id !in resumeItemIds) continue
-                    if (!allowsThermalWork()) return Result.retry()
-                    val folderChildren = dirChildrenMap[folderItem.path] ?: continue
+            for (folderItem in folderPlan.order) {
+                currentCoroutineContext().ensureActive()
+                // A finished folder runs here only to give a pending parent its tile: nothing is published or recorded for it.
+                val publishes = resumeItemIds == null || folderItem.id in resumeItemIds
+                val tileNeeded = (remainingTileUsers[folderItem.path] ?: 0) > 0
+                if (!publishes && !tileNeeded) continue
+                if (!allowsThermalWork()) return Result.retry()
+                if (resumeItemIds != null && requiresWifi && !SuperThumbnailNetworkPolicy.isWifi(applicationContext)) return Result.retry()
+                val folderChildren = dirChildrenMap[folderItem.path] ?: continue
+                if (publishes) {
                     sessionStore.prepare(
                         sessionKey = sessionKey,
                         rootPath = rootPath,
                         items = listOf(folderItem),
                         vaultEnabled = vaultOptions.enabled,
                     )
-                    if (folderChildren.isEmpty()) {
+                }
+                if (folderChildren.isEmpty()) {
+                    if (publishes) {
                         if (vaultOptions.enabled) {
                             vault.storeFolderEmptyMarkerWithRetry(folderItem, rootPath, service)
                         }
                         sessionStore.recordSuccess(sessionKey, folderItem)
-                        completeFolderPaths += folderItem.path
-                    } else {
-                        // Always rebuild from unblurred run-scoped sources. A normal
-                        // generation pass therefore upgrades legacy fixed-blur sheets at
-                        // the same compatible filename, while parents never consume a
-                        // persisted blurred child.
-                        val selected = FolderSuperThumbnailPolicy.selectChildren(folderChildren)
-                        val tileBitmaps = selected.associateWith { child ->
-                            if (child.isDirectory) {
-                                unblurredFolderSheets[child.path]
-                            } else if (thumbnails.hasCached(connection, child)) {
+                    }
+                    completeFolderPaths += folderItem.path
+                } else {
+                    // Always rebuild from unblurred run-scoped sources. A normal
+                    // generation pass therefore upgrades legacy fixed-blur sheets at
+                    // the same compatible filename, while parents never consume a
+                    // persisted blurred child.
+                    val selected = FolderSuperThumbnailPolicy.selectChildren(folderChildren)
+                    val tileBitmaps = selected.associateWith { child ->
+                        if (child.isDirectory) {
+                            unblurredFolderTiles[child.path]
+                        } else {
+                            val cached = if (thumbnails.hasCached(connection, child)) {
                                 try {
                                     thumbnails.load(connection, child, service)
                                 } catch (error: CancellationException) {
@@ -455,54 +553,66 @@ class SuperThumbnailWorker(
                                     null
                                 }
                             } else null
+                            cached ?: restoreSkippedChildTile(child)
                         }
-                        // Never publish a sheet whose selected media/folder tile is missing (failed, unsupported or over budget).
-                        val missingTile = selected.any { child ->
-                            when {
-                                child.isDirectory -> child.path !in completeFolderPaths &&
-                                    dirChildrenMap[child.path]?.isEmpty() != true
-                                child.isImage || child.isVideo -> tileBitmaps[child] == null
-                                else -> false
-                            }
+                    }
+                    // Never publish a sheet whose selected media/folder tile is missing (failed, unsupported or over budget).
+                    val missingTile = selected.any { child ->
+                        when {
+                            child.isDirectory -> child.path !in completeFolderPaths &&
+                                dirChildrenMap[child.path]?.isEmpty() != true
+                            child.isImage || child.isVideo -> tileBitmaps[child] == null
+                            else -> false
                         }
-                        if (missingTile) {
+                    }
+                    if (missingTile) {
+                        releaseChildTiles(selected)
+                        if (publishes) {
                             failed++
                             sessionStore.recordFailure(sessionKey, folderItem, "일부 하위 항목 썸네일이 없어 폴더 썸네일을 보류했습니다.")
+                        }
+                        continue
+                    }
+                    val rawSheet = FolderSuperThumbnailComposer.composeRawSheet(selected, tileBitmaps::get)
+                    releaseChildTiles(selected)
+                    try {
+                        if (tileNeeded) unblurredFolderTiles[folderItem.path] = FolderSuperThumbnailComposer.rawTile(rawSheet)
+                        if (!publishes) {
+                            completeFolderPaths += folderItem.path
                             continue
                         }
-                        val rawSheet = FolderSuperThumbnailComposer.composeRawSheet(selected, tileBitmaps::get)
-                        unblurredFolderSheets.put(folderItem.path, rawSheet)?.let { previous ->
-                            if (!previous.isRecycled) previous.recycle()
-                        }
-                        val finalSheet = rawSheet.copy(rawSheet.config ?: Bitmap.Config.ARGB_8888, true)
-                        FolderSuperThumbnailComposer.applySkinToneBlurIfNeeded(finalSheet)
+                        // The parent's tile is already taken, so the sheet this loop owns can be blurred in place.
+                        FolderSuperThumbnailComposer.applySkinToneBlurIfNeeded(rawSheet)
                         val out = ByteArrayOutputStream()
-                        if (finalSheet.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
-                            val jpegBytes = out.toByteArray()
-                            finalSheet.recycle()
-                            if (jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
-                                thumbnails.storeJpegData(connection, folderItem, jpegBytes)
-                                if (vaultOptions.enabled) {
-                                    vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
-                                }
-                                generated++
-                                completeFolderPaths += folderItem.path
-                                sessionStore.recordSuccess(sessionKey, folderItem)
-                            } else {
-                                failed++
-                                sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 데이터가 유효하지 않습니다.")
+                        val compressed = rawSheet.compress(Bitmap.CompressFormat.JPEG, 88, out)
+                        rawSheet.recycle()
+                        val jpegBytes = out.toByteArray()
+                        if (compressed && jpegBytes.isNotEmpty() && jpegBytes.size <= 8 * 1024 * 1024) {
+                            thumbnails.storeJpegData(connection, folderItem, jpegBytes)
+                            if (vaultOptions.enabled) {
+                                vault.storeFolderThumbnailWithRetry(folderItem, rootPath, service, jpegBytes)
                             }
+                            generated++
+                            completeFolderPaths += folderItem.path
+                            sessionStore.recordSuccess(sessionKey, folderItem)
                         } else {
-                            finalSheet.recycle()
+                            // Not complete, so no parent will composite it.
+                            unblurredFolderTiles.remove(folderItem.path)?.recycle()
                             failed++
-                            sessionStore.recordFailure(sessionKey, folderItem, "폴더 썸네일 생성에 실패했습니다.")
+                            sessionStore.recordFailure(
+                                sessionKey,
+                                folderItem,
+                                if (compressed) "폴더 썸네일 데이터가 유효하지 않습니다." else "폴더 썸네일 생성에 실패했습니다.",
+                            )
                         }
+                    } finally {
+                        if (!rawSheet.isRecycled) rawSheet.recycle()
                     }
                 }
             }
         } finally {
-            unblurredFolderSheets.values.forEach { if (!it.isRecycled) it.recycle() }
-            unblurredFolderSheets.clear()
+            unblurredFolderTiles.values.forEach { if (!it.isRecycled) it.recycle() }
+            unblurredFolderTiles.clear()
         }
         if (vaultOptions.enabled && (observedMedia.isNotEmpty() || currentListed.isNotEmpty())) {
             // Changed sources get fresh state first so an old completion is never kept.

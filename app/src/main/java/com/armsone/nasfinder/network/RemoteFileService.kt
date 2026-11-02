@@ -3,6 +3,7 @@ package com.armsone.nasfinder.network
 import com.armsone.nasfinder.model.ConnectionKind
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -70,14 +71,22 @@ interface RemoteFileService : Closeable {
 }
 
 object RemoteFileServiceFactory {
-    fun create(connection: RemoteConnection, password: String): RemoteFileService = when (connection.kind) {
+    /**
+     * [cloudAccessTokens]는 저장된 클라우드 연결의 현재 토큰을 요청마다 돌려준다. 입력 중인 토큰처럼
+     * [password]를 그대로 시험해야 하는 경우에만 null을 넘긴다.
+     */
+    fun create(
+        connection: RemoteConnection,
+        password: String,
+        cloudAccessTokens: CloudAccessTokenSource?,
+    ): RemoteFileService = when (connection.kind) {
         ConnectionKind.SYNOLOGY -> SynologyFileService(connection, password)
         ConnectionKind.SFTP -> SftpFileService(connection, password)
         ConnectionKind.SMB -> SmbFileService(connection, password)
         ConnectionKind.WEBDAV -> WebDavFileService(connection, password)
         ConnectionKind.FTP -> FtpFileService(connection, password)
         ConnectionKind.DROPBOX, ConnectionKind.ONEDRIVE, ConnectionKind.GOOGLE_DRIVE ->
-            CloudDriveFileService(connection, password)
+            CloudDriveFileService(connection, password, tokenSource = cloudAccessTokens)
         else -> UnsupportedRemoteFileService(connection)
     }
 }
@@ -321,25 +330,60 @@ class SynologyFileService(
         timeoutMillis: Long = 180_000L,
     ) {
         val startTime = System.currentTimeMillis()
-        while (true) {
-            currentCoroutineContext().ensureActive()
-            if (System.currentTimeMillis() - startTime > timeoutMillis) {
-                throw RemoteServiceException.Server("Synology 작업 상태 확인 시간이 초과되었습니다. 서버에서 작업이 계속 진행 중일 수 있습니다.")
+        // close()가 먼저 세션을 비워도 이 작업을 시작한 세션으로 중지를 시도할 수 있게 기억한다.
+        var lastSessionId = sid
+        try {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                if (System.currentTimeMillis() - startTime > timeoutMillis) {
+                    throw RemoteServiceException.Server("Synology 작업 상태 확인 시간이 초과되었습니다. 서버에서 작업이 계속 진행 중일 수 있습니다.")
+                }
+                val status = apiJson(
+                    api = api,
+                    version = version,
+                    method = "status",
+                    parameters = mapOf("taskid" to JSONObject.quote(taskId)),
+                ).getJSONObject("data")
+                lastSessionId = sid ?: lastSessionId
+                val errorCode = status.optInt("error_code", 0).takeIf { it > 0 }
+                    ?: status.optJSONArray("errors")?.optJSONObject(0)?.optInt("code", 0)?.takeIf { it > 0 }
+                val hasErrors = (status.optJSONArray("errors")?.length() ?: 0) > 0
+                if (status.optBoolean("has_fail") || status.optBoolean("failed") || hasErrors || errorCode != null) {
+                    throw RemoteServiceException.Server("Synology 작업 실패${errorCode?.let { " ($it)" } ?: ""}")
+                }
+                if (status.optBoolean("finished")) return
+                delay(250)
             }
-            val status = apiJson(
-                api = api,
-                version = version,
-                method = "status",
-                parameters = mapOf("taskid" to JSONObject.quote(taskId)),
-            ).getJSONObject("data")
-            val errorCode = status.optInt("error_code", 0).takeIf { it > 0 }
-                ?: status.optJSONArray("errors")?.optJSONObject(0)?.optInt("code", 0)?.takeIf { it > 0 }
-            val hasErrors = (status.optJSONArray("errors")?.length() ?: 0) > 0
-            if (status.optBoolean("has_fail") || status.optBoolean("failed") || hasErrors || errorCode != null) {
-                throw RemoteServiceException.Server("Synology 작업 실패${errorCode?.let { " ($it)" } ?: ""}")
-            }
-            if (status.optBoolean("finished")) return
-            delay(250)
+        } catch (cancelled: CancellationException) {
+            // 폴링을 멈춰도 서버가 받아들인 작업은 계속되므로 이 작업에만 중지를 요청한다.
+            requestTaskStop(api, version, taskId, sid ?: lastSessionId)
+            throw cancelled
+        } catch (error: RemoteServiceException.Connection) {
+            throw RemoteServiceException.Connection(
+                "Synology 작업 상태를 확인하지 못했습니다. 서버에서 작업이 계속 진행 중일 수 있습니다.",
+                error,
+            )
+        }
+    }
+
+    /**
+     * Sends one time-limited stop request without logging in again. A stop is not a rollback: items
+     * already deleted or moved stay that way, and the task may still run if this request fails.
+     */
+    private fun requestTaskStop(api: String, version: String, taskId: String, sessionId: String?) {
+        if (sessionId == null) return
+        runCatching {
+            val url = "$baseUrl/webapi/entry.cgi".toHttpUrl().newBuilder()
+                .addQueryParameter("api", api)
+                .addQueryParameter("version", version)
+                .addQueryParameter("method", "stop")
+                .addQueryParameter("_sid", sessionId)
+                .addQueryParameter("taskid", JSONObject.quote(taskId))
+                .build()
+            client.newBuilder().callTimeout(5, TimeUnit.SECONDS).build()
+                .newCall(Request.Builder().url(url).get().build())
+                .execute()
+                .close()
         }
     }
 

@@ -7,6 +7,11 @@
 
 package com.armsone.nasfinder.ui
 
+import androidx.compose.ui.graphics.vector.ImageVector
+import kotlinx.coroutines.isActive
+import android.text.format.Formatter
+import kotlin.math.abs
+import androidx.media3.ui.AspectRatioFrameLayout
 import com.armsone.nasfinder.ui.theme.LocalInterfaceIconPack
 
 import android.app.Activity
@@ -134,6 +139,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
@@ -226,6 +232,7 @@ fun NasFinderApp(
     onCheckForUpdates: () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
+    var transferHostCreated by remember { mutableStateOf(false) }
     val privacyEpoch by com.armsone.nasfinder.data.PrivacyMode.epoch.collectAsStateWithLifecycle()
     var showBusyOverlay by remember { mutableStateOf(false) }
     LaunchedEffect(state.isBusy) {
@@ -257,7 +264,7 @@ fun NasFinderApp(
         // Leaving the foreground (home, recents, another app, screen off) returns the next visit to
         // the dashboard. Configuration changes such as rotation or folding keep the current screen.
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && appContext.findHostActivity()?.isChangingConfigurations != true) {
+            if (event == Lifecycle.Event.ON_STOP && appContext.findHostActivity()?.isChangingConfigurations != true && (appContext.findHostActivity() as? com.armsone.nasfinder.MainActivity)?.hasPendingExternalActivityResult != true) {
                 model.returnToDashboardAfterBackground()
             }
         }
@@ -268,7 +275,20 @@ fun NasFinderApp(
         model.closeImagePreview()
     }
     BackHandler(enabled = state.imagePreview == null && state.screen != Screen.Dashboard) {
-        model.show(Screen.Dashboard)
+        when (state.screen) {
+            Screen.PhotoSelection,
+            Screen.PhotoTransfer,
+            Screen.SuperThumbnail,
+            Screen.ThumbnailCache -> model.selectMainDestination(MainNavigationDestination.TOOLS)
+            is Screen.AddConnection,
+            Screen.Favorites,
+            Screen.Inbox,
+            Screen.WebHard,
+            Screen.WebBrowser,
+            is Screen.LocalPhotoLibrary,
+            Screen.GooglePhotos -> model.exitToMainRoot()
+            else -> model.show(Screen.Dashboard)
+        }
     }
 
     val mediaLibraryStateHolder = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
@@ -306,19 +326,15 @@ fun NasFinderApp(
             androidx.compose.runtime.key(privacyEpoch) {
             when (val screen = state.screen) {
                 Screen.Dashboard -> DashboardScreen(state, model)
-                is Screen.AddConnection -> ConnectionEditor(screen.editing, state, model)
+                is Screen.AddConnection -> PorcelainWideHost(state, model) {
+                    ConnectionEditor(screen.editing, state, model)
+                }
                 is Screen.Browser -> PorcelainWideHost(state, model, selectedConnectionId = screen.connection.id.toString(), fullscreen = coverFlowFullscreen) {
                     BrowserScreen(screen, state, model, onCoverFlowFullscreen = { browserCoverFlowFullscreen = it })
                 }
                 Screen.Inbox, Screen.WebHard -> PorcelainWideHost(state, model, phoneHardSelected = true) { InboxScreen(state, model) }
                 // Wide windows keep the persistent navigation beside the content; the transfer content uses the right pane width only.
-                Screen.PhotoTransfer -> PorcelainWideHost(state, model) {
-                    PhotoTransferScreen(
-                        state = state,
-                        model = model,
-                        onBack = { model.show(Screen.Dashboard) },
-                    )
-                }
+                Screen.PhotoTransfer -> Unit
                 Screen.Favorites -> {
                     var pendingFavoriteRemoval by remember { mutableStateOf<RemoteFavorite?>(null) }
                     PorcelainWideHost(state, model, favoritesSelected = true) {
@@ -339,7 +355,7 @@ fun NasFinderApp(
                 Screen.PhotoSelection -> PorcelainWideHost(state, model) {
                     PhotoSelectionScreen(
                         session = model.photoSelection,
-                        onBack = { model.show(Screen.Dashboard) },
+                        onBack = { model.selectMainDestination(MainNavigationDestination.TOOLS) },
                         onShowMessage = model::showMessage,
                         pendingShares = state.pendingMediaShares,
                         onOpenPendingShares = model::reopenPendingMediaShares,
@@ -356,7 +372,7 @@ fun NasFinderApp(
                     model = model,
                     initialIntent = (screen as? Screen.LocalPhotoLibrary)?.initialIntent ?: LocalMediaEditIntent.NONE,
                     googlePhotosSource = screen == Screen.GooglePhotos || (screen as? Screen.LocalPhotoLibrary)?.googlePhotosSource == true,
-                    onBack = { model.show(Screen.Dashboard) },
+                    onBack = { model.exitToMainRoot() },
                     onPreview = model::previewLocalMediaUri,
                     onCreateTrailer = model::startLocalMediaTrailer,
                     onMusicOverlay = { model.startLocalMusicOverlay(it, null) },
@@ -382,7 +398,7 @@ fun NasFinderApp(
                     preferredConnectionId = state.preferredId,
                     resumedDownload = state.pendingLocalUpload,
                     trailerActive = state.trailer != null,
-                    onClose = { model.show(Screen.Dashboard) },
+                    onClose = { model.exitToMainRoot() },
                     onToggleFavorite = model::toggleBrowserFavorite,
                     onSetHomepage = model::setBrowserHomepage,
                     onEditFavorite = model::editBrowserFavorite,
@@ -392,9 +408,40 @@ fun NasFinderApp(
                     onDiscardDownloadedFile = model::discardWebDownload,
                 ) }
                 Screen.MaterialBasket -> PorcelainWideHost(state, model) { WorkbenchScreen(state, model, embedded = false, onBack = { model.show(Screen.Dashboard) }) }
-                Screen.VideoDrafts -> PorcelainWideHost(state, model) { VideoDraftsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
-                Screen.VideoCollections -> PorcelainWideHost(state, model) { VideoCollectionsScreen(state, model, onBack = { model.show(Screen.Dashboard) }) }
+                Screen.VideoDrafts -> PorcelainWideHost(state, model) { VideoDraftsScreen(state, model, onBack = { model.selectMainDestination(MainNavigationDestination.VIDEO) }) }
+                // 예전 컬렉션 경로(복원된 상태 등)는 빈 화면 대신 폰하드를 연다. 기존 컬렉션 영상은 폰하드로 복사된다.
+                Screen.VideoCollections -> PorcelainWideHost(state, model, phoneHardSelected = true) { InboxScreen(state, model) }
             }
+            }
+
+            if (state.screen == Screen.PhotoTransfer || transferHostCreated) {
+                SideEffect { transferHostCreated = true }
+                val visible = state.screen == Screen.PhotoTransfer
+                Box(if (visible) Modifier.fillMaxSize() else Modifier.size(0.dp)) {
+                    PorcelainWideHost(state, model, fullscreen = !visible) {
+                        Box(Modifier.fillMaxSize()) {
+                            PhotoTransferScreen(
+                                state = state,
+                                model = model,
+                                visible = visible,
+                                onActivityChanged = model::updateMediaTransferActivity,
+                                onBack = { model.selectMainDestination(MainNavigationDestination.TOOLS) },
+                            )
+                            if (visible && state.mediaTransferOriginPrivate && !com.armsone.nasfinder.data.PrivacyMode.isActive) {
+                                Column(
+                                    Modifier.fillMaxSize(),
+                                    verticalArrangement = Arrangement.Center,
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Text("비공개 전송은 프라이버시를 켜면 확인할 수 있습니다.")
+                                    TextButton(onClick = { model.selectMainDestination(MainNavigationDestination.SETTINGS) }) {
+                                        Text("설정")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // 작업대에 담기 / 영상 제작 확인 / 다시 연결 확인: one host for every source screen.
@@ -497,18 +544,6 @@ fun NasFinderApp(
                 }
             )
         }
-        state.pendingCollectionImport?.let { pending ->
-            PendingCollectionImportDialog(pending, model)
-        }
-        state.collectionCopyOffer?.let { offer ->
-            AlertDialog(
-                onDismissRequest = model::dismissCollectionCopyOffer,
-                title = { Text("외부 참조로 보관할 수 없습니다") },
-                text = { Text(offer.message) },
-                confirmButton = { Button(onClick = model::acceptCollectionCopyOffer) { Text("앱 안에 사본 보관") } },
-                dismissButton = { TextButton(onClick = model::dismissCollectionCopyOffer) { Text("취소") } },
-            )
-        }
         state.trailerConflict?.let { conflict ->
             AlertDialog(
                 onDismissRequest = model::dismissTrailerConflict,
@@ -559,6 +594,53 @@ private tailrec fun Context.findHostActivity(): Activity? = when (this) {
 }
 
 @Composable
+private fun PreviewCircleActionButton(
+    onClick: () -> Unit,
+    icon: ImageVector,
+    contentDescription: String?,
+    enabled: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .size(48.dp)
+            .semantics(mergeDescendants = true) {
+                if (!enabled) {
+                    disabled()
+                }
+            }
+            .clickable(
+                enabled = enabled,
+                onClick = onClick,
+                role = Role.Button,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .background(
+                    color = Color.Black.copy(alpha = if (enabled) 0.56f else 0.28f),
+                    shape = CircleShape,
+                )
+                .border(
+                    width = 1.dp,
+                    color = Color.White.copy(alpha = if (enabled) 0.22f else 0.10f),
+                    shape = CircleShape,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+@Composable
 internal fun BuiltInPreviewScreen(
     preview: ImagePreviewState,
     onClose: () -> Unit,
@@ -578,8 +660,21 @@ internal fun BuiltInPreviewScreen(
     val haptics = LocalHapticFeedback.current
     val hostView = LocalView.current
     val touchExploration = rememberTouchExplorationEnabled()
-    val edgeToEdgePreview = preview.kind == BuiltInPreviewKind.IMAGE || preview.kind == BuiltInPreviewKind.VIDEO
+    val isImage = preview.kind == BuiltInPreviewKind.IMAGE
+    val isAudio = preview.kind == BuiltInPreviewKind.AUDIO
+    val isVideo = preview.kind == BuiltInPreviewKind.VIDEO
+    val isPdf = preview.kind == BuiltInPreviewKind.PDF
+    val edgeToEdgePreview = isImage || isVideo
     val previewSourceKey = preview.connection?.id ?: "phonehard"
+
+    val imageIndices = remember(preview.images) {
+        preview.images.indices.filter { preview.images[it].isImage }
+    }
+    val currentImagePosition = remember(preview.index, imageIndices) {
+        val pos = imageIndices.indexOf(preview.index)
+        if (pos >= 0) pos else 0
+    }
+
     var playbackMode by rememberSaveable(previewSourceKey) {
         mutableStateOf(MediaViewerPreferences.getPlaybackMode(context))
     }
@@ -588,19 +683,33 @@ internal fun BuiltInPreviewScreen(
     }
     var controlsVisible by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
     var controlInteraction by remember(previewSourceKey) { mutableIntStateOf(0) }
-    var slideshowPlaying by rememberSaveable(previewSourceKey) { mutableStateOf(true) }
-    // Index reached by end-of-playback auto-advance (not by the user); a failure there must stay visible in the app.
+    var slideshowPlaying by remember(previewSourceKey) { mutableStateOf(false) }
+
     var implicitAdvanceIndex by remember(previewSourceKey) { mutableStateOf<Int?>(null) }
     LaunchedEffect(preview.index) { if (implicitAdvanceIndex != preview.index) implicitAdvanceIndex = null }
     val focusRequester = remember { FocusRequester() }
 
     fun revealControls() { controlsVisible = true; controlInteraction++ }
 
+    fun navigateImagePrev() {
+        if (imageIndices.size >= 2) {
+            val prevPos = if (currentImagePosition > 0) currentImagePosition - 1 else imageIndices.lastIndex
+            onSelectIndex(imageIndices[prevPos])
+        }
+    }
+
+    fun navigateImageNext() {
+        if (imageIndices.size >= 2) {
+            val nextPos = if (currentImagePosition < imageIndices.lastIndex) currentImagePosition + 1 else 0
+            onSelectIndex(imageIndices[nextPos])
+        }
+    }
+
     LaunchedEffect(Unit) {
         runCatching { focusRequester.requestFocus() }
     }
 
-    val activeKeepAwake = slideshowPlaying || (preview.kind == BuiltInPreviewKind.VIDEO)
+    val activeKeepAwake = (isImage && slideshowPlaying) || isVideo
     DisposableEffect(hostView, activeKeepAwake) {
         if (activeKeepAwake) {
             val previous = hostView.keepScreenOn
@@ -612,10 +721,10 @@ internal fun BuiltInPreviewScreen(
     }
 
     DisposableEffect(context, hostView, preview.kind) {
-        if (preview.kind == BuiltInPreviewKind.IMAGE || preview.kind == BuiltInPreviewKind.VIDEO) {
+        if (edgeToEdgePreview) {
             val window = context.findHostActivity()?.window
             val insetsController = window?.let { WindowInsetsControllerCompat(it, hostView) }
-            val hiddenInsets = if (preview.kind == BuiltInPreviewKind.VIDEO) {
+            val hiddenInsets = if (isVideo) {
                 WindowInsetsCompat.Type.systemBars()
             } else {
                 WindowInsetsCompat.Type.statusBars()
@@ -629,21 +738,103 @@ internal fun BuiltInPreviewScreen(
         }
     }
 
-    val isAudio = preview.kind == BuiltInPreviewKind.AUDIO
-    val effectiveControlsVisible = if (isAudio) true else controlsVisible
+    var videoPlaying by remember(previewSourceKey) { mutableStateOf(false) }
+    var videoBuffering by remember(previewSourceKey) { mutableStateOf(false) }
+    var videoError by remember(previewSourceKey) { mutableStateOf(false) }
 
-    LaunchedEffect(preview.cachedFile.absolutePath, controlsVisible, controlInteraction, isAudio) {
-        if (!isAudio && controlsVisible && !touchExploration) { delay(2_500); controlsVisible = false }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isLifecycleStopped by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                isLifecycleStopped = true
+            } else if (event == Lifecycle.Event.ON_START) {
+                isLifecycleStopped = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
-    LaunchedEffect(preview.index, slideshowPlaying, slideshowInterval, playbackMode) {
-        if (slideshowPlaying && preview.kind == BuiltInPreviewKind.IMAGE) {
-            delay(slideshowInterval * 1000L)
-            val nextIdx = MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)
-            if (preview.images.size > 1 || playbackMode == MediaPlaybackMode.ONE_REPEAT) {
-                onSelectIndex(nextIdx)
-            } else {
-                slideshowPlaying = false
+    val isSuspended = playbackSuspended || isLifecycleStopped
+    val effectiveControlsVisible = if (touchExploration || isAudio) {
+        true
+    } else if (isImage) {
+        !slideshowPlaying || isSuspended || preview.bitmap == null || controlsVisible
+    } else if (isVideo) {
+        !videoPlaying || videoBuffering || videoError || controlsVisible
+    } else {
+        controlsVisible
+    }
+
+    val shouldAutoHideControls = !isAudio && controlsVisible && !touchExploration && when {
+        isVideo -> videoPlaying && !videoBuffering && !videoError
+        isImage -> slideshowPlaying && !isSuspended && preview.bitmap != null
+        else -> false
+    }
+
+    LaunchedEffect(preview.cachedFile.absolutePath, controlsVisible, controlInteraction, shouldAutoHideControls) {
+        if (shouldAutoHideControls) {
+            delay(2_500)
+            controlsVisible = false
+        }
+    }
+
+    LaunchedEffect(
+        preview.index,
+        slideshowPlaying,
+        slideshowInterval,
+        playbackMode,
+        isSuspended,
+        preview.bitmap != null,
+    ) {
+        if (isImage && slideshowPlaying && !isSuspended && preview.bitmap != null) {
+            while (isActive && slideshowPlaying && !isSuspended && preview.bitmap != null) {
+                delay(slideshowInterval * 1000L)
+                if (!isActive || !slideshowPlaying || isSuspended || preview.bitmap == null) break
+
+                when (playbackMode) {
+                    MediaPlaybackMode.ONE_REPEAT -> {
+                        // wait full interval repeatedly without onSelectIndex
+                        continue
+                    }
+                    MediaPlaybackMode.ONCE -> {
+                        if (imageIndices.isNotEmpty()) {
+                            if (currentImagePosition >= imageIndices.lastIndex) {
+                                slideshowPlaying = false
+                                break
+                            } else {
+                                val nextPos = currentImagePosition + 1
+                                onSelectIndex(imageIndices[nextPos])
+                                break
+                            }
+                        } else {
+                            slideshowPlaying = false
+                            break
+                        }
+                    }
+                    MediaPlaybackMode.ALL_REPEAT -> {
+                        if (imageIndices.size >= 2) {
+                            val nextPos = (currentImagePosition + 1) % imageIndices.size
+                            onSelectIndex(imageIndices[nextPos])
+                            break
+                        } else {
+                            continue
+                        }
+                    }
+                    MediaPlaybackMode.SHUFFLE -> {
+                        if (imageIndices.size >= 2) {
+                            val remainingIndices = imageIndices.filter { it != preview.index }
+                            val targetIdx = if (remainingIndices.isNotEmpty()) remainingIndices.random() else imageIndices[0]
+                            onSelectIndex(targetIdx)
+                            break
+                        } else {
+                            continue
+                        }
+                    }
+                }
             }
         }
     }
@@ -653,20 +844,53 @@ internal fun BuiltInPreviewScreen(
         topBar = {
             if (effectiveControlsVisible) {
                 TopAppBar(
-                    modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
+                    modifier = Modifier.windowInsetsPadding(
+                        WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility)
+                            .only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
+                    ),
                     title = {
                         Column {
-                            Text(preview.images[preview.index].name, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val titleText = if (isImage && imageIndices.isNotEmpty()) {
+                                preview.images.getOrNull(preview.index)?.name ?: ""
+                            } else {
+                                preview.images.getOrNull(preview.index)?.name ?: ""
+                            }
+                            Text(
+                                titleText,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium.copy(fontSize = 16.sp),
+                            )
                             when {
-                                preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1 -> {
+                                isImage && imageIndices.size >= 2 -> {
+                                    val currentFile = preview.cachedFile
+                                    val sizeFormatted = remember(currentFile.length()) {
+                                        Formatter.formatFileSize(context, currentFile.length())
+                                    }
                                     Text(
-                                        "${preview.index + 1} / ${preview.images.size} • ${playbackMode.title} • ${slideshowInterval}초",
-                                        color = Color.White.copy(alpha = .68f),
-                                        style = MaterialTheme.typography.labelSmall,
+                                        "${currentImagePosition + 1} / ${imageIndices.size} • $sizeFormatted",
+                                        color = Color.White.copy(alpha = 0.68f),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
                                     )
                                 }
-                                preview.kind == BuiltInPreviewKind.PDF -> {
-                                    Text("${preview.pdfPageIndex + 1} / ${preview.pdfPageCount}", color = Color.White.copy(alpha = .68f), style = MaterialTheme.typography.labelSmall)
+                                isImage && imageIndices.size == 1 -> {
+                                    val currentFile = preview.cachedFile
+                                    val sizeFormatted = remember(currentFile.length()) {
+                                        Formatter.formatFileSize(context, currentFile.length())
+                                    }
+                                    Text(
+                                        "1 / 1 • $sizeFormatted",
+                                        color = Color.White.copy(alpha = 0.68f),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                                    )
+                                }
+                                isPdf -> {
+                                    Text(
+                                        "${preview.pdfPageIndex + 1} / ${preview.pdfPageCount}",
+                                        color = Color.White.copy(alpha = 0.68f),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                                    )
                                 }
                             }
                         }
@@ -677,7 +901,7 @@ internal fun BuiltInPreviewScreen(
                         }
                     },
                     actions = {
-                        if (preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+                        if (!isImage && preview.images.size > 1 && !isPdf) {
                             IconButton(
                                 onClick = {
                                     val nextMode = playbackMode.next()
@@ -691,31 +915,20 @@ internal fun BuiltInPreviewScreen(
                                         MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
                                         MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
                                         MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                                        MediaPlaybackMode.ONCE -> Icons.Default.LooksOne
                                     },
                                     contentDescription = "재생 모드: ${playbackMode.title}",
                                     tint = Color.White,
                                 )
                             }
-                            TextButton(
-                                onClick = {
-                                    val nextSec = MediaSlideshowPolicy.nextInterval(slideshowInterval)
-                                    slideshowInterval = nextSec
-                                    MediaViewerPreferences.setSlideshowInterval(context, nextSec)
-                                    revealControls()
-                                },
-                            ) {
-                                Text(
-                                    "${slideshowInterval}초",
-                                    color = Color.White,
-                                    style = MaterialTheme.typography.labelMedium,
-                                )
-                            }
                         }
                         accessoryControls()
-                        if (showShare) IconButton(onClick = onShare) {
-                            Icon(Icons.Default.Share, "공유", tint = Color.White)
+                        if (showShare) {
+                            IconButton(onClick = onShare) {
+                                Icon(Icons.Default.Share, "공유", tint = Color.White)
+                            }
                         }
-                        if (preview.kind == BuiltInPreviewKind.PDF && preview.images.size > 1) {
+                        if (isPdf && preview.images.size > 1) {
                             IconButton(onClick = onPrevious, enabled = preview.index > 0) {
                                 Icon(Icons.Default.SkipPrevious, "이전 파일", tint = Color.White)
                             }
@@ -726,7 +939,9 @@ internal fun BuiltInPreviewScreen(
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = if (edgeToEdgePreview) Color.Transparent else Color.Black),
                 )
-            } else if (!edgeToEdgePreview) Spacer(Modifier.height(64.dp).fillMaxWidth().background(Color.Black))
+            } else if (!edgeToEdgePreview) {
+                Spacer(Modifier.height(64.dp).fillMaxWidth().background(Color.Black))
+            }
         },
     ) { padding ->
         Box(
@@ -741,17 +956,29 @@ internal fun BuiltInPreviewScreen(
                         when (keyEvent.key) {
                             Key.Escape, Key.Back -> { onClose(); true }
                             Key.DirectionLeft -> {
-                                if (preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) { onPrevious(); true }
-                                else if (preview.kind == BuiltInPreviewKind.PDF) { onPreviousPdfPage(); true }
-                                else false
+                                if (isImage) {
+                                    navigateImagePrev()
+                                    true
+                                } else if (isVideo || isAudio) {
+                                    if (preview.images.size > 1) { onPrevious(); true } else false
+                                } else if (isPdf) {
+                                    onPreviousPdfPage()
+                                    true
+                                } else false
                             }
                             Key.DirectionRight -> {
-                                if (preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) { onNext(); true }
-                                else if (preview.kind == BuiltInPreviewKind.PDF) { onNextPdfPage(); true }
-                                else false
+                                if (isImage) {
+                                    navigateImageNext()
+                                    true
+                                } else if (isVideo || isAudio) {
+                                    if (preview.images.size > 1) { onNext(); true } else false
+                                } else if (isPdf) {
+                                    onNextPdfPage()
+                                    true
+                                } else false
                             }
                             Key.Spacebar, Key.MediaPlayPause -> {
-                                if (preview.kind == BuiltInPreviewKind.IMAGE && preview.images.size > 1) {
+                                if (isImage && imageIndices.size >= 2) {
                                     slideshowPlaying = !slideshowPlaying
                                     revealControls()
                                     true
@@ -763,24 +990,40 @@ internal fun BuiltInPreviewScreen(
                 },
             contentAlignment = Alignment.Center,
         ) {
-            when (preview.kind) {
-                BuiltInPreviewKind.IMAGE, BuiltInPreviewKind.PDF -> preview.bitmap?.let { bitmap ->
+            when {
+                isImage || isPdf -> preview.bitmap?.let { bitmap ->
+                    // ZoomablePreviewBitmap existing function does not provide a gesture activity / interaction hook
+                    // so controls reveal and double-tap toggle are wired directly via onToggleControls and onDoubleTap callbacks.
                     ZoomablePreviewBitmap(
                         bitmap = bitmap,
-                        animatedFile = preview.cachedFile.takeIf { preview.kind == BuiltInPreviewKind.IMAGE && preview.animatedImage },
-                        description = preview.images[preview.index].name,
+                        animatedFile = preview.cachedFile.takeIf { isImage && preview.animatedImage },
+                        description = preview.images.getOrNull(preview.index)?.name ?: "",
                         stateKey = "${preview.cachedFile.absolutePath}:${preview.pdfPageIndex}",
-                        onPrevious = onPrevious,
-                        onNext = onNext,
+                        onPrevious = if (isImage) ::navigateImagePrev else onPrevious,
+                        onNext = if (isImage) ::navigateImageNext else onNext,
                         onClose = onClose,
                         onToggleControls = {
-                            if (touchExploration) revealControls()
-                            else if (controlsVisible) controlsVisible = false
-                            else revealControls()
+                            if (isImage) {
+                                revealControls()
+                            } else if (touchExploration) {
+                                revealControls()
+                            } else if (controlsVisible) {
+                                controlsVisible = false
+                            } else {
+                                revealControls()
+                            }
                         },
+                        onDoubleTap = if (isImage) {
+                            {
+                                if (imageIndices.size >= 2) {
+                                    slideshowPlaying = !slideshowPlaying
+                                }
+                                revealControls()
+                            }
+                        } else null,
                     )
                 }
-                BuiltInPreviewKind.AUDIO, BuiltInPreviewKind.VIDEO -> {
+                isAudio || isVideo -> {
                     MediaPreviewContent(
                         preview = preview,
                         controlsVisible = effectiveControlsVisible,
@@ -795,6 +1038,11 @@ internal fun BuiltInPreviewScreen(
                         onPlaybackFailure = onPlaybackFailure,
                         autoRouteOnFailure = implicitAdvanceIndex != preview.index,
                         playbackSuspended = playbackSuspended,
+                        onPlayStateChanged = { isPlaying, isBuffering, isError ->
+                            videoPlaying = isPlaying
+                            videoBuffering = isBuffering
+                            videoError = isError
+                        },
                         onNextMedia = if (preview.images.size > 1) {
                             {
                                 slideshowPlaying = true
@@ -806,48 +1054,154 @@ internal fun BuiltInPreviewScreen(
                     )
                 }
             }
-            if (preview.kind == BuiltInPreviewKind.IMAGE && controlsVisible) {
-                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .10f)))
+
+            if (isImage && controlsVisible) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.10f)),
+                )
             }
-            if (effectiveControlsVisible && preview.kind != BuiltInPreviewKind.PDF && preview.images.size > 1) {
-                FilledIconButton(
-                    onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onPrevious() },
-                    enabled = preview.index > 0,
-                    modifier = Modifier.align(Alignment.CenterStart).padding(12.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                ) { Icon(Icons.Default.ChevronLeft, "이전 파일") }
-                FilledIconButton(
-                    onClick = { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onNext() },
-                    enabled = preview.index < preview.images.lastIndex,
-                    modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                ) { Icon(Icons.Default.ChevronRight, "다음 파일") }
-                if (preview.kind == BuiltInPreviewKind.IMAGE) {
-                    FilledIconButton(
-                        onClick = { slideshowPlaying = !slideshowPlaying; revealControls() },
-                        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(14.dp),
-                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
-                    ) {
-                        Icon(
-                            if (slideshowPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            if (slideshowPlaying) "슬라이드쇼 일시정지" else "슬라이드쇼 재생",
-                        )
-                    }
-                }
-            }
-            if (controlsVisible && preview.kind == BuiltInPreviewKind.PDF && preview.pdfPageCount > 1) {
+
+            // PDF Center Edge Arrows
+            if (controlsVisible && isPdf && preview.pdfPageCount > 1) {
                 FilledIconButton(
                     onClick = onPreviousPdfPage,
                     enabled = preview.pdfPageIndex > 0,
-                    modifier = Modifier.align(Alignment.CenterStart).padding(12.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.Black.copy(alpha = 0.56f),
+                        contentColor = Color.White,
+                    ),
                 ) { Icon(Icons.Default.ChevronLeft, "이전 페이지") }
                 FilledIconButton(
                     onClick = onNextPdfPage,
                     enabled = preview.pdfPageIndex < preview.pdfPageCount - 1,
-                    modifier = Modifier.align(Alignment.CenterEnd).padding(12.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color.Black.copy(alpha = .56f), contentColor = Color.White),
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.Black.copy(alpha = 0.56f),
+                        contentColor = Color.White,
+                    ),
                 ) { Icon(Icons.Default.ChevronRight, "다음 페이지") }
+            }
+
+            // Video Center Edge Arrows
+            if (effectiveControlsVisible && isVideo && preview.images.size > 1) {
+                FilledIconButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onPrevious()
+                    },
+                    enabled = preview.index > 0,
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.Black.copy(alpha = 0.56f),
+                        contentColor = Color.White,
+                    ),
+                ) { Icon(Icons.Default.ChevronLeft, "이전 파일") }
+                FilledIconButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onNext()
+                    },
+                    enabled = preview.index < preview.images.lastIndex,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(12.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.Black.copy(alpha = 0.56f),
+                        contentColor = Color.White,
+                    ),
+                ) { Icon(Icons.Default.ChevronRight, "다음 파일") }
+            }
+
+            // Photo bottom controls bar: previous / play / next, then interval / mode settings
+            if (isImage && effectiveControlsVisible) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility)
+                                .only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal),
+                        )
+                        .padding(bottom = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        PreviewCircleActionButton(
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                navigateImagePrev()
+                                revealControls()
+                            },
+                            icon = Icons.Default.ChevronLeft,
+                            contentDescription = "이전 이미지",
+                            enabled = imageIndices.size >= 2,
+                        )
+
+                        PreviewCircleActionButton(
+                            onClick = {
+                                if (imageIndices.size >= 2) {
+                                    slideshowPlaying = !slideshowPlaying
+                                }
+                                revealControls()
+                            },
+                            icon = if (slideshowPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (slideshowPlaying) "슬라이드쇼 일시정지" else "슬라이드쇼 재생",
+                            enabled = imageIndices.size >= 2,
+                        )
+
+                        PreviewCircleActionButton(
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                navigateImageNext()
+                                revealControls()
+                            },
+                            icon = Icons.Default.ChevronRight,
+                            contentDescription = "다음 이미지",
+                            enabled = imageIndices.size >= 2,
+                        )
+
+                        PreviewCircleActionButton(
+                            onClick = {
+                                val nextSec = MediaSlideshowPolicy.nextInterval(slideshowInterval)
+                                slideshowInterval = nextSec
+                                MediaViewerPreferences.setSlideshowInterval(context, nextSec)
+                                revealControls()
+                            },
+                            icon = Icons.Default.Timer,
+                            contentDescription = "재생 간격: ${slideshowInterval}초",
+                            enabled = true,
+                        )
+
+                        PreviewCircleActionButton(
+                            onClick = {
+                                val nextMode = playbackMode.next()
+                                playbackMode = nextMode
+                                MediaViewerPreferences.setPlaybackMode(context, nextMode)
+                                revealControls()
+                            },
+                            icon = when (playbackMode) {
+                                MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
+                                MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
+                                MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                                MediaPlaybackMode.ONCE -> Icons.Default.LooksOne
+                            },
+                            contentDescription = "재생 모드: ${playbackMode.title}",
+                            enabled = true,
+                        )
+                    }
+                }
             }
         }
     }
@@ -863,6 +1217,7 @@ private fun ZoomablePreviewBitmap(
     onNext: () -> Unit,
     onClose: () -> Unit,
     onToggleControls: () -> Unit,
+    onDoubleTap: (() -> Unit)? = null,
 ) {
     val touchExploration = rememberTouchExplorationEnabled()
     var scale by remember(stateKey) { mutableFloatStateOf(1f) }
@@ -881,16 +1236,27 @@ private fun ZoomablePreviewBitmap(
                     Modifier.clickable(onClick = onToggleControls)
                 } else {
                     Modifier
-                        .pointerInput(stateKey) {
+                        .pointerInput(stateKey, onDoubleTap) {
                             detectTapGestures(
                                 onTap = { onToggleControls() },
                                 onDoubleTap = {
-                                    if (scale > 1.05f) {
-                                        scale = 1.0f
-                                        translation = Offset.Zero
+                                    val isZoomedOrPanned = abs(scale - 1.0f) > MediaViewerGesturePolicy.ZOOM_RESET_EPSILON ||
+                                        hypot(translation.x, translation.y) > MediaViewerGesturePolicy.PAN_RESET_EPSILON_PX
+                                    if (onDoubleTap != null) {
+                                        if (isZoomedOrPanned) {
+                                            scale = 1.0f
+                                            translation = Offset.Zero
+                                        } else {
+                                            onDoubleTap()
+                                        }
                                     } else {
-                                        scale = MediaViewerGesturePolicy.DOUBLE_TAP_ZOOM_SCALE
-                                        translation = Offset.Zero
+                                        if (isZoomedOrPanned) {
+                                            scale = 1.0f
+                                            translation = Offset.Zero
+                                        } else {
+                                            scale = MediaViewerGesturePolicy.DOUBLE_TAP_ZOOM_SCALE
+                                            translation = Offset.Zero
+                                        }
                                     }
                                 },
                             )
@@ -1177,6 +1543,7 @@ private fun MediaPreviewContent(
     onNextMedia: (() -> Unit)? = null,
     autoRouteOnFailure: Boolean = true,
     playbackSuspended: Boolean = false,
+    onPlayStateChanged: ((isPlaying: Boolean, isBuffering: Boolean, isError: Boolean) -> Unit)? = null,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
@@ -1192,6 +1559,12 @@ private fun MediaPreviewContent(
     var duration by remember(mediaSourceKey, retryTrigger) { mutableIntStateOf(0) }
     var position by rememberSaveable(mediaSourceKey) { mutableIntStateOf(0) }
     var playing by rememberSaveable(mediaSourceKey) { mutableStateOf(true) }
+    var videoRepeat by rememberSaveable(mediaSourceKey) {
+        mutableStateOf(MediaViewerPreferences.getVideoRepeat(context))
+    }
+    var videoResizeMode by rememberSaveable(mediaSourceKey) {
+        mutableStateOf(MediaViewerPreferences.getVideoResizeMode(context))
+    }
     var scale by rememberSaveable(mediaSourceKey) { mutableFloatStateOf(1f) }
     var translation by remember(mediaSourceKey) { mutableStateOf(Offset.Zero) }
     var dismissTranslationY by remember(mediaSourceKey) { mutableFloatStateOf(0f) }
@@ -1199,6 +1572,10 @@ private fun MediaPreviewContent(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var gestureMessage by remember { mutableStateOf<String?>(null) }
     var fineVolumeFraction by remember(mediaSourceKey) { mutableStateOf<Float?>(null) }
+
+    LaunchedEffect(playing, isBuffering, playbackError) {
+        onPlayStateChanged?.invoke(playing, isBuffering, playbackError != null)
+    }
 
     var resumeAfterSuspension by remember(mediaSourceKey) { mutableStateOf(false) }
     LaunchedEffect(player, playbackSuspended) {
@@ -1260,6 +1637,10 @@ private fun MediaPreviewContent(
         }
     }
 
+    LaunchedEffect(player, videoRepeat) {
+        player?.repeatMode = if (videoRepeat) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+    }
+
     LaunchedEffect(gestureMessage) {
         if (gestureMessage != null) {
             delay(850)
@@ -1312,9 +1693,23 @@ private fun MediaPreviewContent(
                             Modifier.clickable(onClick = onInteraction)
                         } else {
                             Modifier
-                                .pointerInput(mediaSourceKey, retryTrigger) {
+                                .pointerInput(mediaSourceKey, retryTrigger, controlsVisible, playing) {
                                     detectTapGestures(
-                                        onTap = { onInteraction() },
+                                        onTap = {
+                                            if (controlsVisible) {
+                                                if (playing) {
+                                                    player?.pause()
+                                                    audioManager.abandonAudioFocus(focusChangeListener)
+                                                    playing = false
+                                                } else {
+                                                    player?.play()
+                                                    playing = true
+                                                }
+                                                onInteraction()
+                                            } else {
+                                                onInteraction()
+                                            }
+                                        },
                                         onDoubleTap = {
                                             scale = 1f
                                             translation = Offset.Zero
@@ -1355,7 +1750,10 @@ private fun MediaPreviewContent(
                                                 isMultiTouch = true
                                                 val zoom = event.calculateZoom()
                                                 val pan = event.calculatePan()
-                                                val nextScale = (scale * zoom).coerceIn(1f, 4f)
+                                                val nextScale = (scale * zoom).coerceIn(
+                                                    MediaViewerGesturePolicy.MIN_VIDEO_SCALE,
+                                                    MediaViewerGesturePolicy.MAX_VIDEO_SCALE,
+                                                )
                                                 scale = nextScale
                                                 translation = MediaViewerGesturePolicy.clampImageTranslation(
                                                     currentTranslation = if (nextScale == 1f) Offset.Zero else translation + pan,
@@ -1484,13 +1882,24 @@ private fun MediaPreviewContent(
                                 isBuffering = false
                                 playbackError = null
                             } else if (playbackState == Player.STATE_ENDED) {
-                                if (playbackMode == MediaPlaybackMode.ONE_REPEAT) {
-                                    seekTo(0)
-                                    play()
+                                if (preview.kind == BuiltInPreviewKind.VIDEO) {
+                                    if (videoRepeat) {
+                                        seekTo(0)
+                                        play()
+                                    } else {
+                                        pause()
+                                        playing = false
+                                        position = duration
+                                    }
                                 } else {
-                                    playing = false
-                                    position = duration
-                                    onNextMedia?.invoke()
+                                    if (playbackMode == MediaPlaybackMode.ONE_REPEAT) {
+                                        seekTo(0)
+                                        play()
+                                    } else {
+                                        playing = false
+                                        position = duration
+                                        onNextMedia?.invoke()
+                                    }
                                 }
                             }
                         }
@@ -1536,9 +1945,20 @@ private fun MediaPreviewContent(
                 PlayerView(ctx).apply {
                     useController = false
                     this.player = exoPlayer
+                    resizeMode = when (videoResizeMode) {
+                        VideoResizeMode.FIT -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                        VideoResizeMode.FILL -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    }
                 }
             },
-            update = { view -> player = view.player as? ExoPlayer },
+            update = {
+                view ->
+                player = view.player as? ExoPlayer
+                view.resizeMode = when (videoResizeMode) {
+                    VideoResizeMode.FIT -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    VideoResizeMode.FILL -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
             onRelease = { released ->
                 audioManager.abandonAudioFocus(focusChangeListener)
                 val releasedPlayer = released.player as? ExoPlayer
@@ -1731,18 +2151,61 @@ private fun MediaPreviewContent(
                             )
                         }
                     }
-                    IconButton(
-                        onClick = { onPlaybackModeChange(playbackMode.next()) },
-                    ) {
-                        Icon(
-                            imageVector = when (playbackMode) {
-                                MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
-                                MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
-                                MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
-                            },
-                            contentDescription = "재생 모드: ${playbackMode.title}",
-                            tint = Color.White,
-                        )
+                    if (preview.kind == BuiltInPreviewKind.VIDEO) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    onInteraction()
+                                    val nextMode = when (videoResizeMode) {
+                                        VideoResizeMode.FIT -> VideoResizeMode.FILL
+                                        VideoResizeMode.FILL -> VideoResizeMode.FIT
+                                    }
+                                    videoResizeMode = nextMode
+                                    MediaViewerPreferences.setVideoResizeMode(context, nextMode)
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = when (videoResizeMode) {
+                                        VideoResizeMode.FIT -> Icons.Default.FitScreen
+                                        VideoResizeMode.FILL -> Icons.Default.CropFree
+                                    },
+                                    contentDescription = when (videoResizeMode) {
+                                        VideoResizeMode.FIT -> "화면 맞춤"
+                                        VideoResizeMode.FILL -> "화면 채우기"
+                                    },
+                                    tint = Color.White,
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    onInteraction()
+                                    val nextRepeat = !videoRepeat
+                                    videoRepeat = nextRepeat
+                                    MediaViewerPreferences.setVideoRepeat(context, nextRepeat)
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = if (videoRepeat) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                                    contentDescription = if (videoRepeat) "반복 재생: 켜짐" else "반복 재생: 꺼짐",
+                                    tint = if (videoRepeat) Color.White else Color.White.copy(alpha = 0.5f),
+                                )
+                            }
+                        }
+                    } else {
+                        IconButton(
+                            onClick = { onPlaybackModeChange(playbackMode.next()) },
+                        ) {
+                            Icon(
+                                imageVector = when (playbackMode) {
+                                    MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
+                                    MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
+                                    MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                                    MediaPlaybackMode.ONCE -> Icons.Default.LooksOne
+                                },
+                                contentDescription = "재생 모드: ${playbackMode.title}",
+                                tint = Color.White,
+                            )
+                        }
                     }
                 }
             }
@@ -1852,7 +2315,7 @@ private fun TrailerDraftManager(drafts: List<TrailerDraft>, model: NasFinderView
             AlertDialog(
                 onDismissRequest = { draftToDelete = null },
                 title = { Text("이 편집본을 지울까요?") },
-                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어, 컬렉션에 보관된 영상은 지워지지 않습니다.") },
+                text = { Text("이 편집 정보와 앱이 만든 이 프로젝트의 작업 폴더만 삭제됩니다. 원본 미디어와 폰하드에 저장한 영상은 지워지지 않습니다.") },
                 dismissButton = { TextButton(onClick = { draftToDelete = null }) { Text("취소") } },
                 confirmButton = {
                     TextButton(onClick = {
@@ -2090,35 +2553,162 @@ internal fun rememberTrailerDraftDuration(draft: TrailerDraft): Double {
 private fun skyBrush(theme: AppTheme): Brush = SolidColor(paletteFor(theme).background)
 
 /**
+ * Brand lockup shared by the main header and the sidebar: selected launcher icon (24, radius 5) + 8 gap + Nas/Finder
+ * (Privacy while privacy mode is active). [showText] = false renders the icon only (compact rail).
+ */
+@Composable
+internal fun MainAppBrand(state: AppState, modifier: Modifier = Modifier, showText: Boolean = true) {
+    val privacyActive by com.armsone.nasfinder.data.PrivacyMode.active.collectAsStateWithLifecycle()
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Image(
+            painter = painterResource(launcherIconDrawable(state.launcherIcon)),
+            contentDescription = null,
+            modifier = Modifier
+                .size(24.dp)
+                .clip(androidx.compose.foundation.shape.RoundedCornerShape(5.dp))
+        )
+        if (showText) {
+            val headerPalette = themePalette()
+            Text(
+                text = androidx.compose.ui.text.buildAnnotatedString {
+                    if (privacyActive) {
+                        pushStyle(androidx.compose.ui.text.SpanStyle(color = headerPalette.accent))
+                        append("Privacy")
+                        pop()
+                    } else {
+                        pushStyle(androidx.compose.ui.text.SpanStyle(color = headerPalette.text))
+                        append("Nas")
+                        pop()
+                        pushStyle(androidx.compose.ui.text.SpanStyle(color = headerPalette.accent))
+                        append("Finder")
+                        pop()
+                    }
+                },
+                style = com.armsone.nasfinder.ui.theme.HomeType.Brand,
+                maxLines = 1,
+                softWrap = false
+            )
+        }
+    }
+}
+
+/**
  * Phone bottom bar: exactly THREE visible main tabs (감상 / 영상 만들기 / 도구).
  * Retains all internal routes/keys; folds home+finder under 감상, and exposes workbench via toolbar capsule/sheet.
  */
 @Composable
-private fun MainTabBar(
+internal fun MainAppHeader(state: AppState, model: NasFinderViewModel) {
+    var themeMenuExpanded by remember { mutableStateOf(false) }
+
+    androidx.compose.material3.TopAppBar(
+        expandedHeight = 44.dp,
+        colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
+            containerColor = Color.Transparent
+        ),
+        title = { if (!rememberWideShell()) MainAppBrand(state) },
+        actions = {
+            Box {
+                val themeCycle = listOf(AppTheme.LIGHT, AppTheme.FRIDAY, AppTheme.JARVIS, AppTheme.ULTRON)
+                val currentThemeIndex = themeCycle.indexOf(state.theme)
+                val nextCycleTheme = if (currentThemeIndex < 0) {
+                    themeCycle.first()
+                } else {
+                    themeCycle[(currentThemeIndex + 1) % themeCycle.size]
+                }
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .combinedClickable(
+                            role = Role.Button,
+                            onClickLabel = "다음 테마",
+                            onClick = { model.setTheme(nextCycleTheme) },
+                            onLongClickLabel = "수동 테마 선택",
+                            onLongClick = { themeMenuExpanded = true }
+                        )
+                        .semantics {
+                            customActions = listOf(
+                                CustomAccessibilityAction("수동 테마 선택") {
+                                    themeMenuExpanded = true
+                                    true
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    ThemePackIcon(
+                        theme = state.theme,
+                        contentDescription = "테마",
+                        modifier = Modifier.size(20.dp),
+                        tint = themePalette().accent
+                    )
+                }
+                DropdownMenu(
+                    expanded = themeMenuExpanded,
+                    onDismissRequest = { themeMenuExpanded = false }
+                ) {
+                    AppTheme.entries.forEach { theme ->
+                        DropdownMenuItem(
+                            text = { Text(themeTitle(theme)) },
+                            leadingIcon = {
+                                ThemePackIcon(
+                                    theme = theme,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                    tint = themePalette().accent
+                                )
+                            },
+                            onClick = {
+                                model.setTheme(theme)
+                                themeMenuExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+            androidx.compose.material3.IconButton(
+                onClick = { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
+            ) {
+                PackIcon(
+                    glyph = PackGlyph.WORKBENCH,
+                    contentDescription = "작업대",
+                    modifier = Modifier.size(18.dp),
+                    tint = themePalette().accent
+                )
+            }
+        }
+    )
+}
+
+@Composable
+internal fun MainTabBar(
     selected: MainNavigationDestination,
     onTogglePrivacy: () -> Unit,
     onSelect: (MainNavigationDestination) -> Unit,
 ) {
     val tabs = listOf(
-        Triple(MainNavigationDestination.HOME, "감상", PackGlyph.PLAY),
-        Triple(MainNavigationDestination.VIDEO, "영상 만들기", PackGlyph.VIDEO),
         Triple(MainNavigationDestination.TOOLS, "도구", PackGlyph.TRANSFER),
+        Triple(MainNavigationDestination.FINDER, "파인더", PackGlyph.FOLDER),
+        Triple(MainNavigationDestination.HOME, "홈", PackGlyph.HOME),
+        Triple(MainNavigationDestination.VIDEO, "만들기", PackGlyph.VIDEO),
+        Triple(MainNavigationDestination.SETTINGS, "설정", PackGlyph.SETTINGS),
     )
-    val current = selected
+    // The 작업대 is shown under 만들기, so that tab stays highlighted while it is open.
+    val current = if (selected == MainNavigationDestination.WORKBENCH) MainNavigationDestination.VIDEO else selected
     Column(Modifier.background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)).navigationBarsPadding()) {
         HorizontalDivider(thickness = .5.dp, color = MaterialTheme.colorScheme.outlineVariant)
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).selectableGroup()) {
             tabs.forEach { (tab, label, glyph) ->
-                val isSelected = when (tab) {
-                    MainNavigationDestination.HOME -> current == MainNavigationDestination.HOME || current == MainNavigationDestination.FINDER
-                    else -> current == tab
-                }
+                val isSelected = current == tab
                 val color = if (isSelected) themePalette().accent else MaterialTheme.colorScheme.onSurfaceVariant
                 Column(
                     Modifier.weight(1f).heightIn(min = 49.dp)
                         .then(
-                            if (tab == MainNavigationDestination.TOOLS) {
-                                // 도구 탭을 길게 누르면 프라이버시 모드가 바뀐다. 짧게 누르는 동작(도구 열기)은 그대로다.
+                            if (tab == MainNavigationDestination.SETTINGS) {
                                 Modifier
                                     .semantics {
                                         this.selected = isSelected
@@ -2128,7 +2718,7 @@ private fun MainTabBar(
                                     }
                                     .combinedClickable(
                                         role = Role.Tab,
-                                        onClickLabel = "도구 열기",
+                                        onClickLabel = "설정 열기",
                                         onLongClickLabel = if (com.armsone.nasfinder.data.PrivacyMode.isActive) "프라이버시 모드 끄기" else "프라이버시 모드 켜기",
                                         onClick = { onSelect(tab) },
                                         onLongClick = onTogglePrivacy,
@@ -2167,227 +2757,12 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
     val homeRoot = state.activeMainTab == MainNavigationDestination.HOME
     val workbenchTab = state.activeMainTab == MainNavigationDestination.WORKBENCH
     val finderTab = !toolsTab && !videoTab && !finderRoot && !homeRoot && !workbenchTab
-    BackHandler(enabled = (finderRoot || workbenchTab) && !rememberWideShell()) {
+    BackHandler(enabled = finderRoot && !rememberWideShell()) {
         model.selectMainDestination(MainNavigationDestination.HOME)
     }
+    BackHandler(enabled = workbenchTab) { model.closeWorkbench() }
     Scaffold(containerColor = Color.Transparent, topBar = {
-        TopAppBar(
-            navigationIcon = {
-                if ((finderRoot || workbenchTab) && !rememberWideShell()) {
-                    IconButton(onClick = { model.selectMainDestination(MainNavigationDestination.HOME) }) {
-                        PackIcon(PackGlyph.BACK, "홈으로 돌아가기", tint = MaterialTheme.colorScheme.onBackground)
-                    }
-                }
-            },
-            title = {
-            if (homeRoot || finderTab) {
-                Row(
-                    modifier = Modifier
-                        .semantics(mergeDescendants = true) { contentDescription = if (privacyActive) com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME else "NasFinder" }
-                        // iOS logo: a tap goes to 홈, a long press reopens the last network folder.
-                        // 프라이버시 모드에서는 한 번 누르면 모드를 끄고 홈으로 가며, 길게 누르기(마지막 폴더 열기)는 없다.
-                        .combinedClickable(
-                            onClickLabel = if (privacyActive) "프라이버시 모드를 끄고 홈으로 이동합니다." else "홈으로 이동합니다.",
-                            onLongClickLabel = if (privacyActive) null else "마지막으로 보던 네트워크 폴더를 엽니다.",
-                            role = Role.Button,
-                            onClick = {
-                                if (privacyActive) model.exitPrivacyToHome()
-                                else model.selectMainDestination(MainNavigationDestination.HOME)
-                            },
-                            onLongClick = if (privacyActive) null else model::resumeLastLocation,
-                        ),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    // Approved 01-home header: 24 NAS glyph, gap 8, two-tone "NasFinder" wordmark (brand 22/700/28), no capsule.
-                    if (usesUnifiedLayout(state.theme)) PackIcon(PackGlyph.BRAND, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onBackground) else Image(
-                        painterResource(launcherIconDrawable(state.launcherIcon)),
-                        null,
-                        Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).border(.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f), RoundedCornerShape(10.dp)),
-                    )
-                    if (usesUnifiedLayout(state.theme)) Text(
-                        androidx.compose.ui.text.buildAnnotatedString {
-                            if (privacyActive) {
-                                pushStyle(androidx.compose.ui.text.SpanStyle(color = themePalette().accent))
-                                append(com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME)
-                                pop()
-                            } else {
-                                append("Nas")
-                                // "Finder" in the theme accent (BK Style keeps the approved ornament #E44435).
-                                pushStyle(androidx.compose.ui.text.SpanStyle(color = themePalette().accent))
-                                append("Finder")
-                                pop()
-                            }
-                        },
-                        style = com.armsone.nasfinder.ui.theme.HomeType.Brand,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        maxLines = 1,
-                    ) else Text(
-                        if (privacyActive) com.armsone.nasfinder.data.PrivacyMode.BRAND_NAME else "NasFinder",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = .82f),
-                    )
-                }
-            } else {
-                Text(if (toolsTab) "도구" else if (videoTab) "영상" else if (workbenchTab) "작업대" else "파인더", style = com.armsone.nasfinder.ui.theme.HomeType.Section, color = MaterialTheme.colorScheme.onBackground)
-            }
-        }, actions = {
-            // iOS porcelainTrailingItems: 네트워크 추가(+) leads the trailing toolbar group.
-            val settingsButton: @Composable () -> Unit = {
-                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(IconHitTarget)) { Icon(Icons.Default.Settings, "설정", Modifier.size(ToolbarActionIcon)) }
-            }
-            if (usesUnifiedLayout(state.theme) && (finderTab || homeRoot)) {
-                val workbenchCount = state.materials.size
-                // 바깥 48(IconHitTarget) 높이가 실제 클릭 영역, 안쪽 32 pill은 모양만 유지.
-                Box(
-                    Modifier
-                        .padding(end = 4.dp)
-                        .height(IconHitTarget)
-                        .clip(RoundedCornerShape(99.dp))
-                        .clickable(role = Role.Button) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
-                    contentAlignment = Alignment.Center,
-                ) {
-                Surface(
-                    shape = RoundedCornerShape(99.dp),
-                    color = if (workbenchTab) themePalette().accent.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                    border = BorderStroke(1.dp, if (workbenchTab) themePalette().accent else MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier.height(32.dp),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        PackIcon(PackGlyph.WORKBENCH, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
-                        Text("작업대", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                        if (workbenchCount > 0) {
-                            Text(
-                                "$workbenchCount",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = themePalette().accent,
-                            )
-                        }
-                    }
-                }
-                }
-                // Compact, independent actions: glyph 24 in a 44 hit; order (추가 · 설정 · 테마) unchanged.
-                IconButton(onClick = { addingNetwork = true }, modifier = Modifier.size(IconHitTarget)) {
-                    PackIcon(PackGlyph.ADD, "네트워크 추가", Modifier.size(ToolbarActionIcon), tint = MaterialTheme.colorScheme.onBackground)
-                }
-                IconButton(onClick = { model.show(Screen.Settings) }, modifier = Modifier.size(IconHitTarget)) {
-                    PackIcon(PackGlyph.SETTINGS, "설정", Modifier.size(ToolbarActionIcon), tint = MaterialTheme.colorScheme.onBackground)
-                }
-            }
-            // The small theme capsule keeps its look but gets a full 44 hit target with tap cycle and 500ms longpress menu.
-            val currentViewConfig = LocalViewConfiguration.current
-            val custom500msConfig = remember(currentViewConfig) {
-                object : ViewConfiguration by currentViewConfig {
-                    override val longPressTimeoutMillis: Long get() = 500L
-                }
-            }
-            CompositionLocalProvider(LocalViewConfiguration provides custom500msConfig) {
-                Box(
-                    Modifier
-                        .padding(end = 4.dp)
-                        .size(IconHitTarget)
-                        .semantics {
-                            contentDescription = "병기스타일 테마: ${themeTitle(state.theme)} (누르면 ${themeTitle(state.theme.next)}, 길게 누르면 목록)"
-                        }
-                        .combinedClickable(
-                            role = Role.Button,
-                            onClickLabel = "누르면 ${themeTitle(state.theme.next)}",
-                            onLongClickLabel = "목록 열기",
-                            onClick = { model.setTheme(state.theme.next) },
-                            onLongClick = { themeMenuExpanded = true },
-                        ),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    androidx.compose.animation.Crossfade(
-                        targetState = state.theme,
-                        animationSpec = androidx.compose.animation.core.tween(
-                            durationMillis = 200,
-                            easing = androidx.compose.animation.core.CubicBezierEasing(.42f, 0f, .58f, 1f),
-                        ),
-                        modifier = Modifier.size(ToolbarActionIcon),
-                        label = "themeBadge",
-                    ) { theme ->
-                        Box(Modifier.size(ToolbarActionIcon), contentAlignment = Alignment.Center) {
-                            ThemePackIcon(
-                                theme,
-                                contentDescription = null,
-                                modifier = Modifier.size(ToolbarActionIcon),
-                                tint = paletteFor(theme).accent,
-                            )
-                        }
-                    }
-
-                    DropdownMenu(
-                        expanded = themeMenuExpanded,
-                        onDismissRequest = { themeMenuExpanded = false },
-                    ) {
-                        AppTheme.entries.forEach { theme ->
-                            val isCurrent = theme == state.theme
-                            val badge = themeChooserBadge(theme)
-                            DropdownMenuItem(
-                                modifier = Modifier.height(44.dp),
-                                contentPadding = PaddingValues(0.dp),
-                                text = {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(start = 10.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(28.dp)
-                                                .clip(CircleShape)
-                                                .background(badge.fill)
-                                                .border(1.dp, badge.glyph, CircleShape),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            ThemePackIcon(
-                                                theme,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(20.dp),
-                                                tint = badge.glyph,
-                                            )
-                                        }
-                                        Spacer(Modifier.width(10.dp))
-                                        Text(
-                                            themeTitle(theme),
-                                            modifier = Modifier.weight(1f),
-                                            fontSize = 14.sp,
-                                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            maxLines = 1,
-                                        )
-                                        Box(
-                                            modifier = Modifier.padding(end = 12.dp).width(IconGlyphMin),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            if (isCurrent) {
-                                                Icon(
-                                                    Icons.Default.Check,
-                                                    contentDescription = "선택됨",
-                                                    modifier = Modifier.size(12.dp),
-                                                    tint = badge.glyph,
-                                                )
-                                            }
-                                        }
-                                    }
-                                },
-                                onClick = {
-                                    themeMenuExpanded = false
-                                    model.setTheme(theme)
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-            if (!usesUnifiedLayout(state.theme) && (finderTab || homeRoot)) settingsButton()
-        }, expandedHeight = 52.dp, colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent))
+        MainAppHeader(state, model)
     }, bottomBar = {
         // Wide windows navigate with the persistent sidebar only; the bottom tabs would repeat the same five destinations.
         if (!rememberWideShell()) MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode) { model.selectMainDestination(it) }
@@ -2570,7 +2945,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
             // Wide windows keep the persistent sidebar (작업대 selected); narrow windows render the content alone.
             Box(Modifier.padding(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.WORKBENCH) {
-                    WorkbenchScreen(state, model, embedded = true)
+                    WorkbenchScreen(state, model, embedded = false, onBack = { model.closeWorkbench() })
                 }
             }
         } else if (homeRoot) {
@@ -3573,7 +3948,7 @@ private fun SuperThumbnailDashboardRow(detail: String, onClick: () -> Unit) {
     ) {
         SuperThumbnailMark(Modifier.size(30.dp))
         Spacer(Modifier.width(11.dp))
-        Text("Super Thumbnail", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text("수퍼 썸네일", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
@@ -3736,7 +4111,7 @@ private fun ConnectionEditor(editing: RemoteConnection?, state: AppState, model:
     val valid = if (kind.oauth) name.isNotBlank() && (password.isNotBlank() || oauthConnected)
         else name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && password.isNotBlank() && port.toIntOrNull() in 1..65535 && (kind != ConnectionKind.SYNOLOGY || otpValid)
     fun candidate() = RemoteConnection(draftId, name.trim(), kind, (host.ifBlank { cloudApiHost(kind) }).trim().removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':'), port.toIntOrNull() ?: kind.defaultPort, username.trim(), rootPath, tls, trustedHostKey, editing?.createdAt ?: System.currentTimeMillis())
-    Scaffold(containerColor = Color.Transparent, topBar = { PorcelainTopBar(title = if (editing == null) "연결 추가" else "연결 수정", onBack = { model.show(Screen.Dashboard) }, actions = { TextButton(onClick = { localNetworkGate { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } } }, enabled = valid && !state.isBusy, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editing == null) "연결" else "저장") } }) }) { padding ->
+    Scaffold(containerColor = Color.Transparent, topBar = { PorcelainTopBar(title = if (editing == null) "연결 추가" else "연결 수정", onBack = { model.exitToMainRoot() }, actions = { TextButton(onClick = { localNetworkGate { val oneTimeOtp = synologyOtp; synologyOtp = ""; model.testConnection(candidate(), password, oneTimeOtp, onTrustRequired = { pendingHostKey = it }) { model.saveConnection(candidate(), password) } } }, enabled = valid && !state.isBusy, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (editing == null) "연결" else "저장") } }) }) { padding ->
         LazyColumn(Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { Text("연결 방식", style = MaterialTheme.typography.titleSmall) }
             item {
@@ -4003,6 +4378,7 @@ internal fun AppleBaselineActionSheet(
     infoSize: String,
     onDismiss: () -> Unit,
     onShowDisabledReason: (String) -> Unit,
+    infoCount: String? = null,
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -4042,6 +4418,9 @@ internal fun AppleBaselineActionSheet(
                 ActionInfoRow("특징", infoFeature)
                 ActionInfoRow("생성/수정", infoDate)
                 ActionInfoRow("크기", infoSize)
+                if (infoCount != null) {
+                    ActionInfoRow("항목", infoCount)
+                }
             }
             Spacer(Modifier.navigationBarsPadding())
         }
@@ -4514,7 +4893,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         if (pickMode) model.cancelNetworkMediaPick()
         else if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
         else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
-        else if (parentPath == null) model.show(Screen.Dashboard)
+        else if (parentPath == null) model.exitToMainRoot()
         else model.openConnection(browser.connection, parentPath)
     }
 
@@ -4534,7 +4913,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         CompositionLocalProvider(LocalViewConfiguration provides longPress500Configuration()) {
         Box(
             modifier = Modifier.size(48.dp).semantics(mergeDescendants = true) {
-                contentDescription = if (selectionMode) "선택 종료" else if (parentPath == null && (state.pendingInboxUpload != null || state.pendingLocalUpload != null)) "NAS로 보내기 취소" else "이전 폴더"
+                contentDescription = if (selectionMode) "선택 종료" else if (parentPath == null && (state.pendingInboxUpload != null || state.pendingLocalUpload != null)) "NAS로 보내기 취소" else if (parentPath == null) "뒤로" else "이전 폴더"
                 if (!selectionMode) {
                     customActions = listOf(
                         CustomAccessibilityAction("NasFinder 첫 화면") {
@@ -4549,7 +4928,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             else if (parentPath == null && pickMode) model.cancelNetworkMediaPick()
             else if (parentPath == null && state.pendingLocalUpload != null) model.cancelLocalUploadDestination()
             else if (parentPath == null && state.pendingInboxUpload != null) model.cancelInboxUpload()
-            else if (parentPath == null) model.show(Screen.Dashboard)
+            else if (parentPath == null) model.exitToMainRoot()
             else model.openConnection(browser.connection, parentPath)
                 },
                 onLongClick = if (selectionMode) null else ({ model.show(Screen.Dashboard) }),
@@ -4627,8 +5006,6 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
                     BrowserSelectionAction("삭제", Icons.Default.Delete, selectedItems.isNotEmpty() && capabilities.delete, destructive = true) { confirmBatchDelete = true },
                     // Files AND folders of any kind become references only; nothing is downloaded or listed here.
                     BrowserSelectionAction("작업대에 담기", Icons.Default.Inbox, selectedItems.isNotEmpty()) { model.requestWorkbenchAddRemote(browser.connection, selectedItems.toList()); selectedIds.clear(); selectionMode = false },
-                    // NAS/cloud paths are never durable references: this always stores an app-owned copy.
-                    BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, selectedItems.any { it.isVideo }) { model.importRemoteFilesToCollection(browser.connection, selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) { model.startRemoteTrailer(selectedItems); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("뮤직비디오", Icons.Default.MusicNote, canMusic) { model.startRemoteMusicOverlay(selectedItems.toList(), null); selectedIds.clear(); selectionMode = false },
                     BrowserSelectionAction("다운로드", Icons.Default.Download, selectedItems.isNotEmpty()) { pendingDownloadItems = selectedItems.toList(); showDownloadDestDialog = true },
@@ -4936,6 +5313,21 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
         )
     }
     actionItem?.let { item ->
+        if (item.isDirectory) {
+            DisposableEffect(
+                browser.connection.id,
+                item.id,
+                item.path,
+                browser.path,
+                state.folderCountGeneration,
+                browser.preferences.showHiddenFiles,
+            ) {
+                model.loadFolderActionSize(item)
+                onDispose {
+                    model.clearFolderActionSize()
+                }
+            }
+        }
         val isThumbnailActive = state.superThumbnailWork?.status in setOf(SuperThumbnailWorkStatus.WAITING, SuperThumbnailWorkStatus.RUNNING)
         val canTrailer = item.isDirectory || item.isVideo || item.isImage
         val canMusic = item.isDirectory || item.isVideo || item.isImage
@@ -5089,15 +5481,34 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             ),
         )
 
+        val targetKey = "${browser.connection.id}\u0000${item.path}"
+        val folderActionSummary = if (item.isDirectory && state.folderActionTargetKey == targetKey) state.folderActionSize else null
+
         val sizeText = if (item.isDirectory) {
-            when (val count = state.folderCountCache[item.id]) {
-                is FolderChildCountState.Ready -> "폴더 ${count.folderCount}개 · 파일 ${count.fileCount}개"
-                FolderChildCountState.Loading -> "개수 확인 중…"
-                FolderChildCountState.Error -> "개수 확인 불가"
-                null -> "폴더"
+            when (folderActionSummary) {
+                is FolderActionSizeState.Ready -> formatBytes(folderActionSummary.totalBytes)
+                FolderActionSizeState.Loading -> "계산 중…"
+                FolderActionSizeState.Error -> "확인 불가"
+                null -> "계산 중…"
             }
         } else {
             formatBytes(item.size)
+        }
+
+        val countText = if (item.isDirectory) {
+            when (folderActionSummary) {
+                is FolderActionSizeState.Ready -> "폴더 ${folderActionSummary.folderCount}개 · 파일 ${folderActionSummary.fileCount}개 (하위 폴더 포함)"
+                FolderActionSizeState.Loading -> "확인 중…"
+                FolderActionSizeState.Error -> null
+                null -> when (val count = state.folderCountCache[item.id]) {
+                    is FolderChildCountState.Ready -> "폴더 ${count.folderCount}개 · 파일 ${count.fileCount}개"
+                    FolderChildCountState.Loading -> "확인 중…"
+                    FolderChildCountState.Error -> null
+                    null -> null
+                }
+            }
+        } else {
+            null
         }
         val dateText = item.modifiedAt?.let {
             DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date.from(it))
@@ -5115,6 +5526,7 @@ private fun BrowserScreen(browser: Screen.Browser, state: AppState, model: NasFi
             infoFeature = if (item.isDirectory) "하위 항목을 담는 폴더" else listOf(nasExtension, item.mimeType ?: "파일").filter { it.isNotBlank() }.joinToString(" · "),
             infoDate = dateText,
             infoSize = sizeText,
+            infoCount = countText,
             onDismiss = { actionItem = null },
             onShowDisabledReason = { reason ->
                 actionItem = null
@@ -6605,7 +7017,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                         CompositionLocalProvider(LocalViewConfiguration provides longPress500Configuration()) {
                             Box(
                                 modifier = Modifier.size(48.dp).semantics(mergeDescendants = true) {
-                                    contentDescription = if (selectionMode) "선택 종료" else if (currentSubdirectory.isNullOrBlank()) "NasFinder 첫 화면" else "상위 폴더"
+                                    contentDescription = if (selectionMode) "선택 종료" else if (currentSubdirectory.isNullOrBlank()) "뒤로" else "상위 폴더"
                                     if (!selectionMode) {
                                         customActions = listOf(
                                             CustomAccessibilityAction("NasFinder 첫 화면") {
@@ -6624,7 +7036,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                             val parent = currentSubdirectory?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }
                                             currentSubdirectory = parent
                                         } else {
-                                            model.show(Screen.Dashboard)
+                                            model.exitToMainRoot()
                                         }
                                     },
                                     onLongClick = if (selectionMode) null else ({ model.show(Screen.Dashboard) }),
@@ -6733,16 +7145,6 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                                 selectedFolderPaths.clear()
                                 selectionMode = false
                                 model.requestWorkbenchAddPhoneHard(targets, folders)
-                            },
-                            // PhoneHard files are app-private storage, not a durable external reference: always copied.
-                            BrowserSelectionAction("컬렉션에 사본 추가", Icons.Default.VideoLibrary, displayedFiles.any { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }) {
-                                val targets = displayedFiles.filter { it.id in selectedFileIds && it.file.extension.lowercase() in setOf("mp4", "mov", "m4v", "mkv", "webm", "3gp") }
-                                selectedFileIds.clear()
-                                selectedFolderPaths.clear()
-                                selectionMode = false
-                                targets.forEach { target ->
-                                    model.importVideoUriToCollection(android.net.Uri.fromFile(target.file), copyToStorage = true)
-                                }
                             },
                             BrowserSelectionAction("예고편 보기", Icons.Default.Movie, canTrailer) {
                                 val ids = selectedFileIds.toList()
@@ -6899,7 +7301,7 @@ private fun InboxScreen(state: AppState, model: NasFinderViewModel) {
                             files = displayedFiles,
                             theme = state.theme,
                             usesDarkBackground = overflowUsesDarkBackground,
-                            onBack = { model.show(Screen.Dashboard) },
+                            onBack = { model.exitToMainRoot() },
                             onDashboard = { model.show(Screen.Dashboard) },
                             configuredLayout = configuredLayout,
                             onSelectLayout = ::setLayout,
@@ -8480,7 +8882,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
     var vaultTimingMenuExpanded by remember { mutableStateOf(false) }
     val hiddenStartAvailable = selected != null && !conditions.isReady && !active
 
-    BackHandler { model.show(Screen.Dashboard) }
+    BackHandler { model.selectMainDestination(MainNavigationDestination.TOOLS) }
 
     LaunchedEffect(selected?.id, selectedPath) { hiddenStartTapCount = 0 }
     LaunchedEffect(conditions.isReady, active) {
@@ -8491,7 +8893,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            PorcelainTopBar(title = "Super Thumbnail", onBack = { model.show(Screen.Dashboard) })
+PorcelainTopBar(title = "수퍼 썸네일", onBack = { model.selectMainDestination(MainNavigationDestination.TOOLS) })
         },
     ) { padding ->
         LazyColumn(
@@ -8753,7 +9155,7 @@ private fun SuperThumbnailScreen(state: AppState, model: NasFinderViewModel) {
     if (confirmSuperCacheReset) {
         AlertDialog(
             onDismissRequest = { confirmSuperCacheReset = false },
-            title = { Text("Super Thumbnail을 초기화할까요?") },
+            title = { Text("수퍼 썸네일을 초기화할까요?") },
             text = { Text("Super Cache와 작업 기록을 초기화합니다. 원본 영상과 NAS Vault는 삭제하지 않습니다.") },
             dismissButton = { TextButton(onClick = { confirmSuperCacheReset = false }) { Text("취소") } },
             confirmButton = {
@@ -8988,7 +9390,7 @@ private fun SuperThumbnailReportScreen(state: AppState, model: NasFinderViewMode
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            PorcelainTopBar(title = "Super Thumbnail", onBack = model::closeSuperThumbnailProgressOrReport)
+            PorcelainTopBar(title = "수퍼 썸네일", onBack = model::closeSuperThumbnailProgressOrReport)
         },
     ) { padding ->
         LazyColumn(
@@ -9009,7 +9411,7 @@ private fun SuperThumbnailReportScreen(state: AppState, model: NasFinderViewMode
                 }
             }
             if (report == null) {
-                item { EmptyState(Icons.Default.FindInPage, "저장된 보고서 없음", "이 폴더의 Android Super Thumbnail 작업 기록이 없습니다.") }
+                item { EmptyState(Icons.Default.FindInPage, "저장된 보고서 없음", "이 폴더의 Android 수퍼 썸네일 작업 기록이 없습니다.") }
             } else {
                 item {
                     Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), MaterialTheme.colorScheme.surface.copy(alpha = .88f)) {
@@ -9139,7 +9541,7 @@ private fun ThumbnailCacheScreen(state: AppState, model: NasFinderViewModel) {
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            PorcelainTopBar(title = "썸네일 캐시", onBack = { model.show(Screen.Dashboard) })
+PorcelainTopBar(title = "썸네일 캐시", onBack = { model.selectMainDestination(MainNavigationDestination.TOOLS) })
         },
     ) { padding ->
         LazyColumn(
@@ -9294,13 +9696,11 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
     LaunchedEffect(Unit) { model.refreshDownloadCacheSize() }
     Scaffold(
         containerColor = Color.Transparent,
-        topBar = {
-            PorcelainTopBar(title = "설정", onBack = { model.show(Screen.Dashboard) })
-        },
     ) { padding ->
         BoxWithConstraints(Modifier.padding(padding).fillMaxSize()) {
         // Settings use the whole content width: one column on phones, two from 900dp, three from 1500dp (iOS macSettingsColumns).
-        val settingsColumns = if (maxWidth >= 1500.dp) 3 else if (maxWidth >= 900.dp) 2 else 1
+        val outerMaxWidth = maxWidth
+        val settingsColumns = if (outerMaxWidth >= 1500.dp) 3 else if (outerMaxWidth >= 900.dp) 2 else 1
         androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid(
             columns = androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells.Fixed(settingsColumns),
             modifier = Modifier.fillMaxSize(),
@@ -9310,7 +9710,167 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
         ) {
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("테마", Icons.Default.Palette)
+                    SectionTitle("저장공간·캐시", Icons.Default.Storage)
+                        DashboardCard {
+                            PorcelainDeviceStorageRows(null)
+                            HorizontalDivider()
+                            Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Cached, null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text("다운로드 캐시 사용량")
+                                        Text(
+                                            "${state.downloadCacheBytes?.let(::formatBytes) ?: "계산 중…"} · 7일 · 최대 512 MB",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Text(
+                                            "NasFinder가 내려받은 임시 파일만 해당합니다. 원격 원본은 바뀌지 않습니다.",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    TextButton(
+                                        onClick = { confirmCacheClear = true },
+                                        enabled = (state.downloadCacheBytes ?: 0L) > 0L && !state.isBusy,
+                                    ) { Text("다운로드 캐시 비우기") }
+                                }
+                            }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("화면 켜짐", Icons.Default.PhoneAndroid)
+                        DashboardCard {
+                            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                                    ScreenAwakeMode.entries.forEachIndexed { index, mode ->
+                                        SegmentedButton(
+                                            selected = state.screenAwakeMode == mode,
+                                            onClick = { model.setScreenAwakeMode(mode) },
+                                            shape = SegmentedButtonDefaults.itemShape(index, ScreenAwakeMode.entries.size),
+                                            colors = SegmentedButtonDefaults.colors(
+                                                activeContainerColor = themePalette().accent,
+                                                activeContentColor = MaterialTheme.colorScheme.onPrimary,
+                                            ),
+                                        ) { Text(when (mode) { ScreenAwakeMode.AUTOMATIC -> "오토"; ScreenAwakeMode.ALWAYS -> "항상 켜짐"; ScreenAwakeMode.OFF -> "끔" }) }
+                                    }
+                                }
+                                Text(
+                                    when (state.screenAwakeMode) {
+                                        ScreenAwakeMode.AUTOMATIC -> "재생·썸네일 생성·다운로드·파일 작업 중에만 화면을 켜 둡니다."
+                                        ScreenAwakeMode.ALWAYS -> "NasFinder가 화면에 열려 있는 동안 화면을 켜 둡니다."
+                                        ScreenAwakeMode.OFF -> "기기의 화면 자동 잠금 설정을 그대로 따릅니다."
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("앱 아이콘", Icons.Default.Apps)
+                        val choices = listOf(
+                            Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
+                            Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
+                            Triple(LauncherIconVariant.VIBE_CODER, "Vibe Coder", R.drawable.app_icon_vibe_coder),
+                            Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
+                            Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
+                            Triple(LauncherIconVariant.ENAMEL, "BK Style", R.drawable.app_icon_enamel),
+                        )
+                        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
+                            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                choices.chunked(3).forEach { row ->
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        row.forEach { (variant, label, drawable) ->
+                                            val selected = state.launcherIcon == variant
+                                            val cellWidth = (outerMaxWidth / settingsColumns - 64.dp - 16.dp) / 3
+                                            val compactCell = cellWidth < 88.dp
+                                            val iconRadius = if (compactCell) 12.dp else 13.dp
+                                            Column(
+                                                Modifier.weight(1f).height(104.dp)
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .56f))
+                                                    .border(
+                                                        BorderStroke(
+                                                            if (selected) 1.5.dp else 1.dp,
+                                                            if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .75f)
+                                                            else MaterialTheme.colorScheme.onSurface.copy(alpha = .08f),
+                                                        ),
+                                                        RoundedCornerShape(12.dp),
+                                                    )
+                                                    .clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
+                                                    .padding(8.dp)
+                                                    .semantics(mergeDescendants = true) { this.selected = selected },
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
+                                            ) {
+                                                Image(
+                                                    bitmap = ImageBitmap.imageResource(drawable),
+                                                    contentDescription = "$label 앱 아이콘 미리보기",
+                                                    modifier = Modifier
+                                                        .size(if (compactCell) 54.dp else 60.dp)
+                                                        .shadow(4.dp, RoundedCornerShape(iconRadius), ambientColor = Color.Black.copy(alpha = .12f), spotColor = Color.Black.copy(alpha = .12f))
+                                                        .clip(RoundedCornerShape(iconRadius))
+                                                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = .08f), RoundedCornerShape(iconRadius)),
+                                                    filterQuality = FilterQuality.High,
+                                                )
+                                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                    Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                    if (state.pendingLauncherIcon == variant) {
+                                                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                                    } else if (selected) {
+                                                        Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                                    }
+                                }
+                                HorizontalDivider()
+                                Text(
+                                    "선택한 앱 아이콘은 상단에도 반영됩니다. 테마를 바꿔도 선택한 아이콘은 유지됩니다.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("프라이버시", Icons.Default.VisibilityOff)
+                    DashboardCard {
+                        val privacyOn by com.armsone.nasfinder.data.PrivacyMode.active.collectAsStateWithLifecycle()
+                        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("프라이버시 모드", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                                Switch(checked = privacyOn, onCheckedChange = { model.setPrivacyMode(it) })
+                            }
+                            Text(
+                                "켜면 평소 기록에 더해 비공개로 지정한 기록도 함께 보입니다. 끄면 비공개 기록이 목록에서 숨겨집니다. 앱에서 나갔다 돌아오면 홈으로 이동하고 자동으로 꺼집니다. 설정 메뉴을 길게 눌러도 바꿀 수 있습니다. " +
+                                    com.armsone.nasfinder.data.PrivacyMode.HONEST_NOTE,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    SectionTitle("화면·테마", Icons.Default.Palette)
                         val columns = 3
                         Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
                             Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -9352,187 +9912,19 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
                                 }
                                 HorizontalDivider()
                                 Text(
-                                    "선택한 테마는 앱을 다시 열어도 유지됩니다. 레이아웃·글꼴은 같고 색만 바뀝니다.",
+                                    "모든 테마는 같은 배치와 글꼴을 쓰고 색만 바뀝니다. 아이콘 스타일과 앱 아이콘은 그대로 유지됩니다.",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
                         }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("아이콘 스타일", Icons.Default.GridView)
+                    Text("아이콘 스타일", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     InterfaceIconPackChooser(state.iconPack, model::setIconPack)
                 }
             }
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("프라이버시", Icons.Default.VisibilityOff)
-                    DashboardCard {
-                        val privacyOn by com.armsone.nasfinder.data.PrivacyMode.active.collectAsStateWithLifecycle()
-                        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text("프라이버시 모드", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
-                                Switch(checked = privacyOn, onCheckedChange = { model.setPrivacyMode(it) })
-                            }
-                            Text(
-                                "켜면 평소 기록에 더해 비공개로 지정한 기록도 함께 보입니다. 끄면 비공개 기록이 목록에서 숨겨집니다. 앱을 다시 열면 항상 꺼진 상태로 시작합니다. 도구 탭을 길게 눌러도 바꿀 수 있습니다. " +
-                                    com.armsone.nasfinder.data.PrivacyMode.HONEST_NOTE,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("화면 켜짐", Icons.Default.PhoneAndroid)
-                        DashboardCard {
-                            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                                    ScreenAwakeMode.entries.forEachIndexed { index, mode ->
-                                        SegmentedButton(
-                                            selected = state.screenAwakeMode == mode,
-                                            onClick = { model.setScreenAwakeMode(mode) },
-                                            shape = SegmentedButtonDefaults.itemShape(index, ScreenAwakeMode.entries.size),
-                                        ) { Text(when (mode) { ScreenAwakeMode.AUTOMATIC -> "오토"; ScreenAwakeMode.ALWAYS -> "항상 켜짐"; ScreenAwakeMode.OFF -> "끔" }) }
-                                    }
-                                }
-                                Text(
-                                    when (state.screenAwakeMode) {
-                                        ScreenAwakeMode.AUTOMATIC -> "다운로드·썸네일 생성·파일 작업 중에만 화면을 켜 둡니다."
-                                        ScreenAwakeMode.ALWAYS -> "NasFinder가 화면에 열려 있는 동안 화면을 켜 둡니다."
-                                        ScreenAwakeMode.OFF -> "Android의 화면 자동 잠금 설정을 그대로 따릅니다."
-                                    },
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("앱 아이콘", Icons.Default.Apps)
-                        val choices = listOf(
-                            Triple(LauncherIconVariant.DEFAULT, "블루 NAS", R.drawable.app_icon_blue_nas),
-                            Triple(LauncherIconVariant.PURPLE_NAS, "퍼플 NAS", R.drawable.app_icon_purple_nas),
-                            Triple(LauncherIconVariant.VIBE_CODER, "Vibe Coder", R.drawable.app_icon_vibe_coder),
-                            Triple(LauncherIconVariant.CYBER_VAULT, "사이버 볼트", R.drawable.app_icon_cyber_vault),
-                            Triple(LauncherIconVariant.NAS_RADAR, "네트워크 NAS", R.drawable.app_icon_nas_radar),
-                            Triple(LauncherIconVariant.ENAMEL, "BK Style", R.drawable.app_icon_enamel),
-                        )
-                        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), contentColor = MaterialTheme.colorScheme.onSurface) {
-                            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                                choices.chunked(3).forEach { row ->
-                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        row.forEach { (variant, label, drawable) ->
-                                            val selected = state.launcherIcon == variant
-                                            Column(
-                                                Modifier.weight(1f).height(104.dp)
-                                                    .clip(RoundedCornerShape(12.dp))
-                                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .56f))
-                                                    .border(
-                                                        BorderStroke(
-                                                            if (selected) 1.5.dp else 1.dp,
-                                                            if (selected) MaterialTheme.colorScheme.primary.copy(alpha = .75f)
-                                                            else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f),
-                                                        ),
-                                                        RoundedCornerShape(12.dp),
-                                                    )
-                                                    .clickable(enabled = state.pendingLauncherIcon == null && !selected) { model.setLauncherIcon(variant) }
-                                                    .padding(8.dp)
-                                                    .semantics(mergeDescendants = true) { this.selected = selected },
-                                                horizontalAlignment = Alignment.CenterHorizontally,
-                                                verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically),
-                                            ) {
-                                                Image(
-                                                    bitmap = ImageBitmap.imageResource(drawable),
-                                                    contentDescription = "$label 앱 아이콘 미리보기",
-                                                    modifier = Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)),
-                                                    filterQuality = FilterQuality.High,
-                                                )
-                                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                    Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                                    if (state.pendingLauncherIcon == variant) {
-                                                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                                                    } else if (selected) {
-                                                        Icon(Icons.Default.CheckCircle, "선택됨", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
-                                    }
-                                }
-                                HorizontalDivider()
-                                Text(
-                                    "선택한 아이콘은 홈 화면과 앱 보관함에 적용됩니다. 테마를 바꿔도 앱 아이콘은 그대로입니다.",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("저장공간 관리", Icons.Default.Storage)
-                        DashboardCard {
-                            Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.Cached, null, tint = MaterialTheme.colorScheme.primary)
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text("현재 사용량")
-                                    Text(
-                                        "${state.downloadCacheBytes?.let(::formatBytes) ?: "계산 중…"} · 7일 · 최대 512 MB",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                                TextButton(
-                                    onClick = { confirmCacheClear = true },
-                                    enabled = (state.downloadCacheBytes ?: 0L) > 0L && !state.isBusy,
-                                ) { Text("전체 지우기") }
-                            }
-                        }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("썸네일 캐시 및 생성", Icons.Default.PhotoLibrary)
-                        DashboardCard {
-                            DashboardRow(
-                                Icons.Default.PhotoLibrary,
-                                "썸네일 캐시",
-                                formatDashboardCacheBytes(state.thumbnailCacheStatistics?.totalBytes),
-                                MaterialTheme.colorScheme.onSurfaceVariant,
-                                MaterialTheme.colorScheme.onSurfaceVariant,
-                            ) { model.show(Screen.ThumbnailCache) }
-                            DashboardRowDivider()
-                            SuperThumbnailDashboardRow(if (state.superThumbnailSessionReport == null) "0 B" else "관리") {
-                                model.show(Screen.SuperThumbnail)
-                            }
-                        }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("파일 선택기 연동", Icons.Default.FolderOpen)
-                        DashboardCard {
-                            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                                Text(if (state.connections.isEmpty()) "먼저 NAS 또는 SFTP 연결을 추가해 주세요." else "현재 저장된 원격 위치 ${state.connections.size}개를 Android 파일 선택기에서도 열 수 있습니다.", style = MaterialTheme.typography.bodyMedium)
-                                Text("1. 파일 앱 또는 파일 선택 화면의 저장 위치 메뉴를 엽니다.\n2. ‘NasFinder’를 선택합니다.\n3. 서버 이름을 선택해 원격 파일을 엽니다.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text("지원되는 작업은 연결 방식과 서버 권한에 따라 달라집니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("앱 정보", Icons.Default.Info)
+                    SectionTitle("앱 정보·업데이트", Icons.Default.Info)
                         DashboardCard {
                             Row(Modifier.fillMaxWidth().padding(14.dp)) {
                                 Text("버전", Modifier.weight(1f))
@@ -9549,11 +9941,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
                                 Text("${state.connections.size}개", color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("지원 프로토콜", Icons.Default.Hub)
+                    Text("지원 프로토콜", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         DashboardCard {
                             ConnectionKind.entries.forEachIndexed { index, kind ->
                                 Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -9567,11 +9955,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
                                 if (index != ConnectionKind.entries.lastIndex) HorizontalDivider()
                             }
                         }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("업데이트", Icons.Default.Info)
+                    Text("업데이트", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         DashboardCard {
                             Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
@@ -9583,11 +9967,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
                             HorizontalDivider()
                             TextButton(onClick = onCheckForUpdates, modifier = Modifier.fillMaxWidth()) { Text("업데이트 확인") }
                         }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("오픈 소스", Icons.Default.Code)
+                    Text("오픈 소스", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         DashboardCard {
                             DashboardRow(Icons.Default.Code, "오픈 소스 구성요소", "구성요소·버전·라이선스·공식 소스 보기") {
                                 uriHandler.openUri("https://github.com/armsone/NasFinder-Android/blob/main/docs/OPEN_SOURCE.md")
@@ -9595,11 +9975,7 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
                             HorizontalDivider()
                             DashboardRow(Icons.Default.Description, "Apache 2.0 라이선스", "구성요소별 고지와 소스는 각 프로젝트에서 확인") { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0") }
                         }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    SectionTitle("만든 사람", Icons.Default.Person)
+                    Text("만든 사람", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         DashboardCard {
                             DashboardRow(Icons.Default.Link, "GitHub · armsone", "NasFinder를 만든 사람의 GitHub입니다.") {
                                 uriHandler.openUri("https://github.com/armsone")
@@ -9624,14 +10000,14 @@ private fun SettingsScreen(state: AppState, model: NasFinderViewModel, automatic
     if (confirmCacheClear) {
         AlertDialog(
             onDismissRequest = { confirmCacheClear = false },
-            title = { Text("다운로드 캐시를 지울까요?") },
-            text = { Text("미리보기와 공유를 위해 내려받은 임시 파일을 모두 삭제합니다. 원격 서버의 원본은 삭제되지 않습니다.") },
+            title = { Text("다운로드 캐시를 비울까요?") },
+            text = { Text("NasFinder가 미리보기와 공유를 위해 내려받아 둔 임시 파일만 삭제합니다. 원격 서버의 원본은 바뀌지 않으며, 작업이나 편집이 열려 있으면 비우지 않습니다.") },
             dismissButton = { TextButton(onClick = { confirmCacheClear = false }) { Text("취소") } },
             confirmButton = {
                 TextButton(
                     onClick = { confirmCacheClear = false; model.clearDownloadCache() },
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                ) { Text("전체 지우기") }
+                ) { Text("비우기") }
             },
         )
     }

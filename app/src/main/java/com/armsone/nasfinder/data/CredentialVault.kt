@@ -16,10 +16,30 @@ class CredentialVault(context: Context) {
 
     fun save(connectionId: String, password: String) {
         if (password.isEmpty()) return delete(connectionId)
+        preferences.edit().putString(connectionId, encrypted(password)).apply()
+    }
+
+    /**
+     * 여러 키를 한 번의 SharedPreferences 편집으로 저장·삭제한다. 암호화를 모두 끝낸 뒤 편집을 시작하므로
+     * 암호화 실패는 아무것도 바꾸지 않고, 묶음은 전부 이전 값이거나 전부 새 값으로만 남는다.
+     * 디스크에 기록하지 못하면 false를 돌려준다.
+     */
+    fun commitBatch(saves: Map<String, String> = emptyMap(), deletes: Set<String> = emptySet()): Boolean {
+        require(saves.values.none(String::isEmpty))
+        val values = saves.mapValues { (_, value) -> encrypted(value) }
+        return preferences.edit().apply {
+            deletes.forEach { remove(it) }
+            values.forEach { (key, value) -> putString(key, value) }
+        }.commit()
+    }
+
+    /** read()의 null이 값이 없는 것인지 저장된 값을 읽지 못한 것인지 구분할 때 쓴다. */
+    fun contains(connectionId: String): Boolean = preferences.contains(connectionId)
+
+    private fun encrypted(value: String): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
-        val value = cipher.iv + cipher.doFinal(password.toByteArray(Charsets.UTF_8))
-        preferences.edit().putString(connectionId, Base64.encodeToString(value, Base64.NO_WRAP)).apply()
+        return Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
     }
 
     fun read(connectionId: String): String? = runCatching {

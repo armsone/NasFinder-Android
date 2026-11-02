@@ -28,6 +28,8 @@ internal data class SenderTransferRecord(
     /** Items a verified receipt showed committed (informational; never grants deletion after a restart). */
     val confirmedItemIds: Set<String>,
     val complete: Boolean,
+    /** New transfer id the user explicitly replaced this record with. The record is kept but never resumed again. */
+    val supersededBy: String? = null,
 )
 
 /**
@@ -45,7 +47,7 @@ internal class PhotoTransferSenderJournal(context: Context) {
     fun resolve(uriStrings: List<String>): String = synchronized(lock) {
         val key = selectionKey(uriStrings)
         pruneLocked()
-        val open = allLocked().filter { it.selectionKey == key && !it.complete }.maxByOrNull { it.updatedAt }
+        val open = allLocked().filter { it.selectionKey == key && !it.complete && it.supersededBy == null }.maxByOrNull { it.updatedAt }
         if (open != null) return open.transferId
         val now = System.currentTimeMillis()
         val created = SenderTransferRecord(UUID.randomUUID().toString(), key, now, now, null, emptyList(), emptySet(), false)
@@ -56,11 +58,17 @@ internal class PhotoTransferSenderJournal(context: Context) {
     /**
      * Always a NEW transfer id for [uriStrings] (explicit "새로 보내기"): never reuses an open record, so the receiver
      * treats it as a separate transfer and the earlier transfer, its journal and its saved assets stay untouched.
+     * The new record inherits no receiver or confirmation. A [superseding] record of the same selection is only marked,
+     * so a later send of this selection cannot fall back to its old id and receiver.
      */
-    fun startNew(uriStrings: List<String>): String = synchronized(lock) {
+    fun startNew(uriStrings: List<String>, superseding: String? = null): String = synchronized(lock) {
         val now = System.currentTimeMillis()
-        val created = SenderTransferRecord(UUID.randomUUID().toString(), selectionKey(uriStrings), now, now, null, emptyList(), emptySet(), false)
+        val key = selectionKey(uriStrings)
+        val created = SenderTransferRecord(UUID.randomUUID().toString(), key, now, now, null, emptyList(), emptySet(), false)
         writeLocked(created)
+        superseding?.let(::readLocked)?.takeIf { it.selectionKey == key }?.let { previous ->
+            runCatching { writeLocked(previous.copy(supersededBy = created.transferId)) }
+        }
         created.transferId
     }
 
@@ -118,6 +126,7 @@ internal class PhotoTransferSenderJournal(context: Context) {
                 items = items,
                 confirmedItemIds = confirmed,
                 complete = json.optBoolean("complete", false),
+                supersededBy = json.optString("supersededBy", "").takeIf { it.isNotEmpty() },
             )
         }.getOrNull()
     }
@@ -135,7 +144,10 @@ internal class PhotoTransferSenderJournal(context: Context) {
             .put("items", items)
             .put("confirmed", JSONArray(record.confirmedItemIds.toList()))
             .put("complete", record.complete)
-            .apply { record.receiverId?.let { put("receiverId", it) } }
+            .apply {
+                record.receiverId?.let { put("receiverId", it) }
+                record.supersededBy?.let { put("supersededBy", it) }
+            }
         val atomic = AtomicFile(File(directory, "${record.transferId}.json"))
         val stream = atomic.startWrite()
         try {

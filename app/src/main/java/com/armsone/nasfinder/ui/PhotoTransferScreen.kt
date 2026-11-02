@@ -116,7 +116,13 @@ private enum class PhotoPairingRole {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onBack: () -> Unit) {
+internal fun PhotoTransferScreen(
+    state: AppState,
+    model: NasFinderViewModel,
+    visible: Boolean = true,
+    onActivityChanged: (active: Boolean, failure: Boolean, originPrivate: Boolean) -> Unit = { _, _, _ -> },
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // The receive-ready listener/QR lives in a ViewModel so rotation or window resize does not drop it.
@@ -160,9 +166,12 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
     var pairingStatus by rememberSaveable { mutableStateOf("보내기 또는 받기를 선택하세요.") }
     var transferInProgress by remember { mutableStateOf(false) }
     var senderConnecting by remember { mutableStateOf(false) }
+    var sessionOriginPrivate by rememberSaveable { mutableStateOf(false) }
     var senderPeerTitle by remember { mutableStateOf<String?>(null) }
     var sentItemCount by remember { mutableStateOf<Int?>(null) }
     var senderError by remember { mutableStateOf<String?>(null) }
+    // Selection whose send stopped at the receiver mismatch guard; the new-transfer choice is offered only for it.
+    var receiverMismatchSelection by remember { mutableStateOf<String?>(null) }
     var senderUiGeneration by remember { mutableStateOf(0L) }
     var showSenderModal by remember { mutableStateOf(false) }
     var showDismissConfirmation by remember { mutableStateOf(false) }
@@ -235,6 +244,7 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
         senderUiGeneration += 1L
         senderSession?.close()
         senderSession = null
+        sessionOriginPrivate = com.armsone.nasfinder.data.PrivacyMode.capturedOrigin(false)
         pairingRole = PhotoPairingRole.RECEIVE
         receiveController.start()
     }
@@ -249,6 +259,9 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
         senderPeerTitle = null
         sentItemCount = null
         senderError = null
+        sessionOriginPrivate = com.armsone.nasfinder.data.PrivacyMode.capturedOrigin(
+            selectedItems.any { DurableMaterialStore.isEffectivelyPrivate(it) }
+        )
         pairingRole = PhotoPairingRole.SEND
         pairingStatus = "미디어를 선택하세요."
     }
@@ -261,8 +274,12 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
         senderSession = null
         senderPeerTitle = null
         sentItemCount = null
+        sessionOriginPrivate = com.armsone.nasfinder.data.PrivacyMode.capturedOrigin(
+            selectedItems.any { DurableMaterialStore.isEffectivelyPrivate(it) }
+        )
         senderConnecting = true
         senderError = null
+        receiverMismatchSelection = null
         pairingStatus = "연결 중…"
         scanner.startScan()
             .addOnSuccessListener { barcode ->
@@ -325,9 +342,14 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
             pairingStatus = "보낼 항목이 없습니다."
             return@sendSelected
         }
+        sessionOriginPrivate = com.armsone.nasfinder.data.PrivacyMode.capturedOrigin(
+            snapshot.any { DurableMaterialStore.isEffectivelyPrivate(it) }
+        )
         transferInProgress = true
         val currentTransferId = transferId
+        val sendSelectionKey = selectionKey
         senderError = null
+        receiverMismatchSelection = null
         sendReport = null
         deleteOriginals = false
         deleteStatus = null
@@ -428,7 +450,8 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
                     },
                     onFailure = {
                         if (it is kotlinx.coroutines.CancellationException) throw it
-                        senderError = it.userMessage("파일을 보내지 못했습니다. 두 기기가 같은 Wi-Fi에 있는지 확인한 뒤 다시 시도해 주세요.") + if (session.receiptProtocol) {
+                        if (it is PhotoTransferReceiverMismatchException) receiverMismatchSelection = sendSelectionKey
+                        senderError = it.userMessage("파일을 보내지 못했습니다. 두 기기가 같은 Wi-Fi에 있는지 확인한 뒤 다시 시도해 주세요.") + if (session.receiptProtocol && it !is PhotoTransferReceiverMismatchException) {
                             " 작업대 항목은 그대로 남아 있습니다. 다시 연결해 보내면 이미 저장된 항목은 건너뛰고 이어서 확인합니다."
                         } else " 작업대 항목은 그대로 남아 있습니다."
                         pairingStatus = checkNotNull(senderError)
@@ -447,6 +470,17 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
                 senderSession = null
             }
         }
+    }
+
+    // Explicit user choice on the mismatch failure: the current selection goes out under a NEW transfer id. The earlier
+    // record is kept, nothing is inherited for deletion, and the connection restarts from a new QR.
+    val startNewTransferForReceiverMismatch: () -> Unit = recovery@{
+        if (transferInProgress || receiverMismatchSelection != selectionKey || selectedItems.isEmpty()) return@recovery
+        val previousTransferId = transferId
+        transferId = runCatching { senderJournal.startNew(selectedItems.map { it.sourceIdentity }, superseding = previousTransferId) }
+            .getOrElse { UUID.randomUUID().toString() }
+        onPendingChanged()
+        scanReceiverQr()
     }
 
     val stopAndDismissPairing: () -> Unit = {
@@ -507,6 +541,19 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
     val requestPairingDismiss: () -> Unit = {
         if (pairingDismissNeedsConfirmation) showDismissConfirmation = true else stopAndDismissPairing()
     }
+
+    val currentOnActivityChanged by androidx.compose.runtime.rememberUpdatedState(onActivityChanged)
+    val privacyActive by com.armsone.nasfinder.data.PrivacyMode.active.collectAsState()
+    val isTransferActive = senderConnecting || transferInProgress ||
+        (senderSession != null && sentItemCount == null) || receiverStarting ||
+        (receiverConnected && !receiverFinished) ||
+        (receiveUi.qr != null && receiveUi.modalOpen && !receiverFinished && receiveUi.error == null)
+    val hasTransferFailure = senderError != null || receiveUi.error != null ||
+        receiveUi.partialNote != null || (sendReport?.let { failedOutputItemIds(it).isNotEmpty() } == true)
+    androidx.compose.runtime.LaunchedEffect(isTransferActive, hasTransferFailure, sessionOriginPrivate) {
+        currentOnActivityChanged(isTransferActive, hasTransferFailure, sessionOriginPrivate)
+    }
+    if (!visible || (sessionOriginPrivate && !privacyActive)) return
 
     Scaffold(
         containerColor = Color.Transparent,
@@ -708,6 +755,23 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
                     canSend = senderSession != null && selectedItems.isNotEmpty(),
                     onSend = sendSelected,
                     onRetry = scanReceiverQr,
+                    errorRecovery = {
+                        if (receiverMismatchSelection != null && receiverMismatchSelection == selectionKey) {
+                            Text(
+                                "새 전송으로 보내면 지금 고른 ${selectedItems.size}개를 처음부터 다시 보냅니다. 이전에 받은 항목이 받는 기기에 중복될 수 있습니다. " +
+                                    "누른 뒤 받는 기기에서 새 QR을 만들어 다시 연결하세요. 원본은 그대로입니다.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            OutlinedButton(
+                                onClick = startNewTransferForReceiverMismatch,
+                                enabled = selectedItems.isNotEmpty() && !transferInProgress,
+                                modifier = Modifier.semantics {
+                                    contentDescription = "새 전송으로 보내기. 지금 고른 항목을 새 전송으로 다시 보내도록 준비합니다. 받는 기기에 중복될 수 있습니다."
+                                },
+                            ) { Text("새 전송으로 보내기") }
+                        }
+                    },
                     notice = if (senderSession?.legacyTokenExposed == true) {
                         "이전 방식으로 연결되어 이 QR은 노출되었으므로 원본 삭제를 사용할 수 없습니다. " +
                             "삭제하려면 받는 기기에서 새 QR을 만든 뒤 다시 스캔하세요."
@@ -732,11 +796,11 @@ internal fun PhotoTransferScreen(state: AppState, model: NasFinderViewModel, onB
                                             if (retainedRoots.isNotEmpty()) {
                                                 val retainedIdentities = selectedItems.filter { it.id in retainedRoots }.map { it.sourceIdentity }
                                                 model.setWorkbenchSelected(retainedRoots)
-                                                transferId = runCatching { senderJournal.startNew(retainedIdentities) }
+                                                transferId = runCatching { senderJournal.startNew(retainedIdentities, superseding = report.transferId) }
                                                     .getOrElse { UUID.randomUUID().toString() }
                                                 onPendingChanged()
-                                                sentItemCount = null
-                                                pairingStatus = "새로 보내기 준비: ${retainedRoots.size}개 항목을 새 전송으로 보냅니다. 받는 기기에서 새 QR을 만들어 다시 연결하세요."
+                                                // The finished session is closed: only a new QR connection can send this new transfer.
+                                                scanReceiverQr()
                                             }
                                         },
                                         enabled = !transferInProgress,
@@ -1056,6 +1120,7 @@ private fun SenderTransferState(
     canSend: Boolean,
     onSend: () -> Unit,
     onRetry: () -> Unit,
+    errorRecovery: @Composable () -> Unit = {},
     notice: String? = null,
     afterSend: @Composable () -> Unit = {},
 ) {
@@ -1077,6 +1142,7 @@ private fun SenderTransferState(
                         modifier = Modifier.size(40.dp),
                     )
                     Text(error, style = MaterialTheme.typography.bodyMedium)
+                    errorRecovery()
                     Button(onClick = onRetry) { Text("다시 스캔") }
                 }
                 peerTitle != null -> {
@@ -1353,12 +1419,12 @@ private fun formatBytes(bytes: Long): String = when {
     else -> "${bytes}B"
 }
 
-/** Items the receiver reported failed because its earlier received output is missing/modified/unverifiable. */
+/** Items the receiver reported failed because its earlier received output is missing/modified/unverifiable or its earlier save is unsettled. */
 internal fun failedOutputItemIds(report: PhotoTransferSendReport): Set<String> =
     report.outcomes.values.filter { !it.committed && it.reason in ReceivedOutputCheck.OUTPUT_REASONS }.map { it.itemId }.toSet()
 
 internal fun outputFailureNote(count: Int): String =
-    if (count == 0) "" else " 받는 기기에 이전에 저장된 ${count}개의 사본이 없어졌거나 바뀌었거나 확인되지 않아 실패로 보고되었습니다. 자동으로 다시 저장하지 않았고 받은 기기의 파일은 그대로입니다. 원본은 삭제 대상에서 제외됩니다. 다시 받으려면 '새로 보내기'를 선택하세요."
+    if (count == 0) "" else " 받는 기기에 이전에 저장된 ${count}개의 사본이 없어졌거나 바뀌었거나 확인되지 않아 실패로 보고되었습니다. 자동으로 다시 저장하지 않았고 받은 기기의 파일은 그대로입니다. 원본은 삭제 대상에서 제외됩니다. 다시 받으려면 '새로 보내기'를 선택하세요. 이미 저장된 항목이 있으면 받는 기기에 중복될 수 있으며, 누른 뒤 받는 기기에서 새 QR을 만들어 다시 연결하세요."
 
 /** Completion counts only items whose stored content matches what was sent; a differing stored copy is reported separately. */
 internal fun sendCompletionText(receiptProtocol: Boolean, sentCount: Int, confirmed: Int, mismatched: Int, total: Int): String = when {

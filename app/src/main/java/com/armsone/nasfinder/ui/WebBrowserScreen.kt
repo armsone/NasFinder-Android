@@ -554,6 +554,7 @@ fun WebBrowserScreen(
     }
     var handedOffFile by remember { mutableStateOf(resumedDownload?.file) }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
+    val downloadRequestSequence = remember { intArrayOf(0) }
     var downloadActionInFlight by remember { mutableStateOf(false) }
     var chooseNetworkConnection by remember { mutableStateOf(false) }
     var shortcut by remember { mutableStateOf<WebShortcut?>(null) }
@@ -605,6 +606,9 @@ fun WebBrowserScreen(
         val initialName = safeWebFilename(
             if (isMusic) musicDownloadFilename(musicTitle, guessedInitialName, mimeType) else guessedInitialName
         )
+        // A cancelled job can stay blocked in its call after a newer download starts, so only the latest request may touch shared state.
+        val requestId = ++downloadRequestSequence[0]
+        fun isCurrentRequest() = requestId == downloadRequestSequence[0]
         activeDownload = ActiveWebDownload(initialName, 0, length.takeIf { it >= 0 })
         downloadJob = scope.launch {
             runCatching {
@@ -618,18 +622,36 @@ fun WebBrowserScreen(
                     suggestedLength = length,
                     musicDownload = isMusic,
                     musicTitle = musicTitle,
-                    onProgress = { state -> withContext(Dispatchers.Main.immediate) { activeDownload = state } },
+                    onProgress = { state ->
+                        withContext(Dispatchers.Main.immediate) { if (isCurrentRequest()) activeDownload = state }
+                    },
                 )
             }.onSuccess { downloaded ->
-                pendingDownload?.file?.let { cleanupLocalWebDownload(context.cacheDir, it) }
+                if (!isCurrentRequest()) {
+                    // Superseded: nobody will be offered this file, and it belongs to this request alone.
+                    cleanupLocalWebDownload(context.cacheDir, downloaded.file)
+                    return@onSuccess
+                }
+                pendingDownload?.file?.let { replaced ->
+                    if (replaced == handedOffFile) {
+                        onDiscardDownloadedFile(replaced)
+                        handedOffFile = null
+                    } else {
+                        cleanupLocalWebDownload(context.cacheDir, replaced)
+                    }
+                }
                 pendingDownload = downloaded
                 // Consumed: the saved song must not stay offered, whichever song plays now.
                 if (musicKey != null) dismissedMusicKeys = dismissedMusicKeys + musicKey
             }.onFailure { failure ->
-                if (failure !is CancellationException) error = failure.message ?: "파일을 다운로드하지 못했습니다."
+                if (failure !is CancellationException && isCurrentRequest()) {
+                    error = failure.message ?: "파일을 다운로드하지 못했습니다."
+                }
             }
-            activeDownload = null
-            downloadJob = null
+            if (isCurrentRequest()) {
+                activeDownload = null
+                downloadJob = null
+            }
         }
     }
 

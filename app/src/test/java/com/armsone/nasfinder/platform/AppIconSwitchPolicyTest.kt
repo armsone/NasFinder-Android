@@ -7,26 +7,38 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AppIconSwitchPolicyTest {
+    // Boundary: Repository.icon() needs an AndroidContext and this JVM suite has JUnit only (no mocks),
+    // so explicit-saved-choice persistence is not executed here; only the pure policy APIs are covered.
     @Test
-    fun `themed launcher icons follow Digital Rain and BK Style`() {
-        AppTheme.entries.forEach { theme ->
-            val expected = when (theme) {
-                AppTheme.DIGITAL_RAIN -> LauncherIconVariant.VIBE_CODER
-                AppTheme.SKEUOMORPHIC -> LauncherIconVariant.ENAMEL
-                else -> LauncherIconVariant.DEFAULT
-            }
-            assertEquals(expected, AppIconSwitchPolicy.iconFor(theme))
+    fun `legacy raw theme ids map to launcher icons and the applied icon stays stable`() {
+        assertEquals(LauncherIconVariant.ENAMEL, AppIconSwitchPolicy.legacyThemeIcon("SKEUOMORPHIC"))
+        assertEquals(LauncherIconVariant.VIBE_CODER, AppIconSwitchPolicy.legacyThemeIcon("DIGITAL_RAIN"))
+        listOf(null, "LIGHT", "BKSTYLE", "NIGHT", "JARVIS", "FRIDAY", "ULTRON", "REMOVED_OLD_ICON").forEach { raw ->
+            assertEquals(LauncherIconVariant.DEFAULT, AppIconSwitchPolicy.legacyThemeIcon(raw))
         }
         LauncherIconVariant.entries.forEach { icon ->
-            assertEquals(icon, AppIconSwitchPolicy.restoredIcon(icon.name, AppTheme.SYSTEM))
+            val enabled = state(
+                default = overrideFor(LauncherIconVariant.DEFAULT, icon),
+                digitalRain = overrideFor(LauncherIconVariant.VIBE_CODER, icon),
+                purpleNas = overrideFor(LauncherIconVariant.PURPLE_NAS, icon),
+                cyberVault = overrideFor(LauncherIconVariant.CYBER_VAULT, icon),
+                nasRadar = overrideFor(LauncherIconVariant.NAS_RADAR, icon),
+                enamel = overrideFor(LauncherIconVariant.ENAMEL, icon),
+            )
+            val fallback = if (icon == LauncherIconVariant.DEFAULT) LauncherIconVariant.ENAMEL else LauncherIconVariant.DEFAULT
+            assertEquals(icon, AppIconSwitchPolicy.previousStableIcon(enabled, fallback))
         }
-        assertEquals(
-            LauncherIconVariant.VIBE_CODER,
-            AppIconSwitchPolicy.restoredIcon(null, AppTheme.DIGITAL_RAIN),
+        val none = state(
+            default = AliasOverride.DISABLED,
+            digitalRain = AliasOverride.DISABLED,
+            purpleNas = AliasOverride.DISABLED,
+            cyberVault = AliasOverride.DISABLED,
+            nasRadar = AliasOverride.DISABLED,
+            enamel = AliasOverride.DISABLED,
         )
         assertEquals(
-            LauncherIconVariant.DEFAULT,
-            AppIconSwitchPolicy.restoredIcon("REMOVED_OLD_ICON", AppTheme.SYSTEM),
+            LauncherIconVariant.VIBE_CODER,
+            AppIconSwitchPolicy.previousStableIcon(none, LauncherIconVariant.VIBE_CODER),
         )
     }
 

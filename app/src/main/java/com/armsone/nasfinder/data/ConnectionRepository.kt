@@ -8,6 +8,11 @@ import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.StoredBrowserPreferences
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
+
+/** 저장된 연결 목록을 읽지 못해 변경을 막았다. 원본 데이터와 연결된 로그인 정보는 그대로 남아 있다. */
+class ConnectionStoreReadException :
+    IOException("저장된 연결 목록을 읽지 못해 변경 사항을 저장하지 않았습니다. 기존 데이터는 그대로 보존했습니다.")
 
 class ConnectionRepository(context: Context) {
     private val appContext = context.applicationContext
@@ -18,14 +23,27 @@ class ConnectionRepository(context: Context) {
     val oauthTokens = OAuthTokenStore(context)
 
     /** 비공개를 포함한 전체 저장 연결. 정리·id 조회·저장은 항상 이 전체를 기준으로 한다. */
-    fun loadAll(): List<RemoteConnection> = runCatching {
-        val array = JSONArray(preferences.getString(KEY_CONNECTIONS, "[]"))
-        buildList {
-            for (index in 0 until array.length()) add(array.getJSONObject(index).toConnection())
-        }
-    }.getOrElse { emptyList() }.also { all ->
+    fun loadAll(): List<RemoteConnection> = runCatching { readStored() }.getOrElse { emptyList() }.also { all ->
         PrivacyMode.setPrivateConnectionIds(all.filter(RemoteConnection::isPrivate).mapTo(hashSetOf(), RemoteConnection::id))
     }
+
+    /** 키가 없는 새 설치는 빈 목록이며 정상이다. 저장된 값이 있는데 해석할 수 없을 때만 true다. */
+    fun isStoreUnreadable(): Boolean = runCatching { readStored() }.isFailure
+
+    private fun readStored(): List<RemoteConnection> {
+        val array = JSONArray(preferences.getString(KEY_CONNECTIONS, "[]"))
+        return buildList {
+            for (index in 0 until array.length()) add(array.getJSONObject(index).toConnection())
+        }
+    }
+
+    /** 쓰기 전용 조회. 읽기 실패를 빈 목록으로 보면 원본을 덮어쓰게 되므로 변경 전체를 막는다. */
+    private fun readForWrite(): List<RemoteConnection> =
+        try {
+            readStored()
+        } catch (_: Exception) {
+            throw ConnectionStoreReadException()
+        }
 
     /** 지금 모드에서 보이는 연결: 일반 모드는 공개만, 프라이버시 모드는 공개 + 비공개. */
     fun load(): List<RemoteConnection> = loadAll().filter { PrivacyMode.isVisible(it.isPrivate) }
@@ -35,25 +53,25 @@ class ConnectionRepository(context: Context) {
      * 비공개 플래그는 저장된 값을 이어받으며, 프라이버시 모드에서 새로 만든 연결만 비공개로 시작한다.
      */
     fun save(incoming: List<RemoteConnection>) {
-        val raw = loadAll()
+        val raw = readForWrite()
         val rawById = raw.associateBy(RemoteConnection::id)
         val visibleNew = incoming.map { connection ->
             val stored = rawById[connection.id]
             connection.copy(isPrivate = stored?.isPrivate ?: (connection.isPrivate || PrivacyMode.isActive))
         }
-        persist(PrivacyMode.preservingHidden(raw, visibleNew, { !PrivacyMode.isVisible(it.isPrivate) }, RemoteConnection::id))
+        persist(raw, PrivacyMode.preservingHidden(raw, visibleNew, { !PrivacyMode.isVisible(it.isPrivate) }, RemoteConnection::id))
     }
 
     /** 명시적인 공개/비공개 전환. 플래그만 바꾸고 id·로그인 정보·순서는 그대로 둔다. */
     fun setPrivate(id: String, isPrivate: Boolean) {
-        val raw = loadAll()
+        val raw = readForWrite()
         if (raw.none { it.id == id && it.isPrivate != isPrivate }) return
-        persist(raw.map { if (it.id == id) it.copy(isPrivate = isPrivate) else it })
+        persist(raw, raw.map { if (it.id == id) it.copy(isPrivate = isPrivate) else it })
     }
 
-    private fun persist(connections: List<RemoteConnection>) {
+    private fun persist(previous: List<RemoteConnection>, connections: List<RemoteConnection>) {
         val retainedIds = connections.mapTo(mutableSetOf(), RemoteConnection::id)
-        loadAll().asSequence().map(RemoteConnection::id).filterNot(retainedIds::contains).forEach { removedId ->
+        previous.asSequence().map(RemoteConnection::id).filterNot(retainedIds::contains).forEach { removedId ->
             oauthTokens.delete(removedId)
             SuperThumbnailSessionStore(appContext.filesDir.resolve("super-thumbnail/session-v2.json"))
                 .clearConnection(removedId)

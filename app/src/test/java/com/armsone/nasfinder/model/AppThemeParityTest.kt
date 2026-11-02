@@ -5,16 +5,15 @@ import org.junit.Test
 
 class AppThemeParityTest {
     @Test
-    fun `themes match iPhone display order and wrap`() {
+    fun `manual six themes keep order and next wraps (header quick4 is not exercised here)`() {
         assertEquals(
             listOf(
-                AppTheme.SYSTEM,
-                AppTheme.DAY,
+                AppTheme.LIGHT,
+                AppTheme.BKSTYLE,
                 AppTheme.NIGHT,
-                AppTheme.DIGITAL_RAIN,
-                AppTheme.WINDY_MEADOW,
-                AppTheme.WORKBENCH,
-                AppTheme.SKEUOMORPHIC,
+                AppTheme.JARVIS,
+                AppTheme.FRIDAY,
+                AppTheme.ULTRON,
             ),
             AppTheme.entries,
         )

@@ -45,6 +45,7 @@ internal val DOCUMENTS_PROVIDER_CONNECTION_KINDS = setOf(
  */
 class NasFinderDocumentsProvider : DocumentsProvider() {
     private lateinit var repository: ConnectionRepository
+    private val cloudAccessTokens by lazy { OAuthAccessTokenProvider(checkNotNull(context)) }
 
     override fun onCreate(): Boolean {
         repository = ConnectionRepository(checkNotNull(context))
@@ -497,7 +498,7 @@ class NasFinderDocumentsProvider : DocumentsProvider() {
         return try {
             signal?.throwIfCanceled()
             val password = repository.credentials.read(connection.id).orEmpty()
-            val service = RemoteFileServiceFactory.create(connection, password)
+            val service = RemoteFileServiceFactory.create(connection, password, cloudAccessTokens)
             try {
                 runBlocking(Dispatchers.IO + cancellationJob) {
                     signal?.throwIfCanceled()

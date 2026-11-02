@@ -31,6 +31,53 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : ComponentActivity() {
+    // 실제 startActivityForResult/startIntentSenderForResult 요청 코드만 추적한다.
+    // (로컬 미디어/문서/Google Photos/QR 선택기 왕복 중 개인정보 보호 초기화 방지용)
+    private val pendingExternalResultRequests = mutableSetOf<Int>()
+
+    val hasPendingExternalActivityResult: Boolean
+        get() = pendingExternalResultRequests.isNotEmpty()
+
+    @Suppress("DEPRECATION")
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        val tracked = requestCode >= 0 && pendingExternalResultRequests.add(requestCode)
+        try {
+            super.startActivityForResult(intent, requestCode, options)
+        } catch (t: Throwable) {
+            if (tracked) pendingExternalResultRequests.remove(requestCode)
+            throw t
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun startIntentSenderForResult(
+        intentSender: android.content.IntentSender,
+        requestCode: Int,
+        fillInIntent: Intent?,
+        flagsMask: Int,
+        flagsValues: Int,
+        extraFlags: Int,
+        options: Bundle?
+    ) {
+        val tracked = requestCode >= 0 && pendingExternalResultRequests.add(requestCode)
+        try {
+            super.startIntentSenderForResult(
+                intentSender, requestCode, fillInIntent, flagsMask, flagsValues, extraFlags, options
+            )
+        } catch (t: Throwable) {
+            if (tracked) pendingExternalResultRequests.remove(requestCode)
+            throw t
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        // super 이전에 제거: 취소/예외 시에도 이미 정리되며, 콜백에서 같은 코드를 재사용해
+        // 다시 시작한 요청의 pending 상태를 지우지 않는다.
+        pendingExternalResultRequests.remove(requestCode)
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
     private val incomingIntent = mutableStateOf<Intent?>(null)
     private var intentConsumed = false
     private val appUpdateService by lazy { GitHubAppUpdateService(this, installedVersionCode()) }
@@ -38,6 +85,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        savedInstanceState?.getIntArray("nasfinder.pendingExternalResults")?.let { pendingExternalResultRequests.addAll(it.toList()) }
         // 소비 플래그는 같은 프로세스의 구성 변경에서만 신뢰한다. 프로세스가 새로 만들어졌다면 미완료 intake를 다시 평가한다.
         intentConsumed = savedInstanceState != null &&
             savedInstanceState.getLong(KEY_PROCESS_SESSION, 0L) == processSession &&
@@ -174,6 +222,7 @@ class MainActivity : ComponentActivity() {
     private fun showToast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putIntArray("nasfinder.pendingExternalResults", pendingExternalResultRequests.toIntArray())
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_INTENT_CONSUMED, intentConsumed)
         outState.putLong(KEY_PROCESS_SESSION, processSession)

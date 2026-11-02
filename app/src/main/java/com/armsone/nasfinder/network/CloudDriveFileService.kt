@@ -33,15 +33,25 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
+ * 요청 직전에 연결의 현재 Bearer 토큰을 돌려준다. null은 쓸 수 있는 로그인이 없다는 뜻이다.
+ * 수동 토큰과 자동 OAuth 토큰의 구분, 갱신, 저장은 구현체가 맡는다.
+ */
+interface CloudAccessTokenSource {
+    suspend fun currentAccessToken(connection: RemoteConnection): String?
+}
+
+/**
  * REST implementation shared by Dropbox, OneDrive and Google Drive.
  *
- * [accessToken] is the already persisted OAuth access token. Token refresh and
- * interactive sign-in deliberately live outside this transport service.
+ * With [tokenSource], every authorized request asks for the current token and
+ * [accessToken] is ignored. Without it, [accessToken] is used as given. Token
+ * refresh and interactive sign-in deliberately live outside this transport service.
  */
 class CloudDriveFileService(
     private val connection: RemoteConnection,
     private val accessToken: String,
     private val client: OkHttpClient = cloudHttpClient(),
+    private val tokenSource: CloudAccessTokenSource? = null,
 ) : RemoteFileService {
     override val supportsRangeStreaming: Boolean = true
     private val monitorClient = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
@@ -51,7 +61,7 @@ class CloudDriveFileService(
 
     init {
         require(connection.kind in SUPPORTED_KINDS) { "지원하지 않는 클라우드 연결입니다." }
-        if (accessToken.isBlank() || '\r' in accessToken || '\n' in accessToken) {
+        if (tokenSource == null && !isUsableBearerToken(accessToken)) {
             throw RemoteServiceException.Authentication("저장된 클라우드 로그인이 없습니다.")
         }
     }
@@ -289,7 +299,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun listDropbox(directory: String): List<RemoteFileItem> {
+    private suspend fun listDropbox(directory: String): List<RemoteFileItem> {
         var request = authorized(
             jsonPost(
                 DROPBOX_LIST,
@@ -322,7 +332,7 @@ class CloudDriveFileService(
         throw invalidCloudResponse()
     }
 
-    private fun listOneDrive(directory: String): List<RemoteFileItem> {
+    private suspend fun listOneDrive(directory: String): List<RemoteFileItem> {
         var next: HttpUrl? = oneDriveChildrenUrl(directory)
         val result = mutableListOf<RemoteFileItem>()
         val seenPages = mutableSetOf<String>()
@@ -458,7 +468,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun listGoogle(directory: String): List<RemoteFileItem> {
+    private suspend fun listGoogle(directory: String): List<RemoteFileItem> {
         val parentId = googleFolderId(directory)
         var pageToken: String? = null
         val seenTokens = mutableSetOf<String>()
@@ -492,7 +502,7 @@ class CloudDriveFileService(
         throw invalidCloudResponse()
     }
 
-    private fun uploadDropbox(parent: String, source: File) {
+    private suspend fun uploadDropbox(parent: String, source: File) {
         if (source.length() > DROPBOX_SINGLE_UPLOAD_LIMIT) {
             uploadDropboxSession(parent, source)
             return
@@ -507,7 +517,7 @@ class CloudDriveFileService(
         executeJson(request)
     }
 
-    private fun uploadDropboxSession(parent: String, source: File) {
+    private suspend fun uploadDropboxSession(parent: String, source: File) {
         val session = executeJson(
             authorized(
                 Request.Builder().url(DROPBOX_UPLOAD_SESSION_START)
@@ -543,7 +553,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun uploadOneDrive(parent: String, source: File) {
+    private suspend fun uploadOneDrive(parent: String, source: File) {
         val chosenName = keepBothName(source.name, listOneDrive(parent).map { it.name })
         val path = childPath(parent, chosenName)
         if (source.length() == 0L) {
@@ -581,7 +591,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun uploadGoogle(parent: String, source: File) {
+    private suspend fun uploadGoogle(parent: String, source: File) {
         val chosenName = keepBothName(source.name, listGoogle(parent).map { it.name })
         val metadata = JSONObject().put("name", chosenName)
             .put("parents", JSONArray().put(googleFolderId(parent)))
@@ -671,7 +681,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun googleFolderId(path: String): String {
+    private suspend fun googleFolderId(path: String): String {
         synchronized(googleFolderIds) { googleFolderIds[path]?.let { return it } }
         var currentPath = "/"
         var parentId = "root"
@@ -716,7 +726,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun oneDriveFolderReference(path: String): OneDriveFolderReference {
+    private suspend fun oneDriveFolderReference(path: String): OneDriveFolderReference {
         synchronized(oneDriveFolderReferences) { oneDriveFolderReferences[path]?.let { return it } }
         val value = executeJson(
             authorized(
@@ -734,7 +744,7 @@ class CloudDriveFileService(
         }
     }
 
-    private fun oneDriveDriveId(): String {
+    private suspend fun oneDriveDriveId(): String {
         cachedOneDriveDriveId?.let { return it }
         val id = executeJson(
             authorized(
@@ -827,8 +837,14 @@ class CloudDriveFileService(
         throw RemoteServiceException.Connection("OneDrive 복사 상태를 확인할 수 없습니다.", error)
     }
 
-    private fun authorized(builder: Request.Builder): Request.Builder =
-        builder.header("Authorization", "Bearer $accessToken").header("Accept", "application/json")
+    private suspend fun authorized(builder: Request.Builder): Request.Builder =
+        builder.header("Authorization", "Bearer ${currentBearerToken()}").header("Accept", "application/json")
+
+    private suspend fun currentBearerToken(): String {
+        val source = tokenSource ?: return accessToken
+        return source.currentAccessToken(connection)?.takeIf(::isUsableBearerToken)
+            ?: throw RemoteServiceException.Authentication("저장된 클라우드 로그인이 없습니다.")
+    }
 
     private fun checkedPath(raw: String): String {
         if (raw.isBlank() || '\u0000' in raw || '\r' in raw || '\n' in raw || !raw.startsWith('/')) {
@@ -982,6 +998,9 @@ private class FileSegmentRequestBody(
         }
     }
 }
+
+private fun isUsableBearerToken(token: String): Boolean =
+    token.isNotBlank() && '\r' !in token && '\n' !in token
 
 private fun jsonPost(url: HttpUrl, value: JSONObject): Request.Builder =
     Request.Builder().url(url).post(jsonBody(value))

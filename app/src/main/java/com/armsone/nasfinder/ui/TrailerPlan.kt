@@ -33,6 +33,7 @@ data class TrailerSource(
     // Stable identity of the Finder item this source was prepared from ("remote:<conn>:<path>",
     // "phonehard:<uuid>", "local:<uri>", "web:<path>"); null for legacy drafts. Only used to show 사용 중.
     val originKey: String? = null,
+    val isImportant: Boolean = false,
 ) {
     fun effectivePhotoDurationRatio(): Double {
         val raw = if (photoDurationRatio.isFinite() && photoDurationRatio > 0.0) photoDurationRatio else DEFAULT_PHOTO_DURATION_RATIO
@@ -42,13 +43,27 @@ data class TrailerSource(
 
     // Actual automatic scene duration for this photo given the configured video-clip ("base clip") length: the
     // weighted share, but never shorter than the camera-move minimum. Stored editor scenes keep their own lengths.
-    fun weightedPhotoLength(clipLength: Double): Double =
-        unflooredPhotoLength(clipLength).coerceIn(MIN_AUTO_PHOTO_SCENE_SECONDS, MAX_EDITOR_PHOTO_SCENE_SECONDS)
+    // Important photos receive longer priority duration within configured maximum (not blindly 30s) while integrating
+    // HanYang quality ranking.
+    fun weightedPhotoLength(clipLength: Double): Double {
+        val configuredClipMax = max(clipLength, MIN_AUTO_PHOTO_SCENE_SECONDS)
+        return if (isImportant) {
+            val hanYangRatio = effectivePhotoDurationRatio()
+            val priorityRatio = 0.85 + 0.15 * (hanYangRatio / 0.95).coerceIn(0.0, 1.0)
+            (configuredClipMax * priorityRatio).coerceIn(MIN_AUTO_PHOTO_SCENE_SECONDS, configuredClipMax)
+        } else {
+            unflooredPhotoLength(clipLength).coerceIn(MIN_AUTO_PHOTO_SCENE_SECONDS, configuredClipMax)
+        }
+    }
 
-    // The pre-3s-floor weighted length (raw stored ratio, clamped frame...30s); only used to recognize legacy totals.
+    // The pre-3s-floor weighted length (raw stored ratio, clamped frame...configuredClipMax); only used to recognize legacy totals.
     internal fun unflooredPhotoLength(clipLength: Double): Double {
         val raw = if (photoDurationRatio.isFinite() && photoDurationRatio > 0.0) photoDurationRatio else DEFAULT_PHOTO_DURATION_RATIO
-        return (clipLength * raw).coerceIn(MIN_PHOTO_SCENE_DURATION, MAX_EDITOR_PHOTO_SCENE_SECONDS)
+        val ratio = if (isImportant) {
+            0.85 + 0.15 * (raw / 0.95).coerceIn(0.0, 1.0)
+        } else raw
+        val configuredClipMax = max(clipLength, MIN_AUTO_PHOTO_SCENE_SECONDS)
+        return (clipLength * ratio).coerceIn(MIN_PHOTO_SCENE_DURATION, configuredClipMax)
     }
     // This source's own evidence-based clip length (see TrailerSourceEvidence), always within
     // 0 < clip <= duration for a valid video, so sub-second videos stay valid.
@@ -490,7 +505,8 @@ internal fun musicOverlayScenes(
     // only videos' own full duration and the music-fit policy affect this mode's total length.
     val baseScenes = sources.map { source ->
         if (source.isImage) {
-            TrailerScene(source, 0.0, 1.0)
+            val photoLen = if (source.isImportant) 2.0 else 1.0
+            TrailerScene(source, 0.0, photoLen)
         } else {
             TrailerScene(source, 0.0, max(0.5, source.duration))
         }

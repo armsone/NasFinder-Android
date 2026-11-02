@@ -43,7 +43,9 @@ internal object ReceivedOutputCheck {
     const val OUT_MISSING = "outmissing"
     const val OUT_MODIFIED = "outmodified"
     const val OUT_UNVERIFIED = "outunverified"
-    val OUTPUT_REASONS = setOf(OUT_MISSING, OUT_MODIFIED, OUT_UNVERIFIED)
+    /** Apple receiver: an interrupted save it cannot settle may already exist, so it is not saved again on this transferId. */
+    const val CONFLICT = "conflict"
+    val OUTPUT_REASONS = setOf(OUT_MISSING, OUT_MODIFIED, OUT_UNVERIFIED, CONFLICT)
 
     /** Failure reason for a verdict that is not VERIFIED; unknown/legacy/pending stay "unverified", never "missing". */
     fun failureReason(verdict: OutputVerdict): String = when (verdict) {

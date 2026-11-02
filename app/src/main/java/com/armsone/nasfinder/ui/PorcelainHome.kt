@@ -18,6 +18,7 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,6 +34,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -42,9 +46,13 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -134,7 +142,7 @@ internal fun PorcelainHome(
         val isTablet = configuration.smallestScreenWidthDp >= 600
         val totalWidth = maxWidth
         val wide = isTablet && totalWidth >= SidebarMinWidth
-        val sidebarWidth = sidebarWidthFor(totalWidth)
+        val sidebarWidth = sidebarWidthFor(state, totalWidth)
         val mainInnerWidth = totalWidth - sidebarWidth - 1.dp - WideMainPadding * 2
         val split = wide && mainInnerWidth >= TwoColumnMinWidth
         Row(Modifier.fillMaxSize()) {
@@ -153,7 +161,6 @@ internal fun PorcelainHome(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainFavorites(state, model, onRemoveFavorite) } }
-                    item { Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeCollection(state, model) } }
                     item {
                         Box(Modifier.widthIn(max = 640.dp)) {
                             PorcelainFileOpen(state, model, onAddNetwork, onEditGooglePhotos, onDeleteGooglePhotos, onDeleteConnection, allConnections = false)
@@ -171,7 +178,6 @@ internal fun PorcelainHome(
                     verticalArrangement = Arrangement.spacedBy(SectionGap),
                 ) {
                     item { PorcelainFavorites(state, model, onRemoveFavorite) }
-                    item { PorcelainHomeCollection(state, model) }
                     if (split) {
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(WideColumnGap)) {
@@ -230,72 +236,152 @@ internal fun PorcelainPhoneHome(
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
-        modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = PhoneOuter, top = 4.dp, end = PhoneOuter, bottom = 16.dp),
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(PhoneOuter),
         verticalArrangement = Arrangement.spacedBy(SectionGap),
-        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainFavorites(
-                    state = state,
-                    model = model,
-                    onRemoveFavorite = onRemoveFavorite,
-                    onOpenFinder = { model.selectMainDestination(MainNavigationDestination.FINDER) },
-                    onViewAll = { model.show(Screen.Favorites) },
-                )
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainHomeCollection(state, model)
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainFileOpen(
-                    state = state,
-                    model = model,
-                    onAddNetwork = onAddNetwork,
-                    onEditGooglePhotos = onEditGooglePhotos,
-                    onDeleteGooglePhotos = onDeleteGooglePhotos,
-                    onDeleteConnection = onDeleteConnection,
-                    allConnections = false,
-                    onImportFiles = onImportFiles,
-                )
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainSavedConnections(state, model, onDeleteConnection)
-            }
-        }
-        // 홈 aggregates every destination group (Finder above, 영상 and 도구 here) with the same navigation actions as the
-        // 영상 / 도구 tabs and the wide sidebar.
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeWorkbench(state, model) }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) { PorcelainVideo(state, model) }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) { PorcelainHomeTools(model) }
-        }
-    }
-}
+        val superThumbStatus = state.superThumbnailWork?.status?.name ?: ""
+        val isSuperThumbActive = superThumbStatus in setOf("WAITING", "RUNNING", "FAILED", "PARTIAL")
+        val isVideoExportActive = (state.trailer?.export?.running == true || state.trailer?.export?.error != null) &&
+            (state.trailer?.originPrivate != true || com.armsone.nasfinder.data.PrivacyMode.isVisible(true))
 
-/** 컬렉션 location on the 홈 screen: opens the saved finished videos collection destination. */
-@Composable
-private fun PorcelainHomeCollection(state: AppState, model: NasFinderViewModel) {
-    PorcelainSection("컬렉션") {
-        PorcelainPanel(Modifier.fillMaxWidth()) {
-            PorcelainRow(
-                "컬렉션",
-                PackGlyph.COLLECTION,
-                subtitle = "완성된 영상 및 재생 보관소",
-                trailing = { Text("${state.collections.size}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                onClick = { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
-            )
+        val isMediaTransferVisible = (state.mediaTransferActive || state.mediaTransferFailure) &&
+            com.armsone.nasfinder.data.PrivacyMode.isVisible(state.mediaTransferOriginPrivate)
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainFavorites(
+                        state = state,
+                        model = model,
+                        onRemoveFavorite = onRemoveFavorite,
+                        onOpenFinder = { model.selectMainDestination(MainNavigationDestination.FINDER) },
+                        onViewAll = { model.show(Screen.Favorites) },
+                    )
+                }
+            }
+        }
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainHomeWorkbench(state = state, model = model)
+                }
+            }
+        }
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainVideo(state = state, model = model)
+                }
+            }
+        }
+
+        if (isMediaTransferVisible || isSuperThumbActive || isVideoExportActive) {
+            item {
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                        PorcelainSection(title = "진행 중인 작업") {
+                            PorcelainPanel(Modifier.fillMaxWidth()) {
+                                if (isMediaTransferVisible) {
+                                    PorcelainRow(
+                                        title = "미디어 전송",
+                                        glyph = PackGlyph.TRANSFER,
+                                        subtitle = if (state.mediaTransferFailure) "확인이 필요한 전송이 있습니다." else "전송 진행 화면으로 돌아가기",
+                                        onClick = { model.show(Screen.PhotoTransfer) },
+                                    )
+                                    if (isSuperThumbActive || isVideoExportActive) {
+                                        Spacer(Modifier.height(8.dp))
+                                    }
+                                }
+                                if (isSuperThumbActive) {
+                                    val work = state.superThumbnailWork
+                                    PorcelainRow(
+                                        title = "수퍼 썸네일",
+                                        glyph = PackGlyph.SUPER_THUMBNAIL,
+                                        subtitle = if (work?.status?.name == "FAILED") "작업 실패" else "처리 중...",
+                                        onClick = {
+                                            if (state.superThumbnailWorkLocation != null) {
+                                                model.show(Screen.SuperThumbnailProgress)
+                                            } else {
+                                                model.show(Screen.SuperThumbnail)
+                                            }
+                                        },
+                                    )
+                                }
+                                if (isSuperThumbActive && isVideoExportActive) {
+                                    PorcelainDivider()
+                                }
+                                if (isVideoExportActive) {
+                                    val export = state.trailer?.export
+                                    PorcelainRow(
+                                        title = "영상 저장·내보내기",
+                                        glyph = PackGlyph.VIDEO,
+                                        subtitle = if (export?.error != null) "내보내기 실패" else "내보내는 중...",
+                                        onClick = { model.restoreEditor() },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Home media-transfer progress is supplied by the retained transfer host.
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainSection(title = "대표 메뉴") {
+                        PorcelainPanel(Modifier.fillMaxWidth()) {
+                            PorcelainRow(
+                                title = "파인더",
+                                glyph = PackGlyph.FOLDER,
+                                subtitle = "파일 및 저장소 탐색",
+                                onClick = { model.selectMainDestination(MainNavigationDestination.FINDER) },
+                            )
+                            PorcelainDivider()
+                            PorcelainRow(
+                                title = "만들기",
+                                glyph = PackGlyph.VIDEO,
+                                subtitle = "영상 편집 및 제작",
+                                onClick = { model.selectMainDestination(MainNavigationDestination.VIDEO) },
+                            )
+                            PorcelainDivider()
+                            PorcelainRow(
+                                title = "도구",
+                                glyph = PackGlyph.TRANSFER,
+                                subtitle = "유틸리티 및 도구함",
+                                onClick = { model.selectMainDestination(MainNavigationDestination.TOOLS) },
+                            )
+                            PorcelainDivider()
+                            PorcelainRow(
+                                title = "설정",
+                                glyph = PackGlyph.SETTINGS,
+                                subtitle = "앱 환경 설정",
+                                onClick = { model.selectMainDestination(MainNavigationDestination.SETTINGS) },
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -303,13 +389,28 @@ private fun PorcelainHomeCollection(state: AppState, model: NasFinderViewModel) 
 /** 작업대 location on the 홈 aggregate: independent of the Finder / 영상 / 도구 groups, opens the same destination as the tab. */
 @Composable
 private fun PorcelainHomeWorkbench(state: AppState, model: NasFinderViewModel) {
-    PorcelainSection("작업대") {
+    PorcelainSection(title = "작업대") {
         PorcelainPanel(Modifier.fillMaxWidth()) {
-            PorcelainRow(
-                "작업대",
-                PackGlyph.SAVE,
-                subtitle = "포켓 ${state.pockets.size}개 · 참조 ${state.materials.size}개 · 원본은 복사하지 않음",
-            ) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
+            if (state.pockets.isEmpty()) {
+                PorcelainRow(
+                    title = "기본 포켓",
+                    glyph = PackGlyph.WORKBENCH,
+                    subtitle = "작업대로 이동",
+                    onClick = { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
+                )
+            } else {
+                state.pockets.forEachIndexed { index, pocket ->
+                    if (index > 0) PorcelainDivider()
+                    PorcelainRow(
+                        title = pocket.name,
+                        glyph = PackGlyph.WORKBENCH,
+                        onClick = {
+                            model.selectWorkbenchPocket(pocket.id)
+                            model.selectMainDestination(MainNavigationDestination.WORKBENCH)
+                        },
+                    )
+                }
+            }
         }
     }
 }
@@ -346,17 +447,122 @@ internal fun PorcelainFinder(
     onImportFiles: (() -> Unit)? = null,
 ) {
     LazyColumn(
-        modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = PhoneOuter, top = 4.dp, end = PhoneOuter, bottom = 16.dp),
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(PhoneOuter),
         verticalArrangement = Arrangement.spacedBy(SectionGap),
-        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         item {
-            Box(Modifier.widthIn(max = 640.dp)) { PorcelainFavorites(state, model, onRemoveFavorite) }
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainFavorites(
+                        state = state,
+                        model = model,
+                        onRemoveFavorite = onRemoveFavorite,
+                        onViewAll = { model.show(Screen.Favorites) },
+                    )
+                }
+            }
         }
+
         item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainFileOpen(state, model, onAddNetwork, onEditGooglePhotos, onDeleteGooglePhotos, onDeleteConnection, allConnections = true, onImportFiles = onImportFiles)
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainSection(title = "내 기기") {
+                        SourceGroup(
+                            cells = buildList<@Composable (Modifier) -> Unit> {
+                                add { m -> PhotoLibraryCell(model = model, modifier = m) }
+                                add { m -> PhoneHardCell(state = state, model = model, modifier = m) }
+                                if (onImportFiles != null) {
+                                    add { m ->
+                                        SourceCell("기기 파일", "기기·클라우드의 파일 선택", PackGlyph.DEVICE_FILES, m, onClick = onImportFiles)
+                                    }
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainSection(title = "네트워크") {
+                        val netCells = mutableListOf<@Composable (Modifier) -> Unit>()
+                        state.connections.forEach { conn ->
+                            netCells.add { m ->
+                                ConnectionCell(
+                                    connection = conn,
+                                    state = state,
+                                    model = model,
+                                    onDeleteConnection = onDeleteConnection,
+                                    modifier = m,
+                                )
+                            }
+                        }
+                        if (state.googlePhotosVisible) {
+                            netCells.add { m ->
+                                GooglePhotosCell(
+                                    state = state,
+                                    model = model,
+                                    onEditGooglePhotos = onEditGooglePhotos,
+                                    onDeleteGooglePhotos = onDeleteGooglePhotos,
+                                    modifier = m,
+                                )
+                            }
+                        }
+                        if (netCells.isNotEmpty()) {
+                            SourceGroup(cells = netCells)
+                        } else {
+                            PorcelainPanel(Modifier.fillMaxWidth()) {
+                                PorcelainRow(
+                                    title = "등록된 네트워크 연결 없음",
+                                    glyph = PackGlyph.NETWORK,
+                                    subtitle = "연결 추가 버튼을 눌러 추가하세요",
+                                    onClick = onAddNetwork,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        PorcelainPanel {
+                            CompactAction(
+                                title = "연결 추가·관리",
+                                glyph = PackGlyph.ADD,
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = onAddNetwork,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                    PorcelainSection(title = "웹") {
+                        PorcelainPanel(Modifier.fillMaxWidth()) {
+                            PorcelainRow(
+                                title = "브라우저",
+                                glyph = PackGlyph.BROWSER,
+                                subtitle = "웹 사이트 탐색 및 다운로드",
+                                onClick = { model.show(Screen.WebBrowser) },
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -434,55 +640,55 @@ internal fun PorcelainWideHost(
     var googlePhotosName by remember(state.googlePhotosName) { mutableStateOf(state.googlePhotosName) }
     NetworkAddDialogs(state, model, addingNetwork, { addingNetwork = it }, editingGooglePhotos, { editingGooglePhotos = it }, googlePhotosName, { googlePhotosName = it })
     val configuration = LocalConfiguration.current
-    val isTablet = configuration.smallestScreenWidthDp >= 600
-    var navExpanded by rememberSaveable { mutableStateOf(false) }
+    val isTablet = configuration.smallestScreenWidthDp >= 600 || LocalContext.current.applicationContext.resources.configuration.smallestScreenWidthDp >= 600
+    val navExpanded = state.sidebarExpanded
     var portraitWorkbenchOverlay by rememberSaveable { mutableStateOf(false) }
     var wideWorkbenchExpanded by rememberSaveable { mutableStateOf(false) }
     val currentContent by rememberUpdatedState(content)
     val movableContent = remember { movableContentOf { currentContent() } }
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
+        if (state.screen != Screen.Dashboard && !fullscreen) MainAppHeader(state, model)
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
         val totalWidth = maxWidth
         val isLandscapeWide = isTablet && totalWidth >= 960.dp
         // Phone in landscape (smallestScreenWidthDp < 600) suppresses persistent sidebar to avoid duplicate navigation and cramped content.
-        val showSidebar = isTablet && totalWidth >= SidebarMinWidth && !fullscreen
+        val showSidebar = isTablet && !fullscreen
         val showWorkbenchPanel = isLandscapeWide && !fullscreen && state.screen != Screen.MaterialBasket && state.activeMainTab != MainNavigationDestination.WORKBENCH
         if (!showSidebar) {
-            movableContent()
+            if (fullscreen || state.screen == Screen.Dashboard) movableContent()
+            else androidx.compose.material3.Scaffold(containerColor = Color.Transparent, bottomBar = {
+                MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode, onSelect = model::selectMainDestination)
+            }) { padding -> Box(Modifier.padding(padding)) { movableContent() } }
         } else {
             Box(Modifier.fillMaxSize()) {
                 Row(Modifier.fillMaxSize()) {
-                    if (isLandscapeWide || navExpanded) {
-                        Column(Modifier.width(sidebarWidthFor(totalWidth)).fillMaxHeight().navigationBarsPadding()) {
-                            if (!isLandscapeWide) {
-                                Row(
-                                    Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text("내비게이션", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    IconButton(onClick = { navExpanded = false }, modifier = Modifier.size(IconHitTarget)) {
-                                        PackIcon(PackGlyph.ARROW_LEFT, "사이드바 접기", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                }
+                    val widthSpec = rememberSidebarWidthSpec(state, totalWidth)
+                    val expandedWidth = widthSpec.resolve(state.sidebarWidthDp)
+                    Box(Modifier.width(if (navExpanded) expandedWidth else 72.dp).fillMaxHeight()) {
+                        Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+                            if (navExpanded) {
+                                PorcelainSidebar(
+                                    state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
+                                    Modifier.weight(1f).fillMaxWidth(), selectedConnectionId, phoneHardSelected, activeRoot,
+                                    favoritesSelected, onCollapse = { model.setSidebarExpanded(false) },
+                                )
+                            } else {
+                                PorcelainCompactRail(
+                                    state, model, { model.setSidebarExpanded(true) },
+                                    selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected,
+                                )
                             }
-                            PorcelainSidebar(
-                                state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
-                                Modifier.weight(1f).fillMaxWidth(), selectedConnectionId, phoneHardSelected, activeRoot,
-                                favoritesSelected,
+                        }
+                        if (navExpanded) {
+                            // Separate 8dp strip over the sidebar's outer padding; menu rows never receive the drag.
+                            SidebarResizeStrip(
+                                widthDp = expandedWidth.value,
+                                minDp = widthSpec.min.value,
+                                maxDp = widthSpec.max.value,
+                                onWidth = model::setSidebarWidthDp,
+                                modifier = Modifier.align(Alignment.CenterEnd),
                             )
                         }
-                    } else {
-                        PorcelainCompactRail(
-                            state = state,
-                            model = model,
-                            onExpand = { navExpanded = true },
-                            onToggleWorkbenchOverlay = { portraitWorkbenchOverlay = !portraitWorkbenchOverlay },
-                            selectedConnectionId = selectedConnectionId,
-                            phoneHardSelected = phoneHardSelected,
-                            activeRoot = activeRoot,
-                            favoritesSelected = favoritesSelected,
-                            modifier = Modifier.navigationBarsPadding(),
-                        )
                     }
                     VerticalDividerLine()
                     Box(Modifier.weight(1f).fillMaxHeight()) { movableContent() }
@@ -571,17 +777,94 @@ internal fun PorcelainWideHost(
             }
         }
     }
+    }
 }
 
 /** True when the window keeps the persistent sidebar (tablet-class window ≥ 600dp wide); the bottom tab bar is then not shown. */
 @Composable
 internal fun rememberWideShell(): Boolean {
     val configuration = LocalConfiguration.current
-    return configuration.smallestScreenWidthDp >= 600 && configuration.screenWidthDp >= 600
+    return configuration.smallestScreenWidthDp >= 600 || LocalContext.current.applicationContext.resources.configuration.smallestScreenWidthDp >= 600
 }
 
-/** Contract proposal: sidebar ≈ 20–22 % of the window, 200…280. */
-private fun sidebarWidthFor(total: Dp): Dp = (total * .21f).coerceIn(200.dp, 280.dp)
+private val SidebarMinNaturalWidth = 180.dp
+private val SidebarMinMainArea = 120.dp
+private val SidebarResizeStep = 16f
+private val SidebarRootLabels = listOf("홈", "파인더", "만들기", "도구", "설정")
+private val SidebarChildLabels = listOf(
+    "즐겨찾기", "내 미디어", "폰하드", "기기 파일", "연결 추가·관리", "브라우저",
+    "미디어 고르기", "작업대", "편집본 전체",
+    "사진 선별", "미디어 전송", "수퍼 썸네일", "썸네일 캐시",
+)
+
+/** Expanded sidebar sizing: [natural] fits the longest real label; [min]..[max] bound a user-dragged width for the current window. */
+private class SidebarWidthSpec(val natural: Dp, val min: Dp, val max: Dp) {
+    fun resolve(requestedDp: Float?): Dp = (requestedDp?.dp ?: natural).coerceIn(min, max)
+}
+
+/**
+ * Natural width = widest of the root rows (8 outer + 10 pad + 26 icon + 12 gap + text + 10 pad + 8 outer), child rows (same with a
+ * 24 indent and 20 icon) and the header (8 + 10 + 24 icon + 8 gap + brand + 8 + 48 toggle + 8), using the real styled text
+ * measured at the current font scale (selected = semibold, the widest case), plus 4dp. Bounds: min = natural (≥ 180dp);
+ * max = min(50 % of the window, window − 240dp), never below min and always leaving at least 120dp for the main area.
+ */
+@Composable
+private fun rememberSidebarWidthSpec(state: AppState, total: Dp): SidebarWidthSpec {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val typography = MaterialTheme.typography
+    val childLabels = buildList {
+        addAll(SidebarChildLabels)
+        state.connections.forEach { add(it.name) }
+        if (state.googlePhotosVisible) add(state.googlePhotosName)
+    }
+    val natural = remember(childLabels, density.density, density.fontScale, typography) {
+        fun widest(labels: List<String>, style: TextStyle): Float = labels.maxOf { label ->
+            with(density) { measurer.measure(label, style, maxLines = 1, softWrap = false).size.width.toDp().value }
+        }
+        val rootText = widest(SidebarRootLabels, typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold))
+        val childText = widest(childLabels, typography.bodySmall.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold))
+        val brandText = widest(listOf("Privacy", "NasFinder"), HomeType.Brand)
+        val needed = maxOf(74f + rootText, 92f + childText, 114f + brandText)
+        kotlin.math.ceil(needed + 4f).dp.coerceAtLeast(SidebarMinNaturalWidth)
+    }
+    val max = minOf(total * .5f, total - 240.dp)
+        .coerceAtLeast(natural)
+        .coerceAtMost((total - SidebarMinMainArea).coerceAtLeast(0.dp))
+    return SidebarWidthSpec(natural, minOf(natural, max), max)
+}
+
+/** One sizing rule for every sidebar caller: the dragged RAM width if any, else the measured natural width, clamped to this window. */
+@Composable
+private fun sidebarWidthFor(state: AppState, total: Dp): Dp =
+    rememberSidebarWidthSpec(state, total).resolve(state.sidebarWidthDp)
+
+/** Narrow right-edge drag strip (and 넓히기/줄이기 accessibility actions, 16dp each) that resizes the expanded sidebar. */
+@Composable
+private fun SidebarResizeStrip(widthDp: Float, minDp: Float, maxDp: Float, onWidth: (Float) -> Unit, modifier: Modifier = Modifier) {
+    val latestWidth by rememberUpdatedState(widthDp)
+    val latestOnWidth by rememberUpdatedState(onWidth)
+    Box(
+        modifier
+            .width(8.dp)
+            .fillMaxHeight()
+            .pointerInput(minDp, maxDp) {
+                var base = 0f
+                detectHorizontalDragGestures(onDragStart = { base = latestWidth }) { change, dragAmount ->
+                    change.consume()
+                    base = (base + dragAmount / density).coerceIn(minDp, maxDp)
+                    latestOnWidth(base)
+                }
+            }
+            .semantics {
+                contentDescription = "사이드바 너비 조절"
+                customActions = listOf(
+                    CustomAccessibilityAction("넓히기") { latestOnWidth((latestWidth + SidebarResizeStep).coerceIn(minDp, maxDp)); true },
+                    CustomAccessibilityAction("줄이기") { latestOnWidth((latestWidth - SidebarResizeStep).coerceIn(minDp, maxDp)); true },
+                )
+            }
+    )
+}
 
 @Composable
 private fun VerticalDividerLine() {
@@ -874,14 +1157,23 @@ private fun GooglePhotosCell(
 @Composable
 private fun SourceGroup(cells: List<@Composable (Modifier) -> Unit>) {
     PorcelainPanel(Modifier.fillMaxWidth()) {
-        cells.chunked(2).forEachIndexed { index, pair ->
-            if (index > 0) PorcelainDivider(start = 0.dp)
-            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-                pair.forEachIndexed { cellIndex, cell ->
-                    if (cellIndex > 0) PorcelainVerticalHairline()
-                    cell(Modifier.weight(1f).fillMaxHeight())
+        androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val columns = if (maxWidth >= 560.dp) 2 else 1
+            Column(Modifier.fillMaxWidth()) {
+                cells.chunked(columns).forEachIndexed { index, group ->
+                    if (index > 0) PorcelainDivider(start = 0.dp)
+                    if (columns == 1) {
+                        group.single()(Modifier.fillMaxWidth())
+                    } else {
+                        Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+                            group.forEachIndexed { cellIndex, cell ->
+                                if (cellIndex > 0) PorcelainVerticalHairline()
+                                cell(Modifier.weight(1f).fillMaxHeight())
+                            }
+                            if (group.size == 1) Spacer(Modifier.weight(1f))
+                        }
+                    }
                 }
-                if (pair.size == 1) Spacer(Modifier.weight(1f))
             }
         }
     }
@@ -961,32 +1253,32 @@ private fun CompactAction(title: String, glyph: PackGlyph, modifier: Modifier, d
  */
 @Composable
 private fun PorcelainVideo(state: AppState, model: NasFinderViewModel) {
-    PorcelainSection("영상") {
-        Surface(
-            onClick = { model.selectVideoDestination(VideoNavigationDestination.CREATE) },
-            shape = RoundedCornerShape(10.dp),
-            color = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-        ) {
-            Row(
-                Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Box(Modifier.size(32.dp).background(MaterialTheme.colorScheme.onPrimary, CircleShape), contentAlignment = Alignment.Center) {
-                    PackIcon(PackGlyph.VIDEO, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
-                }
-                Text("영상 제작", Modifier.weight(1f), style = HomeType.Cta, color = MaterialTheme.colorScheme.onPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Icon(Icons.Default.ChevronRight, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary)
-            }
+    // 새 저장소 없이 기존 TrailerDraftStore.getAllDrafts()(비공개 모드 필터·최신순)를 IO에서 읽는다.
+    // 읽기 실패(metadataProblem)는 빈 목록으로 숨기지 않고 그대로 보여 준다.
+    val draftList by produceState<Pair<List<TrailerDraft>, String?>?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            TrailerDraftStore.getAllDrafts() to TrailerDraftStore.metadataProblem()
+        }
+    }
+    PorcelainSection("이어서 편집") {
+        val loaded = draftList
+        val metadataProblem = loaded?.second
+        val recent = loaded?.first.orEmpty().take(3)
+        if (metadataProblem != null) {
+            Text(metadataProblem, style = HomeType.Tertiary, color = MaterialTheme.colorScheme.error)
+        } else if (loaded != null && recent.isEmpty()) {
+            Text("보관된 편집본이 없습니다", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        recent.forEach { draft ->
+            CreateDraftRow(draft, Modifier.fillMaxWidth()) { model.resumeTrailerDraft(draft) }
         }
         PorcelainPanel(Modifier.fillMaxWidth()) {
             PorcelainRow(
-                "편집본",
+                "편집본 전체",
                 PackGlyph.DRAFTS,
-                subtitle = "저장된 영상 프로젝트",
-                trailing = { Text("${state.trailerDraftCount}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                onClick = { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) },
+                subtitle = "이름 변경 · 삭제",
+                trailing = { Text("${loaded?.first?.size ?: state.trailerDraftCount}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                onClick = { model.show(Screen.VideoDrafts) },
             )
         }
     }
@@ -1014,7 +1306,7 @@ private fun PorcelainUtilities(model: NasFinderViewModel, onImportFiles: () -> U
  * [onImportFiles] null = the static Tools-tab card (no chevron, no percent, no action), as on iOS ToolsView.storageCard.
  */
 @Composable
-private fun PorcelainDeviceStorageRows(onImportFiles: (() -> Unit)?) {
+internal fun PorcelainDeviceStorageRows(onImportFiles: (() -> Unit)?) {
     val filesDir = LocalContext.current.filesDir
     val total = filesDir.totalSpace.coerceAtLeast(0L)
     val available = filesDir.usableSpace.coerceIn(0L, total.coerceAtLeast(1L))
@@ -1038,13 +1330,11 @@ private fun PorcelainDeviceStorageRows(onImportFiles: (() -> Unit)?) {
 }
 
 /**
- * iOS ToolsView.toolsList (도구 tab): 전송 → 저장공간 (device storage, 작업대 참조 수, 컬렉션) → 앱 (설정 row + version caption).
+ * iOS ToolsView.toolsList (도구 tab): 전송 → 저장공간 (device storage, 작업대 참조 수) → 앱 (설정 row + version caption).
  * Every row is an existing destination or read-only count; 설정 stays a row here instead of being the tab itself.
  */
 @Composable
 internal fun PorcelainTools(state: AppState, model: NasFinderViewModel, modifier: Modifier = Modifier) {
-    val materialBytes = state.materials.sumOf { if (it.localFilePath != null) it.fileSize ?: 0L else 0L }
-    val collectionBytes = state.collections.sumOf { it.fileSizeBytes }
     LazyColumn(
         modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = PhoneOuter, top = 4.dp, end = PhoneOuter, bottom = 16.dp),
@@ -1053,133 +1343,164 @@ internal fun PorcelainTools(state: AppState, model: NasFinderViewModel, modifier
     ) {
         item {
             Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainSection("미디어") {
+                PorcelainSection("도구") {
                     PorcelainPanel(Modifier.fillMaxWidth()) {
-                        PorcelainRow("사진 선별", PackGlyph.PHOTO_SELECTION, subtitle = "비슷한 사진을 묶고 몇 장이 적당한지 추천") { model.show(Screen.PhotoSelection) }
+                        PorcelainRow("사진 선별", PackGlyph.PHOTO_SELECTION) {
+                            model.show(Screen.PhotoSelection)
+                        }
                         PorcelainDivider()
-                        PorcelainRow("미디어 전송", PackGlyph.TRANSFER, subtitle = "미디어·Live Photos·Motion Photos 기기 간 전송") { model.show(Screen.PhotoTransfer) }
-                    }
-                }
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainSection("저장공간") {
-                    PorcelainPanel(Modifier.fillMaxWidth()) {
-                        PorcelainDeviceStorageRows(null)
+                        PorcelainRow("미디어 전송", PackGlyph.TRANSFER) {
+                            model.show(Screen.PhotoTransfer)
+                        }
                         PorcelainDivider()
-                        PorcelainRow("작업대 참조 ${state.materials.size}개", PackGlyph.SAVE, subtitle = "기존 재료 앱 안 복사본 ${porcelainBytes(materialBytes)} (새로 담은 항목은 복사하지 않음)", showsChevron = false, onClick = null)
+                        PorcelainRow("수퍼 썸네일", PackGlyph.SUPER_THUMBNAIL) {
+                            model.show(Screen.SuperThumbnail)
+                        }
                         PorcelainDivider()
-                        PorcelainRow("컬렉션 ${state.collections.size}편", PackGlyph.COLLECTION, subtitle = "앱 안 복사본 ${porcelainBytes(collectionBytes)}", showsChevron = false, onClick = null)
+                        PorcelainRow("썸네일 캐시", PackGlyph.THUMBNAIL_CACHE) {
+                            model.show(Screen.ThumbnailCache)
+                        }
                     }
-                }
-            }
-        }
-        item {
-            Box(Modifier.widthIn(max = 640.dp)) {
-                PorcelainSection("앱") {
-                    PorcelainPanel(Modifier.fillMaxWidth()) {
-                        PorcelainRow("설정", PackGlyph.SETTINGS) { model.show(Screen.Settings) }
-                    }
-                    VersionCaption()
                 }
             }
         }
     }
 }
 
+
+
+
 /**
- * iOS VideoHubView (영상 tab): inline title is the shell's, then the three destinations as a picker bar (accent + 3 capsule when selected)
- * over the selected destination. 영상 제작 is the explicit entry into the existing media picker; 편집본/컬렉션 reuse the existing screens.
+ * iOS VideoHubView (영상 tab): inline title is the shell's, then the two destinations as a picker bar (accent + 3 capsule when selected)
+ * over the selected destination. 영상 제작 is the explicit entry into the existing media picker; 편집본 reuses the existing screen.
  * The former 영상 재료 tab is the 작업대 (own top-level destination); its old destination only redirects there.
  */
 @Composable
 internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modifier: Modifier = Modifier) {
-    val destinations = listOf(
-        VideoNavigationDestination.CREATE to "영상 제작",
-        VideoNavigationDestination.DRAFTS to "편집본",
-        VideoNavigationDestination.COLLECTIONS to "컬렉션",
-    )
-    val toCreate = { model.selectVideoDestination(VideoNavigationDestination.CREATE) }
-    // Wide windows pick the destination in the sidebar; the underline picker is the phone-width form of the same choice.
-    // 펼친 세로(<960dp)는 사이드바가 72dp 레일로 접혀 있어 영상 제작/편집본/컬렉션을 고를 수 없으므로 같은 탭 바를 쓴다.
-    val destinationPicker = !rememberWideShell() || LocalConfiguration.current.screenWidthDp < 960
-    Column(modifier.fillMaxSize()) {
-        if (destinationPicker) Box(Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).selectableGroup()) {
-                destinations.forEach { (destination, label) ->
-                    val selected = state.activeVideoTab == destination
-                    Column(
-                        Modifier.weight(1f).heightIn(min = 44.dp)
-                            .selectable(selected = selected, role = Role.Tab, onClick = { model.selectVideoDestination(destination) }),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
-                    ) {
-                        Text(
-                            label,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (selected) themePalette().accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
+    var showCreatePocket by remember { mutableStateOf(false) }
+    var newPocketName by remember { mutableStateOf("") }
+
+    val workbenchCount = state.materials.size
+    // 편집본 목록: 새 저장소 없이 기존 TrailerDraftStore.getAllDrafts()(비공개 모드 필터·최신순)를 IO에서 읽는다.
+    // 읽기 실패(metadataProblem)는 빈 목록으로 숨기지 않고 그대로 보여 준다. 이름 변경·삭제는 '편집본 전체'가 맡는다.
+    val draftList by produceState<Pair<List<TrailerDraft>, String?>?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            TrailerDraftStore.getAllDrafts() to TrailerDraftStore.metadataProblem()
+        }
+    }
+    LazyColumn(
+        modifier.fillMaxSize(),
+        contentPadding = PaddingValues(PhoneOuter),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        item(key = "create-make") {
+            Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                PorcelainSection(title = "영상 만들기") {
+                    PorcelainPanel(Modifier.fillMaxWidth()) {
+                        PorcelainRow("미디어 고르기", PackGlyph.GRID, subtitle = "미디어·폰하드·NAS에서 골라 바로 제작합니다") { model.chooseMediaForVideo() }
+                        PorcelainDivider()
+                        PorcelainRow(
+                            "작업대에서 가져오기",
+                            PackGlyph.VIDEO,
+                            subtitle = if (workbenchCount == 0) "작업대가 비어 있습니다 · 항목을 담은 뒤 포켓에서 영상 제작" else "포켓에서 항목을 골라 영상 제작 · 참조 ${workbenchCount}개",
+                        ) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
+                        PorcelainDivider()
+                        PorcelainRow(
+                            "뮤직비디오",
+                            PackGlyph.VIDEO,
+                            subtitle = "사진·영상에 음악을 입혀 뮤직비디오를 만듭니다",
+                        ) { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.MUSIC)) }
+                    }
+                }
+            }
+        }
+
+        item(key = "create-drafts-header") {
+            Column(Modifier.widthIn(max = 640.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                PorcelainHeader("이어서 편집", "${draftList?.first?.size ?: state.trailerDraftCount}개")
+                val metadataProblem = draftList?.second
+                if (metadataProblem != null) {
+                    Text(metadataProblem, style = HomeType.Tertiary, color = MaterialTheme.colorScheme.error)
+                } else if (draftList?.first?.isEmpty() == true) {
+                    Text("보관된 편집본이 없습니다", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        draftList?.let { (drafts, _) ->
+            items(drafts, key = { it.id }) { draft ->
+                CreateDraftRow(draft, Modifier.widthIn(max = 640.dp).fillMaxWidth()) { model.resumeTrailerDraft(draft) }
+            }
+        }
+        item(key = "create-drafts-all") {
+            Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                PorcelainPanel(Modifier.fillMaxWidth()) {
+                    PorcelainRow(
+                        "편집본 전체",
+                        PackGlyph.DRAFTS,
+                        subtitle = "이름 변경 · 삭제",
+                        trailing = { Text("${draftList?.first?.size ?: state.trailerDraftCount}개", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                        onClick = { model.show(Screen.VideoDrafts) },
+                    )
+                }
+            }
+        }
+
+        item(key = "create-workbench") {
+            Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
+                PorcelainSection(title = "작업대") {
+                    PorcelainPanel(Modifier.fillMaxWidth()) {
+                        PorcelainRow(
+                            title = "포켓 목록",
+                            glyph = PackGlyph.WORKBENCH,
+                            subtitle = "작업대 화면으로 이동",
+                            onClick = { model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
                         )
-                        Box(Modifier.height(3.dp).fillMaxWidth().clip(CircleShape).background(if (selected) themePalette().accent else Color.Transparent))
+                        PorcelainDivider()
+                        PorcelainRow(
+                            title = "포켓 만들기",
+                            glyph = PackGlyph.ADD,
+                            subtitle = "새 작업대 포켓 생성",
+                            onClick = {
+                                newPocketName = ""
+                                showCreatePocket = true
+                            },
+                        )
                     }
                 }
             }
-            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(.5.dp).background(MaterialTheme.colorScheme.outlineVariant))
         }
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            when (state.activeVideoTab) {
-                VideoNavigationDestination.CREATE -> {
-                    val workbenchCount = state.materials.size
-                    // 편집본 목록: 새 저장소 없이 기존 TrailerDraftStore.getAllDrafts()(비공개 모드 필터·최신순)를 IO에서 읽는다.
-                    // 읽기 실패(metadataProblem)는 빈 목록으로 숨기지 않고 그대로 보여 준다. 이름 변경·삭제는 편집본 탭이 맡는다.
-                    val draftList by produceState<Pair<List<TrailerDraft>, String?>?>(null, state.trailerDraftCount, state.trailerDraftsVersion, state.trailer?.saveState) {
-                        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            TrailerDraftStore.getAllDrafts() to TrailerDraftStore.metadataProblem()
-                        }
+    }
+
+    if (showCreatePocket) {
+        AlertDialog(
+            onDismissRequest = { showCreatePocket = false },
+            title = { Text("포켓 만들기") },
+            text = {
+                OutlinedTextField(
+                    value = newPocketName,
+                    onValueChange = { newPocketName = it },
+                    label = { Text("포켓 이름") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        model.createWorkbenchPocket(newPocketName)
+                        model.selectMainDestination(MainNavigationDestination.WORKBENCH)
+                        showCreatePocket = false
                     }
-                    LazyColumn(
-                        Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(PhoneOuter),
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        item {
-                            Column(Modifier.widthIn(max = 640.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                                Text("새 영상을 만들 때만 편집본이 생깁니다. 작업대 항목은 그대로 남습니다.", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                PorcelainPanel(Modifier.fillMaxWidth()) {
-                                    PorcelainRow(
-                                        "작업대에서 시작",
-                                        PackGlyph.VIDEO,
-                                        subtitle = if (workbenchCount == 0) "작업대가 비어 있습니다 · 항목을 담은 뒤 포켓에서 영상 제작" else "포켓에서 항목을 골라 영상 제작 · 참조 ${workbenchCount}개",
-                                    ) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
-                                    PorcelainDivider()
-                                    PorcelainRow("미디어 고르기", PackGlyph.GRID, subtitle = "미디어·폰하드·NAS에서 골라 바로 제작합니다") { model.chooseMediaForVideo() }
-                                }
-                            }
-                        }
-                        draftList?.let { (drafts, metadataProblem) ->
-                            item(key = "create-drafts-header") {
-                                Column(Modifier.widthIn(max = 640.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    PorcelainHeader("편집본", "${drafts.size}개")
-                                    if (metadataProblem != null) {
-                                        Text(metadataProblem, style = HomeType.Tertiary, color = MaterialTheme.colorScheme.error)
-                                    } else if (drafts.isEmpty()) {
-                                        Text("보관된 편집본이 없습니다", style = HomeType.Tertiary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                }
-                            }
-                            items(drafts, key = { it.id }) { draft ->
-                                CreateDraftRow(draft, Modifier.widthIn(max = 640.dp).fillMaxWidth()) { model.resumeTrailerDraft(draft) }
-                            }
-                        }
-                    }
+                ) {
+                    Text("생성")
                 }
-                VideoNavigationDestination.MATERIALS -> WorkbenchScreen(state, model, embedded = true, onBack = toCreate)
-                VideoNavigationDestination.DRAFTS -> VideoDraftsScreen(state, model, onBack = toCreate, embedded = true)
-                VideoNavigationDestination.COLLECTIONS -> VideoCollectionsScreen(state, model, onBack = toCreate, embedded = true)
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreatePocket = false }) {
+                    Text("취소")
+                }
             }
-        }
+        )
     }
 }
 
@@ -1284,83 +1605,222 @@ private fun PorcelainSidebar(
     phoneHardSelected: Boolean = false,
     activeRoot: MainNavigationDestination? = null,
     favoritesSelected: Boolean = false,
+    onCollapse: () -> Unit = {},
 ) {
-    val isHome = activeRoot == MainNavigationDestination.HOME
-    val isFinder = activeRoot == MainNavigationDestination.FINDER
-    val watchSelected = if (activeRoot != null) isHome || isFinder else selectedConnectionId == null && !phoneHardSelected && !favoritesSelected
-    val videoSelected = activeRoot == MainNavigationDestination.VIDEO
-    val toolsSelected = activeRoot == MainNavigationDestination.TOOLS
-    val workbenchSelected = activeRoot == MainNavigationDestination.WORKBENCH
-    Column(modifier.verticalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        // Jarvis main destinations
-        SidebarItem("감상", PackGlyph.PLAY, selected = watchSelected, onClick = { if (!watchSelected) model.selectMainDestination(MainNavigationDestination.FINDER) })
-        SidebarItem("영상 만들기", PackGlyph.VIDEO, selected = videoSelected, onClick = { if (!videoSelected) model.selectMainDestination(MainNavigationDestination.VIDEO) })
-        SidebarItem("도구", PackGlyph.TRANSFER, selected = toolsSelected, onClick = { if (!toolsSelected) model.selectMainDestination(MainNavigationDestination.TOOLS) })
+    val screen = state.screen
+    val effectiveSection = sidebarSectionFor(state, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+
+    val homeSelected = effectiveSection == MainNavigationDestination.HOME
+    val finderSelected = effectiveSection == MainNavigationDestination.FINDER
+    val videoSelected = effectiveSection == MainNavigationDestination.VIDEO
+    val toolsSelected = effectiveSection == MainNavigationDestination.TOOLS
+    val settingsSelected = effectiveSection == MainNavigationDestination.SETTINGS
+
+    Column(
+        modifier.padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        // Fixed outside the scrolling menu: brand at left (flexible, one line), 48dp collapse target at right (never shrinks).
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MainAppBrand(state, Modifier.weight(1f).padding(start = 10.dp))
+            IconButton(onClick = onCollapse, modifier = Modifier.size(IconHitTarget)) {
+                PackIcon(PackGlyph.ARROW_LEFT, "사이드바 접기", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurface)
+            }
+        }
+        // One continuous list (roots with their active children); weight is only the viewport, the whole list scrolls.
+        Column(
+            Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
         SidebarItem(
-            "작업대",
-            PackGlyph.WORKBENCH,
-            selected = workbenchSelected,
-            onClick = { if (!workbenchSelected) model.selectMainDestination(MainNavigationDestination.WORKBENCH) },
-            trailing = if (state.materials.isNotEmpty()) ({
-                Text("${state.materials.size}", style = HomeType.Badge, color = themePalette().accent)
-            }) else null,
+            "홈",
+            PackGlyph.HOME,
+            selected = homeSelected,
+            onClick = { model.selectMainDestination(MainNavigationDestination.HOME) }
         )
-        SidebarDivider()
-        Text(
-            "소스",
-            style = HomeType.Tertiary,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+
+        SidebarItem(
+            "파인더",
+            PackGlyph.FOLDER,
+            selected = finderSelected,
+            onClick = { model.selectMainDestination(MainNavigationDestination.FINDER) }
         )
-        // Finder & Sources group: 연결 목록, 각 연결, 한스트리 NAS, 내 미디어, 기기 파일, Google 포토, 즐겨찾기, 폰하드, 브라우저
-        val screen = state.screen
-        ReorderableSidebarGroup(
-            "finder",
-            buildList {
-                add(SidebarEntry("connections", "연결 목록", PackGlyph.CONNECTIONS, isFinder) { model.selectMainDestination(MainNavigationDestination.FINDER) })
-                primaryNas(state)?.let { nas ->
-                    add(SidebarEntry("nas", nas.name, PackGlyph.NAS, nas.id.toString() == selectedConnectionId) {
-                        model.resumeConnection(nas)
-                    })
-                }
-                state.connections.filter { it.id != primaryNas(state)?.id }.forEach { connection ->
-                    add(
-                        SidebarEntry("connection:${connection.id}", connection.name, connectionGlyph(connection.kind), connection.id.toString() == selectedConnectionId) {
-                            model.resumeConnection(connection)
-                        },
-                    )
-                }
-                add(SidebarEntry("my-photos", "내 미디어", PackGlyph.PHOTOS, screen is Screen.LocalPhotoLibrary && screen.initialIntent == LocalMediaEditIntent.NONE && !screen.googlePhotosSource) { model.show(Screen.LocalPhotoLibrary()) })
-                add(SidebarEntry("device-storage", "기기 파일", PackGlyph.DEVICE_FILES, onClick = onImportFiles))
-                if (state.googlePhotosVisible) add(SidebarEntry("google-photos", state.googlePhotosName, PackGlyph.PHOTOS, googleMark = true, onClick = model::requestGooglePhotosImport))
-                add(SidebarEntry("favorites", "즐겨찾기", PackGlyph.FAVORITES, favoritesSelected) { if (!favoritesSelected) model.show(Screen.Favorites) })
-                add(SidebarEntry("phonehard", "폰하드", PackGlyph.PHONEHARD, phoneHardSelected, onLongClick = model::openPhoneHardLongTouch) { model.show(Screen.Inbox) })
-                add(SidebarEntry("browser", "브라우저", PackGlyph.BROWSER, screen == Screen.WebBrowser) { model.show(Screen.WebBrowser) })
-                if (state.connections.isNotEmpty()) add(SidebarEntry("add-network", "네트워크 추가", PackGlyph.ADD, onClick = onAddNetwork))
-            },
+        if (effectiveSection == MainNavigationDestination.FINDER) {
+            SidebarChildren(MainNavigationDestination.FINDER, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+        }
+        SidebarItem(
+            "만들기",
+            PackGlyph.VIDEO,
+            selected = videoSelected,
+            onClick = { model.selectMainDestination(MainNavigationDestination.VIDEO) }
         )
-        SidebarDivider()
-        val onVideo = activeRoot == MainNavigationDestination.VIDEO && screen == Screen.Dashboard
-        ReorderableSidebarGroup(
-            "video",
-            listOf(
-                SidebarEntry("video-create", "영상 제작", PackGlyph.VIDEO, onVideo && state.activeVideoTab == VideoNavigationDestination.CREATE) { model.selectVideoDestination(VideoNavigationDestination.CREATE) },
-                SidebarEntry("video-drafts", "편집본", PackGlyph.DRAFTS, onVideo && state.activeVideoTab == VideoNavigationDestination.DRAFTS) { model.selectVideoDestination(VideoNavigationDestination.DRAFTS) },
-                SidebarEntry("video-collections", "컬렉션", PackGlyph.COLLECTION, onVideo && state.activeVideoTab == VideoNavigationDestination.COLLECTIONS) { model.selectVideoDestination(VideoNavigationDestination.COLLECTIONS) },
-            ),
+        if (effectiveSection == MainNavigationDestination.VIDEO) {
+            SidebarChildren(MainNavigationDestination.VIDEO, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+        }
+        SidebarItem(
+            "도구",
+            PackGlyph.TRANSFER,
+            selected = toolsSelected,
+            onClick = { model.selectMainDestination(MainNavigationDestination.TOOLS) }
         )
-        SidebarDivider()
-        ReorderableSidebarGroup(
-            "tools",
-            listOf(
-                SidebarEntry("photo-selection", "사진 선별", PackGlyph.PHOTO_SELECTION, screen == Screen.PhotoSelection) { model.show(Screen.PhotoSelection) },
-                SidebarEntry("photo-transfer", "미디어 전송", PackGlyph.TRANSFER, screen == Screen.PhotoTransfer) { model.show(Screen.PhotoTransfer) },
-                SidebarEntry("device-storage-import", "파일 가져오기", PackGlyph.DEVICE_FILES, onClick = onImportFiles),
-                SidebarEntry("settings", "설정", PackGlyph.SETTINGS, screen == Screen.Settings, onLongClick = model::togglePrivacyMode) { model.show(Screen.Settings) },
-            ),
+        if (effectiveSection == MainNavigationDestination.TOOLS) {
+            SidebarChildren(MainNavigationDestination.TOOLS, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+        }
+        SidebarItem(
+            "설정",
+            PackGlyph.SETTINGS,
+            selected = settingsSelected,
+            onLongClick = model::togglePrivacyMode,
+            onClick = { model.selectMainDestination(MainNavigationDestination.SETTINGS) }
         )
+        }
     }
 }
+
+/** Section (root) a screen belongs to; shared by the expanded sidebar and the collapsed rail so both agree. */
+private fun sidebarSectionFor(
+    state: AppState,
+    selectedConnectionId: String?,
+    phoneHardSelected: Boolean,
+    activeRoot: MainNavigationDestination?,
+    favoritesSelected: Boolean,
+): MainNavigationDestination {
+    val screen = state.screen
+    return when {
+        screen == Screen.Settings -> MainNavigationDestination.SETTINGS
+        screen == Screen.PhotoSelection || screen == Screen.PhotoTransfer ||
+            screen == Screen.SuperThumbnail || screen == Screen.SuperThumbnailFolderPicker ||
+            screen == Screen.SuperThumbnailProgress || screen == Screen.SuperThumbnailReport ||
+            screen == Screen.ThumbnailCache -> MainNavigationDestination.TOOLS
+        screen == Screen.MaterialBasket || screen == Screen.VideoDrafts ||
+            (screen is Screen.LocalPhotoLibrary && (screen.initialIntent == LocalMediaEditIntent.TRAILER || screen.initialIntent == LocalMediaEditIntent.MUSIC)) ||
+            activeRoot == MainNavigationDestination.WORKBENCH -> MainNavigationDestination.VIDEO
+        screen is Screen.Browser || screen == Screen.Favorites || screen == Screen.Inbox ||
+            screen == Screen.WebHard || screen == Screen.WebBrowser ||
+            screen == Screen.GooglePhotos || (screen is Screen.LocalPhotoLibrary && screen.initialIntent != LocalMediaEditIntent.TRAILER && screen.initialIntent != LocalMediaEditIntent.MUSIC) ||
+            selectedConnectionId != null || phoneHardSelected || favoritesSelected -> MainNavigationDestination.FINDER
+        activeRoot != null -> if (activeRoot == MainNavigationDestination.WORKBENCH) MainNavigationDestination.VIDEO else activeRoot
+        state.activeMainTab == MainNavigationDestination.WORKBENCH -> MainNavigationDestination.VIDEO
+        else -> state.activeMainTab
+    }
+}
+
+/** Child rows of one accordion [group] (a root's payload, unchanged); the caller shows it only under the active root. */
+@Composable
+private fun SidebarChildren(
+    group: MainNavigationDestination,
+    state: AppState,
+    model: NasFinderViewModel,
+    onAddNetwork: () -> Unit,
+    onImportFiles: () -> Unit,
+    selectedConnectionId: String?,
+    phoneHardSelected: Boolean,
+    activeRoot: MainNavigationDestination?,
+    favoritesSelected: Boolean,
+) {
+    val screen = state.screen
+    run {
+        if (group == MainNavigationDestination.FINDER) {
+            ReorderableSidebarGroup(
+                "finder",
+                buildList {
+                    add(SidebarEntry("favorites", "즐겨찾기", PackGlyph.FAVORITES, favoritesSelected || screen == Screen.Favorites) {
+                        model.show(Screen.Favorites)
+                    })
+                    add(SidebarEntry(
+                        "my-photos",
+                        "내 미디어",
+                        PackGlyph.PHOTOS,
+                        screen is Screen.LocalPhotoLibrary && screen.initialIntent == LocalMediaEditIntent.NONE && !screen.googlePhotosSource
+                    ) {
+                        model.show(Screen.LocalPhotoLibrary())
+                    })
+                    add(SidebarEntry("phonehard", "폰하드", PackGlyph.PHONEHARD, phoneHardSelected || screen == Screen.Inbox, onLongClick = model::openPhoneHardLongTouch) {
+                        model.show(Screen.Inbox)
+                    })
+                    add(SidebarEntry("device-storage", "기기 파일", PackGlyph.DEVICE_FILES, onClick = onImportFiles))
+
+                    state.connections.forEach { connection ->
+                        add(
+                            SidebarEntry(
+                                "connection:${connection.id}",
+                                connection.name,
+                                connectionGlyph(connection.kind),
+                                connection.id.toString() == selectedConnectionId
+                            ) {
+                                model.resumeConnection(connection)
+                            }
+                        )
+                    }
+
+                    if (state.googlePhotosVisible) {
+                        add(SidebarEntry(
+                            "google-photos",
+                            state.googlePhotosName,
+                            PackGlyph.PHOTOS,
+                            screen == Screen.GooglePhotos,
+                            googleMark = true,
+                            onClick = model::requestGooglePhotosImport
+                        ))
+                    }
+
+                    add(SidebarEntry("add-network", "연결 추가·관리", PackGlyph.ADD, onClick = onAddNetwork))
+                    add(SidebarEntry("browser", "브라우저", PackGlyph.BROWSER, screen == Screen.WebBrowser) {
+                        model.show(Screen.WebBrowser)
+                    })
+                }
+            )
+        }
+
+        if (group == MainNavigationDestination.VIDEO) {
+            val isCreateSelected = screen is Screen.LocalPhotoLibrary &&
+                (screen.initialIntent == LocalMediaEditIntent.TRAILER || screen.initialIntent == LocalMediaEditIntent.MUSIC)
+            val isWorkbenchSelected = activeRoot == MainNavigationDestination.WORKBENCH || screen == Screen.MaterialBasket
+            val isDraftsSelected = screen == Screen.VideoDrafts || (screen == Screen.Dashboard && state.activeVideoTab == VideoNavigationDestination.DRAFTS)
+
+            ReorderableSidebarGroup(
+                "video",
+                listOf(
+                    SidebarEntry("video-choose-media", "미디어 고르기", PackGlyph.PHOTOS, isCreateSelected) {
+                        model.chooseMediaForVideo()
+                    },
+                    SidebarEntry("video-workbench", "작업대", PackGlyph.WORKBENCH, isWorkbenchSelected) {
+                        model.selectMainDestination(MainNavigationDestination.WORKBENCH)
+                    },
+                    SidebarEntry("video-drafts", "편집본 전체", PackGlyph.DRAFTS, isDraftsSelected) {
+                        model.selectVideoDestination(VideoNavigationDestination.DRAFTS)
+                    }
+                )
+            )
+        }
+
+        if (group == MainNavigationDestination.TOOLS) {
+            val isSuperThumbnailSelected = screen == Screen.SuperThumbnail ||
+                screen == Screen.SuperThumbnailFolderPicker ||
+                screen == Screen.SuperThumbnailProgress ||
+                screen == Screen.SuperThumbnailReport
+
+            ReorderableSidebarGroup(
+                "tools",
+                listOf(
+                    SidebarEntry("photo-selection", "사진 선별", PackGlyph.PHOTO_SELECTION, screen == Screen.PhotoSelection) {
+                        model.show(Screen.PhotoSelection)
+                    },
+                    SidebarEntry("photo-transfer", "미디어 전송", PackGlyph.TRANSFER, screen == Screen.PhotoTransfer) {
+                        model.show(Screen.PhotoTransfer)
+                    },
+                    SidebarEntry("super-thumbnail", "수퍼 썸네일", PackGlyph.SUPER_THUMBNAIL, isSuperThumbnailSelected) {
+                        model.show(Screen.SuperThumbnail)
+                    },
+                    SidebarEntry("thumbnail-cache", "썸네일 캐시", PackGlyph.THUMBNAIL_CACHE, screen == Screen.ThumbnailCache) {
+                        model.show(Screen.ThumbnailCache)
+                    }
+                )
+            )
+        }
+    }
+}
+
 
 private val SidebarRowHeight = 46.dp
 private val SidebarRowGap = 2.dp
@@ -1400,7 +1860,22 @@ private fun ReorderableSidebarGroup(group: String, entries: List<SidebarEntry>) 
         if (from < 0 || from == to) return ids
         return ids.toMutableList().also { it.add(to, it.removeAt(from)) }
     }
-    Column(verticalArrangement = Arrangement.spacedBy(SidebarRowGap)) {
+    // Row centres measured from the real layout (before any drag translation) so the tree guide follows font scaling.
+    val rowCenters = remember(group) { mutableStateMapOf<String, Float>() }
+    val guideColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .35f)
+    Column(
+        Modifier.drawBehind {
+            val lastCenter = shownIds.mapNotNull { rowCenters[it] }.maxOrNull() ?: return@drawBehind
+            val x = 23.dp.toPx()
+            val stroke = 1.dp.toPx()
+            drawLine(guideColor, androidx.compose.ui.geometry.Offset(x, 0f), androidx.compose.ui.geometry.Offset(x, lastCenter), stroke)
+            shownIds.forEach { shown ->
+                val y = rowCenters[shown] ?: return@forEach
+                drawLine(guideColor, androidx.compose.ui.geometry.Offset(x, y), androidx.compose.ui.geometry.Offset(34.dp.toPx(), y), stroke)
+            }
+        },
+        verticalArrangement = Arrangement.spacedBy(SidebarRowGap)
+    ) {
         shownIds.forEach { id ->
             val entry = byId[id] ?: return@forEach
             key(id) {
@@ -1411,7 +1886,10 @@ private fun ReorderableSidebarGroup(group: String, entries: List<SidebarEntry>) 
                     // 길게 누르기는 아래 제스처가 직접 처리한다(움직였으면 순서 바꾸기, 가만히 뗐으면 행 고유의 길게 누르기 동작).
                     onLongClick = null,
                     onClick = { if (android.os.SystemClock.uptimeMillis() >= suppressClickUntil) entry.onClick() },
+                    child = true,
                     modifier = Modifier
+                        .onGloballyPositioned { rowCenters[id] = it.positionInParent().y + it.size.height / 2f }
+                        .padding(start = 24.dp)
                         .graphicsLayer { translationY = if (dragging) dragOffset else 0f; shadowElevation = if (dragging) 8f else 0f }
                         .zIndex(if (dragging) 1f else 0f)
                         .then(if (dragging) Modifier.border(1.5.dp, themePalette().accent, RoundedCornerShape(10.dp)) else Modifier)
@@ -1483,8 +1961,10 @@ private fun SidebarItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     trailing: (@Composable () -> Unit)? = null,
+    child: Boolean = false,
 ) {
     val shape = RoundedCornerShape(10.dp)
+    val iconSize = if (child) 20.dp else 26.dp
     Row(
         modifier.fillMaxWidth().heightIn(min = SidebarRowHeight).clip(shape)
             .background(if (selected) themePalette().selected else Color.Transparent)
@@ -1493,11 +1973,11 @@ private fun SidebarItem(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (googleMark) GooglePhotosMark(Modifier.size(26.dp)) else PackIcon(glyph, null, Modifier.size(26.dp), tint = if (selected) themePalette().accent else MaterialTheme.colorScheme.onSurface)
+        if (googleMark) GooglePhotosMark(Modifier.size(iconSize)) else PackIcon(glyph, null, Modifier.size(iconSize), tint = if (selected) themePalette().accent else MaterialTheme.colorScheme.onSurface)
         Text(
             title,
             Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyMedium,
+            style = if (child) MaterialTheme.typography.bodySmall.copy(fontSize = 14.sp) else MaterialTheme.typography.bodyMedium,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             // Selected rows keep the primary text colour on the selected fill; the accent marks only the glyph.
             color = MaterialTheme.colorScheme.onSurface,
@@ -1513,58 +1993,51 @@ private fun PorcelainCompactRail(
     state: AppState,
     model: NasFinderViewModel,
     onExpand: () -> Unit,
-    onToggleWorkbenchOverlay: () -> Unit,
     selectedConnectionId: String? = null,
     phoneHardSelected: Boolean = false,
     activeRoot: MainNavigationDestination? = null,
     favoritesSelected: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val isHome = activeRoot == MainNavigationDestination.HOME
-    val isFinder = activeRoot == MainNavigationDestination.FINDER
-    val watchSelected = if (activeRoot != null) isHome || isFinder else selectedConnectionId == null && !phoneHardSelected && !favoritesSelected
-    val videoSelected = activeRoot == MainNavigationDestination.VIDEO
-    val toolsSelected = activeRoot == MainNavigationDestination.TOOLS
-    val workbenchSelected = activeRoot == MainNavigationDestination.WORKBENCH
-    val screen = state.screen
+    val section = sidebarSectionFor(state, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
 
     Column(
         modifier = modifier
             .width(72.dp)
             .fillMaxHeight()
-            .verticalScroll(rememberScrollState())
             .padding(vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // Fixed outside the scrolling list: selected app icon, then the expand target, so neither overlaps or clips.
+        MainAppBrand(state, showText = false)
         IconButton(onClick = onExpand, modifier = Modifier.size(IconHitTarget)) {
-            PackIcon(PackGlyph.MENU, "사이드바 펼치기", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurface)
+            PackIcon(PackGlyph.ARROW_RIGHT, "사이드바 펼치기", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurface)
         }
         Spacer(Modifier.height(4.dp))
-        CompactRailItem("감상", PackGlyph.PLAY, selected = watchSelected) {
-            if (!watchSelected) model.selectMainDestination(MainNavigationDestination.FINDER)
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+        CompactRailItem("홈", PackGlyph.HOME, selected = section == MainNavigationDestination.HOME) {
+            model.selectMainDestination(MainNavigationDestination.HOME)
         }
-        CompactRailItem("영상", PackGlyph.VIDEO, selected = videoSelected) {
-            if (!videoSelected) model.selectMainDestination(MainNavigationDestination.VIDEO)
-        }
-        CompactRailItem("도구", PackGlyph.TRANSFER, selected = toolsSelected) {
-            if (!toolsSelected) model.selectMainDestination(MainNavigationDestination.TOOLS)
-        }
-        CompactRailItem("작업대", PackGlyph.WORKBENCH, selected = workbenchSelected, badge = state.materials.size.takeIf { it > 0 }) {
-            onToggleWorkbenchOverlay()
-        }
-        SidebarDivider()
-        CompactRailItem("연결", PackGlyph.CONNECTIONS, selected = isFinder) {
+        CompactRailItem("파인더", PackGlyph.FOLDER, selected = section == MainNavigationDestination.FINDER) {
             model.selectMainDestination(MainNavigationDestination.FINDER)
         }
-        CompactRailItem("미디어", PackGlyph.PHOTOS, selected = screen is Screen.LocalPhotoLibrary) {
-            model.show(Screen.LocalPhotoLibrary())
+        CompactRailItem("만들기", PackGlyph.VIDEO, selected = section == MainNavigationDestination.VIDEO) {
+            model.selectMainDestination(MainNavigationDestination.VIDEO)
         }
-        CompactRailItem("폰하드", PackGlyph.PHONEHARD, selected = phoneHardSelected) {
-            model.show(Screen.Inbox)
+        CompactRailItem("도구", PackGlyph.TRANSFER, selected = section == MainNavigationDestination.TOOLS) {
+            model.selectMainDestination(MainNavigationDestination.TOOLS)
         }
-        CompactRailItem("설정", PackGlyph.SETTINGS, selected = screen == Screen.Settings) {
-            model.show(Screen.Settings)
+        CompactRailItem(
+            "설정", PackGlyph.SETTINGS, selected = section == MainNavigationDestination.SETTINGS,
+            onLongClick = model::togglePrivacyMode,
+        ) {
+            model.selectMainDestination(MainNavigationDestination.SETTINGS)
+        }
         }
     }
 }
@@ -1575,6 +2048,7 @@ private fun CompactRailItem(
     glyph: PackGlyph,
     selected: Boolean,
     badge: Int? = null,
+    onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     val accent = themePalette().accent
@@ -1585,7 +2059,8 @@ private fun CompactRailItem(
             .size(56.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(bg)
-            .clickable(role = Role.Tab, onClick = onClick),
+            .semantics { this.selected = selected }
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick, role = Role.Tab),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {

@@ -13,6 +13,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
@@ -393,41 +394,49 @@ private fun pretendard(size: Int, lineHeight: Int, weight: FontWeight = FontWeig
 )
 
 /**
- * Approved-proposal role defaults. Only the home roles below come from HOME-VISUAL-EXECUTION-2232 §1; the rest keep the
- * earlier proposal sizes. Same family for all six themes; sp keeps the user's Android font scale.
+ * Approved-proposal role defaults. Reuses unified Pretendard type hierarchy across themes:
+ * Titles 20/26 semibold, sections 17/24 semibold, body 16/23, action 15/21 medium, secondary 13/19, metadata 12/17.
+ * sp keeps the user's Android font scale.
  */
 object PorcelainType {
     val Brand = pretendard(22, 28, FontWeight.Bold)
-    val LargeHeading = pretendard(20, 25, FontWeight.SemiBold)
-    val Section = pretendard(17, 22, FontWeight.SemiBold)
-    val Row = pretendard(15, 20, FontWeight.Medium)
-    val Body = pretendard(13, 18)
-    val Caption = pretendard(12, 16)
-    val Meta = pretendard(11, 15)
+    val LargeHeading = pretendard(20, 26, FontWeight.SemiBold)
+    val Title = pretendard(20, 26, FontWeight.SemiBold)
+    val Section = pretendard(17, 24, FontWeight.SemiBold)
+    val Row = pretendard(15, 21, FontWeight.Medium)
+    val Action = pretendard(15, 21, FontWeight.Medium)
+    val BodyPrimary = pretendard(16, 23)
+    val Body = pretendard(16, 23)
+    val Secondary = pretendard(13, 19)
+    val Caption = pretendard(13, 19)
+    val Meta = pretendard(12, 17)
+    val Metadata = pretendard(12, 17)
     val Badge = pretendard(10, 13, FontWeight.SemiBold)
-    /** 07-states title: 20/600 (proposal). */
-    val StateTitle = pretendard(20, 25, FontWeight.SemiBold)
+    val StateTitle = pretendard(20, 26, FontWeight.SemiBold)
 }
 
-/** Home direct roles (HOME-VISUAL-EXECUTION-2232 §1): size / line height / weight exactly as specified. */
+/** Home direct roles: size / line height / weight with improved legibility. */
 object HomeType {
     val Brand = pretendard(22, 28, FontWeight.Bold)
     val Section = pretendard(20, 26, FontWeight.SemiBold)
-    val Source = pretendard(14, 19, FontWeight.Medium)
-    val Description = pretendard(12, 17)
-    val Caption = pretendard(12, 16)
+    val Source = pretendard(15, 21, FontWeight.Medium)
+    val Action = pretendard(15, 21, FontWeight.Medium)
+    val Body = pretendard(16, 23)
+    val Description = pretendard(13, 19)
+    val Secondary = pretendard(13, 19)
+    val Caption = pretendard(12, 17)
+    val Metadata = pretendard(12, 17)
     /** Favorite shelf caption 11/400 (line 14), centered under the 52 cover in the 68 column. */
     val FavoriteCaption = pretendard(11, 14)
-    val Tertiary = pretendard(12, 16)
+    val Tertiary = pretendard(12, 17)
     val Badge = pretendard(10, 13, FontWeight.SemiBold)
-    val Cta = pretendard(16, 21, FontWeight.SemiBold)
-    /** Browser / 연결 추가 compact action title 14/500. */
-    val Compact = pretendard(14, 19, FontWeight.Medium)
+    val Cta = pretendard(16, 22, FontWeight.SemiBold)
+    val Compact = pretendard(14, 20, FontWeight.Medium)
 }
 
 /**
- * One Material typography for all six themes: SwiftUI semantic counterparts (body 17, subheadline 15, footnote 13,
- * caption 12, caption2 11) with the proposal title/label roles, every role on Pretendard.
+ * One Material typography for phones: titles 20/26, sections 17/24, body 16/23,
+ * action 15/21, secondary 13/19, metadata 12/17 on Pretendard.
  */
 private val NasFinderTypography = Typography().let { base ->
     fun TextStyle.onPretendard() = copy(
@@ -446,12 +455,43 @@ private val NasFinderTypography = Typography().let { base ->
         titleLarge = PorcelainType.LargeHeading,
         titleMedium = PorcelainType.Section,
         titleSmall = PorcelainType.Row,
-        bodyLarge = pretendard(17, 22),
-        bodyMedium = pretendard(15, 20),
-        bodySmall = PorcelainType.Body,
-        labelLarge = pretendard(14, 20),
-        labelMedium = PorcelainType.Caption,
+        bodyLarge = pretendard(17, 24),
+        bodyMedium = pretendard(16, 23),
+        bodySmall = PorcelainType.Secondary,
+        labelLarge = PorcelainType.Action,
+        labelMedium = PorcelainType.Secondary,
         labelSmall = PorcelainType.Meta,
+    )
+}
+
+/**
+ * Compact Material typography for unfolded foldables (e.g. TriFold ~792dp) and tablets
+ * (smallestScreenWidthDp >= 600dp): title 18/24, section 16/22, body 14/20, secondary 12/17,
+ * action 13/19, metadata 11/16 on Pretendard. Supports user font scale via sp.
+ */
+private val NasFinderCompactTabletTypography = Typography().let { base ->
+    fun TextStyle.onPretendard() = copy(
+        fontFamily = Pretendard,
+        fontSynthesis = FontSynthesis.None,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+        lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.None),
+    )
+    Typography(
+        displayLarge = base.displayLarge.onPretendard(),
+        displayMedium = base.displayMedium.onPretendard(),
+        displaySmall = base.displaySmall.onPretendard(),
+        headlineLarge = base.headlineLarge.onPretendard(),
+        headlineMedium = base.headlineMedium.onPretendard(),
+        headlineSmall = base.headlineSmall.onPretendard(),
+        titleLarge = pretendard(18, 24, FontWeight.SemiBold),
+        titleMedium = pretendard(16, 22, FontWeight.SemiBold),
+        titleSmall = pretendard(14, 20, FontWeight.Medium),
+        bodyLarge = pretendard(15, 21),
+        bodyMedium = pretendard(14, 20),
+        bodySmall = pretendard(12, 17),
+        labelLarge = pretendard(13, 19, FontWeight.Medium),
+        labelMedium = pretendard(12, 17),
+        labelSmall = pretendard(11, 16),
     )
 }
 
@@ -473,6 +513,9 @@ fun folderColor(theme: AppTheme): Color = paletteFor(theme).text
 fun NasFinderTheme(theme: AppTheme, iconPack: InterfaceIconPack = InterfaceIconPack.REALISTIC, content: @Composable () -> Unit) {
     val p = paletteFor(theme)
     val dark = p.isDark
+    val configuration = LocalConfiguration.current
+    val isTablet = configuration.smallestScreenWidthDp >= 600
+    val activeTypography = if (isTablet) NasFinderCompactTabletTypography else NasFinderTypography
     // Every app-owned Material role is mapped so no Material baseline (purple) default leaks into any theme.
     val base = if (dark) darkColorScheme() else lightColorScheme()
     val themedScheme = base.copy(
@@ -526,7 +569,7 @@ fun NasFinderTheme(theme: AppTheme, iconPack: InterfaceIconPack = InterfaceIconP
     CompositionLocalProvider(LocalNasFinderTheme provides theme, LocalThemePalette provides p, LocalInterfaceIconPack provides iconPack) {
         MaterialTheme(
             colorScheme = themedScheme,
-            typography = NasFinderTypography,
+            typography = activeTypography,
         ) {
             // Transparent Scaffolds resolve their content colour from here; without it uncoloured text falls back to black.
             CompositionLocalProvider(LocalContentColor provides p.text, content = content)

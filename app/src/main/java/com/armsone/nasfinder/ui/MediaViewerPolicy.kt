@@ -21,12 +21,14 @@ enum class MediaViewerGestureMode {
 enum class MediaPlaybackMode(val title: String) {
     ALL_REPEAT("전체 반복"),
     SHUFFLE("임의 재생"),
-    ONE_REPEAT("한 항목 반복");
+    ONE_REPEAT("한 항목 반복"),
+    ONCE("한 번 재생");
 
     fun next(): MediaPlaybackMode = when (this) {
         ALL_REPEAT -> SHUFFLE
         SHUFFLE -> ONE_REPEAT
-        ONE_REPEAT -> ALL_REPEAT
+        ONE_REPEAT -> ONCE
+        ONCE -> ALL_REPEAT
     }
 }
 
@@ -80,13 +82,30 @@ object MediaSlideshowPolicy {
             MediaPlaybackMode.ONE_REPEAT -> currentIndex
             MediaPlaybackMode.ALL_REPEAT -> (currentIndex + 1) % totalCount
             MediaPlaybackMode.SHUFFLE -> {
-                var next = randomIndexProvider(totalCount)
-                if (next == currentIndex && totalCount > 1) {
-                    next = (currentIndex + 1) % totalCount
+                if (totalCount <= 1) 0
+                else {
+                    var next = randomIndexProvider(totalCount)
+                    if (next == currentIndex) {
+                        next = (currentIndex + 1 + (randomIndexProvider(totalCount - 1) % (totalCount - 1))) % totalCount
+                    }
+                    next
                 }
-                next
+            }
+            MediaPlaybackMode.ONCE -> {
+                if (currentIndex >= totalCount - 1) -1
+                else currentIndex + 1
             }
         }
+    }
+}
+
+enum class VideoResizeMode(val title: String) {
+    FIT("화면에 맞추기"),
+    FILL("화면 채우기");
+
+    fun next(): VideoResizeMode = when (this) {
+        FIT -> FILL
+        FILL -> FIT
     }
 }
 
@@ -94,6 +113,8 @@ object MediaViewerPreferences {
     private const val PREFS_NAME = "media_viewer_preferences"
     private const val KEY_PLAYBACK_MODE = "playback_mode"
     private const val KEY_SLIDESHOW_INTERVAL = "slideshow_interval_seconds"
+    private const val KEY_VIDEO_REPEAT = "video_repeat_enabled"
+    private const val KEY_VIDEO_RESIZE_MODE = "video_resize_mode"
 
     fun getPlaybackMode(context: Context): MediaPlaybackMode {
         val name = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -118,6 +139,28 @@ object MediaViewerPreferences {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putInt(KEY_SLIDESHOW_INTERVAL, safe).apply()
     }
+
+    fun getVideoRepeat(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_VIDEO_REPEAT, true)
+    }
+
+    fun setVideoRepeat(context: Context, repeat: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_VIDEO_REPEAT, repeat).apply()
+    }
+
+    fun getVideoResizeMode(context: Context): VideoResizeMode {
+        val name = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_VIDEO_RESIZE_MODE, VideoResizeMode.FIT.name)
+        return runCatching { VideoResizeMode.valueOf(name ?: VideoResizeMode.FIT.name) }
+            .getOrDefault(VideoResizeMode.FIT)
+    }
+
+    fun setVideoResizeMode(context: Context, mode: VideoResizeMode) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_VIDEO_RESIZE_MODE, mode.name).apply()
+    }
 }
 
 object MediaViewerGesturePolicy {
@@ -129,6 +172,10 @@ object MediaViewerGesturePolicy {
     const val MAX_IMAGE_SCALE = 6.0f
     const val MIN_IMAGE_SCALE = 1.0f
     const val DOUBLE_TAP_ZOOM_SCALE = 2.5f
+    const val MIN_VIDEO_SCALE = 0.5f
+    const val MAX_VIDEO_SCALE = 4.0f
+    const val ZOOM_RESET_EPSILON = 0.01f
+    const val PAN_RESET_EPSILON_PX = 1.0f
 
     fun logicalDistancePx(distanceDp: Float, density: Float): Float =
         distanceDp * density.coerceAtLeast(0.1f)

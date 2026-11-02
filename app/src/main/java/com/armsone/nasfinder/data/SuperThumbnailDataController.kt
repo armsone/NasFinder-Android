@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.work.WorkManager
 import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.network.RemoteFileServiceFactory
+import com.armsone.nasfinder.platform.OAuthAccessTokenProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -48,7 +49,7 @@ class SuperThumbnailDataController(context: Context) {
         val sessionKey = superThumbnailSessionKey(connectionId, safeRoot)
         val vault = SuperThumbnailVault(appContext.cacheDir.resolve("super-thumbnail-vault-work"))
         val credential = connections.credentials.read(connectionId).orEmpty()
-        RemoteFileServiceFactory.create(connection, credential).use { service ->
+        RemoteFileServiceFactory.create(connection, credential, OAuthAccessTokenProvider(appContext)).use { service ->
             val result = vault.removeVaults(safeRoot, service)
             if (!result.cancelled) {
                 // Clear optimistic UPLOADED state first. A partial delete then upgrades only

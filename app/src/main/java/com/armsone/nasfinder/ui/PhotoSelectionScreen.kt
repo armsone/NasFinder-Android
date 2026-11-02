@@ -11,6 +11,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -76,6 +77,7 @@ internal fun PhotoSelectionScreen(
         state.phase == PhotoSelectionPhase.WORKING
     var confirmCancel by remember { mutableStateOf(false) }
     var analysisDetailsExpanded by rememberSaveable { mutableStateOf(false) }
+    var selectionHelpExpanded by rememberSaveable { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
 
     Scaffold(
@@ -93,28 +95,44 @@ internal fun PhotoSelectionScreen(
             when (state.phase) {
                 PhotoSelectionPhase.IDLE -> {
                     item {
+                        Text(
+                            "기기 안에서 비슷한 사진을 묶고 품질을 비교해 남길 사진을 추천합니다. 원본은 옮기거나 지우지 않습니다.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    item {
                         SelectionCard {
-                            Text("사진을 고르면 이 기기 안에서 분석해 몇 장이 적당한지 추천합니다.", style = MaterialTheme.typography.bodyMedium)
-                            Text(
-                                "동영상은 선별에서 제외됩니다. 원본 사진은 옮기거나 지우지 않습니다. 사진 수에는 제한이 없습니다.",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Button(
-                                onClick = {
+                            ListItem(
+                                headlineContent = { Text("사진 보관함에서 고르기") },
+                                supportingContent = { Text("여러 장의 사진을 한 번에 고릅니다.") },
+                                trailingContent = { Text("›", style = MaterialTheme.typography.titleLarge) },
+                                modifier = Modifier.fillMaxWidth().clickable {
                                     photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                                 },
-                                modifier = Modifier.fillMaxWidth(),
-                            ) { Text("사진 보관함에서 고르기") }
-                            OutlinedButton(
-                                onClick = { filePicker.launch(arrayOf("image/*", "video/*")) },
-                                modifier = Modifier.fillMaxWidth(),
-                            ) { Text("파일에서 고르기 (개수 제한 없음)") }
-                            Text(
-                                "사진 보관함 선택은 시스템이 허용하는 개수까지 고를 수 있고, 파일에서 고르기는 개수 제한이 없습니다.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            ListItem(
+                                headlineContent = { Text("파일에서 고르기") },
+                                supportingContent = { Text("기기·클라우드에서 사진을 고릅니다.") },
+                                trailingContent = { Text("›", style = MaterialTheme.typography.titleLarge) },
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    filePicker.launch(arrayOf("image/*", "video/*"))
+                                },
+                            )
+                            TextButton(onClick = { selectionHelpExpanded = !selectionHelpExpanded }) { Text("선택 도움말") }
+                            if (selectionHelpExpanded) {
+                                Text(
+                                    "동영상은 선별에서 제외됩니다. 원본 사진은 옮기거나 지우지 않습니다. 사진 수에는 제한이 없습니다.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    "사진 보관함 선택은 시스템이 허용하는 개수까지 고를 수 있고, 파일에서 고르기는 개수 제한이 없습니다.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                     if (pendingShares.isNotEmpty()) {
