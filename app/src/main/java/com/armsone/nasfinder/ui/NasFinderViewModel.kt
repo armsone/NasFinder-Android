@@ -80,6 +80,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -5262,6 +5263,54 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val allItems = svc.list(path)
                 allItems.filter { it.isDirectory || it.isAudio }
             }
+        }
+    }
+
+    /** Reads audio metadata through the same authenticated range source used by remote previews. */
+    suspend fun remoteAudioDurationSeconds(
+        connection: RemoteConnection,
+        item: RemoteFileItem,
+    ): Double? = withContext(Dispatchers.IO) {
+        var temporary: File? = null
+        try {
+            val ownerContext = currentCoroutineContext()
+            val credential = repository.credentials.read(connection.id).orEmpty()
+            RemoteFileServiceFactory.create(connection, credential, cloudAccessTokens).use { service ->
+                val retriever = MediaMetadataRetriever()
+                var source: com.armsone.nasfinder.data.SparseRemoteMediaDataSource? = null
+                try {
+                    if (service.supportsRangeStreaming && item.size > 0) {
+                        val budget = com.armsone.nasfinder.data.RemoteThumbnailTrafficBudget(
+                            com.armsone.nasfinder.data.RemoteThumbnailTrafficLimits(
+                                maxRequests = 64, maxExpectedBytes = 4L * 1024 * 1024, maxActualBytes = 4L * 1024 * 1024,
+                            )
+                        )
+                        val session = com.armsone.nasfinder.data.SparseVideoRangeSession(
+                            itemSize = item.size, trafficBudget = budget, ownerJob = currentCoroutineContext()[Job],
+                        ) { offset, length -> service.readRange(item, offset, length) }
+                        source = com.armsone.nasfinder.data.SparseRemoteMediaDataSource(session)
+                        retriever.setDataSource(source)
+                    } else {
+                        // SFTP cannot seek remotely; keep only this visible row's temporary metadata copy.
+                        val file = File.createTempFile("music-duration-", ".audio", application.cacheDir)
+                        temporary = file
+                        service.download(item, file) { _, _ -> ownerContext.ensureActive() }
+                        retriever.setDataSource(file.absolutePath)
+                    }
+                    currentCoroutineContext().ensureActive()
+                    retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toDoubleOrNull()?.div(1000.0)?.takeIf { it.isFinite() && it > 0.0 }
+                } finally {
+                    source?.close()
+                    runCatching { retriever.release() }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        } finally {
+            temporary?.delete()
         }
     }
 

@@ -1060,7 +1060,7 @@ internal class SparseVideoRangeSession(
     }
 }
 
-private class SparseRemoteMediaDataSource(
+internal class SparseRemoteMediaDataSource(
     private val session: SparseVideoRangeSession,
 ) : MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {

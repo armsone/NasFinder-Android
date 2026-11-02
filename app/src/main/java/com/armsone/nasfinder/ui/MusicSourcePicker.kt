@@ -67,6 +67,8 @@ import com.armsone.nasfinder.model.RemoteFileItem
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.util.UUID
 
@@ -92,6 +94,8 @@ fun UnifiedMusicPickerDialog(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val auditionController = rememberMusicAuditionController()
+    val durationCache = remember { mutableStateMapOf<String, Double?>() }
+    val metadataSlots = remember { Semaphore(2) }
 
     // Session cache directory dedicated to this picker dialog instance
     val sessionCacheDir = remember {
@@ -331,6 +335,9 @@ fun UnifiedMusicPickerDialog(
                         if (activeConnection != null) {
                             // Showing contents of favorite folder
                             RemoteFolderView(
+                                model = model,
+                                durationCache = durationCache,
+                                metadataSlots = metadataSlots,
                                 connection = activeConnection!!,
                                 currentPath = currentRemotePath,
                                 items = remoteItems,
@@ -446,6 +453,9 @@ fun UnifiedMusicPickerDialog(
                             }
                         } else {
                             RemoteFolderView(
+                                model = model,
+                                durationCache = durationCache,
+                                metadataSlots = metadataSlots,
                                 connection = activeConnection!!,
                                 currentPath = currentRemotePath,
                                 items = remoteItems,
@@ -593,6 +603,9 @@ private fun ConnectionRow(
 
 @Composable
 private fun RemoteFolderView(
+    model: NasFinderViewModel,
+    durationCache: MutableMap<String, Double?>,
+    metadataSlots: Semaphore,
     connection: RemoteConnection,
     currentPath: String,
     items: List<RemoteFileItem>,
@@ -707,6 +720,10 @@ private fun RemoteFolderView(
                             }
                         } else {
                             RemoteAudioRow(
+                                model = model,
+                                connection = connection,
+                                durationCache = durationCache,
+                                metadataSlots = metadataSlots,
                                 item = item,
                                 auditionController = auditionController,
                                 isDownloading = downloadingItemIds[item.id] == true,
@@ -727,6 +744,10 @@ private fun RemoteFolderView(
 
 @Composable
 private fun RemoteAudioRow(
+    model: NasFinderViewModel,
+    connection: RemoteConnection,
+    durationCache: MutableMap<String, Double?>,
+    metadataSlots: Semaphore,
     item: RemoteFileItem,
     auditionController: MusicAuditionController,
     isDownloading: Boolean,
@@ -737,6 +758,17 @@ private fun RemoteAudioRow(
     onUseClick: () -> Unit,
     onCancelDownload: () -> Unit,
 ) {
+    val durationKey = "${connection.id}:${item.path}:${item.size}:${item.modifiedAt}"
+    LaunchedEffect(durationKey) {
+        if (!durationCache.containsKey(durationKey)) {
+            metadataSlots.withPermit {
+                if (!durationCache.containsKey(durationKey)) {
+                    durationCache[durationKey] = model.remoteAudioDurationSeconds(connection, item)
+                }
+            }
+        }
+    }
+    val duration = durationCache[durationKey]
     val isAuditioning = auditionController.playingPath?.endsWith(item.name) == true
     val isPreparingThis = isAuditioning && auditionController.isPreparing
 
@@ -793,6 +825,15 @@ private fun RemoteAudioRow(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        Text(
+                            when {
+                                duration != null -> trailerLengthTitle(duration)
+                                durationCache.containsKey(durationKey) -> "재생시간 확인 불가"
+                                else -> "재생시간 확인 중…"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         if (item.size > 0L) {
                             Text(
                                 formatBytes(item.size),

@@ -634,14 +634,8 @@ internal fun PorcelainWideHost(
     favoritesSelected: Boolean = false,
     content: @Composable () -> Unit,
 ) {
-    val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { model.importPickedFiles(it) }
-    var addingNetwork by remember { mutableStateOf(false) }
-    var editingGooglePhotos by remember { mutableStateOf(false) }
-    var googlePhotosName by remember(state.googlePhotosName) { mutableStateOf(state.googlePhotosName) }
-    NetworkAddDialogs(state, model, addingNetwork, { addingNetwork = it }, editingGooglePhotos, { editingGooglePhotos = it }, googlePhotosName, { googlePhotosName = it })
     val configuration = LocalConfiguration.current
     val isTablet = configuration.smallestScreenWidthDp >= 600 || LocalContext.current.applicationContext.resources.configuration.smallestScreenWidthDp >= 600
-    val navExpanded = state.sidebarExpanded
     var portraitWorkbenchOverlay by rememberSaveable { mutableStateOf(false) }
     var wideWorkbenchExpanded by rememberSaveable { mutableStateOf(false) }
     val currentContent by rememberUpdatedState(content)
@@ -662,34 +656,7 @@ internal fun PorcelainWideHost(
         } else {
             Box(Modifier.fillMaxSize()) {
                 Row(Modifier.fillMaxSize()) {
-                    val widthSpec = rememberSidebarWidthSpec(state, totalWidth)
-                    val expandedWidth = widthSpec.resolve(state.sidebarWidthDp)
-                    Box(Modifier.width(if (navExpanded) expandedWidth else 72.dp).fillMaxHeight()) {
-                        Column(Modifier.fillMaxSize().navigationBarsPadding()) {
-                            if (navExpanded) {
-                                PorcelainSidebar(
-                                    state, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
-                                    Modifier.weight(1f).fillMaxWidth(), selectedConnectionId, phoneHardSelected, activeRoot,
-                                    favoritesSelected, onCollapse = { model.setSidebarExpanded(false) },
-                                )
-                            } else {
-                                PorcelainCompactRail(
-                                    state, model, { model.setSidebarExpanded(true) },
-                                    selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected,
-                                )
-                            }
-                        }
-                        if (navExpanded) {
-                            // Separate 8dp strip over the sidebar's outer padding; menu rows never receive the drag.
-                            SidebarResizeStrip(
-                                widthDp = expandedWidth.value,
-                                minDp = widthSpec.min.value,
-                                maxDp = widthSpec.max.value,
-                                onWidth = model::setSidebarWidthDp,
-                                modifier = Modifier.align(Alignment.CenterEnd),
-                            )
-                        }
-                    }
+                    PorcelainNavigationSidebar(state, model, totalWidth, selectedConnectionId = selectedConnectionId, phoneHardSelected = phoneHardSelected, activeRoot = activeRoot, favoritesSelected = favoritesSelected)
                     VerticalDividerLine()
                     Box(Modifier.weight(1f).fillMaxHeight()) { movableContent() }
                     if (showWorkbenchPanel) {
@@ -1606,6 +1573,7 @@ private fun PorcelainSidebar(
     activeRoot: MainNavigationDestination? = null,
     favoritesSelected: Boolean = false,
     onCollapse: () -> Unit = {},
+    beforeNavigate: () -> Unit = {},
 ) {
     val screen = state.screen
     val effectiveSection = sidebarSectionFor(state, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
@@ -1636,44 +1604,85 @@ private fun PorcelainSidebar(
             "홈",
             PackGlyph.HOME,
             selected = homeSelected,
-            onClick = { model.selectMainDestination(MainNavigationDestination.HOME) }
+            onClick = { beforeNavigate(); model.selectMainDestination(MainNavigationDestination.HOME) }
         )
 
         SidebarItem(
             "파인더",
             PackGlyph.FOLDER,
             selected = finderSelected,
-            onClick = { model.selectMainDestination(MainNavigationDestination.FINDER) }
+            onClick = { beforeNavigate(); model.selectMainDestination(MainNavigationDestination.FINDER) }
         )
         if (effectiveSection == MainNavigationDestination.FINDER) {
-            SidebarChildren(MainNavigationDestination.FINDER, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+            SidebarChildren(MainNavigationDestination.FINDER, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate)
         }
         SidebarItem(
             "만들기",
             PackGlyph.VIDEO,
             selected = videoSelected,
-            onClick = { model.selectMainDestination(MainNavigationDestination.VIDEO) }
+            onClick = { beforeNavigate(); model.selectMainDestination(MainNavigationDestination.VIDEO) }
         )
         if (effectiveSection == MainNavigationDestination.VIDEO) {
-            SidebarChildren(MainNavigationDestination.VIDEO, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+            SidebarChildren(MainNavigationDestination.VIDEO, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate)
         }
         SidebarItem(
             "도구",
             PackGlyph.TRANSFER,
             selected = toolsSelected,
-            onClick = { model.selectMainDestination(MainNavigationDestination.TOOLS) }
+            onClick = { beforeNavigate(); model.selectMainDestination(MainNavigationDestination.TOOLS) }
         )
         if (effectiveSection == MainNavigationDestination.TOOLS) {
-            SidebarChildren(MainNavigationDestination.TOOLS, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
+            SidebarChildren(MainNavigationDestination.TOOLS, state, model, onAddNetwork, onImportFiles, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate)
         }
         SidebarItem(
             "설정",
             PackGlyph.SETTINGS,
             selected = settingsSelected,
             onLongClick = model::togglePrivacyMode,
-            onClick = { model.selectMainDestination(MainNavigationDestination.SETTINGS) }
+            onClick = { beforeNavigate(); model.selectMainDestination(MainNavigationDestination.SETTINGS) }
         )
         }
+    }
+}
+
+/** Shared navigation for file screens and the full-screen video editor. */
+@Composable
+internal fun PorcelainNavigationSidebar(
+    state: AppState,
+    model: NasFinderViewModel,
+    totalWidth: Dp,
+    editingVideo: Boolean = false,
+    selectedConnectionId: String? = null,
+    phoneHardSelected: Boolean = false,
+    activeRoot: MainNavigationDestination? = null,
+    favoritesSelected: Boolean = false,
+) {
+    val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { model.importPickedFiles(it) }
+    var addingNetwork by remember { mutableStateOf(false) }
+    var editingGooglePhotos by remember { mutableStateOf(false) }
+    var googlePhotosName by remember(state.googlePhotosName) { mutableStateOf(state.googlePhotosName) }
+    NetworkAddDialogs(state, model, addingNetwork, { addingNetwork = it }, editingGooglePhotos, { editingGooglePhotos = it }, googlePhotosName, { googlePhotosName = it })
+    val navExpanded = state.sidebarExpanded
+    val navigationState = if (editingVideo) state.copy(screen = Screen.Dashboard, activeMainTab = MainNavigationDestination.VIDEO, activeVideoTab = VideoNavigationDestination.CREATE) else state
+    val beforeNavigate: () -> Unit = { if (editingVideo) model.minimizeEditor(MainNavigationDestination.VIDEO) }
+    val widthSpec = rememberSidebarWidthSpec(state, totalWidth)
+    val expandedWidth = widthSpec.resolve(state.sidebarWidthDp)
+    Box(Modifier.width(if (navExpanded) expandedWidth else 72.dp).fillMaxHeight()) {
+        Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+            if (navExpanded) {
+                PorcelainSidebar(
+                    navigationState, model, { addingNetwork = true }, { importer.launch(arrayOf("*/*")) },
+                    Modifier.weight(1f).fillMaxWidth(), selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, onCollapse = { model.setSidebarExpanded(false) },
+                    beforeNavigate = beforeNavigate,
+                )
+            } else {
+                PorcelainCompactRail(navigationState, model, { model.setSidebarExpanded(true) }, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate = beforeNavigate)
+            }
+        }
+        if (navExpanded) SidebarResizeStrip(
+            widthDp = expandedWidth.value, minDp = widthSpec.min.value, maxDp = widthSpec.max.value,
+            onWidth = model::setSidebarWidthDp, modifier = Modifier.align(Alignment.CenterEnd),
+        )
     }
 }
 
@@ -1717,13 +1726,15 @@ private fun SidebarChildren(
     phoneHardSelected: Boolean,
     activeRoot: MainNavigationDestination?,
     favoritesSelected: Boolean,
+    beforeNavigate: () -> Unit,
 ) {
     val screen = state.screen
     run {
         if (group == MainNavigationDestination.FINDER) {
             ReorderableSidebarGroup(
                 "finder",
-                buildList {
+                beforeNavigate = beforeNavigate,
+                entries = buildList {
                     add(SidebarEntry("favorites", "즐겨찾기", PackGlyph.FAVORITES, favoritesSelected || screen == Screen.Favorites) {
                         model.show(Screen.Favorites)
                     })
@@ -1780,7 +1791,8 @@ private fun SidebarChildren(
 
             ReorderableSidebarGroup(
                 "video",
-                listOf(
+                beforeNavigate = beforeNavigate,
+                entries = listOf(
                     SidebarEntry("video-choose-media", "미디어 고르기", PackGlyph.PHOTOS, isCreateSelected) {
                         model.chooseMediaForVideo()
                     },
@@ -1802,7 +1814,8 @@ private fun SidebarChildren(
 
             ReorderableSidebarGroup(
                 "tools",
-                listOf(
+                beforeNavigate = beforeNavigate,
+                entries = listOf(
                     SidebarEntry("photo-selection", "사진 선별", PackGlyph.PHOTO_SELECTION, screen == Screen.PhotoSelection) {
                         model.show(Screen.PhotoSelection)
                     },
@@ -1833,7 +1846,7 @@ private val SidebarRowGap = 2.dp
  * readers get 위로/아래로 이동 actions.
  */
 @Composable
-private fun ReorderableSidebarGroup(group: String, entries: List<SidebarEntry>) {
+private fun ReorderableSidebarGroup(group: String, entries: List<SidebarEntry>, beforeNavigate: () -> Unit = {}) {
     val settings = (LocalContext.current.applicationContext as com.armsone.nasfinder.NasFinderApplication).settings
     var saved by remember(group) { mutableStateOf(settings.menuOrder(group)) }
     val ordered = remember(entries.map { it.id }, saved) {
@@ -1885,7 +1898,12 @@ private fun ReorderableSidebarGroup(group: String, entries: List<SidebarEntry>) 
                     entry.title, entry.glyph, entry.selected, entry.googleMark,
                     // 길게 누르기는 아래 제스처가 직접 처리한다(움직였으면 순서 바꾸기, 가만히 뗐으면 행 고유의 길게 누르기 동작).
                     onLongClick = null,
-                    onClick = { if (android.os.SystemClock.uptimeMillis() >= suppressClickUntil) entry.onClick() },
+                    onClick = {
+                        if (android.os.SystemClock.uptimeMillis() >= suppressClickUntil) {
+                            if (entry.id != "device-storage" && entry.id != "add-network") beforeNavigate()
+                            entry.onClick()
+                        }
+                    },
                     child = true,
                     modifier = Modifier
                         .onGloballyPositioned { rowCenters[id] = it.positionInParent().y + it.size.height / 2f }
@@ -1998,6 +2016,7 @@ private fun PorcelainCompactRail(
     activeRoot: MainNavigationDestination? = null,
     favoritesSelected: Boolean = false,
     modifier: Modifier = Modifier,
+    beforeNavigate: () -> Unit = {},
 ) {
     val section = sidebarSectionFor(state, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
 
@@ -2021,21 +2040,26 @@ private fun PorcelainCompactRail(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
         CompactRailItem("홈", PackGlyph.HOME, selected = section == MainNavigationDestination.HOME) {
+            beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.HOME)
         }
         CompactRailItem("파인더", PackGlyph.FOLDER, selected = section == MainNavigationDestination.FINDER) {
+            beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.FINDER)
         }
         CompactRailItem("만들기", PackGlyph.VIDEO, selected = section == MainNavigationDestination.VIDEO) {
+            beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.VIDEO)
         }
         CompactRailItem("도구", PackGlyph.TRANSFER, selected = section == MainNavigationDestination.TOOLS) {
+            beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.TOOLS)
         }
         CompactRailItem(
             "설정", PackGlyph.SETTINGS, selected = section == MainNavigationDestination.SETTINGS,
             onLongClick = model::togglePrivacyMode,
         ) {
+            beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.SETTINGS)
         }
         }

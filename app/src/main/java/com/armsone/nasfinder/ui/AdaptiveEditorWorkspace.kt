@@ -161,7 +161,6 @@ internal fun AdaptiveEditorWorkspace(
     var captionDraft by rememberSaveable(directoryKey, stateSaver = CaptionDraftSaver) { mutableStateOf<CaptionDraft?>(null) }
     val coroutineScope = rememberCoroutineScope()
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
-    var railExpanded by rememberSaveable { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
     // Entering a project always starts at 편집; a render finishing never moves the user to another view.
     var phase by rememberSaveable(directoryKey) { mutableStateOf(EditorPhase.EDIT) }
@@ -251,6 +250,7 @@ internal fun AdaptiveEditorWorkspace(
                 }
             },
     ) {
+        val workspaceWidth = maxWidth
         val tier = editorTier(maxWidth)
         // Two panes only when both stay readable (board ≥ ~500dp, preview+inspector ≥ ~250dp, height ≥ 480dp);
         // a phone in landscape or any short/narrow window uses the one-screen phone layout instead.
@@ -538,18 +538,7 @@ internal fun AdaptiveEditorWorkspace(
                 .consumeWindowInsets(WindowInsets.safeDrawing),
         ) {
             if (tier != EditorTier.FOCUSED && !isPhone) {
-                EditorRail(
-                    expanded = railExpanded,
-                    finderOpen = finderOpen,
-                    onToggleExpanded = { railExpanded = !railExpanded },
-                    // Adding material is editing, so opening the Finder returns to 편집.
-                    onToggleFinder = {
-                        if (!finderOpen) phase = EditorPhase.EDIT
-                        finderOpen = !finderOpen
-                    },
-                    onTools = { model.minimizeEditor(MainNavigationDestination.TOOLS) },
-                    onFinderHome = { model.minimizeEditor(MainNavigationDestination.FINDER) },
-                )
+                PorcelainNavigationSidebar(appState, model, workspaceWidth, editingVideo = true)
                 VerticalHairline()
             }
             if (panelFinderInline) {
@@ -1007,64 +996,7 @@ private fun VerticalHairline() {
     Box(Modifier.fillMaxHeight().width(1.dp).background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f)))
 }
 
-/** 64dp rail (expandable with labels). Finder toggles the Finder panel; Video is the current location; Tools keeps the draft. */
-@Composable
-private fun EditorRail(
-    expanded: Boolean,
-    finderOpen: Boolean,
-    onToggleExpanded: () -> Unit,
-    onToggleFinder: () -> Unit,
-    onTools: () -> Unit,
-    onFinderHome: () -> Unit,
-) {
-    val width = if (expanded) 188.dp else 64.dp
-    Column(
-        Modifier.width(width).fillMaxHeight().background(MaterialTheme.colorScheme.surface).padding(vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        RailButton(expanded, label = if (expanded) "메뉴 접기" else "메뉴 펼치기", selected = false, onClick = onToggleExpanded) {
-            Icon(Icons.Default.Menu, null, Modifier.size(24.dp))
-        }
-        Spacer(Modifier.height(4.dp))
-        RailButton(expanded, label = if (finderOpen) "재료 찾기 닫기" else "재료 찾기 (파인더)", selected = finderOpen, onClick = onToggleFinder) {
-            PackIcon(PackGlyph.HOME, null, Modifier.size(24.dp))
-        }
-        RailButton(expanded, label = "영상 (지금 편집 중)", selected = true, onClick = {}) {
-            PackIcon(PackGlyph.VIDEO, null, Modifier.size(24.dp))
-        }
-        RailButton(expanded, label = "도구 (편집은 보관됨)", selected = false, onClick = onTools) {
-            PackIcon(PackGlyph.SETTINGS, null, Modifier.size(24.dp))
-        }
-        Spacer(Modifier.weight(1f))
-        RailButton(expanded, label = "파인더 (편집 유지)", selected = false, onClick = onFinderHome) {
-            PackIcon(PackGlyph.NAS, null, Modifier.size(24.dp))
-        }
-    }
-}
-
 internal val EditorButtonShape = RoundedCornerShape(10.dp)
-
-@Composable
-private fun RailButton(expanded: Boolean, label: String, selected: Boolean, onClick: () -> Unit, icon: @Composable () -> Unit) {
-    val palette = themePalette()
-    Surface(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 6.dp)
-            .semantics { contentDescription = label; this.selected = selected },
-        shape = EditorButtonShape,
-        color = if (selected) palette.selected else Color.Transparent,
-        contentColor = MaterialTheme.colorScheme.onSurface,
-    ) {
-        Row(
-            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            icon()
-            if (expanded) Text(label, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        }
-    }
-}
 
 @Composable
 private fun EditorHeader(
