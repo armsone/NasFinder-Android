@@ -5901,6 +5901,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private var editorAutosaveJob: Job? = null
     private var editorExportJob: Job? = null
     private var editorAddJob: Job? = null
+    private var tempoAnalysisJob: Job? = null
+    private var tempoGeneration: Long = 0L
     private val pendingAddCandidates = linkedMapOf<String, EditorAddCandidate>()
     // 추가를 요청한 순간 고정한 출처(현재 모드 또는 후보의 비공개 출처). 추가가 끝날 때 프로젝트를 영구히 오염시킨다.
     private val pendingAddPrivate = mutableMapOf<String, Boolean>()
@@ -6005,12 +6007,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * Applies one editor action atomically: [transform] must be pure. The prior state goes to undo history, the
      * revision is bumped and an autosave is scheduled. Returns false when nothing changed.
      */
-    private fun editProject(transform: (TrailerSession) -> TrailerSession?): Boolean {
+    private fun editProject(allowBusy: Boolean = false, transform: (TrailerSession) -> TrailerSession?): Boolean {
         var before: EditorSnapshot? = null
         var directory: File? = null
         _state.update { current ->
             val live = current.trailer ?: return@update current
-            if (!live.prepared || live.editor == null || live.busy) return@update current
+            if (!live.prepared || live.editor == null || (!allowBusy && live.busy)) return@update current
             val updated = transform(live) ?: return@update current
             val snapshot = live.editorSnapshot()
             if (updated.editorSnapshot() == snapshot) return@update current
@@ -6052,7 +6054,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         val actualSum = genScenes.sumOf { it.length }
         return copy(
             total = if (actualSum > 0.0) actualSum else total,
-            editor = EditorProject.fromPlan(genScenes, autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey),
+            editor = EditorProject.fromPlan(
+                genScenes,
+                autoPlan = true,
+                musicVolume = project.musicVolume,
+                firstKey = project.nextKey,
+                introCard = project.introCard,
+                outroCard = project.outroCard,
+            ),
         )
     }
 
@@ -6284,18 +6293,209 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     /** Explicit user choice (select, replace or remove): this is the only path that discards an unavailable stored music choice. */
     fun editorSetMusic(track: TrailerMusicTrack?, policy: TrailerMusicPolicy, fitCount: Int) {
-        editProject { session ->
-            var next = session.copy(
+        val session = _state.value.trailer ?: return
+        val project = session.editor
+        val count = fitCount.coerceAtLeast(1)
+        if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
+            val enabledCardDuration = (if (project?.introCard?.enabled == true) project.introCard.clampedDuration() else 0.0) +
+                (if (project?.outroCard?.enabled == true) project.outroCard.clampedDuration() else 0.0)
+            val minBodyTime = 1.0
+            if (track.durationSeconds * count <= enabledCardDuration + minBodyTime) {
+                _state.update { it.copy(message = "음악 길이가 타이틀 카드(시작·마지막)를 제외하고 본편을 넣기에 너무 짧습니다. 음악 반복 횟수를 늘리거나 카드를 조정해 주세요.") }
+                return
+            }
+        }
+        editProject { s ->
+            var next = s.copy(
                 musicTrack = track,
                 unavailableMusic = null,
                 musicExportPrompt = false,
                 musicPolicy = policy,
-                musicFitCount = fitCount.coerceAtLeast(1),
+                musicFitCount = count,
             )
             if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
-                next = next.copy(total = track.durationSeconds * fitCount.coerceAtLeast(1))
+                next = next.copy(total = (track.durationSeconds * count - s.cardDuration).coerceAtLeast(0.1))
             }
-            if (session.editor?.autoPlan == true) next.withRegeneratedPlan() else next
+            if (s.editor?.autoPlan == true) next.withRegeneratedPlan() else next
+        }
+    }
+
+    fun editorSetIntroCard(card: TrailerTitleCard) {
+        val session = _state.value.trailer ?: return
+        val project = session.editor ?: return
+        val clamped = card.clamped()
+        if (project.introCard == clamped) return
+
+        if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.plannedMusic != null && session.plannedMusic!!.durationSeconds > 0.0) {
+            val introDur = if (clamped.enabled) clamped.clampedDuration() else 0.0
+            val outroDur = if (project.outroCard.enabled) project.outroCard.clampedDuration() else 0.0
+            val minBodyTime = 1.0
+            val totalMusic = session.plannedMusic!!.durationSeconds * session.musicFitCount.coerceAtLeast(1)
+            if (totalMusic <= introDur + outroDur + minBodyTime) {
+                _state.update { it.copy(message = "타이틀 카드를 켜면 음악 길이에 비해 본편 시간이 부족합니다. 음악 반복 횟수를 늘리거나 카드 길이를 줄여 주세요.") }
+                return
+            }
+        }
+
+        editProject { s ->
+            val p = s.editor ?: return@editProject null
+            val updated = s.copy(editor = p.copy(introCard = clamped))
+            val timingChanged = p.introCard.enabled != clamped.enabled || (clamped.enabled && p.introCard.clampedDuration() != clamped.clampedDuration())
+            if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
+                updated.withRegeneratedPlan()
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun editorSetOutroCard(card: TrailerTitleCard) {
+        val session = _state.value.trailer ?: return
+        val project = session.editor ?: return
+        val clamped = card.clamped()
+        if (project.outroCard == clamped) return
+
+        if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.plannedMusic != null && session.plannedMusic!!.durationSeconds > 0.0) {
+            val introDur = if (project.introCard.enabled) project.introCard.clampedDuration() else 0.0
+            val outroDur = if (clamped.enabled) clamped.clampedDuration() else 0.0
+            val minBodyTime = 1.0
+            val totalMusic = session.plannedMusic!!.durationSeconds * session.musicFitCount.coerceAtLeast(1)
+            if (totalMusic <= introDur + outroDur + minBodyTime) {
+                _state.update { it.copy(message = "타이틀 카드를 켜면 음악 길이에 비해 본편 시간이 부족합니다. 음악 반복 횟수를 늘리거나 카드 길이를 줄여 주세요.") }
+                return
+            }
+        }
+
+        editProject { s ->
+            val p = s.editor ?: return@editProject null
+            val updated = s.copy(editor = p.copy(outroCard = clamped))
+            val timingChanged = p.outroCard.enabled != clamped.enabled || (clamped.enabled && p.outroCard.clampedDuration() != clamped.clampedDuration())
+            if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
+                updated.withRegeneratedPlan()
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun analyzeAndAlignMusicTempo() {
+        val session = _state.value.trailer ?: return
+        if (session.busy || !session.prepared) return
+        val project = session.editor ?: return
+        val track = session.musicTrack
+        if (track == null || !track.file.exists() || track.file.length() <= 0L) {
+            _state.update { it.copy(message = "배경음악이 없습니다. 먼저 음악을 선택해 주세요.") }
+            return
+        }
+        val hasPhotos = session.sources.any { src ->
+            src.isImage && project.scenes.any { it.sourceId == src.id }
+        }
+        if (!hasPhotos) {
+            _state.update { it.copy(message = "길이를 맞출 사진 장면이 없습니다.") }
+            return
+        }
+
+        tempoAnalysisJob?.cancel()
+        val generation = ++tempoGeneration
+        val directory = session.directory
+        val capturedRevision = session.revision
+        val capturedTrackPath = track.file.absolutePath
+        val capturedPolicy = session.musicPolicy
+        val capturedFitCount = session.musicFitCount
+        val capturedIntroCard = project.introCard
+        val capturedOutroCard = project.outroCard
+        val capturedScenes = project.scenes
+
+        updateTrailer(directory) { it.copy(busy = true, status = "음악 비트 분석 중…") }
+
+        tempoAnalysisJob = viewModelScope.launch {
+            var applied = false
+            var adjustedCount = 0
+            try {
+                val beats = withContext(Dispatchers.Default) {
+                    AudioAnalysisService.extractBeatOnsets(
+                        context = application,
+                        file = track.file,
+                        maxDuration = track.durationSeconds.coerceAtLeast(1.0)
+                    )
+                }
+                if (generation != tempoGeneration) return@launch
+                val currentSession = _state.value.trailer
+                if (currentSession?.directory != directory) return@launch
+
+                if (beats.isEmpty()) {
+                    if (generation == tempoGeneration && _state.value.trailer?.directory == directory) {
+                        updateTrailer(directory) { it.copy(busy = false, status = "음악 비트를 감지하지 못했습니다.") }
+                        _state.update { it.copy(message = "음악에서 비트를 감지하지 못했습니다.") }
+                    }
+                    return@launch
+                }
+
+                editProject(allowBusy = true) { live ->
+                    if (generation != tempoGeneration) return@editProject null
+                    if (live.directory != directory || live.revision != capturedRevision) return@editProject null
+                    if (live.musicTrack?.file?.absolutePath != capturedTrackPath) return@editProject null
+                    if (live.musicPolicy != capturedPolicy || live.musicFitCount != capturedFitCount) return@editProject null
+                    val liveProj = live.editor ?: return@editProject null
+                    if (liveProj.scenes != capturedScenes || liveProj.introCard != capturedIntroCard || liveProj.outroCard != capturedOutroCard) return@editProject null
+
+                    val introOffset = if (liveProj.introCard.enabled) liveProj.introCard.clampedDuration() else 0.0
+                    val maxBudget = if (live.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0) {
+                        val outroDur = if (liveProj.outroCard.enabled) liveProj.outroCard.clampedDuration() else 0.0
+                        (track.durationSeconds * live.musicFitCount) - outroDur
+                    } else null
+
+                    val (syncedScenes, syncResult) = syncPhotoScenesToBeatOnsets(
+                        scenes = liveProj.scenes,
+                        sources = live.sources,
+                        beatOnsets = beats,
+                        musicDuration = track.durationSeconds,
+                        introOffset = introOffset,
+                        musicPolicy = live.musicPolicy,
+                        maxBudget = maxBudget,
+                    )
+
+                    if (syncResult.adjustedCount == 0 && syncedScenes == liveProj.scenes) {
+                        return@editProject null
+                    }
+                    adjustedCount = syncResult.adjustedCount
+                    applied = true
+                    live.copy(
+                        editor = liveProj.copy(
+                            scenes = syncedScenes,
+                            autoPlan = false,
+                        )
+                    )
+                }
+
+                if (generation == tempoGeneration && _state.value.trailer?.directory == directory) {
+                    updateTrailer(directory) {
+                        it.copy(
+                            busy = false,
+                            status = if (applied) "${adjustedCount}개 사진 클립을 음악 비트에 맞췄습니다." else "비트에 맞게 조절할 사진이 없거나 이미 맞춰져 있습니다."
+                        )
+                    }
+                    if (applied) {
+                        _state.update { it.copy(message = "${adjustedCount}개 사진 클립을 음악 비트에 맞췄습니다.") }
+                    } else {
+                        _state.update { it.copy(message = "비트에 맞게 조절할 사진이 없거나 이미 맞춰져 있습니다.") }
+                    }
+                }
+            } catch (e: CancellationException) {
+                if (generation == tempoGeneration && _state.value.trailer?.directory == directory) {
+                    updateTrailer(directory) { it.copy(busy = false, status = "음악 비트 분석이 취소되었습니다.") }
+                }
+                throw e
+            } catch (e: Throwable) {
+                if (generation == tempoGeneration && _state.value.trailer?.directory == directory) {
+                    updateTrailer(directory) { it.copy(busy = false, status = "음악 템포 분석 중 오류가 발생했습니다.") }
+                    _state.update { it.copy(message = "음악 템포 분석 중 오류가 발생했습니다.") }
+                }
+            } finally {
+                if (generation == tempoGeneration && _state.value.trailer?.directory == directory) {
+                    updateTrailer(directory) { if (it.busy) it.copy(busy = false) else it }
+                }
+            }
         }
     }
 
@@ -6385,6 +6585,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         autoPlan = true,
                         musicVolume = project.musicVolume,
                         firstKey = project.nextKey,
+                        introCard = project.introCard,
+                        outroCard = project.outroCard,
                     )
                     session.copy(
                         sources = migratedSources,
@@ -6442,7 +6644,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 total = defaults.total,
                 photoClipLength = defaultPhotoClipLength(defaults.clipLength, session.hasVideos),
             ) else session
-            base.copy(editor = EditorProject.fromPlan(base.autoPlanScenes(), autoPlan = true, musicVolume = project.musicVolume, firstKey = project.nextKey))
+            base.copy(
+                editor = EditorProject.fromPlan(
+                    base.autoPlanScenes(),
+                    autoPlan = true,
+                    musicVolume = project.musicVolume,
+                    firstKey = project.nextKey,
+                    introCard = project.introCard,
+                    outroCard = project.outroCard,
+                )
+            )
         }
     }
 
@@ -6764,6 +6975,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     autoDucking = autoDucking,
                     aspectSources = scenes.map { it.source },
                     musicVolume = musicVolume,
+                    introCard = session.editor?.introCard?.takeIf { it.enabled },
+                    outroCard = session.editor?.outroCard?.takeIf { it.enabled },
                     onSuccess = { recovered, excluded ->
                         exportRecoveredScenes = recovered
                         exportExcludedScenes = excluded
@@ -6891,6 +7104,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     autoPlan = true,
                     musicVolume = base.editor?.musicVolume ?: 1f,
                     firstKey = base.editor?.nextKey ?: 1L,
+                    introCard = base.editor?.introCard ?: TrailerTitleCard(),
+                    outroCard = base.editor?.outroCard ?: TrailerTitleCard(),
                 ))
             }
         }
@@ -7078,6 +7293,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
 
     /** Cancels this project's export/add/autosave jobs; their own partial files are removed by those jobs. */
     private fun stopEditorBackgroundWork(session: TrailerSession?) {
+        tempoAnalysisJob?.cancel(); tempoAnalysisJob = null
+        tempoGeneration++
         editorExportJob?.cancel(); editorExportJob = null
         editorAddJob?.cancel(); editorAddJob = null
         editorAutosaveJob?.cancel(); editorAutosaveJob = null

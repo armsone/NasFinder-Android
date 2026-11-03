@@ -40,8 +40,15 @@ data class EditorProject(
     // Whole-video background music volume (multiplies the music/ducking gains), independent of scene audio.
     val musicVolume: Float = 1f,
     val nextKey: Long = (scenes.maxOfOrNull { it.key } ?: 0L) + 1L,
+    val introCard: TrailerTitleCard = TrailerTitleCard(),
+    val outroCard: TrailerTitleCard = TrailerTitleCard(),
 ) {
     fun scene(key: Long): EditorScene? = scenes.firstOrNull { it.key == key }
+
+    val totalDuration: Double
+        get() = (if (introCard.enabled) introCard.clampedDuration() else 0.0) +
+            scenes.sumOf { it.length } +
+            (if (outroCard.enabled) outroCard.clampedDuration() else 0.0)
 
     fun toTrailerScenes(sources: List<TrailerSource>): List<TrailerScene> {
         val byId = sources.associateBy { it.id }
@@ -63,7 +70,14 @@ data class EditorProject(
 
     companion object {
         /** Materializes an automatic plan into explicit scenes with fresh stable keys. */
-        fun fromPlan(plan: List<TrailerScene>, autoPlan: Boolean = true, musicVolume: Float = 1f, firstKey: Long = 1L): EditorProject {
+        fun fromPlan(
+            plan: List<TrailerScene>,
+            autoPlan: Boolean = true,
+            musicVolume: Float = 1f,
+            firstKey: Long = 1L,
+            introCard: TrailerTitleCard = TrailerTitleCard(),
+            outroCard: TrailerTitleCard = TrailerTitleCard(),
+        ): EditorProject {
             val scenes = plan.mapIndexed { index, scene ->
                 EditorScene(
                     key = firstKey + index,
@@ -77,7 +91,7 @@ data class EditorProject(
                     caption = scene.caption,
                 )
             }
-            return EditorProject(scenes, autoPlan, musicVolume, firstKey + scenes.size)
+            return EditorProject(scenes, autoPlan, musicVolume, firstKey + scenes.size, introCard, outroCard)
         }
     }
 }
@@ -93,7 +107,7 @@ internal fun clampSceneWindow(source: TrailerSource, start: Double, length: Doub
     return safeStart to safeLength.coerceIn(minLength, max(minLength, duration - safeStart))
 }
 
-private data class SceneDurationBounds(
+internal data class SceneDurationBounds(
     val safeStart: Double,
     val minLen: Double,
     val maxLen: Double,
@@ -101,7 +115,7 @@ private data class SceneDurationBounds(
     val isFixed: Boolean,
 )
 
-private fun resolveSceneDurationBounds(scene: EditorScene, source: TrailerSource?): SceneDurationBounds {
+internal fun resolveSceneDurationBounds(scene: EditorScene, source: TrailerSource?): SceneDurationBounds {
     if (source == null || (!source.isImage && (!source.duration.isFinite() || source.duration <= 0.0))) {
         // Missing/invalid source duration: preserve that scene's duration without inventing capacity
         val len = if (scene.length.isFinite() && scene.length > 0.0) scene.length else MIN_EDITOR_VIDEO_SCENE_SECONDS

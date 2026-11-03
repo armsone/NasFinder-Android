@@ -381,12 +381,15 @@ data class TrailerSession(
         if (!it.isImage) it.duration else if (isMusicOverlayMode) 1.0 else it.weightedPhotoLength(clipLength)
     }
     val scenes: List<TrailerScene> get() = editor?.toTrailerScenes(sources) ?: autoPlanScenes()
+    val cardDuration: Double get() = (if (editor?.introCard?.enabled == true) editor.introCard.clampedDuration() else 0.0) +
+        (if (editor?.outroCard?.enabled == true) editor.outroCard.clampedDuration() else 0.0)
+    val totalDuration: Double get() = cardDuration + scenes.sumOf { it.length }
 
     /** The recommended/automatic plan for the current parameters (what [editor] mirrors while autoPlan is true). */
     fun autoPlanScenes(): List<TrailerScene> = if (isMusicOverlayMode) {
-        musicOverlayScenes(sources, 1.0, plannedMusic, musicPolicy, musicFitCount)
+        musicOverlayScenes(sources, 1.0, plannedMusic, musicPolicy, musicFitCount, reservedDuration = cardDuration)
     } else {
-        trailerScenes(sources, total, clipLength, photoClipLength, plannedMusic, musicPolicy, musicFitCount)
+        trailerScenes(sources, total, clipLength, photoClipLength, plannedMusic, musicPolicy, musicFitCount, reservedDuration = cardDuration)
     }
 
     /** Music the plan follows: the stored choice even while its file is unavailable (only its length is used). */
@@ -409,6 +412,7 @@ internal fun trailerScenes(
     musicTrack: TrailerMusicTrack? = null,
     musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
     musicFitCount: Int = 1,
+    reservedDuration: Double = 0.0,
 ): List<TrailerScene> {
     if (sources.isEmpty() || !length.isFinite() || length <= 0 || !photoLength.isFinite() || photoLength <= 0 || !total.isFinite()) return emptyList()
 
@@ -416,8 +420,9 @@ internal fun trailerScenes(
     // Unchanged recommended total + common clip: use the recommendation's own distinct cuts, no repeats.
     if (!fitsMusicLength) automaticTrailerPlan(sources, total, length)?.let { return it.scenes }
 
+    val safeReserved = if (reservedDuration.isFinite()) reservedDuration.coerceAtLeast(0.0) else 0.0
     val targetTotal = if (fitsMusicLength && musicTrack != null) {
-        musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1)
+        max(0.1, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1) - safeReserved)
     } else {
         total.coerceIn(1.0, 7200.0)
     }
@@ -483,7 +488,7 @@ internal fun trailerScenes(
     }
 
     if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
-        return fitScenesToTargetDuration(rawScenes, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1))
+        return fitScenesToTargetDuration(rawScenes, targetTotal)
     }
     return fitScenesToTargetDuration(rawScenes, targetTotal)
 }
@@ -499,6 +504,7 @@ internal fun musicOverlayScenes(
     musicTrack: TrailerMusicTrack?,
     musicPolicy: TrailerMusicPolicy,
     musicFitCount: Int = 1,
+    reservedDuration: Double = 0.0,
 ): List<TrailerScene> {
     if (sources.isEmpty()) return emptyList()
     // Photos always get a fixed 1s Ken Burns scene here regardless of the caller's photoLength;
@@ -512,7 +518,9 @@ internal fun musicOverlayScenes(
         }
     }
     if (musicTrack != null && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicTrack.durationSeconds > 0.0) {
-        return fitScenesToTargetDuration(baseScenes, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1))
+        val safeReserved = if (reservedDuration.isFinite()) reservedDuration.coerceAtLeast(0.0) else 0.0
+        val targetTotal = max(0.1, musicTrack.durationSeconds * musicFitCount.coerceAtLeast(1) - safeReserved)
+        return fitScenesToTargetDuration(baseScenes, targetTotal)
     }
     return baseScenes
 }
@@ -641,4 +649,119 @@ internal val InboxDisplayItem.isTrailerVideo: Boolean get() = isTrailerMedia
 internal val InboxDisplayItem.isTrailerMedia: Boolean get() {
     val item = com.armsone.nasfinder.model.RemoteFileItem(id.toString(), originalFilename, id.toString(), false, mimeType = mimeType)
     return item.isVideo || item.isImage
+}
+
+data class BeatSyncResult(
+    val adjustedCount: Int,
+    val averageShift: Double,
+    val unalignedCount: Int,
+)
+
+/**
+ * 음악 비트 온셋에 맞춰 사진 장면들의 길이를 미세 조절한다.
+ * 영상 컷, 시작 위치, 자막, 프레이밍, 순서는 100% 보존된다.
+ */
+fun syncPhotoScenesToBeatOnsets(
+    scenes: List<EditorScene>,
+    sources: List<TrailerSource>,
+    beatOnsets: List<Double>,
+    musicDuration: Double,
+    introOffset: Double = 0.0,
+    musicPolicy: TrailerMusicPolicy = TrailerMusicPolicy.LOOP_MUSIC,
+    maxBudget: Double? = null,
+): Pair<List<EditorScene>, BeatSyncResult> {
+    if (scenes.isEmpty() || beatOnsets.isEmpty() || !musicDuration.isFinite() || musicDuration <= 0.0) {
+        return scenes to BeatSyncResult(0, 0.0, 0)
+    }
+
+    val byId = sources.associateBy { it.id }
+    var timelineCursor = max(0.0, introOffset)
+    var adjustedCount = 0
+    var unalignedCount = 0
+    var totalShift = 0.0
+    val resultScenes = scenes.toMutableList()
+
+    for (index in resultScenes.indices) {
+        val scene = resultScenes[index]
+        val source = byId[scene.sourceId]
+        if (source == null || !source.isImage) {
+            // 영상 컷/길이는 원본 의도 및 소리 싱크를 위해 100% 보존
+            timelineCursor += max(0.001, scene.length)
+            continue
+        }
+
+        val bounds = resolveSceneDurationBounds(scene, source)
+        val currentLen = scene.length
+        val targetTransitionTime = timelineCursor + currentLen
+
+        // 타임라인 상의 비트 후보군 생성 (음악 반복 여부 반영)
+        val candidateBeats = mutableListOf<Double>()
+        when (musicPolicy) {
+            TrailerMusicPolicy.LOOP_MUSIC -> {
+                val currentLoop = (max(0.0, targetTransitionTime) / musicDuration).toInt()
+                for (loop in max(0, currentLoop - 1)..(currentLoop + 2)) {
+                    val loopBase = loop.toDouble() * musicDuration
+                    for (b in beatOnsets) {
+                        candidateBeats.add(loopBase + b)
+                    }
+                }
+            }
+            TrailerMusicPolicy.SINGLE -> {
+                if (timelineCursor < musicDuration) {
+                    for (b in beatOnsets) {
+                        if (b >= timelineCursor && b <= musicDuration) {
+                            candidateBeats.add(b)
+                        }
+                    }
+                }
+            }
+            TrailerMusicPolicy.FIT_MUSIC_LENGTH -> {
+                val currentLoop = (max(0.0, targetTransitionTime) / musicDuration).toInt()
+                for (loop in max(0, currentLoop - 1)..(currentLoop + 2)) {
+                    val loopBase = loop.toDouble() * musicDuration
+                    for (b in beatOnsets) {
+                        candidateBeats.add(loopBase + b)
+                    }
+                }
+            }
+        }
+
+        // fitMusic의 마지막 예산끝 이후 후보는 적용되지 않도록 제한
+        val filteredBeats = if (maxBudget != null) candidateBeats.filter { it <= maxBudget } else candidateBeats
+
+        // 사진이 가질 수 있는 최소/최대 길이 범위 안의 비트들 중 targetTransitionTime과 가장 가까운 비트 탐색
+        val minAllowed = max(bounds.minLen, 0.8)
+        val maxAllowed = min(bounds.maxLen, 15.0)
+
+        var bestBeat: Double? = null
+        var smallestDiff = Double.MAX_VALUE
+
+        for (beatTime in filteredBeats) {
+            val candidateLen = beatTime - timelineCursor
+            if (candidateLen < minAllowed || candidateLen > maxAllowed) continue
+            val diff = abs(beatTime - targetTransitionTime)
+            if (diff < smallestDiff) {
+                smallestDiff = diff
+                bestBeat = beatTime
+            }
+        }
+
+        // 1.8초 이내의 가장 가까운 비트가 유효하면 사진 길이를 비트 전환 시점에 맞춤
+        if (bestBeat != null && smallestDiff <= 1.8) {
+            val newLen = bestBeat - timelineCursor
+            val shift = abs(newLen - currentLen)
+            if (shift > 0.02) {
+                resultScenes[index] = scene.copy(length = newLen)
+                adjustedCount++
+                totalShift += shift
+            }
+            timelineCursor += resultScenes[index].length
+        } else {
+            unalignedCount++
+            timelineCursor += currentLen
+        }
+    }
+
+    val avgShift = if (adjustedCount > 0) totalShift / adjustedCount.toDouble() else 0.0
+    return resultScenes to BeatSyncResult(adjustedCount, avgShift, unalignedCount)
 }

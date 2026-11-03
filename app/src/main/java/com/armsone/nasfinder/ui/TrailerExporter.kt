@@ -1167,6 +1167,56 @@ internal object TrailerExporter {
         }
     }
 
+    private suspend fun exportTitleCardChunk(
+        context: Context,
+        cardBitmap: Bitmap,
+        durationSeconds: Double,
+        exportWidth: Int,
+        exportHeight: Int,
+        outputFile: File,
+        destinationParent: File,
+        tempFiles: MutableList<File>,
+        statusText: String,
+        safeProgress: (status: String, progress: Float?) -> Unit,
+        progressStart: Float,
+        progressEnd: Float,
+        onTransformerCreated: (Transformer) -> Unit,
+    ) {
+        val tempJpeg = File(destinationParent, "titlecard-frame-${UUID.randomUUID()}.jpg")
+        tempFiles.add(tempJpeg)
+        withContext(Dispatchers.IO) {
+            FileOutputStream(tempJpeg).use { fos ->
+                cardBitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)
+            }
+        }
+        val durationUs = (durationSeconds * 1_000_000.0).toLong()
+        val presentation = Presentation.createForWidthAndHeight(exportWidth, exportHeight, Presentation.LAYOUT_SCALE_TO_FIT)
+        val input = MediaItem.Builder()
+            .setUri(Uri.fromFile(tempJpeg))
+            .setImageDurationMs((durationSeconds * 1000.0).toLong())
+            .build()
+        val editedItem = EditedMediaItem.Builder(input)
+            .setDurationUs(durationUs)
+            .setFrameRate(30)
+            .setEffects(Effects(emptyList(), listOf(presentation)))
+            .build()
+        val sequence = EditedMediaItemSequence.withAudioAndVideoFrom(listOf(editedItem))
+        val composition = Composition.Builder(listOf(sequence))
+            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
+            .build()
+        runTransformerExport(
+            context = context,
+            composition = composition,
+            outputFile = outputFile,
+            statusText = statusText,
+            safeProgress = safeProgress,
+            progressStart = progressStart,
+            progressEnd = progressEnd,
+            onTransformerCreated = onTransformerCreated,
+            outputPixels = exportWidth.toLong() * exportHeight,
+        )
+    }
+
     suspend fun export(
         context: Context,
         scenes: List<TrailerScene>,
@@ -1178,6 +1228,8 @@ internal object TrailerExporter {
         autoDucking: Boolean = true,
         aspectSources: List<TrailerSource> = scenes.map { it.source },
         musicVolume: Float = 1f,
+        introCard: TrailerTitleCard? = null,
+        outroCard: TrailerTitleCard? = null,
         onSuccess: ((recoveredScenes: Int, excludedScenes: Int) -> Unit)? = null,
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
@@ -1279,16 +1331,131 @@ internal object TrailerExporter {
                 throw IllegalStateException("내보낼 수 있는 유효한 장면이 없습니다.")
             }
 
-            val effectiveTotalDuration = effectiveScenes.sumOf { it.length }
+            val introCardEnabled = introCard?.enabled == true
+            val outroCardEnabled = outroCard?.enabled == true
 
-            if (intermediateFiles.size == 1 && copiedMusicFile == null) {
-                val singleChunk = intermediateFiles[0]
+            var introChunkFile: File? = null
+            var outroChunkFile: File? = null
+
+            val firstIncludedScene = effectiveScenes.firstOrNull()
+            val lastIncludedScene = effectiveScenes.lastOrNull()
+
+            if (introCardEnabled && introCard != null) {
+                val introDur = introCard.clampedDuration()
+                val introBgBitmap = if (introCard.usesFirstOrLastImage && firstIncludedScene != null) {
+                    withContext(Dispatchers.IO) {
+                        loadFrame(
+                            file = firstIncludedScene.source.file,
+                            isImage = firstIncludedScene.source.isImage,
+                            atSeconds = firstIncludedScene.start,
+                            maxDimension = maxOf(exportWidth, exportHeight),
+                            exact = true,
+                        )
+                    }
+                } else null
+
+                val introBitmap = withContext(Dispatchers.Default) {
+                    TrailerTitleCardRenderer.renderCardBitmap(
+                        context = context,
+                        card = introCard,
+                        sourceBitmap = introBgBitmap,
+                        width = exportWidth,
+                        height = exportHeight,
+                    )
+                }
+                introBgBitmap?.recycle()
+
+                if (introBitmap != null) {
+                    val introFile = File(destinationParent, "chunk-intro-${UUID.randomUUID()}.mp4")
+                    taskOwnedTempFiles.add(introFile)
+                    try {
+                        exportTitleCardChunk(
+                            context = context,
+                            cardBitmap = introBitmap,
+                            durationSeconds = introDur,
+                            exportWidth = exportWidth,
+                            exportHeight = exportHeight,
+                            outputFile = introFile,
+                            destinationParent = destinationParent,
+                            tempFiles = taskOwnedTempFiles,
+                            statusText = "시작 화면 생성 중…",
+                            safeProgress = ::safeProgress,
+                            progressStart = chunkPhaseEnd,
+                            progressEnd = chunkPhaseEnd + (0.85f - chunkPhaseEnd) * 0.5f,
+                            onTransformerCreated = { currentTransformer = it },
+                        )
+                        introChunkFile = introFile
+                    } finally {
+                        introBitmap.recycle()
+                    }
+                }
+            }
+
+            if (outroCardEnabled && outroCard != null) {
+                val outroDur = outroCard.clampedDuration()
+                val outroBgBitmap = if (outroCard.usesFirstOrLastImage && lastIncludedScene != null) {
+                    withContext(Dispatchers.IO) {
+                        val atTime = maxOf(lastIncludedScene.start, lastIncludedScene.start + lastIncludedScene.length - 0.5)
+                        loadFrame(
+                            file = lastIncludedScene.source.file,
+                            isImage = lastIncludedScene.source.isImage,
+                            atSeconds = atTime,
+                            maxDimension = maxOf(exportWidth, exportHeight),
+                            exact = true,
+                        )
+                    }
+                } else null
+
+                val outroBitmap = withContext(Dispatchers.Default) {
+                    TrailerTitleCardRenderer.renderCardBitmap(
+                        context = context,
+                        card = outroCard,
+                        sourceBitmap = outroBgBitmap,
+                        width = exportWidth,
+                        height = exportHeight,
+                    )
+                }
+                outroBgBitmap?.recycle()
+
+                if (outroBitmap != null) {
+                    val outroFile = File(destinationParent, "chunk-outro-${UUID.randomUUID()}.mp4")
+                    taskOwnedTempFiles.add(outroFile)
+                    try {
+                        exportTitleCardChunk(
+                            context = context,
+                            cardBitmap = outroBitmap,
+                            durationSeconds = outroDur,
+                            exportWidth = exportWidth,
+                            exportHeight = exportHeight,
+                            outputFile = outroFile,
+                            destinationParent = destinationParent,
+                            tempFiles = taskOwnedTempFiles,
+                            statusText = "마지막 화면 생성 중…",
+                            safeProgress = ::safeProgress,
+                            progressStart = chunkPhaseEnd + (0.85f - chunkPhaseEnd) * 0.5f,
+                            progressEnd = 0.85f,
+                            onTransformerCreated = { currentTransformer = it },
+                        )
+                        outroChunkFile = outroFile
+                    } finally {
+                        outroBitmap.recycle()
+                    }
+                }
+            }
+
+            val allIntermediateFiles = listOfNotNull(introChunkFile) + intermediateFiles + listOfNotNull(outroChunkFile)
+            val introDuration = if (introChunkFile != null && introCard != null) introCard.clampedDuration() else 0.0
+            val outroDuration = if (outroChunkFile != null && outroCard != null) outroCard.clampedDuration() else 0.0
+            val effectiveTotalDuration = introDuration + effectiveScenes.sumOf { it.length } + outroDuration
+
+            if (allIntermediateFiles.size == 1 && copiedMusicFile == null) {
+                val singleChunk = allIntermediateFiles[0]
                 withContext(Dispatchers.IO) {
                     singleChunk.copyTo(destination, overwrite = true)
                 }
                 safeProgress("영상으로 저장 중 (${effectiveScenes.size}/${effectiveScenes.size}개 연결 완료)", 1.0f)
             } else {
-                val concatEditedItems = intermediateFiles.map { chunkFile ->
+                val concatEditedItems = allIntermediateFiles.map { chunkFile ->
                     val inputUri = Uri.fromFile(chunkFile)
                     val input = MediaItem.Builder().setUri(inputUri).build()
                     EditedMediaItem.Builder(input)
@@ -1300,9 +1467,13 @@ internal object TrailerExporter {
                 sequences.add(videoSequence)
 
                 if (copiedMusicFile != null && musicTrack != null) {
+                    val duckingScenes = (if (introDuration > 0.0) listOf(TrailerScene(source = TrailerSource(id = -999, name = "intro", file = File(""), duration = introDuration, width = 0, height = 0, analysis = AudioAnalysisResult(emptyList(), 0.0), thumbnail = null, isImage = true), start = 0.0, length = introDuration)) else emptyList()) +
+                        effectiveScenes +
+                        (if (outroDuration > 0.0) listOf(TrailerScene(source = TrailerSource(id = -998, name = "outro", file = File(""), duration = outroDuration, width = 0, height = 0, analysis = AudioAnalysisResult(emptyList(), 0.0), thumbnail = null, isImage = true), start = 0.0, length = outroDuration)) else emptyList())
+
                     val musicSequence = buildMusicSequence(
                         context = context,
-                        scenes = effectiveScenes,
+                        scenes = duckingScenes,
                         copiedMusicFile = copiedMusicFile,
                         musicTrack = musicTrack,
                         musicPolicy = musicPolicy,
@@ -1341,7 +1512,7 @@ internal object TrailerExporter {
                 try {
                     reader.setDataSource(destination.absolutePath)
                     val duration = reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
-                    check(reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes" && abs(duration - effectiveTotalDuration) <= maxOf(.5, effectiveScenes.size * .05)) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
+                    check(reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes" && abs(duration - effectiveTotalDuration) <= maxOf(.5, allIntermediateFiles.size * .05)) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
                 } finally { reader.release() }
             }
 

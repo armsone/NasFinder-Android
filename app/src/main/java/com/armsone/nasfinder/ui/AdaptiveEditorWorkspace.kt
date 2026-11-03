@@ -1015,7 +1015,7 @@ private fun EditorHeader(
         EditorSaveState.FAILED -> "편집본 저장 실패"
         EditorSaveState.IDLE -> ""
     }
-    val counts = "재료 ${session.sources.size}개 · 클립 ${project?.scenes?.size ?: 0}개 · ${trailerLengthTitle(session.scenes.sumOf { it.length })}"
+    val counts = "재료 ${session.sources.size}개 · 클립 ${project?.scenes?.size ?: 0}개 · ${trailerLengthTitle(session.totalDuration)}"
     val metadataText = listOf(counts, saveLabel, if (project?.autoPlan == false) "직접 편집" else "자동 추천").filter { it.isNotBlank() }.joinToString(" · ")
 
     BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -2009,6 +2009,7 @@ private fun SceneBoard(
     val effectiveMultiSelectMode = if (onToggleMultiSelectMode != null) multiSelectMode else internalMultiSelectMode
     var menuSceneKey by remember { mutableStateOf<Long?>(null) }
     var columnsMenu by remember { mutableStateOf(false) }
+    var activeTitleCardSheet by rememberSaveable { mutableStateOf<Boolean?>(null) }
     val indexedScenes = remember(project.scenes) { project.scenes.mapIndexed { idx, s -> idx to s } }
 
     // Compact toolbar: one text toggle for multi-selection; count, 전체 선택 and the
@@ -2139,6 +2140,13 @@ private fun SceneBoard(
                     }
                 }
             }
+        }
+        item(key = "intro_card_item", span = { GridItemSpan(maxLineSpan) }) {
+            TitleCardBanner(
+                isIntro = true,
+                card = project.introCard,
+                onOpenSettings = { activeTitleCardSheet = true },
+            )
         }
         itemsIndexed(indexedScenes, key = { _, item -> item.second.key }) { _, (originalIndex, scene) ->
             val source = sourcesById[scene.sourceId] ?: return@itemsIndexed
@@ -2356,6 +2364,277 @@ private fun SceneBoard(
                     Text("재료 추가", style = MaterialTheme.typography.labelSmall)
                 }
             }
+        }
+        item(key = "outro_card_item", span = { GridItemSpan(maxLineSpan) }) {
+            TitleCardBanner(
+                isIntro = false,
+                card = project.outroCard,
+                onOpenSettings = { activeTitleCardSheet = false },
+            )
+        }
+    }
+
+    activeTitleCardSheet?.let { isIntro ->
+        TitleCardSettingsSheet(
+            isIntro = isIntro,
+            card = if (isIntro) project.introCard else project.outroCard,
+            session = session,
+            model = model ?: return@let,
+            onDismiss = { activeTitleCardSheet = null },
+        )
+    }
+}
+
+@Composable
+private fun TitleCardBanner(
+    isIntro: Boolean,
+    card: TrailerTitleCard,
+    onOpenSettings: () -> Unit,
+) {
+    val configuration = LocalConfiguration.current
+    val isTablet = configuration.smallestScreenWidthDp >= 600
+    val label = if (isIntro) "시작 화면" else "마지막 화면"
+    val settingButtonLabel = if (isIntro) "시작 화면 설정" else "마지막 화면 설정"
+
+    Surface(
+        onClick = onOpenSettings,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$label, ${if (card.enabled) "사용 중, ${seconds1(card.duration)}초" else "사용 안 함"}"
+            },
+        shape = EditorButtonShape,
+        color = if (card.enabled) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = BorderStroke(
+            1.dp,
+            if (card.enabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = if (isTablet) 6.dp else 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = if (isTablet) 14.sp else 13.sp,
+                        ),
+                    )
+                    Text(
+                        if (card.enabled) "사용 중 · ${seconds1(card.duration)}초" else "사용 안 함",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 11.sp,
+                            fontWeight = if (card.enabled) FontWeight.SemiBold else FontWeight.Normal,
+                        ),
+                        color = if (card.enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (card.enabled && (card.title.isNotBlank() || card.subtitle.isNotBlank())) {
+                    val previewText = listOf(card.title.trim(), card.subtitle.trim()).filter { it.isNotBlank() }.joinToString(" · ")
+                    Text(
+                        previewText,
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            OutlinedButton(
+                shape = EditorButtonShape,
+                onClick = onOpenSettings,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = if (isTablet) 4.dp else 6.dp),
+                modifier = Modifier.heightIn(min = if (isTablet) 32.dp else 36.dp),
+            ) {
+                Text(
+                    settingButtonLabel,
+                    style = MaterialTheme.typography.labelMedium.copy(fontSize = if (isTablet) 12.sp else 11.sp),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TitleCardSettingsSheet(
+    isIntro: Boolean,
+    card: TrailerTitleCard,
+    session: TrailerSession,
+    model: NasFinderViewModel,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var draftCard by remember(card) { mutableStateOf(card) }
+    val sheetName = if (isIntro) "시작 화면 설정" else "마지막 화면 설정"
+    val toggleLabel = if (isIntro) "시작 화면 사용" else "마지막 화면 사용"
+    val bgToggleLabel = if (isIntro) "첫 사진/영상 배경 사용" else "마지막 사진/영상 배경 사용"
+
+    val scenes = session.scenes
+    val targetScene = if (isIntro) scenes.firstOrNull() else scenes.lastOrNull()
+    val backgroundBitmap by produceState<Bitmap?>(null, isIntro, draftCard.usesFirstOrLastImage, targetScene) {
+        if (!draftCard.usesFirstOrLastImage || targetScene == null) {
+            value = null
+            return@produceState
+        }
+        val atSeconds = if (isIntro) targetScene.start else maxOf(targetScene.start, targetScene.start + targetScene.length - 0.5)
+        value = withContext(Dispatchers.IO) {
+            loadFrame(targetScene.source.file, targetScene.source.isImage, atSeconds, 480, exact = true)
+        }
+    }
+
+    val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
+    val scale = 360f / maxOf(outputWidth, outputHeight).coerceAtLeast(1)
+    val previewW = (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2)
+    val previewH = (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
+
+    val previewBitmap by produceState<Bitmap?>(null, draftCard, backgroundBitmap, previewW, previewH) {
+        value = withContext(Dispatchers.Default) {
+            TrailerTitleCardRenderer.renderCardBitmap(context, draftCard, backgroundBitmap, previewW, previewH)
+        }
+    }
+
+    fun commit(updated: TrailerTitleCard) {
+        draftCard = updated
+        if (isIntro) model.editorSetIntroCard(updated)
+        else model.editorSetOutroCard(updated)
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(sheetName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "닫기")
+                }
+            }
+
+            // LIVE Preview box using the same renderer
+            val aspect = if (outputHeight > 0) outputWidth.toFloat() / outputHeight.toFloat() else 16f / 9f
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 220.dp)
+                    .aspectRatio(aspect, matchHeightConstraintsFirst = true)
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                val bmp = previewBitmap
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = "$sheetName 실시간 미리보기",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+            }
+
+            // Toggle: 시작 화면 사용 / 마지막 화면 사용
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(toggleLabel, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                    Text("영상의 시작/끝에 타이틀 카드를 넣습니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(
+                    checked = draftCard.enabled,
+                    onCheckedChange = { commit(draftCard.copy(enabled = it)) },
+                )
+            }
+
+            HorizontalDivider()
+
+            // Title and Subtitle fields
+            OutlinedTextField(
+                value = draftCard.title,
+                onValueChange = { commit(draftCard.copy(title = it)) },
+                label = { Text("제목") },
+                placeholder = { Text(if (isIntro) "예: 제주도 여행" else "예: The End") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            OutlinedTextField(
+                value = draftCard.subtitle,
+                onValueChange = { commit(draftCard.copy(subtitle = it)) },
+                label = { Text("부제목") },
+                placeholder = { Text(if (isIntro) "예: 2026 여름" else "예: 시청해 주셔서 감사합니다") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            // 1..10s slider
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "재생 시간: ${seconds1(draftCard.duration)}초",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Slider(
+                    value = draftCard.duration.toFloat().coerceIn(1f, 10f),
+                    onValueChange = { pos ->
+                        val snapped = (pos * 10).roundToInt() / 10.0
+                        commit(draftCard.copy(duration = snapped))
+                    },
+                    valueRange = 1f..10f,
+                    steps = 89,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
+            HorizontalDivider()
+
+            // Background toggle: 첫/마지막 사진/영상 배경 사용
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(bgToggleLabel, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    Text("끄면 깔끔한 어두운 단색 배경이 적용됩니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(
+                    checked = draftCard.usesFirstOrLastImage,
+                    onCheckedChange = { commit(draftCard.copy(usesFirstOrLastImage = it)) },
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
         }
     }
 }
@@ -2600,20 +2879,47 @@ private fun SoundMusicSection(session: TrailerSession, model: NasFinderViewModel
         }
     }
     if (session.musicTrack != null) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
             TrailerChoice(
-                if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.musicFitCount > 1) "${session.musicFitCount}번 맞추기" else "음악 길이에 맞추기",
-                session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH, Modifier.weight(1f),
+                "음악길이",
+                session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH,
+                Modifier.weight(1f),
+                compact = true,
             ) {
                 val count = if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) session.musicFitCount + 1 else 1
                 model.editorSetMusic(session.musicTrack, TrailerMusicPolicy.FIT_MUSIC_LENGTH, count)
             }
-            TrailerChoice("음악 반복", session.musicPolicy == TrailerMusicPolicy.LOOP_MUSIC, Modifier.weight(1f)) {
+            TrailerChoice(
+                "음악 반복",
+                session.musicPolicy == TrailerMusicPolicy.LOOP_MUSIC,
+                Modifier.weight(1f),
+                compact = true,
+            ) {
                 model.editorSetMusic(session.musicTrack, TrailerMusicPolicy.LOOP_MUSIC, 1)
             }
-            TrailerChoice("한 번만", session.musicPolicy == TrailerMusicPolicy.SINGLE, Modifier.weight(1f)) {
+            TrailerChoice(
+                "음악한번",
+                session.musicPolicy == TrailerMusicPolicy.SINGLE,
+                Modifier.weight(1f),
+                compact = true,
+            ) {
                 model.editorSetMusic(session.musicTrack, TrailerMusicPolicy.SINGLE, 1)
             }
+            TrailerChoice(
+                "음악템포",
+                false,
+                Modifier.weight(1f),
+                enabled = !session.busy && session.musicTrack != null,
+                compact = true,
+            ) {
+                model.analyzeAndAlignMusicTempo()
+            }
+        }
+        if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.musicFitCount > 1) {
+            Text("음악 길이에 맞춰 ${session.musicFitCount}번 반복합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (project.autoPlan.not() && session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
             Text("직접 편집한 클립은 그대로 두고, 음악을 영상 길이에 맞춰 자릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2940,8 +3246,15 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
     val recDefaults = remember(session.sources) { recommendedTrailerDefaults(session.sources) }
 
     if (session.isMusicOverlayMode) {
-        TrailerSectionTitle("전체 길이")
-        Text("현재 전체 영상 길이: ${formatAdaptiveDurationTitle(totalTime)} (총 ${session.scenes.size}개 클립)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        val fullTotal = session.totalDuration
+        val hasCards = session.cardDuration > 0.0
+        TrailerSectionTitle(if (!project.autoPlan) "본편 길이" else "전체 길이")
+        val label = if (hasCards) {
+            "현재 본편 길이: ${formatAdaptiveDurationTitle(totalTime)} (시작·마지막 포함 ${formatAdaptiveDurationTitle(fullTotal)}, 총 ${session.scenes.size}개 클립)"
+        } else {
+            "현재 전체 영상 길이: ${formatAdaptiveDurationTitle(totalTime)} (총 ${session.scenes.size}개 클립)"
+        }
+        Text(label, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
         Text("뮤직비디오 모드: 원본 영상을 자르지 않고 음악에 맞춰 이어 붙입니다. '예고편' 모드로 바꾸면 전체 길이를 직접 설정할 수 있습니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         HorizontalDivider()
@@ -2964,9 +3277,16 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
             totalTime
         }
 
-        TrailerSectionTitle("전체 길이")
+        TrailerSectionTitle(if (!project.autoPlan) "본편 길이" else "전체 길이")
+        val fullTotal = session.totalDuration
+        val hasCards = session.cardDuration > 0.0
+        val durationLabel = if (hasCards) {
+            "${formatAdaptiveDurationTitle(displayedTotal)} (시작·마지막 포함 ${formatAdaptiveDurationTitle(displayedTotal + session.cardDuration)}, 총 ${session.scenes.size}개 클립)"
+        } else {
+            "${formatAdaptiveDurationTitle(displayedTotal)} (총 ${session.scenes.size}개 클립)"
+        }
         Text(
-            text = "${formatAdaptiveDurationTitle(displayedTotal)} (총 ${session.scenes.size}개 클립)",
+            text = durationLabel,
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
         )
@@ -3574,7 +3894,7 @@ private fun FinderEmpty(text: String) {
 
 /** Shared choice button (iOS TrailerChoiceButton look). */
 @Composable
-internal fun TrailerChoice(title: String, selected: Boolean, modifier: Modifier = Modifier, enabled: Boolean = true, click: () -> Unit) {
+internal fun TrailerChoice(title: String, selected: Boolean, modifier: Modifier = Modifier, enabled: Boolean = true, compact: Boolean = false, click: () -> Unit) {
     val accent = MaterialTheme.colorScheme.primary
     val content = (if (selected) accent else MaterialTheme.colorScheme.onSurface).let { if (enabled) it else it.copy(alpha = .38f) }
     val configuration = LocalConfiguration.current
@@ -3593,19 +3913,19 @@ internal fun TrailerChoice(title: String, selected: Boolean, modifier: Modifier 
         contentColor = content,
     ) {
         Row(
-            Modifier.padding(horizontal = 6.dp, vertical = if (isTablet) 2.dp else 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+            Modifier.padding(horizontal = if (compact) 4.dp else 6.dp, vertical = if (isTablet) 2.dp else 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 4.dp, Alignment.CenterHorizontally),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 title,
-                style = if (isTablet) MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp) else MaterialTheme.typography.labelLarge,
+                style = if (isTablet) MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp) else if (compact) MaterialTheme.typography.labelLarge.copy(fontSize = 12.sp) else MaterialTheme.typography.labelLarge,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false),
             )
-            if (selected) Icon(Icons.Default.Check, null, Modifier.size(if (isTablet) 12.dp else 14.dp), tint = accent)
+            if (selected && !compact) Icon(Icons.Default.Check, null, Modifier.size(if (isTablet) 12.dp else 14.dp), tint = accent)
         }
     }
 }

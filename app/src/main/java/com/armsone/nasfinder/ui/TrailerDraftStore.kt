@@ -486,6 +486,12 @@ object TrailerDraftStore {
                 put("musicVolume", editor.musicVolume.toDouble())
                 put("nextKey", editor.nextKey)
                 put("scenes", JSONArray().apply { editor.scenes.forEach { put(sceneJson(it)) } })
+                if (editor.introCard.enabled || editor.introCard.title.isNotEmpty() || editor.introCard.subtitle.isNotEmpty() || editor.introCard.duration != 3.0 || !editor.introCard.usesFirstOrLastImage) {
+                    put("introCard", editor.introCard.toJson())
+                }
+                if (editor.outroCard.enabled || editor.outroCard.title.isNotEmpty() || editor.outroCard.subtitle.isNotEmpty() || editor.outroCard.duration != 3.0 || !editor.outroCard.usesFirstOrLastImage) {
+                    put("outroCard", editor.outroCard.toJson())
+                }
             })
         }
         val sourcesArr = JSONArray()
@@ -668,12 +674,16 @@ object TrailerDraftStore {
                     caption = sceneCaptionFromJson(sc.optJSONObject("caption")),
                 )
             }
+            val introCard = editorObj.optJSONObject("introCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
+            val outroCard = editorObj.optJSONObject("outroCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
             if (scenes.isEmpty()) null
             else EditorProject(
                 scenes = scenes,
                 autoPlan = editorObj.optBoolean("autoPlan", true),
                 musicVolume = editorObj.optDouble("musicVolume", 1.0).toFloat(),
                 nextKey = maxOf(editorObj.optLong("nextKey", 1L), (scenes.maxOf { it.key }) + 1L),
+                introCard = introCard,
+                outroCard = outroCard,
             )
         }
 
