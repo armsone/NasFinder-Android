@@ -2402,7 +2402,7 @@ private fun TitleCardBanner(
             .fillMaxWidth()
             .padding(vertical = 2.dp)
             .semantics(mergeDescendants = true) {
-                contentDescription = "$label, ${if (card.enabled) "사용 중, ${seconds1(card.duration)}초" else "사용 안 함"}"
+                contentDescription = "$label, ${if (card.enabled) "사용 중, ${seconds1(card.duration)}" else "사용 안 함"}"
             },
         shape = EditorButtonShape,
         color = if (card.enabled) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
@@ -2434,7 +2434,7 @@ private fun TitleCardBanner(
                         ),
                     )
                     Text(
-                        if (card.enabled) "사용 중 · ${seconds1(card.duration)}초" else "사용 안 함",
+                        if (card.enabled) "사용 중 · ${seconds1(card.duration)}" else "사용 안 함",
                         style = MaterialTheme.typography.labelSmall.copy(
                             fontSize = 11.sp,
                             fontWeight = if (card.enabled) FontWeight.SemiBold else FontWeight.Normal,
@@ -2600,7 +2600,7 @@ private fun TitleCardSettingsSheet(
             // 1..10s slider
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    "재생 시간: ${seconds1(draftCard.duration)}초",
+                    "재생 시간: ${seconds1(draftCard.duration)}",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Medium,
                 )
