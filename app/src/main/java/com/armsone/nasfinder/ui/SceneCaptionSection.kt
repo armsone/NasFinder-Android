@@ -143,7 +143,7 @@ private val CAPTION_COLUMN_NAMES = listOf("왼쪽", "왼쪽 안쪽", "가운데"
  * Provides 48dp touch target, 32dp visual pill, 12sp text, avoids FilterChip's heavy internal padding.
  */
 @Composable
-private fun CompactChoice(
+internal fun CompactChoice(
     text: String,
     selected: Boolean,
     onClick: () -> Unit,
@@ -204,6 +204,51 @@ private fun CompactChoice(
 }
 
 /**
+ * 적용 범위(현재/선택/전체)와 호출자가 넘기는 추가 선택지(시작/마지막 화면)를 한 줄로 그린다. 폭이 모자라면 줄바꿈한다.
+ * [scope] 가 null 이면 범위 선택지는 모두 해제 상태(카드 편집 중)다. 본문 inspector 와 카드 inspector 가 이 행 하나를 공유한다.
+ */
+@Composable
+internal fun CaptionScopeChoices(
+    scope: CaptionScope?,
+    selectedCount: Int,
+    onChoose: (CaptionScope) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    extra: @Composable () -> Unit = {},
+) {
+    FlowRow(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp),
+    ) {
+        val choiceModifier = Modifier.width(80.dp)
+        CompactChoice(
+            text = "현재 클립",
+            selected = scope == CaptionScope.CURRENT,
+            onClick = { onChoose(CaptionScope.CURRENT) },
+            modifier = choiceModifier,
+            enabled = enabled,
+        )
+        CompactChoice(
+            text = "선택 클립",
+            selected = scope == CaptionScope.SELECTED,
+            onClick = { onChoose(CaptionScope.SELECTED) },
+            enabled = enabled && selectedCount >= 2,
+            contentDescription = if (selectedCount >= 2) "선택 클립 $selectedCount" else "선택 클립",
+            modifier = choiceModifier,
+        )
+        CompactChoice(
+            text = "전체 영상",
+            selected = scope == CaptionScope.ALL,
+            onClick = { onChoose(CaptionScope.ALL) },
+            modifier = choiceModifier,
+            enabled = enabled,
+        )
+        extra()
+    }
+}
+
+/**
  * Helper to wrap atomic visual groups in the Home porcelain card pattern:
  * left-aligned section title outside the Surface card with an 8dp gap,
  * clean Surface card with 12dp rounded corners and 0.5dp outlineVariant border.
@@ -257,10 +302,14 @@ internal fun sceneCaptionColumns(
     onDraftChange: (CaptionDraft?) -> Unit,
     model: NasFinderViewModel,
     onSelectScene: (Long) -> Unit,
+    scopeExtras: @Composable () -> Unit = {},
+    pendingScope: CaptionScope? = null,
+    onPendingScopeHandled: () -> Unit = {},
 ): InspectorColumns {
     val project = session.editor ?: return InspectorColumns(left = {})
     if (scene == null) {
         return InspectorColumns(left = {
+            CaptionScopeChoices(scope = null, selectedCount = 0, onChoose = {}, enabled = false, extra = scopeExtras)
             Text("자막을 넣을 클립을 클립 목록에서 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         })
     }
@@ -271,6 +320,7 @@ internal fun sceneCaptionColumns(
         if (!ownerDirty && owner != null) {
             LaunchedEffect(draft) { onDraftChange(null) }
         } else return InspectorColumns(left = {
+            CaptionScopeChoices(scope = null, selectedCount = 0, onChoose = {}, enabled = false, extra = scopeExtras)
             val ownerIndex = project.scenes.indexOfFirst { it.key == draft.sceneKey }
             Surface(color = MaterialTheme.colorScheme.errorContainer, shape = RoundedCornerShape(10.dp)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -304,8 +354,9 @@ internal fun sceneCaptionColumns(
 
     val sceneKeys = remember(project.scenes) { project.scenes.map { it.key }.toSet() }
     val selectedInProject = selectedKeys.filter { it in sceneKeys }.toSet().ifEmpty { setOf(scene.key) }
-    // Defaults to the whole video; a pending form carries its own scope, so tab/relayout/rotation never resets it.
-    var chosenScope by rememberSaveable(scene.key) { mutableStateOf(ownDraft?.scope ?: CaptionScope.ALL) }
+    // Defaults to the current clip so typing autosaves into exactly this clip; 선택/전체 are explicit choices that keep the
+    // manual 적용. A pending form carries its own scope, so tab/relayout/rotation never resets it.
+    var chosenScope by rememberSaveable(scene.key) { mutableStateOf(ownDraft?.scope ?: CaptionScope.CURRENT) }
     val requestedScope = ownDraft?.scope ?: chosenScope
     fun shownScope(requested: CaptionScope) = if (requested == CaptionScope.SELECTED && selectedInProject.size < 2) CaptionScope.CURRENT else requested
     fun targetsOf(requested: CaptionScope) = when (shownScope(requested)) {
@@ -323,6 +374,13 @@ internal fun sceneCaptionColumns(
     // A pending form follows a selection change of its scope; equal targets write nothing, so this never loops.
     LaunchedEffect(ownDraft, targetKeys) {
         if (ownDraft != null && ownDraft.targetKeys != targetKeys) onDraftChange(ownDraft.copy(targetKeys = targetKeys))
+    }
+    // 카드 화면에서 범위 선택지를 눌러 본문으로 돌아온 경우, 그 범위를 기존 choose() 로 한 번만 적용한다.
+    LaunchedEffect(pendingScope) {
+        if (pendingScope != null) {
+            choose(pendingScope)
+            onPendingScopeHandled()
+        }
     }
 
     var fieldValue by remember(scene.key) { mutableStateOf(TextFieldValue(form.text, TextRange(form.text.length))) }
@@ -521,31 +579,19 @@ internal fun sceneCaptionColumns(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top
             ) {
-                CompactChoice(
-                    text = "현재 클립",
-                    selected = scope == CaptionScope.CURRENT,
-                    onClick = { choose(CaptionScope.CURRENT) },
-                    modifier = Modifier.weight(1f)
-                )
-                CompactChoice(
-                    text = "선택 클립",
-                    selected = scope == CaptionScope.SELECTED,
-                    onClick = { choose(CaptionScope.SELECTED) },
-                    enabled = selectedInProject.size >= 2,
-                    contentDescription = if (selectedInProject.size >= 2) "선택 클립 ${selectedInProject.size}" else "선택 클립",
-                    modifier = Modifier.weight(1f)
-                )
-                CompactChoice(
-                    text = "전체 영상",
-                    selected = scope == CaptionScope.ALL,
-                    onClick = { choose(CaptionScope.ALL) },
-                    modifier = Modifier.weight(1f)
+                CaptionScopeChoices(
+                    scope = scope,
+                    selectedCount = selectedInProject.size,
+                    onChoose = ::choose,
+                    modifier = Modifier.weight(1f),
+                    extra = scopeExtras,
                 )
                 val blank = form.text.isBlank()
                 Button(
                     modifier = Modifier
+                        .padding(top = 7.dp) // 첫 줄 선택지(48dp 터치 영역, 32dp 알약)와 세로 중심을 맞춘다.
                         .width(64.dp)
                         .height(34.dp),
                     shape = EditorButtonShape,

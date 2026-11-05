@@ -657,6 +657,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         addPhotoSelectionToMaterials(batchId, photos, pocketId)
     }
 
+    private val projectMigrationMutex = kotlinx.coroutines.sync.Mutex()
+
     init {
         // Shares that arrived before an exit/restart come back as pending (their copies are durable).
         shareRestoreJob = viewModelScope.launch {
@@ -7380,16 +7382,22 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      */
     private fun migrateEphemeralProjectData() {
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { TrailerDraftStore.cleanupInterruptedMigrations() }
-            runCatching { TrailerDraftStore.migrateLegacyDrafts(::isTrailerDirectoryInUse) }
-            runCatching { DurableCollectionStore.ephemeralRecordsToPromote().forEach { DurableCollectionStore.promoteEphemeralRecord(it) } }
-            _state.update {
-                it.copy(
-                    trailerDraftCount = TrailerDraftStore.draftCount(),
-                    trailerDraftsVersion = it.trailerDraftsVersion + 1,
-                    trailerDraftPicker = it.trailerDraftPicker?.let { TrailerDraftStore.getAllDrafts() },
-                    collections = DurableCollectionStore.getItems(),
-                )
+            if (!projectMigrationMutex.tryLock()) return@launch
+            try {
+                runCatching { TrailerDraftStore.cleanupInterruptedMigrations() }
+                runCatching { TrailerDraftStore.recoverDuplicateRevisions(::isTrailerDirectoryInUse) }
+                runCatching { TrailerDraftStore.migrateLegacyDrafts(::isTrailerDirectoryInUse) }
+                runCatching { DurableCollectionStore.ephemeralRecordsToPromote().forEach { DurableCollectionStore.promoteEphemeralRecord(it) } }
+                _state.update {
+                    it.copy(
+                        trailerDraftCount = TrailerDraftStore.draftCount(),
+                        trailerDraftsVersion = it.trailerDraftsVersion + 1,
+                        trailerDraftPicker = it.trailerDraftPicker?.let { TrailerDraftStore.getAllDrafts() },
+                        collections = DurableCollectionStore.getItems(),
+                    )
+                }
+            } finally {
+                projectMigrationMutex.unlock()
             }
         }
     }

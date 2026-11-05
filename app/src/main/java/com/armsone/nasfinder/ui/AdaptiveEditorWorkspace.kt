@@ -17,9 +17,13 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.draggable
@@ -36,6 +40,7 @@ import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,6 +61,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
@@ -67,15 +73,18 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
@@ -118,7 +127,7 @@ private fun editorTier(width: Dp): EditorTier = when {
 }
 
 // PLAN stays only so a saved older tab restores; it is shown as 클립, which now holds the whole-video plan too.
-private enum class InspectorTab(val title: String) { SCENE("클립"), CAPTION("자막"), SOUND("음악"), SCREEN("화면"), PLAN("클립") }
+private enum class InspectorTab(val title: String) { SCENE("클립"), CAPTION("자막·구간"), SOUND("음악"), SCREEN("화면"), PLAN("클립") }
 
 /**
  * Two screens of one project, without visible navigation tabs: editing (the draft is saved from the header) and the
@@ -127,8 +136,31 @@ private enum class InspectorTab(val title: String) { SCENE("클립"), CAPTION("�
  */
 private enum class EditorPhase { EDIT, EXPORT }
 
+/** Portrait tablet / TriFold: the one switch under the fixed preview (클립 board or 설정 tabs). UI-only, survives rotation. */
+private enum class PortraitPane(val title: String) { CLIPS("클립"), SETTINGS("설정") }
+
+/** Tablet / board display mode: 자세히 (detail), 썸네일 (thumbnail), 포스터 (poster). UI-only, survives rotation. */
+internal enum class BoardDisplayMode(val title: String) {
+    DETAIL("자세히"),
+    THUMBNAIL("썸네일"),
+    POSTER("포스터"),
+}
+
+/** Tablet landscape placement: arrangement of preview, settings and clips board. UI-only, survives rotation. */
+private enum class LandscapePlacement(val title: String) {
+    PREVIEW_LEFT("미리보기 좌측"),
+    CLIPS_LEFT("클립 좌측"),
+    SETTINGS_LEFT("설정 좌측"),
+}
+
 // Very short scenes (e.g. near-duplicate photos at 1% weight) would otherwise all read "0.0초".
 private fun seconds1(value: Double): String = if (value > 0.0 && value < 0.095) "%.2f초".format(value) else "%.1f초".format(value)
+
+// Timeline transport clock in the iPhone style (m:ss).
+private fun timelineClock(seconds: Double): String {
+    val whole = seconds.coerceAtLeast(0.0).toInt()
+    return "${whole / 60}:${(whole % 60).toString().padStart(2, '0')}"
+}
 
 /**
  * The current-project editing workspace: 64dp rail, Finder panel that adds into THIS project, editor stage with the
@@ -156,17 +188,31 @@ internal fun AdaptiveEditorWorkspace(
     val effectiveSelectedKeys = if (selectedSceneKeys.isNotEmpty()) selectedSceneKeys else setOfNotNull(selectedSceneKey)
     val multiActive = multiSelectMode || effectiveSelectedKeys.size > 1
     val gridScrollState = rememberLazyGridState()
+    // UI-only return point of 설정으로 ↓ → 클립으로 ↑ (0 until the first jump); never part of the project, revision or undo.
+    var settingsReturnIndex by rememberSaveable(directoryKey) { mutableIntStateOf(0) }
+    var settingsReturnOffset by rememberSaveable(directoryKey) { mutableIntStateOf(0) }
     var moveTargetDialogKeys by remember { mutableStateOf<Set<Long>?>(null) }
     // Unapplied 자막 form of one scene (preview only until 적용); survives rotation, never moves to another scene.
     var captionDraft by rememberSaveable(directoryKey, stateSaver = CaptionDraftSaver) { mutableStateOf<CaptionDraft?>(null) }
     val coroutineScope = rememberCoroutineScope()
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
+    var portraitPane by rememberSaveable(directoryKey) { mutableStateOf(PortraitPane.CLIPS) }
+    val portraitSettingsScroll = rememberScrollState()
+    var landscapePlacement by rememberSaveable(directoryKey) { mutableStateOf(LandscapePlacement.CLIPS_LEFT) }
+    var boardDisplayMode by rememberSaveable(directoryKey) { mutableStateOf(BoardDisplayMode.DETAIL) }
+    // UI-only left/right column width ratio of the landscape workspace (as on Mac); kept across rotation and placement changes.
+    var landscapeSplitRatio by rememberSaveable { mutableFloatStateOf(0.5f) }
+    val landscapeLeftScroll = rememberScrollState()
+    val landscapeCenterScroll = rememberScrollState()
+    val landscapeRightScroll = rememberScrollState()
     // Entering a project always starts at 편집; a render finishing never moves the user to another view.
     var phase by rememberSaveable(directoryKey) { mutableStateOf(EditorPhase.EDIT) }
     var showMusicPicker by rememberSaveable(directoryKey) { mutableStateOf(false) }
     // UI-only preview size (1 = default); never part of the project, revision or undo.
     var previewScale by rememberSaveable { mutableFloatStateOf(1f) }
+    // Clip play/pause and position live here so moving the preview between layouts never restarts the clip.
+    val clipPlayback = remember(directoryKey) { ClipPlaybackState() }
     // UI-only clips per row (phone / two-pane board); never part of the project, revision or undo.
     var phoneColumns by rememberSaveable { mutableIntStateOf(3) }
     var tabletColumns by rememberSaveable { mutableIntStateOf(4) }
@@ -214,9 +260,134 @@ internal fun AdaptiveEditorWorkspace(
         val owner = project.scene(draft.sceneKey)
         owner == null || draft.caption.normalizedOrNull() != owner.caption?.normalizedOrNull()
     } == true
+    // In-progress 자막 autosave (as on Mac): a short pause after typing writes the draft through commitSceneCaption, but only
+    // for a draft whose scope is exactly its own scene. Bulk scopes keep the explicit 적용. The effect restarts on every
+    // keystroke and re-runs only when the draft differs from the project, so a committed draft never loops. A refused
+    // commit keeps the form (same as 편집본 저장); the draft's own scene key is used, never the current selection.
+    LaunchedEffect(captionDraft) {
+        val draft = captionDraft ?: return@LaunchedEffect
+        if (!captionPending) return@LaunchedEffect
+        delay(800)
+        val live = model.state.value.trailer?.editor ?: return@LaunchedEffect
+        if (live.scene(draft.sceneKey) == null) return@LaunchedEffect
+        val keys = draft.commitKeys(live)
+        if (keys.size != 1 || keys.first() != draft.sceneKey) return@LaunchedEffect
+        // Keep typing intact: if the form changed meanwhile this effect was already cancelled; the draft stays for the next pass.
+        model.commitSceneCaption(keys, draft.caption)
+    }
     val usedSourceIds = project.scenes.map { it.sourceId }.toSet()
-    val usedOrigins = session.sources.filter { it.id in usedSourceIds }.mapNotNull { it.originKey }.toSet()
+    val usedOrigins =session.sources.filter { it.id in usedSourceIds }.mapNotNull { it.originKey }.toSet()
     val originToSource = session.sources.filter { it.originKey != null }.associateBy { it.originKey!! }
+
+    // Project timeline play: one clock over [intro card] + scenes + [outro card] (the enabled cards are timed segments,
+    // as in the export). It selects each scene as it is reached (same selection a board tap makes) and starts it
+    // through the shared ClipPlaybackState, so the real video/photo previews run; a card segment holds the first/last
+    // scene as its selection and shows the title-card render instead. It stops on any other selection, edit-phase exit or end.
+    fun selectOnly(key: Long) {
+        selectedSceneKey = key
+        selectedSceneKeys = setOf(key)
+    }
+    val timelineSegs = remember(project.scenes, project.introCard, project.outroCard) {
+        timelineSegments(project.scenes, project.introCard, project.outroCard)
+    }
+    fun toggleProjectPlay() {
+        val scenes = project.scenes
+        if (scenes.isEmpty() || timelineSegs.isEmpty()) return
+        if (clipPlayback.playing && clipPlayback.continuous) {
+            clipPlayback.playing = false
+            return
+        }
+        val current = scenes.firstOrNull { it.key == selectedSceneKey } ?: scenes.first()
+        val total = timelineSegs.last().let { it.startSec + it.lengthSec }
+        var at = timelineSecondsAt(timelineSegs, current.key, clipPlayback)
+        if (at >= total - 0.05) at = 0.0
+        seekTimeline(timelineSegs, at, clipPlayback, ::selectOnly, selectedSceneKey)
+        clipPlayback.continuous = true
+        clipPlayback.playing = true
+    }
+    val timelineSignature = timelineSegs.map { Triple(it.slot, it.scene?.key, it.lengthSec) }
+    LaunchedEffect(clipPlayback.playing, clipPlayback.continuous, clipPlayback.epoch, timelineSignature) {
+        if (!clipPlayback.playing || !clipPlayback.continuous) return@LaunchedEffect
+        val scenes = project.scenes
+        val key = clipPlayback.sceneKey
+        val index = scenes.indexOfFirst { it.key == key }
+        if (key == null || index < 0 || selectedSceneKey != key) {
+            clipPlayback.playing = false
+            clipPlayback.continuous = false
+            clipPlayback.card = null
+            return@LaunchedEffect
+        }
+        val slot = clipPlayback.card
+        val lengthMs = when (slot) {
+            TitleSlot.INTRO -> (project.introCard.clampedDuration() * 1000).toLong()
+            TitleSlot.OUTRO -> (project.outroCard.clampedDuration() * 1000).toLong()
+            null -> (scenes[index].length * 1000).toLong()
+        }
+        val startMs = (if (slot != null) clipPlayback.cardPositionMs else clipPlayback.positionFor(key)) ?: 0L
+        val startedAt = android.os.SystemClock.uptimeMillis()
+        while (isActive) {
+            delay(30)
+            // The user picked another clip on the board (or the preview moved on): timeline play ends there.
+            if (selectedSceneKey != key) {
+                clipPlayback.playing = false
+                clipPlayback.continuous = false
+                clipPlayback.card = null
+                return@LaunchedEffect
+            }
+            val elapsed = startMs + (android.os.SystemClock.uptimeMillis() - startedAt)
+            // A card has no player: this clock is its position.
+            if (slot != null) clipPlayback.cardPositionMs = elapsed.coerceAtMost(lengthMs)
+            if (elapsed >= lengthMs) break
+        }
+        when (slot) {
+            TitleSlot.INTRO -> {
+                // The start card holds the first scene; its own clip starts from 0.
+                selectOnly(scenes.first().key)
+                clipPlayback.seekWithin(scenes.first().key, 0L)
+            }
+            TitleSlot.OUTRO -> {
+                clipPlayback.playing = false
+                clipPlayback.continuous = false
+            }
+            null -> {
+                val next = scenes.getOrNull(index + 1)
+                if (next != null) {
+                    selectOnly(next.key)
+                    clipPlayback.seekWithin(next.key, 0L)
+                } else if (project.outroCard.enabled) {
+                    clipPlayback.positionMs = lengthMs
+                    clipPlayback.seekCard(TitleSlot.OUTRO, key, 0L, lengthMs)
+                } else {
+                    clipPlayback.positionMs = lengthMs
+                    clipPlayback.playing = false
+                    clipPlayback.continuous = false
+                }
+            }
+        }
+    }
+    // A card view never outlives its owner: another clip selected, or the card switched off, returns to the scene view.
+    LaunchedEffect(selectedSceneKey, project.introCard.enabled, project.outroCard.enabled) {
+        val slot = clipPlayback.card ?: return@LaunchedEffect
+        val enabled = if (slot == TitleSlot.INTRO) project.introCard.enabled else project.outroCard.enabled
+        if (!enabled || selectedSceneKey != clipPlayback.sceneKey) clipPlayback.card = null
+    }
+    // Fullscreen result / export screens never leave the editing timeline playing underneath.
+    LaunchedEffect(phase) {
+        if (phase != EditorPhase.EDIT) {
+            clipPlayback.playing = false
+            clipPlayback.continuous = false
+        }
+    }
+    TimelineMusic(
+        active = clipPlayback.playing && clipPlayback.continuous,
+        track = session.musicTrack,
+        policy = session.musicPolicy,
+        volume = project.musicVolume,
+        autoDucking = session.autoDucking,
+        sources = session.sources,
+        segments = timelineSegs,
+        clipPlayback = clipPlayback,
+    )
 
     fun shareOutput() {
         // A render of an older edit is never shared as if it were the current project.
@@ -251,11 +422,17 @@ internal fun AdaptiveEditorWorkspace(
             },
     ) {
         val workspaceWidth = maxWidth
+        val workspaceIsWiderThanTall = maxWidth > maxHeight
         val tier = editorTier(maxWidth)
         // Two panes only when both stay readable (board ≥ ~500dp, preview+inspector ≥ ~250dp, height ≥ 480dp);
         // a phone in landscape or any short/narrow window uses the one-screen phone layout instead.
         val isLandscape = maxWidth > maxHeight && maxWidth >= 840.dp && maxHeight >= 480.dp
-        val isPhone = !isLandscape && (tier == EditorTier.FOCUSED || maxHeight < 560.dp)
+        // Classified from the full window (not the content box): a TriFold unfolded in portrait with the app sidebar open
+        // leaves ~560dp of content but the window itself is a large portrait screen. Pane sizes still follow the content width.
+        val windowConfiguration = LocalConfiguration.current
+        val largePortrait = windowConfiguration.screenHeightDp > windowConfiguration.screenWidthDp &&
+            windowConfiguration.screenWidthDp >= 600 && maxWidth >= 480.dp && maxHeight >= 560.dp
+        val isPhone = !isLandscape && !largePortrait && (tier == EditorTier.FOCUSED || maxHeight < 560.dp)
         val panelFinderInline = finderOpen && !isPhone && (tier == EditorTier.WIDE || tier == EditorTier.MEDIUM)
         // While typing, stages keep only their (smaller) picture so the inspector field and 적용/취소 stay reachable.
         val imeVisible = WindowInsets.isImeVisible
@@ -309,7 +486,7 @@ internal fun AdaptiveEditorWorkspace(
         // The scene board's lazy grid: on a phone its [page] (preview/tabs group + the selected tab's body) comes first,
         // then only on 클립 the board toolbar and clips; a wide page's right column passes no page. 영상 만들기 replaces the area.
         @Composable
-        fun Board(fixedColumns: Int, maxColumns: Int, onColumnsChange: (Int) -> Unit, thumbnailAspect: Float, compactCells: Boolean, modifier: Modifier, page: (@Composable () -> Unit)?) {
+        fun Board(fixedColumns: Int, maxColumns: Int, onColumnsChange: (Int) -> Unit, thumbnailAspect: Float, compactCells: Boolean, modifier: Modifier, page: (@Composable () -> Unit)?, forceClips: Boolean = false, footer: (@Composable () -> Unit)? = null, titleInGrid: Boolean = true) {
             SceneBoard(
                 session = session,
                 selectedKey = selectedSceneKey,
@@ -364,11 +541,27 @@ internal fun AdaptiveEditorWorkspace(
                 fixedColumns = fixedColumns,
                 maxColumns = maxColumns,
                 onColumnsChange = onColumnsChange,
-                showClips = inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN,
-                showToolbar = false,
+                showClips = forceClips || inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN,
+                // Every clip board keeps its own selection/move/clone/remove/columns toolbar (as on Mac); on the phone it
+                // follows the preview page inside the same lazy scroll.
+                showToolbar = forceClips,
+                // Phone only (page given): the clip menu opens 자막·구간 for that clip without scrolling.
+                onOpenCaption = if (isPhone && page != null) {
+                    { key: Long ->
+                        selectedSceneKey = key
+                        selectedSceneKeys = setOf(key)
+                        inspectorTab = InspectorTab.CAPTION
+                    }
+                } else null,
                 page = page,
+                footer = footer,
+                // 미리보기 좌측 shows its own heading (with 설정으로 ↓) above the grid, so it passes titleInGrid = false.
+                showTitle = !isPhone && titleInGrid,
+                macStyle = !isPhone,
                 modifier = modifier,
                 model = model,
+                boardDisplayMode = boardDisplayMode,
+                onBoardDisplayModeChange = { boardDisplayMode = it },
             )
         }
 
@@ -376,34 +569,70 @@ internal fun AdaptiveEditorWorkspace(
         fun widthSafeColumns(boardWidth: Dp, cap: Int): Int = (((boardWidth - 8.dp) / 56.dp).toInt()).coerceIn(2, cap)
 
         @Composable
-        fun Stage(paneHeight: Dp, baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp) {
+        fun Stage(paneHeight: Dp, baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp, portraitSwitch: Boolean = false, tabsBelowPicture: Boolean = true, reservedBelow: Dp = 0.dp) {
             // paneHeight is the editing area left above the keyboard (IME insets are in the Row's padding).
             BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val paneWidth = (maxWidth - horizontalPadding * 2).coerceAtLeast(1.dp)
                 val safePaneHeight = paneHeight.coerceAtLeast(72.dp)
-                val cap = (safePaneHeight * baseShare).coerceIn(72.dp, baseMax)
+                // Tablet/landscape/portrait panes are bounded: the controls under the picture (6dp gaps, 4dp stage padding, tab row,
+                // transport + film timeline = 110dp, 24dp handle) are reserved first, so the picture takes only what is left and
+                // the stage never overflows its pane. The phone page scrolls and keeps its unbounded sizing.
+                val controlsHeight = if (isPhone) 0.dp else {
+                    8.dp + (if (tabsBelowPicture) 58.dp else 0.dp) +
+                        (if (imeVisible) 0.dp else 6.dp + 110.dp + 6.dp + 24.dp)
+                }
+                val pictureRoom = if (isPhone) safePaneHeight else (paneHeight - controlsHeight - reservedBelow).coerceAtLeast(48.dp)
+                val cap = minOf((safePaneHeight * baseShare).coerceIn(72.dp, baseMax), pictureRoom)
+                val tabsContent: @Composable (Modifier, List<CustomAccessibilityAction>) -> Unit = { dragModifier, resizeActions ->
+                    if (portraitSwitch) {
+                        PortraitPaneSwitch(portraitPane, onPane = { portraitPane = it }, resizeActions = resizeActions, modifier = dragModifier)
+                    } else {
+                        // Phone: the tab row ignores the resize drag so vertical swipes on it reach the page's lazy scroll;
+                        // the dedicated handle under the picture still resizes.
+                        InspectorTabs(inspectorTab, onTab = { inspectorTab = it }, resizeActions = resizeActions, modifier = if (isPhone) Modifier else dragModifier, connected = isPhone)
+                    }
+                }
+                // Without tabs under the picture the resize handle stays (empty row, same drag state).
+                val noTabsContent: @Composable (Modifier, List<CustomAccessibilityAction>) -> Unit = { _, _ -> }
+                val tabsRow = if (tabsBelowPicture) tabsContent else noTabsContent
                 EditorStage(
                     session = session,
                     scene = selectedScene,
                     source = selectedSource,
                     caption = previewCaption,
-                    visualHeight = scaledStageHeight(session, paneWidth, cap, safePaneHeight * maxShare, previewScale, imeVisible),
+                    // The persisted previewScale is clamped here: a scale saved in a roomier layout never exceeds pictureRoom.
+                    visualHeight = scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), previewScale, imeVisible),
                     baseVisualHeight = stageVisualHeight(session, paneWidth, cap),
-                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, safePaneHeight * maxShare, 2f, imeVisible),
+                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), 2f, imeVisible),
                     previewScale = previewScale,
                     onPreviewScaleChange = { previewScale = it },
                     showControls = !imeVisible,
                     inlinePlaybackAllowed = !fullscreenPlayback,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
-                    belowPicture = { dragModifier, resizeActions ->
-                        InspectorTabs(inspectorTab, onTab = { inspectorTab = it }, resizeActions = resizeActions, modifier = dragModifier)
+                    clipPlayback = clipPlayback,
+                    titleScenes = project.scenes,
+                    introCard = project.introCard,
+                    outroCard = project.outroCard,
+                    timeline = { sizeRatio ->
+                        ProjectTimeline(
+                            sizeRatio = sizeRatio,
+                            compactPhone = isPhone,
+                            session = session,
+                            segments = timelineSegs,
+                            selectedKey = selectedSceneKey,
+                            clipPlayback = clipPlayback,
+                            onSelectScene = ::selectOnly,
+                            onTogglePlay = ::toggleProjectPlay,
+                        )
                     },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
+                    // 설정 좌측 places the tabs above the settings instead, so the preview alone stays on the right.
+                    belowPicture = tabsRow,
                 )
             }
         }
 
         @Composable
-        fun inspectorColumns(): InspectorColumns =
+        fun inspectorColumns(shownTab: InspectorTab): InspectorColumns =
             editorInspectorColumns(
                 session = session,
                 scene = selectedScene,
@@ -411,7 +640,7 @@ internal fun AdaptiveEditorWorkspace(
                 selectedKeys = selectedSceneKeys,
                 captionDraft = captionDraft,
                 onCaptionDraftChange = { captionDraft = it },
-                tab = inspectorTab,
+                tab = shownTab,
                 model = model,
                 onSelectScene = { key ->
                     selectedSceneKey = key
@@ -491,21 +720,17 @@ internal fun AdaptiveEditorWorkspace(
                         } else {
                             Modifier.widthIn(min = 120.dp, max = 190.dp)
                         }
-                        OutlinedButton(
-                            shape = EditorButtonShape,
-                            onClick = ::requestDraftSave,
-                            enabled = session.saveState != EditorSaveState.SAVING && !session.busy,
-                            modifier = buttonModifier.heightIn(min = 48.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                        ) {
-                            Text(
-                                saveButtonLabel,
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Medium,
-                                color = if (session.saveState == EditorSaveState.FAILED) palette.danger else Color.Unspecified,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                        // Edits autosave; the pending 자막 form is committed by 내보내기. Only a failed autosave offers a retry.
+                        if (session.saveState == EditorSaveState.FAILED) {
+                            OutlinedButton(
+                                shape = EditorButtonShape,
+                                onClick = ::requestDraftSave,
+                                enabled = !session.busy,
+                                modifier = buttonModifier.heightIn(min = 48.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                            ) {
+                                Text(saveButtonLabel, style = MaterialTheme.typography.labelLarge, color = palette.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
                         }
                         when {
                             rendering && export?.status == EDITOR_EXPORT_SAVING_STATUS ->
@@ -518,7 +743,7 @@ internal fun AdaptiveEditorWorkspace(
                             // then commits the form, saves the draft and renders anew.
                             outputCurrent && !captionPending -> PhasePrimaryButton("내보내기", enabled = true, modifier = buttonModifier, onClick = ::openResult)
                             else -> PhasePrimaryButton(
-                                "저장 후 내보내기",
+                                "내보내기",
                                 enabled = !session.busy && project.scenes.isNotEmpty(),
                                 modifier = buttonModifier,
                                 onClick = ::startVideo,
@@ -565,6 +790,9 @@ internal fun AdaptiveEditorWorkspace(
                     onRename = { renameOpen = true },
                     onUndo = model::editorUndo,
                     onRedo = model::editorRedo,
+                    // Both orientations: the header itself shows the three roles once its width (= the pane area's) fits two panes.
+                    landscapePlacement = if (!isPhone) landscapePlacement else null,
+                    onLandscapePlacementChange = { landscapePlacement = it },
                 )
                 SessionStatusLine(session)
                 when (phase) {
@@ -578,208 +806,262 @@ internal fun AdaptiveEditorWorkspace(
                         // lazy grid). A clip tap only selects it.
                         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                             val paneHeight = maxHeight
-                            val twoColumns = !isPhone && maxWidth >= 640.dp
+                            // Two panes (the same three roles and chooser as Mac) whenever both stay ≥ 240dp: 240 + 12 divider + 240
+                            // = 492dp, in either orientation (a TriFold unfolded in portrait with the sidebar open included).
+                            val twoColumns = !isPhone && maxWidth >= 492.dp
+                            // Other narrow large portrait windows: fixed preview on top, 클립/설정 switch below, one column.
+                            val portraitSplit = !twoColumns && largePortrait && maxHeight > maxWidth
+                            // Ratio bounds follow the actual shared width: each pane ≥ 240dp, never outside the 0.3..0.7 of wide screens.
+                            val paneMinShare = 240.dp / (maxWidth - 12.dp).coerceAtLeast(1.dp)
+                            val minSplitRatio = max(0.3f, paneMinShare).coerceAtMost(0.5f)
+                            val maxSplitRatio = min(0.7f, 1f - paneMinShare).coerceAtLeast(0.5f)
                             // On a wide page the board fills the right column only.
-                            val boardWidth = if (twoColumns) (maxWidth - 4.dp) / 2 else maxWidth
+                            val splitRatio = landscapeSplitRatio.coerceIn(minSplitRatio, maxSplitRatio)
+                            val boardShare = if (landscapePlacement == LandscapePlacement.CLIPS_LEFT) splitRatio else 1f - splitRatio
+                            val boardWidth = if (twoColumns) (maxWidth - 12.dp) * boardShare else maxWidth
                             val maxColumns = widthSafeColumns(boardWidth, 6)
                             val columns = (if (isPhone) phoneColumns else tabletColumns).coerceIn(2, maxColumns)
                             // Phone: wider thumbnails at 2 columns, square once cells get narrow. Tablet: shorter/narrower aspect ~1.55.
                             val thumbAspect = if (!isPhone) 1.55f else when (columns) { 2 -> 2.2f; 3 -> 1.9f; 4 -> 1.5f; else -> 1f }
                             val compactCells = (boardWidth - 16.dp - 8.dp * (columns - 1)) / columns < 80.dp
                             // The tab body is built once, whatever the arrangement; its groups are only placed, never composed twice.
-                            val body = inspectorColumns()
+                            // The tablet/portrait settings panes have no 클립 tab: their first frame already builds 자막·구간
+                            // (the LaunchedEffect in those panes then stores it), so no clip toolbar flashes.
+                            val settingsPaneLayout = portraitSplit || twoColumns
+                            val bodyTab = if (settingsPaneLayout && (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN)) InspectorTab.CAPTION else inspectorTab
+                            val body = inspectorColumns(bodyTab)
                             @Composable
-                            fun PreviewAndTabs() {
+                            fun PreviewAndTabs(tabsBelowPicture: Boolean = true, stageHeight: Dp = paneHeight) {
                                 when {
-                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.17f, baseMax = 120.dp, maxShare = if (imeVisible) 0.18f else 0.30f, horizontalPadding = 4.dp)
-                                    isLandscape -> Stage(paneHeight = paneHeight, baseShare = 0.20f, baseMax = 150.dp, maxShare = 0.42f, horizontalPadding = 0.dp)
-                                    else -> Stage(paneHeight = paneHeight, baseShare = 0.165f, baseMax = 140.dp, maxShare = 0.30f, horizontalPadding = 4.dp)
+                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.15f, baseMax = 96.dp, maxShare = if (imeVisible) 0.18f else 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = tabsBelowPicture)
+                                    // Two-pane portrait (TriFold) sizes the picture like landscape, not with the 140dp phone-ish cap.
+                                    isLandscape || twoColumns -> Stage(paneHeight = stageHeight, baseShare = 0.55f, baseMax = 420.dp, maxShare = if (imeVisible) 0.42f else 0.75f, horizontalPadding = 0.dp, tabsBelowPicture = tabsBelowPicture)
+                                    else -> Stage(paneHeight = paneHeight, baseShare = 0.165f, baseMax = 140.dp, maxShare = 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = tabsBelowPicture)
                                 }
                                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
                             }
-                            if (twoColumns) {
-                                val leftScroll = rememberScrollState()
-                                val rightScroll = rememberScrollState()
-                                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(leftScroll).padding(horizontal = 8.dp, vertical = 6.dp)) {
-                                        PreviewAndTabs()
-                                        if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) {
-                                            EditorSettingsPanel(
-                                                session = session,
-                                                selectedScene = selectedScene,
-                                                selectedSource = selectedSource,
-                                                selectedKeys = selectedSceneKeys,
-                                                multiSelectMode = multiSelectMode,
-                                                onToggleMultiSelectMode = {
-                                                    if (multiActive) {
-                                                        multiSelectMode = false
-                                                        if (effectiveSelectedKeys.size > 1) selectedSceneKeys = emptySet()
-                                                    } else {
-                                                        multiSelectMode = true
-                                                    }
-                                                },
-                                                onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
-                                                onClearSelection = { selectedSceneKeys = emptySet() },
-                                                onMarkImportant = { keys, important -> model.editorSetPhotosImportant(keys, important) },
-                                                onMove = { keys -> moveTargetDialogKeys = keys },
-                                                onDuplicate = { keys ->
-                                                    if (keys.size == 1) {
-                                                        model.editorDuplicateScene(keys.first())?.let { newKey ->
-                                                            selectedSceneKey = newKey
-                                                            selectedSceneKeys = setOf(newKey)
-                                                        }
-                                                    } else {
-                                                        val newKeys = model.editorDuplicateScenes(keys)
-                                                        if (newKeys.isNotEmpty()) {
-                                                            selectedSceneKeys = newKeys.toSet()
-                                                            selectedSceneKey = newKeys.first()
-                                                        }
-                                                    }
-                                                },
-                                                onRemove = { keys ->
-                                                    if (keys.size == 1) model.editorRemoveScene(keys.first())
-                                                    else model.editorRemoveScenes(keys)
-                                                },
-                                                fixedColumns = columns,
-                                                maxColumns = maxColumns,
-                                                onColumnsChange = { tabletColumns = it },
-                                                model = model,
-                                            )
-                                        } else {
-                                            InspectorBody(Modifier.fillMaxWidth()) { body.left() }
-                                        }
-                                    }
-                                    if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) {
+                            if (portraitSplit) {
+                                Column(Modifier.fillMaxSize()) {
+                                    Stage(paneHeight = paneHeight, baseShare = 0.30f, baseMax = 360.dp, maxShare = if (imeVisible) 0.2f else 0.55f, horizontalPadding = 8.dp, portraitSwitch = true, reservedBelow = paneHeight * 0.52f)
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                                    if (portraitPane == PortraitPane.CLIPS) {
                                         Board(
                                             fixedColumns = columns,
                                             maxColumns = maxColumns,
                                             onColumnsChange = { tabletColumns = it },
                                             thumbnailAspect = thumbAspect,
                                             compactCells = compactCells,
-                                            modifier = Modifier.weight(1f).fillMaxHeight(),
+                                            modifier = Modifier.weight(1f).fillMaxWidth(),
                                             page = null,
+                                            forceClips = true,
                                         )
                                     } else {
-                                        Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rightScroll).padding(horizontal = 8.dp, vertical = 6.dp)) {
-                                            InspectorBody(Modifier.fillMaxWidth()) { body.right?.invoke() }
+                                        Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(portraitSettingsScroll).padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                            // A legacy 클립/PLAN tab is moved to 자막·구간 here, as an effect (never during composition).
+                                            LaunchedEffect(inspectorTab) {
+                                                if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) inspectorTab = InspectorTab.CAPTION
+                                            }
+                                            InspectorTabs(inspectorTab, onTab = { inspectorTab = it }, resizeActions = emptyList(), modifier = Modifier, settingsPane = true)
+                                            InspectorBody(Modifier.fillMaxWidth()) {
+                                                val single = body.single
+                                                if (single != null) {
+                                                    single()
+                                                } else {
+                                                    body.left()
+                                                    body.right?.let { right ->
+                                                        if (body.dividerBetween) HorizontalDivider()
+                                                        right()
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if (twoColumns) {
+                                @Composable
+                                fun SettingsColumnContent() {
+                                    InspectorBody(Modifier.fillMaxWidth()) {
+                                        val single = body.single
+                                        if (single != null) {
+                                            single()
+                                        } else {
+                                            body.left()
+                                            body.right?.let { right ->
+                                                if (body.dividerBetween) HorizontalDivider()
+                                                right()
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // The three panes are always all present, whatever the settings tab; only their place changes.
+                                // Scroll states are per role (preview / inspector; the board keeps the shared grid state).
+                                @Composable
+                                fun PreviewPane(paneModifier: Modifier, stageHeight: Dp) {
+                                    Column(paneModifier.verticalScroll(landscapeLeftScroll).padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                        // The pane's own 6dp vertical padding and the 1dp divider under the stage are not available to it.
+                                        PreviewAndTabs(tabsBelowPicture = false, stageHeight = stageHeight - 13.dp)
+                                    }
+                                }
+
+                                // Natural-height preview (no scroll of its own) for a column that scrolls as one page; the
+                                // picture is sized from the whole column, so shrinking it pulls the following content up.
+                                @Composable
+                                fun PreviewHeader() {
+                                    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                        PreviewAndTabs(tabsBelowPicture = false, stageHeight = paneHeight - 13.dp)
+                                    }
+                                }
+
+                                @Composable
+                                fun BoardPane(paneModifier: Modifier, page: (@Composable () -> Unit)? = null, footer: (@Composable () -> Unit)? = null, titleInGrid: Boolean = true) {
+                                    Board(
+                                        fixedColumns = columns,
+                                        maxColumns = maxColumns,
+                                        onColumnsChange = { tabletColumns = it },
+                                        thumbnailAspect = thumbAspect,
+                                        compactCells = compactCells,
+                                        modifier = paneModifier,
+                                        page = page,
+                                        footer = footer,
+                                        titleInGrid = titleInGrid,
+                                        forceClips = true,
+                                    )
+                                }
+
+                                // Tabs + body at natural height, no scroll of its own (the caller's single scroll carries it).
+                                @Composable
+                                fun InspectorContent() {
+                                    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                        // A legacy 클립/PLAN tab is moved to 자막·구간 here, as an effect (never during composition).
+                                        LaunchedEffect(inspectorTab) {
+                                            if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) inspectorTab = InspectorTab.CAPTION
+                                        }
+                                        InspectorTabs(inspectorTab, onTab = { inspectorTab = it }, resizeActions = emptyList(), modifier = Modifier, settingsPane = true)
+                                        SettingsColumnContent()
+                                    }
+                                }
+
+                                @Composable
+                                fun InspectorPane(paneModifier: Modifier) {
+                                    Column(paneModifier.verticalScroll(landscapeRightScroll)) { InspectorContent() }
+                                }
+
+                                // Shared 12dp divider between the two columns: drag changes the UI-only ratio (never the project).
+                                @Composable
+                                fun SplitDivider() {
+                                    val density = LocalDensity.current
+                                    val totalPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+                                    val dragState = rememberDraggableState { deltaPx ->
+                                        landscapeSplitRatio = (landscapeSplitRatio.coerceIn(minSplitRatio, maxSplitRatio) + deltaPx / totalPx).coerceIn(minSplitRatio, maxSplitRatio)
+                                    }
+                                    Box(
+                                        Modifier
+                                            .width(12.dp)
+                                            .fillMaxHeight()
+                                            .draggable(state = dragState, orientation = Orientation.Horizontal)
+                                            .semantics {
+                                                contentDescription = "좌우 폭 조절"
+                                                stateDescription = "왼쪽 ${(splitRatio * 100).roundToInt()}%"
+                                                customActions = listOf(
+                                                    CustomAccessibilityAction("왼쪽 넓게") {
+                                                        landscapeSplitRatio = (landscapeSplitRatio.coerceIn(minSplitRatio, maxSplitRatio) + 0.05f).coerceIn(minSplitRatio, maxSplitRatio); true
+                                                    },
+                                                    CustomAccessibilityAction("오른쪽 넓게") {
+                                                        landscapeSplitRatio = (landscapeSplitRatio.coerceIn(minSplitRatio, maxSplitRatio) - 0.05f).coerceIn(minSplitRatio, maxSplitRatio); true
+                                                    },
+                                                )
+                                            },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Box(Modifier.width(2.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
+                                    }
+                                }
+
+                                when (landscapePlacement) {
+                                    LandscapePlacement.PREVIEW_LEFT -> {
+                                        Row(Modifier.fillMaxSize()) {
+                                            PreviewPane(Modifier.weight(splitRatio).fillMaxHeight(), paneHeight)
+                                            SplitDivider()
+                                            Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
+                                                // The settings sit after every clip in the ONE grid, so a compact heading outside the grid
+                                                // (not a second scroll) jumps straight to that footer; 클립 N is not repeated inside the grid.
+                                                Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        "클립 ${project.scenes.size}",
+                                                        Modifier.weight(1f),
+                                                        style = MaterialTheme.typography.titleMedium,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                    )
+                                                    TextButton(
+                                                        shape = EditorButtonShape,
+                                                        onClick = {
+                                                            val footerIndex = (gridScrollState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+                                                            // Remember the clip list position, but never overwrite it while already at the footer.
+                                                            if (gridScrollState.firstVisibleItemIndex < footerIndex) {
+                                                                settingsReturnIndex = gridScrollState.firstVisibleItemIndex
+                                                                settingsReturnOffset = gridScrollState.firstVisibleItemScrollOffset
+                                                            }
+                                                            coroutineScope.launch { gridScrollState.animateScrollToItem(footerIndex) }
+                                                        },
+                                                        modifier = Modifier.heightIn(min = IconHitTarget),
+                                                    ) { Text("설정으로 ↓", maxLines = 1) }
+                                                }
+                                                BoardPane(
+                                                    Modifier.weight(1f).fillMaxWidth(),
+                                                    titleInGrid = false,
+                                                    footer = {
+                                                        Column(Modifier.fillMaxWidth()) {
+                                                            TextButton(
+                                                                shape = EditorButtonShape,
+                                                                onClick = {
+                                                                    coroutineScope.launch {
+                                                                        val lastIndex = (gridScrollState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+                                                                        gridScrollState.scrollToItem(settingsReturnIndex.coerceIn(0, lastIndex), settingsReturnOffset.coerceAtLeast(0))
+                                                                    }
+                                                                },
+                                                                modifier = Modifier.heightIn(min = IconHitTarget),
+                                                            ) { Text("클립으로 ↑", maxLines = 1) }
+                                                            InspectorContent()
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                    LandscapePlacement.CLIPS_LEFT -> {
+                                        Row(Modifier.fillMaxSize()) {
+                                            BoardPane(Modifier.weight(splitRatio).fillMaxHeight())
+                                            SplitDivider()
+                                            Column(Modifier.weight(1f - splitRatio).fillMaxHeight().verticalScroll(landscapeRightScroll)) {
+                                                PreviewHeader()
+                                                InspectorContent()
+                                            }
+                                        }
+                                    }
+                                    LandscapePlacement.SETTINGS_LEFT -> {
+                                        Row(Modifier.fillMaxSize()) {
+                                            InspectorPane(Modifier.weight(splitRatio).fillMaxHeight())
+                                            SplitDivider()
+                                            BoardPane(Modifier.weight(1f - splitRatio).fillMaxHeight(), page = { PreviewHeader() })
                                         }
                                     }
                                 }
                             } else {
                                 if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) {
-                                    var previewHeightPx by remember { mutableFloatStateOf(0f) }
-                                    var previewOffsetPx by rememberSaveable(directoryKey) { mutableFloatStateOf(0f) }
-                                    val nestedScrollConnection = remember(previewHeightPx) {
-                                        object : NestedScrollConnection {
-                                            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                                                val delta = available.y
-                                                return if (delta < 0f && previewHeightPx > 0f && previewOffsetPx > -previewHeightPx) {
-                                                    val newOffset = (previewOffsetPx + delta).coerceIn(-previewHeightPx, 0f)
-                                                    val consumed = newOffset - previewOffsetPx
-                                                    previewOffsetPx = newOffset
-                                                    Offset(0f, consumed)
-                                                } else {
-                                                    Offset.Zero
-                                                }
-                                            }
-
-                                            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                                                val delta = available.y
-                                                return if (delta > 0f && previewHeightPx > 0f && previewOffsetPx < 0f) {
-                                                    val newOffset = (previewOffsetPx + delta).coerceIn(-previewHeightPx, 0f)
-                                                    val consumed = newOffset - previewOffsetPx
-                                                    previewOffsetPx = newOffset
-                                                    Offset(0f, consumed)
-                                                } else {
-                                                    Offset.Zero
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .nestedScroll(nestedScrollConnection),
-                                    ) {
-                                        val collapseDp = if (previewHeightPx > 0f) {
-                                            with(LocalDensity.current) { (previewHeightPx + previewOffsetPx).coerceAtLeast(0f).toDp() }
-                                        } else null
-
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .then(if (collapseDp != null) Modifier.height(collapseDp) else Modifier)
-                                                .clipToBounds(),
-                                        ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .wrapContentHeight(unbounded = true)
-                                                    .onGloballyPositioned { coords ->
-                                                        val h = coords.size.height.toFloat()
-                                                        if (h > 0f && h != previewHeightPx) {
-                                                            previewHeightPx = h
-                                                            previewOffsetPx = previewOffsetPx.coerceIn(-h, 0f)
-                                                        }
-                                                    },
-                                            ) {
-                                                PreviewAndTabs()
-                                            }
-                                        }
-
-                                        EditorSettingsPanel(
-                                            session = session,
-                                            selectedScene = selectedScene,
-                                            selectedSource = selectedSource,
-                                            selectedKeys = selectedSceneKeys,
-                                            multiSelectMode = multiSelectMode,
-                                            onToggleMultiSelectMode = {
-                                                if (multiActive) {
-                                                    multiSelectMode = false
-                                                    if (effectiveSelectedKeys.size > 1) selectedSceneKeys = emptySet()
-                                                } else {
-                                                    multiSelectMode = true
-                                                }
-                                            },
-                                            onSelectAll = { selectedSceneKeys = project.scenes.map { it.key }.toSet() },
-                                            onClearSelection = { selectedSceneKeys = emptySet() },
-                                            onMarkImportant = { keys, important -> model.editorSetPhotosImportant(keys, important) },
-                                            onMove = { keys -> moveTargetDialogKeys = keys },
-                                            onDuplicate = { keys ->
-                                                if (keys.size == 1) {
-                                                    model.editorDuplicateScene(keys.first())?.let { newKey ->
-                                                        selectedSceneKey = newKey
-                                                        selectedSceneKeys = setOf(newKey)
-                                                    }
-                                                } else {
-                                                    val newKeys = model.editorDuplicateScenes(keys)
-                                                    if (newKeys.isNotEmpty()) {
-                                                        selectedSceneKeys = newKeys.toSet()
-                                                        selectedSceneKey = newKeys.first()
-                                                    }
-                                                }
-                                            },
-                                            onRemove = { keys ->
-                                                if (keys.size == 1) model.editorRemoveScene(keys.first())
-                                                else model.editorRemoveScenes(keys)
-                                            },
-                                            fixedColumns = columns,
-                                            maxColumns = maxColumns,
-                                            onColumnsChange = { phoneColumns = it },
-                                            model = model,
-                                        )
-
-                                        Board(
-                                            fixedColumns = columns,
-                                            maxColumns = maxColumns,
-                                            onColumnsChange = { phoneColumns = it },
-                                            thumbnailAspect = thumbAspect,
-                                            compactCells = compactCells,
-                                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                                            page = null,
-                                        )
-                                    }
+                                    // One lazy scroll: the preview/transport/tabs scroll off the top, the clips take the page.
+                                    Board(
+                                        fixedColumns = columns,
+                                        maxColumns = maxColumns,
+                                        onColumnsChange = { phoneColumns = it },
+                                        thumbnailAspect = thumbAspect,
+                                        compactCells = compactCells,
+                                        modifier = Modifier.fillMaxSize(),
+                                        page = { PreviewAndTabs() },
+                                        forceClips = true,
+                                    )
                                 } else {
                                     Column(
                                         Modifier
@@ -1006,14 +1288,14 @@ private fun EditorHeader(
     onRename: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
+    landscapePlacement: LandscapePlacement? = null,
+    onLandscapePlacementChange: ((LandscapePlacement) -> Unit)? = null,
 ) {
     val palette = themePalette()
     val project = session.editor
     val saveLabel = when (session.saveState) {
-        EditorSaveState.SAVING -> "편집본 저장 중…"
-        EditorSaveState.SAVED -> "편집본 저장됨"
         EditorSaveState.FAILED -> "편집본 저장 실패"
-        EditorSaveState.IDLE -> ""
+        else -> ""
     }
     val counts = "재료 ${session.sources.size}개 · 클립 ${project?.scenes?.size ?: 0}개 · ${trailerLengthTitle(session.totalDuration)}"
     val metadataText = listOf(counts, saveLabel, if (project?.autoPlan == false) "직접 편집" else "자동 추천").filter { it.isNotBlank() }.joinToString(" · ")
@@ -1057,37 +1339,65 @@ private fun EditorHeader(
                 )
             }
         } else {
-            Row(
-                Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) {
-                    PackIcon(PackGlyph.BACK, if (editing) "편집 닫기 (편집본 자동 저장)" else "편집으로 돌아가기", Modifier.size(ToolbarActionIcon))
-                }
-                Column(
-                    Modifier.weight(1f).clickable(enabled = editing, onClickLabel = "프로젝트 이름 바꾸기", onClick = onRename).padding(vertical = 2.dp),
+            // Mac's three roles on any pane area that can hold two ≥ 240dp panes (492dp+), in both orientations. Wide headers
+            // keep them inline and flexible; narrower tablets give them a full-width row under the title and undo/redo.
+            val showRoles = editing && landscapePlacement != null && onLandscapePlacementChange != null && maxWidth >= 492.dp
+            val rolesInline = showRoles && maxWidth >= 720.dp
+            Column(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(session.displayTitle, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(
-                        metadataText,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (session.saveState == EditorSaveState.FAILED) palette.danger else MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                if (editing) {
-                    IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
-                        Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon))
+                    IconButton(onClick = onClose, modifier = Modifier.size(IconHitTarget)) {
+                        PackIcon(PackGlyph.BACK, if (editing) "편집 닫기 (편집본 자동 저장)" else "편집으로 돌아가기", Modifier.size(ToolbarActionIcon))
                     }
-                    IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
-                        Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon))
+                    Column(
+                        Modifier.weight(1f).clickable(enabled = editing, onClickLabel = "프로젝트 이름 바꾸기", onClick = onRename).padding(vertical = 2.dp),
+                    ) {
+                        Text(session.displayTitle, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            metadataText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (session.saveState == EditorSaveState.FAILED) palette.danger else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
+                    if (editing) {
+                        if (rolesInline && landscapePlacement != null && onLandscapePlacementChange != null) {
+                            LandscapePlacementChooser(landscapePlacement, onLandscapePlacementChange, Modifier.widthIn(min = 240.dp, max = 360.dp))
+                            Spacer(Modifier.width(4.dp))
+                        }
+                        IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                            Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon))
+                        }
+                        IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                            Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon))
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
                 }
-                Spacer(Modifier.width(4.dp))
+                if (showRoles && !rolesInline && landscapePlacement != null && onLandscapePlacementChange != null) {
+                    LandscapePlacementChooser(landscapePlacement, onLandscapePlacementChange, Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, bottom = 6.dp))
+                }
             }
         }
     }
+}
+
+/** 클립 / 미리보기 / 설정 roles of the two-pane workspace as one connected segmented control (Mac order). */
+@Composable
+private fun LandscapePlacementChooser(current: LandscapePlacement, onChange: (LandscapePlacement) -> Unit, modifier: Modifier) {
+    MacSegmentedControl(
+        options = listOf(
+            LandscapePlacement.CLIPS_LEFT to "클립",
+            LandscapePlacement.PREVIEW_LEFT to "미리보기",
+            LandscapePlacement.SETTINGS_LEFT to "설정",
+        ),
+        selected = current,
+        onSelect = onChange,
+        modifier = modifier,
+    )
 }
 
 private const val PHONEHARD_SAVING_STATUS = "폰하드에 저장하는 중…"
@@ -1199,6 +1509,14 @@ private fun EditorStage(
     maxVisualHeight: Dp = visualHeight,
     // False while the fullscreen viewer is open: inline players pause (and stay paused on return) so only one plays.
     inlinePlaybackAllowed: Boolean = true,
+    clipPlayback: ClipPlaybackState,
+    // Scenes and cards for the timeline's start/end card segments (shown in place of the scene while one is active).
+    titleScenes: List<EditorScene> = emptyList(),
+    introCard: TrailerTitleCard = TrailerTitleCard(),
+    outroCard: TrailerTitleCard = TrailerTitleCard(),
+    // Connected project timeline row between the picture and the tabs; hidden while typing.
+    // It receives the shown picture height relative to its default (1 = default), so the whole preview group shrinks together.
+    timeline: (@Composable (sizeRatio: Float) -> Unit)? = null,
     // Row directly under the picture (the four inspector tabs); it receives the resize drag modifier and the
     // TalkBack resize actions, both empty while typing.
     belowPicture: (@Composable (dragModifier: Modifier, resizeActions: List<CustomAccessibilityAction>) -> Unit)? = null,
@@ -1208,12 +1526,31 @@ private fun EditorStage(
     // picture and the tabs stay, without resizing.
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
-            if (scene != null && source != null) {
-                ScenePreview(session, scene, source, caption, inlinePlaybackAllowed, Modifier.fillMaxSize())
+            val cardSlot = clipPlayback.card?.takeIf { scene != null && clipPlayback.sceneKey == scene.key }
+            if (cardSlot != null) {
+                val isIntro = cardSlot == TitleSlot.INTRO
+                val card = if (isIntro) introCard else outroCard
+                val holder = if (isIntro) titleScenes.firstOrNull() else titleScenes.lastOrNull()
+                val dims = rememberOutputDims(session)
+                val cardBitmap by rememberTitleCardBitmap(
+                    card, isIntro, holder, holder?.let { h -> session.sources.firstOrNull { it.id == h.sourceId } }, dims.first, dims.second, 720,
+                    bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(titleScenes.map { it.caption }),
+                    backgroundCandidates = session.scenes.map { it.source },
+                )
+                TitleCardPreview(
+                    bitmap = cardBitmap,
+                    label = (if (isIntro) "시작 화면" else "마지막 화면") + " · ${seconds1(card.clampedDuration())}",
+                    aspect = outputAspect(session),
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else if (scene != null && source != null) {
+                ScenePreview(session, scene, source, caption, inlinePlaybackAllowed, clipPlayback, Modifier.fillMaxSize(), timelineShown = timeline != null && showControls)
             } else {
                 Text("클립을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+        // Ratio of the height actually shown (already clamped by the pane), not the persisted scale.
+        if (timeline != null && showControls) timeline(if (baseVisualHeight > 0.dp) visualHeight / baseVisualHeight else 1f)
         if (belowPicture != null) {
             if (onPreviewScaleChange != null && showControls) {
                 // Preview size is a UI preference only: dragging the tab row under the picture changes this picture's
@@ -1232,12 +1569,42 @@ private fun EditorStage(
                 val dragState = rememberDraggableState { deltaPx -> applyHeight(dragHeight + with(density) { deltaPx.toDp() }) }
                 val step = baseVisualHeight * 0.1f
                 belowPicture(
-                    Modifier.draggable(dragState, Orientation.Vertical, onDragStarted = { dragHeight = currentVisual }),
+                    Modifier.draggable(dragState, Orientation.Vertical, onDragStarted = { dragHeight = currentVisual })
+                        .pointerInput(minHeight, maxHeight) {
+                            // Double tap toggles min/max without consuming anything, so tab taps and drags still work.
+                            var lastTapUptime = 0L
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
+                                val up = waitForUpOrCancellation(PointerEventPass.Final)
+                                if (up != null && (up.position - down.position).getDistance() < viewConfiguration.touchSlop) {
+                                    if (up.uptimeMillis - lastTapUptime <= 300L) {
+                                        lastTapUptime = 0L
+                                        dragHeight = currentVisual
+                                        applyHeight(if (currentVisual - minHeight < maxHeight - currentVisual) maxHeight else minHeight)
+                                    } else lastTapUptime = up.uptimeMillis
+                                } else lastTapUptime = 0L
+                            }
+                        },
                     listOf(
                         CustomAccessibilityAction("미리보기 크게") { dragHeight = currentVisual; applyHeight(currentVisual + step); true },
                         CustomAccessibilityAction("미리보기 작게") { dragHeight = currentVisual; applyHeight(currentVisual - step); true },
                     ),
                 )
+                // Dedicated handle: drag to resize, double tap toggles min/max (the tab-row gesture is not discoverable).
+                Box(
+                    Modifier.fillMaxWidth().heightIn(min = 24.dp)
+                        .draggable(dragState, Orientation.Vertical, onDragStarted = { dragHeight = currentVisual })
+                        .pointerInput(minHeight, maxHeight) {
+                            detectTapGestures(onDoubleTap = {
+                                dragHeight = currentVisual
+                                applyHeight(if (currentVisual - minHeight < maxHeight - currentVisual) maxHeight else minHeight)
+                            })
+                        }
+                        .semantics { contentDescription = "미리보기 크기 조절 핸들. 두 번 탭하면 크기를 바꿉니다" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(Modifier.width(40.dp).height(4.dp).background(MaterialTheme.colorScheme.outline, CircleShape))
+                }
             } else {
                 belowPicture(Modifier, emptyList())
             }
@@ -1311,6 +1678,588 @@ private fun RenderScenePreview(session: TrailerSession, export: EditorExportStat
 }
 
 /**
+ * Clip playback owned by the workspace, not by whichever layout branch shows the preview, so play/pause and the
+ * elapsed position (relative to the clipped range) survive portrait/landscape/resize relocation of the preview.
+ */
+@Stable
+internal class ClipPlaybackState {
+    var sceneKey by mutableStateOf<Long?>(null)
+    var playing by mutableStateOf(false)
+    var positionMs by mutableLongStateOf(0L)
+    var seekRequestMs by mutableStateOf<Long?>(null)
+    // True while the project timeline plays through the scenes in order; any single-clip control turns it off
+    // (those loop the one clip as before).
+    var continuous by mutableStateOf(false)
+    // Set while the timeline is on its start/end card: the card (not [sceneKey]'s clip) is shown, [cardPositionMs] is
+    // its elapsed time, and [sceneKey] holds the first/last scene so the clip selection never changes.
+    var card by mutableStateOf<TitleSlot?>(null)
+    var cardPositionMs by mutableLongStateOf(0L)
+
+    fun isPlaying(key: Long) = playing && sceneKey == key && card == null
+    fun positionFor(key: Long) = if (sceneKey == key) positionMs else 0L
+    fun toggle(key: Long) {
+        continuous = false
+        card = null
+        if (sceneKey != key) { sceneKey = key; positionMs = 0L; playing = true } else playing = !playing
+    }
+    fun seek(key: Long, posMs: Long) {
+        continuous = false
+        seekWithin(key, posMs)
+    }
+
+    /** Timeline move onto a card: [key] is the scene held for selection, [scenePosMs] the position that scene keeps. */
+    fun seekCard(slot: TitleSlot, key: Long, posMs: Long, scenePosMs: Long, byUser: Boolean = false) {
+        sceneKey = key
+        positionMs = scenePosMs
+        seekRequestMs = null
+        card = slot
+        cardPositionMs = posMs
+        epoch++
+        if (byUser) userEpoch++
+    }
+    fun restart(key: Long) {
+        seek(key, 0L)
+        playing = true
+    }
+
+    /** Timeline seek/advance: moves to [posMs] of scene [key] without leaving continuous mode. */
+    fun seekWithin(key: Long, posMs: Long, byUser: Boolean = false) {
+        card = null
+        sceneKey = key
+        positionMs = posMs
+        seekRequestMs = posMs
+        epoch++
+        if (byUser) userEpoch++
+    }
+
+    // Bumped by every timeline move (re-anchors the advance clock) and, separately, by touch seeks only (re-syncs music).
+    var epoch by mutableIntStateOf(0)
+    var userEpoch by mutableIntStateOf(0)
+}
+
+/** Which title card a timeline segment / the card view stands for. */
+internal enum class TitleSlot { INTRO, OUTRO }
+
+/** One timed piece of the project timeline: an enabled start/end card ([slot]) or a scene, in export order. */
+private class TimelineSegment(
+    val slot: TitleSlot?,
+    val scene: EditorScene?,
+    val startSec: Double,
+    val lengthSec: Double,
+    val card: TrailerTitleCard? = null,
+)
+
+/** Enabled intro card, every scene, enabled outro card, back to back (the export's order and durations). */
+private fun timelineSegments(scenes: List<EditorScene>, intro: TrailerTitleCard, outro: TrailerTitleCard): List<TimelineSegment> {
+    if (scenes.isEmpty()) return emptyList()
+    val out = ArrayList<TimelineSegment>(scenes.size + 2)
+    var at = 0.0
+    if (intro.enabled) { val d = intro.clampedDuration(); out += TimelineSegment(TitleSlot.INTRO, null, at, d, intro); at += d }
+    for (scene in scenes) { out += TimelineSegment(null, scene, at, scene.length); at += scene.length }
+    if (outro.enabled) out += TimelineSegment(TitleSlot.OUTRO, null, at, outro.clampedDuration(), outro)
+    return out
+}
+
+/** The clip a card segment holds for selection: the first scene for the start card, the last for the end card. */
+private fun heldSceneKey(segments: List<TimelineSegment>, slot: TitleSlot): Long? =
+    (if (slot == TitleSlot.INTRO) segments.firstOrNull { it.scene != null } else segments.lastOrNull { it.scene != null })?.scene?.key
+
+/** Shown position (seconds from the video start) of the selected clip, or of the card while one is active. */
+private fun timelineSecondsAt(segments: List<TimelineSegment>, selectedKey: Long?, clipPlayback: ClipPlaybackState): Double {
+    val slot = clipPlayback.card?.takeIf { clipPlayback.sceneKey == selectedKey }
+    // A null selectedKey must not match card segments (their scene is null too), and a stale card/scene falls back to 0.
+    val seg = if (slot != null) segments.firstOrNull { it.slot == slot }
+    else if (selectedKey == null) null
+    else segments.firstOrNull { it.scene?.key == selectedKey }
+    seg ?: return 0.0
+    val posMs = if (slot != null) clipPlayback.cardPositionMs else clipPlayback.positionFor(seg.scene?.key ?: return 0.0)
+    return seg.startSec + (posMs / 1000.0).coerceIn(0.0, seg.lengthSec)
+}
+
+/** Moves the timeline to [targetSec]: selects the owning clip (the held one for a card) and seeks scene or card. */
+private fun seekTimeline(
+    segments: List<TimelineSegment>,
+    targetSec: Double,
+    clipPlayback: ClipPlaybackState,
+    onSelectScene: (Long) -> Unit,
+    selectedKey: Long?,
+) {
+    if (segments.isEmpty()) return
+    val total = segments.last().let { it.startSec + it.lengthSec }
+    val t = targetSec.coerceIn(0.0, total)
+    val seg = segments.lastOrNull { it.startSec <= t } ?: segments.first()
+    val offsetMs = ((t - seg.startSec).coerceIn(0.0, seg.lengthSec) * 1000).toLong()
+    val slot = seg.slot
+    val key = (if (slot != null) heldSceneKey(segments, slot) else seg.scene?.key) ?: return
+    if (key != selectedKey) onSelectScene(key)
+    if (slot == null) clipPlayback.seekWithin(key, offsetMs, byUser = true)
+    else clipPlayback.seekCard(slot, key, offsetMs, if (slot == TitleSlot.INTRO) 0L else (segments.last { it.scene?.key == key }.lengthSec * 1000).toLong(), byUser = true)
+}
+
+/** Output size of the whole video (what the cards are rendered at), recomputed only when the session's inputs change. */
+@Composable
+private fun rememberOutputDims(session: TrailerSession): Pair<Int, Int> =
+    remember(session.revision, session.format, session.sources) {
+        session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
+    }
+
+/**
+ * The exporter's start/end card render at [maxSide] px: the same source selection as the inline card editor and the
+ * export (first scene's first frame / last scene's frame 0.5s before its end, only while 첫/마지막 사진 배경 is on),
+ * drawn by [TrailerTitleCardRenderer].
+ */
+@Composable
+private fun rememberTitleCardBitmap(
+    card: TrailerTitleCard,
+    isIntro: Boolean,
+    holder: EditorScene?,
+    holderSource: TrailerSource?,
+    outputWidth: Int,
+    outputHeight: Int,
+    maxSide: Int,
+    active: Boolean = true,
+    bodyCaption: SceneCaption? = null,
+    backgroundCandidates: List<TrailerSource> = emptyList(),
+): State<Bitmap?> {
+    val context = LocalContext.current
+    val scale = maxSide.toFloat() / maxOf(outputWidth, outputHeight).coerceAtLeast(1)
+    val w = (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2)
+    val h = (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
+    val chosen = card.resolveBackgroundSource(backgroundCandidates)
+    return produceState<Bitmap?>(null, card, isIntro, holder, holderSource, w, h, active, bodyCaption, chosen) {
+        if (!active) {
+            value = null
+            return@produceState
+        }
+        value = withContext(Dispatchers.Default) {
+            val background = if (chosen != null) {
+                loadFrame(chosen.file, true, 0.0, maxSide, exact = true)
+            } else if (card.usesFirstOrLastImage && holder != null && holderSource != null) {
+                val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
+                val at = if (isIntro) start else maxOf(start, start + length - 0.5)
+                loadFrame(holderSource.file, holderSource.isImage, at, maxSide, exact = true)
+            } else null
+            TrailerTitleCardRenderer.renderCardBitmap(context, card, background, w, h, bodyCaption)
+        }
+    }
+}
+
+@Composable
+private fun TitleCardPreview(bitmap: Bitmap?, label: String, aspect: Float, modifier: Modifier) {
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val boxWidth = minOf(maxWidth, maxHeight * aspect)
+            Box(
+                Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                bitmap?.let {
+                    val image = remember(it) { it.asImageBitmap() }
+                    Image(image, contentDescription = label, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
+                } ?: CircularProgressIndicator(Modifier.size(28.dp))
+                Text(
+                    label,
+                    Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+    }
+}
+
+/** Small bounded cache of timeline frames (the same low-res [loadFrame] the board thumbnails use). */
+private object TimelineFrameCache {
+    private val cache = object : android.util.LruCache<String, Bitmap>(6 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+    fun get(key: String): Bitmap? = cache.get(key)?.takeIf { !it.isRecycled }
+    fun put(key: String, bitmap: Bitmap) { cache.put(key, bitmap) }
+}
+
+/**
+ * One connected row under the preview: a segment per scene (width ∝ length, photo/video tinted, selected outlined),
+ * a playhead at the shown position, and touch/drag seeking. Seeking selects the scene under the finger exactly like
+ * tapping it on the board. It always shows the editing state of the project, never an exported file.
+ */
+@Composable
+private fun ProjectTimeline(
+    session: TrailerSession,
+    segments: List<TimelineSegment>,
+    selectedKey: Long?,
+    clipPlayback: ClipPlaybackState,
+    onSelectScene: (Long) -> Unit,
+    onTogglePlay: () -> Unit,
+    sizeRatio: Float,
+    compactPhone: Boolean = false,
+    modifier: Modifier = Modifier,
+) {
+    if (segments.isEmpty()) return
+    // Below the default picture size the film thins from 56dp (ratio 1) to 24dp (ratio 0.5); at compact size the clock hides.
+    // Phone only: 40dp default thinning to the same 24dp minimum.
+    val filmRatio = ((sizeRatio - 0.5f) / 0.5f).coerceIn(0f, 1f)
+    val filmHeight = (if (compactPhone) 24f + 16f * filmRatio else 24f + 32f * filmRatio).dp
+    val compact = sizeRatio <= 0.6f
+    val scenes = remember(segments) { segments.mapNotNull { it.scene } }
+    val totalSeconds = segments.last().let { it.startSec + it.lengthSec }.coerceAtLeast(0.1)
+    val selectedIndex = scenes.indexOfFirst { it.key == selectedKey }.coerceAtLeast(0)
+    val activeSlot = clipPlayback.card?.takeIf { clipPlayback.sceneKey == selectedKey }
+    val activeSegmentIndex = if (activeSlot != null) segments.indexOfFirst { it.slot == activeSlot }
+    else segments.indexOfFirst { it.scene?.key == scenes[selectedIndex].key }
+    val shownSeconds = timelineSecondsAt(segments, scenes[selectedIndex].key, clipPlayback)
+    val playingAll = clipPlayback.playing && clipPlayback.continuous
+    val sourcesById = remember(session.sources) { session.sources.associateBy { it.id } }
+    var widthPx by remember { mutableIntStateOf(0) }
+    val currentSegments by rememberUpdatedState(segments)
+    val currentSelected by rememberUpdatedState(selectedKey)
+
+    fun seekToFraction(fraction: Float) {
+        val list = currentSegments
+        val total = list.last().let { it.startSec + it.lengthSec }
+        seekTimeline(list, fraction.coerceIn(0f, 1f) * total, clipPlayback, onSelectScene, currentSelected)
+    }
+    fun seekToScene(index: Int) {
+        val scene = scenes.getOrNull(index) ?: return
+        val seg = currentSegments.firstOrNull { it.scene?.key == scene.key } ?: return
+        seekTimeline(currentSegments, seg.startSec, clipPlayback, onSelectScene, currentSelected)
+    }
+
+    Column(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color.Black).padding(if (compact) 3.dp else 6.dp),
+        verticalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp),
+    ) {
+      CompositionLocalProvider(LocalContentColor provides Color.White) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Start) {
+            IconButton(onClick = onTogglePlay, modifier = Modifier.size(if (compactPhone) 32.dp else if (compact) 30.dp else 36.dp)) {
+                PackIcon(if (playingAll) PackGlyph.PAUSE else PackGlyph.PLAY, if (playingAll) "전체 타임라인 재생 멈춤" else "타임라인 ${seconds1(if (shownSeconds >= totalSeconds - 0.05) 0.0 else shownSeconds)}부터 이어서 재생", Modifier.size(if (compact) 18.dp else 20.dp))
+            }
+            if (!compact) {
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "${timelineClock(shownSeconds)} / ${timelineClock(totalSeconds)}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                    color = Color.White,
+                    maxLines = 1,
+                )
+            }
+        }
+      }
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(filmHeight)
+                .onSizeChangedPx { widthPx = it }
+                .clip(RoundedCornerShape(6.dp))
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val w = size.width.coerceAtLeast(1)
+                        seekToFraction(down.position.x / w)
+                        down.consume()
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) break
+                            seekToFraction(change.position.x / w)
+                            change.consume()
+                        }
+                    }
+                }
+                .semantics {
+                    contentDescription = "프로젝트 타임라인, 클립 ${scenes.size}개, 편집 내용 기준 미리보기"
+                    stateDescription = when (activeSlot) {
+                        TitleSlot.INTRO -> "${seconds1(shownSeconds)} / ${seconds1(totalSeconds)}, 시작 화면"
+                        TitleSlot.OUTRO -> "${seconds1(shownSeconds)} / ${seconds1(totalSeconds)}, 마지막 화면"
+                        null -> "${seconds1(shownSeconds)} / ${seconds1(totalSeconds)}, ${selectedIndex + 1}번째 클립"
+                    }
+                    customActions = listOf(
+                        CustomAccessibilityAction("이전 클립") { seekToScene(selectedIndex - 1); true },
+                        CustomAccessibilityAction("다음 클립") { seekToScene(selectedIndex + 1); true },
+                    )
+                },
+        ) {
+            TimelineFilmstrip(session, segments, sourcesById, widthPx, activeSegmentIndex)
+            if (widthPx > 0) {
+                val playheadDp = with(LocalDensity.current) { ((shownSeconds / totalSeconds).toFloat().coerceIn(0f, 1f) * widthPx).toDp() }
+                Box(
+                    Modifier.offset(x = (playheadDp - 1.dp).coerceAtLeast(0.dp)).width(2.dp).fillMaxHeight().background(Color.White)
+                        .border(0.5.dp, Color.Black.copy(alpha = .6f)),
+                )
+            }
+        }
+    }
+}
+
+private fun segmentIndexAt(segments: List<TimelineSegment>, t: Double): Int {
+    var lo = 0
+    var hi = segments.lastIndex
+    while (lo < hi) {
+        val mid = (lo + hi + 1) / 2
+        if (segments[mid].startSec <= t) lo = mid else hi = mid - 1
+    }
+    return lo
+}
+
+/**
+ * The timeline as a filmstrip. Segment tint and boundaries are drawn for every segment (cheap, even for hundreds of
+ * scenes), but frames are sampled: a bounded number of ~64dp cells across the strip (at most 48, whatever the scene
+ * count), each showing the frame of whatever segment is under its center, loaded lazily through the board's low-res
+ * [loadFrame] with a small cache. The start/end cards show their own [TrailerTitleCardRenderer] render.
+ */
+@Composable
+private fun TimelineFilmstrip(
+    session: TrailerSession,
+    segments: List<TimelineSegment>,
+    sourcesById: Map<Int, TrailerSource>,
+    widthPx: Int,
+    activeIndex: Int,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val photoTint = scheme.tertiaryContainer
+    val videoTint = scheme.primaryContainer
+    val cardTint = scheme.secondaryContainer
+    val outline = scheme.primary
+    val total = segments.last().let { it.startSec + it.lengthSec }.coerceAtLeast(0.1)
+    val dims = rememberOutputDims(session)
+    val firstScene = segments.firstOrNull { it.scene != null }?.scene
+    val lastScene = segments.lastOrNull { it.scene != null }?.scene
+    val introSeg = segments.firstOrNull { it.slot == TitleSlot.INTRO }
+    val outroSeg = segments.firstOrNull { it.slot == TitleSlot.OUTRO }
+    val bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(segments.mapNotNull { it.scene?.caption })
+    val bgCandidates = remember(session.revision, session.scenes) { session.scenes.map { it.source } }
+    val introThumb by rememberTitleCardBitmap(
+        introSeg?.card ?: TrailerTitleCard(), true, firstScene, firstScene?.let { sourcesById[it.sourceId] }, dims.first, dims.second, 160, active = introSeg != null,
+        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates,
+    )
+    val outroThumb by rememberTitleCardBitmap(
+        outroSeg?.card ?: TrailerTitleCard(), false, lastScene, lastScene?.let { sourcesById[it.sourceId] }, dims.first, dims.second, 160, active = outroSeg != null,
+        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates,
+    )
+    Box(Modifier.fillMaxSize()) {
+        Canvas(Modifier.fillMaxSize()) {
+            segments.forEach { seg ->
+                val x0 = (seg.startSec / total * size.width).toFloat()
+                val x1 = ((seg.startSec + seg.lengthSec) / total * size.width).toFloat()
+                val color = when {
+                    seg.slot != null -> cardTint
+                    sourcesById[seg.scene?.sourceId]?.isImage == true -> photoTint
+                    else -> videoTint
+                }
+                drawRect(color, Offset(x0, 0f), androidx.compose.ui.geometry.Size((x1 - x0).coerceAtLeast(0f), size.height))
+            }
+        }
+        if (widthPx > 0) {
+            val cellPx = with(LocalDensity.current) { 64.dp.toPx() }
+            val cellCount = kotlin.math.ceil(widthPx / cellPx).toInt().coerceIn(1, 48)
+            Row(Modifier.fillMaxSize()) {
+                for (i in 0 until cellCount) {
+                    key(i) {
+                        val t = (i + 0.5) / cellCount * total
+                        val index = segmentIndexAt(segments, t)
+                        val seg = segments[index]
+                        val alpha = if (index == activeIndex) 1f else .7f
+                        Box(Modifier.weight(1f).fillMaxHeight().clipToBounds()) {
+                            when (seg.slot) {
+                                TitleSlot.INTRO -> TimelineBitmap(introThumb, alpha)
+                                TitleSlot.OUTRO -> TimelineBitmap(outroThumb, alpha)
+                                null -> seg.scene?.let { scene ->
+                                    FilmstripFrame(scene, sourcesById[scene.sourceId], (t - seg.startSec).coerceIn(0.0, seg.lengthSec), alpha)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Canvas(Modifier.fillMaxSize()) {
+            val gap = 3.dp.toPx()
+            segments.forEachIndexed { i, seg ->
+                val x0 = (seg.startSec / total * size.width).toFloat()
+                val x1 = ((seg.startSec + seg.lengthSec) / total * size.width).toFloat()
+                // Boundaries only where segments are wide enough to tell apart; hundreds of scenes stay a clean strip.
+                if (i > 0 && x1 - x0 >= gap) drawLine(Color.Black.copy(alpha = .55f), Offset(x0, 0f), Offset(x0, size.height), 1.dp.toPx())
+                if (i == activeIndex) {
+                    val width = maxOf(x1 - x0, gap)
+                    val left = (x0 - (width - (x1 - x0)) / 2f).coerceIn(0f, (size.width - width).coerceAtLeast(0f))
+                    drawRect(
+                        outline, Offset(left, 0f), androidx.compose.ui.geometry.Size(width, size.height),
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TimelineBitmap(bitmap: Bitmap?, alpha: Float) {
+    if (bitmap == null || bitmap.isRecycled) return
+    val image = remember(bitmap) { bitmap.asImageBitmap() }
+    Image(image, contentDescription = null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = alpha)
+}
+
+@Composable
+private fun FilmstripFrame(scene: EditorScene, source: TrailerSource?, offsetSec: Double, alpha: Float) {
+    if (source == null) return
+    // Photos use one frame; videos are sampled in 0.5s steps inside the clipped range.
+    val at = if (source.isImage) 0.0 else scene.start + kotlin.math.floor(offsetSec * 2) / 2.0
+    val cacheKey = remember(source.file, source.isImage, at) { "${source.file.absolutePath}|${source.file.lastModified()}|${(at * 10).toLong()}" }
+    val frame by produceState<Bitmap?>(TimelineFrameCache.get(cacheKey) ?: source.thumbnail, cacheKey) {
+        TimelineFrameCache.get(cacheKey)?.let { value = it; return@produceState }
+        if (source.isImage && value != null) return@produceState
+        val loaded = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, at, 160) }
+        if (loaded != null) {
+            TimelineFrameCache.put(cacheKey, loaded)
+            value = loaded
+        }
+    }
+    TimelineBitmap(frame, alpha)
+}
+
+private fun Modifier.onSizeChangedPx(onWidth: (Int) -> Unit): Modifier =
+    this.then(Modifier.onGloballyPositioned { onWidth(it.size.width) })
+
+/** Loudness envelopes per source file, bounded by total bins (LRU) so a 400-clip project stays small. */
+private object TimelineLoudnessCache {
+    private const val MAX_BINS = 2_000_000
+    private val map = LinkedHashMap<String, FloatArray>(16, 0.75f, true)
+    private var bins = 0
+    private fun key(s: TrailerSource) = "${s.file.absolutePath}|${s.file.lastModified()}|${s.file.length()}|${s.duration}"
+    @Synchronized fun get(s: TrailerSource): FloatArray? = map[key(s)]
+    @Synchronized fun put(s: TrailerSource, env: FloatArray) {
+        map.put(key(s), env)?.let { bins -= it.size }
+        bins += env.size
+        val it = map.entries.iterator()
+        while (bins > MAX_BINS && map.size > 1 && it.hasNext()) {
+            val e = it.next()
+            if (e.value === env) continue
+            bins -= e.value.size
+            it.remove()
+        }
+    }
+}
+
+/**
+ * Background music for the project timeline play: it starts where the timeline is (video-wide, cards included, as the
+ * export mixes it), loops unless the music plays once, and stops with the timeline. Volume follows the project
+ * music volume up to 100% (a player cannot go louder); with auto-ducking the gain follows the export's ducking
+ * timeline; tempo shifts are not previewed.
+ */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun TimelineMusic(
+    active: Boolean,
+    track: TrailerMusicTrack?,
+    policy: TrailerMusicPolicy,
+    volume: Float,
+    autoDucking: Boolean,
+    sources: List<TrailerSource>,
+    segments: List<TimelineSegment>,
+    clipPlayback: ClipPlaybackState,
+) {
+    val context = LocalContext.current
+    val currentSegments by rememberUpdatedState(segments)
+    val file = track?.file?.takeIf { it.isFile && it.length() > 0L }
+    val player = remember(file?.absolutePath) {
+        file?.let {
+            ExoPlayer.Builder(context).build().apply {
+                setMediaItem(MediaItem.fromUri(Uri.fromFile(it)))
+                playWhenReady = false
+                prepare()
+            }
+        }
+    }
+    DisposableEffect(player) { onDispose { player?.release() } }
+    LaunchedEffect(player, policy) { player?.repeatMode = if (policy == TrailerMusicPolicy.SINGLE) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ALL }
+    val duck = autoDucking && player != null
+    LaunchedEffect(player, volume, duck) { if (!duck) player?.volume = volume.coerceIn(0f, 1f) }
+    // Auto-ducking: the exporter's own loudness envelopes (0.05s bins) and AudioDuckingTimeline over the same
+    // card + scene layout, analysed lazily off the main thread (upcoming sources only) and cached per source file.
+    val sourcesById = remember(sources) { sources.associateBy { it.id } }
+    var envVersion by remember { mutableIntStateOf(0) }
+    val duckingTimeline by produceState<AudioDuckingTimeline?>(null, duck, segments, sourcesById, envVersion) {
+        if (!duck) { value = null; return@produceState }
+        value = withContext(Dispatchers.Default) {
+            var placeholderId = -1000
+            fun silent(length: Double) = TrailerScene(
+                source = TrailerSource(id = placeholderId--, name = "", file = File(""), duration = length, width = 0, height = 0, analysis = AudioAnalysisResult(emptyList(), 0.0), thumbnail = null, isImage = true),
+                start = 0.0, length = length,
+            )
+            val envelopes = HashMap<Int, FloatArray>()
+            val timelineScenes = segments.map { seg ->
+                val scene = seg.scene
+                val source = scene?.let { sourcesById[it.sourceId] }
+                if (scene == null || source == null) silent(seg.lengthSec)
+                else {
+                    if (!source.isImage) TimelineLoudnessCache.get(source)?.let { envelopes[source.id] = it }
+                    TrailerScene(source = source, start = scene.start, length = scene.length, sourceVolume = scene.sourceVolume)
+                }
+            }
+            AudioDuckingTimeline.buildWithLoudnessEnvelopes(timelineScenes, envelopes, binSeconds = 0.05, originalClipGain = 1.0f)
+        }
+    }
+    LaunchedEffect(duck, active, segments, sourcesById) {
+        if (!duck) return@LaunchedEffect
+        val appContext = context.applicationContext
+        while (isActive) {
+            val position = timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback)
+            // Playing: a few sources ahead; otherwise only the current one, so opening never decodes the project.
+            val pending = currentSegments.asSequence()
+                .filter { it.startSec + it.lengthSec >= position }
+                .mapNotNull { seg -> seg.scene?.let { sourcesById[it.sourceId] } }
+                .filter { !it.isImage && it.duration > 0.0 && TimelineLoudnessCache.get(it) == null }
+                .distinctBy { it.id }
+                .take(if (active) 3 else 1)
+                .toList()
+            val next = pending.firstOrNull()
+            if (next == null) { delay(500); continue }
+            val envelope = runCatching {
+                AudioAnalysisService.extractLoudnessEnvelope(appContext, Uri.fromFile(next.file), next.duration, 0.05)
+            }.getOrDefault(FloatArray(0))
+            TimelineLoudnessCache.put(next, envelope)
+            envVersion++
+        }
+    }
+    // Gain follows the export's processor: target from the timeline at the shown video position, ~0.08s attack / ~0.28s release.
+    LaunchedEffect(player, duck, duckingTimeline, active, volume, clipPlayback.userEpoch) {
+        val p = player ?: return@LaunchedEffect
+        val timeline = duckingTimeline ?: return@LaunchedEffect
+        val musicGain = volume.coerceIn(0f, 2f)
+        val full = 0.85f * musicGain
+        val ducked = 0.18f * musicGain
+        fun target() = timeline.targetMusicGainAt(timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback), ducked, full)
+        var gain = target()
+        p.volume = gain.coerceIn(0f, 1f)
+        if (!active) return@LaunchedEffect
+        var last = android.os.SystemClock.uptimeMillis()
+        while (isActive) {
+            delay(40)
+            val now = android.os.SystemClock.uptimeMillis()
+            val dt = (now - last) / 1000.0
+            last = now
+            val goal = target()
+            val tau = if (goal < gain) 0.08 else 0.28
+            gain += ((1.0 - kotlin.math.exp(-dt / tau)).toFloat()) * (goal - gain)
+            p.volume = gain.coerceIn(0f, 1f)
+        }
+    }
+    // Re-synced only when the timeline starts or the user seeks, not on every automatic scene advance.
+    LaunchedEffect(player, active, clipPlayback.userEpoch) {
+        val p = player ?: return@LaunchedEffect
+        if (!active) { p.pause(); return@LaunchedEffect }
+        // The video-wide position: start card, scenes and end card all count, so music lines up with the export.
+        val atSeconds = timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback)
+        val durationMs = ((track?.durationSeconds ?: 0.0) * 1000).toLong()
+        var targetMs = (atSeconds * 1000).toLong()
+        if (durationMs > 0L) {
+            if (policy == TrailerMusicPolicy.SINGLE && targetMs >= durationMs) { p.pause(); return@LaunchedEffect }
+            targetMs %= durationMs
+        }
+        p.seekTo(targetMs)
+        p.play()
+    }
+}
+
+/**
  * Framed still of the selected scene at its trim start, drawn with the scene's fit/focus in the whole-video aspect,
  * plus an optional clip player for video scenes (trimmed range, scene volume).
  */
@@ -1329,13 +2278,13 @@ private data class PhotoPlanKey(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, playbackAllowed: Boolean, modifier: Modifier) {
+private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, playbackAllowed: Boolean, clipPlayback: ClipPlaybackState, modifier: Modifier, timelineShown: Boolean = false) {
     val context = LocalContext.current
     val aspect = outputAspect(session)
-    var playing by remember(scene.key) { mutableStateOf(false) }
-    // Fullscreen opened: the clip player leaves composition this frame (released) and play is reset, so returning
-    // shows the paused preview instead of auto-resuming. Photo progress is kept.
-    if (!playbackAllowed && playing) SideEffect { playing = false }
+    val playing = clipPlayback.isPlaying(scene.key)
+    // Fullscreen opened: the clip player leaves composition this frame (released) and play is paused, so returning
+    // shows the paused preview instead of auto-resuming. The clip position and photo progress are kept.
+    if (!playbackAllowed && playing) SideEffect { clipPlayback.playing = false }
     val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
     val planKey = if (source.isImage) {
         PhotoPlanKey(
@@ -1376,7 +2325,19 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
         }
     }
     val photoPlan = if (photoPlanEntry?.first == planKey) photoPlanEntry?.second else pendingPlan
-    var photoPlayProgress by remember(scene.key, planKey) { mutableFloatStateOf(0f) }
+    // A photo scene entered by the timeline (or resumed) starts at the position the workspace holds for it.
+    var photoPlayProgress by remember(scene.key, planKey) {
+        mutableFloatStateOf(
+            if (source.isImage) (clipPlayback.positionFor(scene.key).toFloat() / (scene.length * 1000).toFloat().coerceAtLeast(100f)).coerceIn(0f, 1f) else 0f,
+        )
+    }
+    LaunchedEffect(clipPlayback.seekRequestMs, scene.key, source.isImage) {
+        val target = clipPlayback.seekRequestMs ?: return@LaunchedEffect
+        if (source.isImage && clipPlayback.sceneKey == scene.key) {
+            photoPlayProgress = (target.toFloat() / (scene.length * 1000).toFloat().coerceAtLeast(100f)).coerceIn(0f, 1f)
+            clipPlayback.seekRequestMs = null
+        }
+    }
     LaunchedEffect(playing, source.isImage, scene.length, planKey, scene.key) {
         if (!playing || !source.isImage) {
             return@LaunchedEffect
@@ -1386,12 +2347,18 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
         val startTime = android.os.SystemClock.uptimeMillis() - startOffsetMs
         while (isActive && playing) {
             val elapsed = android.os.SystemClock.uptimeMillis() - startTime
-            photoPlayProgress = ((elapsed % durationMs).toFloat() / durationMs).coerceIn(0f, 1f)
+            // On the project timeline a photo plays its camera move once; alone it loops.
+            val shown = if (clipPlayback.continuous) elapsed.coerceAtMost(durationMs) else elapsed % durationMs
+            photoPlayProgress = (shown.toFloat() / durationMs).coerceIn(0f, 1f)
+            if (clipPlayback.sceneKey == scene.key) clipPlayback.positionMs = shown
             delay(16)
         }
     }
-    val frame by produceState<Bitmap?>(null, source.file, scene.start, source.isImage) {
-        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, scene.start, 960, exact = true) }
+    // A paused video shows the frame at the held position (timeline/slider seek), in 0.1s steps; a playing one uses its player.
+    val frameAt = if (source.isImage || playing) scene.start
+    else scene.start + (clipPlayback.positionFor(scene.key).coerceIn(0L, (scene.length * 1000).toLong()) / 100) / 10.0
+    val frame by produceState<Bitmap?>(null, source.file, frameAt, source.isImage) {
+        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, frameAt, 960, exact = true) }
     }
     // The exporter's own caption bitmap (exact output size, same layout) scaled into this output-shaped box.
     val captionBitmap by produceState<Bitmap?>(null, caption, outputWidth, outputHeight) {
@@ -1402,7 +2369,8 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
         delay(120)
         value = withContext(Dispatchers.Default) { SceneCaptionRenderer.render(context, caption, outputWidth, outputHeight) }
     }
-    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+    BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
         val boxWidth = minOf(maxWidth, maxHeight * aspect)
         Box(
             Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
@@ -1431,6 +2399,8 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                                      .setEndPositionMs(((scene.start + scene.length) * 1000).toLong())
                                      .build(),
                             ).build(),
+                            // Resumes where the previous player (another layout, or before pause) stopped, inside the clip.
+                            clipPlayback.positionFor(scene.key).coerceIn(0L, (scene.length * 1000).toLong()),
                         )
                         repeatMode = Player.REPEAT_MODE_ONE
                         playWhenReady = true
@@ -1438,7 +2408,26 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                     }
                 }
                 LaunchedEffect(player, scene.sourceVolume) { player.volume = scene.sourceVolume.coerceIn(0f, 1f) }
-                DisposableEffect(player) { onDispose { player.release() } }
+                LaunchedEffect(player, clipPlayback.seekRequestMs) {
+                    val target = clipPlayback.seekRequestMs ?: return@LaunchedEffect
+                    if (clipPlayback.sceneKey == scene.key) {
+                        player.seekTo(target)
+                        clipPlayback.seekRequestMs = null
+                    }
+                }
+                LaunchedEffect(player) {
+                    while (isActive) {
+                        clipPlayback.positionMs = player.currentPosition.coerceAtLeast(0L)
+                        delay(200)
+                    }
+                }
+                DisposableEffect(player) {
+                    onDispose {
+                        // The last known clip position; the next player (this or another layout) continues from it.
+                        runCatching { if (clipPlayback.sceneKey == scene.key) clipPlayback.positionMs = player.currentPosition.coerceAtLeast(0L) }
+                        player.release()
+                    }
+                }
                 // With effects the frames are already output-shaped, so FIT shows them 1:1 in this output-aspect box.
                 val resize = when {
                     !framingEffectsFailed || scene.fit == SceneFit.FIT -> AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -1501,7 +2490,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                     PhotoMotionMode.STILL -> "사진 고정 · ${plan.reason}"
                     null -> "사진 미리보기"
                 }
-                if (caption == null) {
+                if (caption == null && !timelineShown) {
                     Text(
                         statusText,
                         Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
@@ -1525,20 +2514,104 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 val captionImage = remember(bitmap) { bitmap.asImageBitmap() }
                 Image(captionImage, contentDescription = caption?.text, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
             }
-            FilledIconButton(
-                shape = EditorButtonShape,
-                onClick = { playing = !playing },
-                modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
+        }
+    }
+    // Enhanced preview controls: scrubber slider, play/pause, replay from start, and stepping.
+    val elapsedSeconds = clipPlayback.positionFor(scene.key) / 1000.0
+    // With the project timeline attached below the picture, its transport/scrub row is the only control set (no duplicate column).
+    if (!timelineShown) Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        if (!source.isImage && scene.length > 0.0) {
+            val totalMs = (scene.length * 1000).toLong().coerceAtLeast(1L)
+            var scrubbingValue by remember(scene.key) { mutableStateOf<Float?>(null) }
+            val currentScrubPos = scrubbingValue ?: (clipPlayback.positionFor(scene.key).toFloat() / totalMs)
+            Row(
+                modifier = Modifier.fillMaxWidth().height(26.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "클립 재생 멈춤" else "클립 재생", Modifier.size(24.dp))
+                Text(
+                    seconds1(elapsedSeconds),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Slider(
+                    value = currentScrubPos.coerceIn(0f, 1f),
+                    onValueChange = { scrubbingValue = it },
+                    onValueChangeFinished = {
+                        scrubbingValue?.let { fraction ->
+                            val targetMs = (fraction * totalMs).toLong()
+                            clipPlayback.seek(scene.key, targetMs)
+                        }
+                        scrubbingValue = null
+                    },
+                    modifier = Modifier.weight(1f).heightIn(max = 26.dp),
+                )
+                Text(
+                    seconds1(scene.length),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-            Text(
-                "${seconds1(scene.length)}${if (!source.isImage) " · ${seconds1(scene.start)}부터" else ""}",
-                Modifier.align(Alignment.BottomEnd).padding(8.dp).background(Color.Black.copy(alpha = .6f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
-                color = Color.White,
-                style = MaterialTheme.typography.labelSmall,
+        } else if (source.isImage && playing) {
+            LinearProgressIndicator(
+                progress = { photoPlayProgress },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
             )
         }
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            // With the project timeline above, its play/pause is the only visible one; restart and trim controls stay.
+            if (!timelineShown) {
+                FilledIconButton(
+                    shape = EditorButtonShape,
+                    onClick = { clipPlayback.toggle(scene.key) },
+                    modifier = Modifier.size(36.dp).semantics {
+                        if (!source.isImage) stateDescription = "경과 ${seconds1(elapsedSeconds)} / ${seconds1(scene.length)}"
+                    },
+                ) {
+                    PackIcon(if (playing) PackGlyph.PAUSE else PackGlyph.PLAY, if (playing) "클립 재생 멈춤" else "클립 재생", Modifier.size(20.dp))
+                }
+            }
+            IconButton(
+                onClick = { clipPlayback.restart(scene.key) },
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(Icons.Default.Replay, contentDescription = "처음부터 재생", Modifier.size(20.dp))
+            }
+            if (!source.isImage) {
+                IconButton(
+                    onClick = {
+                        val prevMs = (clipPlayback.positionFor(scene.key) - 1000L).coerceAtLeast(0L)
+                        clipPlayback.seek(scene.key, prevMs)
+                    },
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Icon(Icons.Default.FastRewind, contentDescription = "1초 뒤로", Modifier.size(18.dp))
+                }
+                IconButton(
+                    onClick = {
+                        val nextMs = (clipPlayback.positionFor(scene.key) + 1000L).coerceAtMost((scene.length * 1000).toLong())
+                        clipPlayback.seek(scene.key, nextMs)
+                    },
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Icon(Icons.Default.FastForward, contentDescription = "1초 앞으로", Modifier.size(18.dp))
+                }
+            }
+            Text(
+                if (source.isImage) seconds1(scene.length)
+                else "경과 ${seconds1(elapsedSeconds)} / ${seconds1(scene.length)} · ${seconds1(scene.start)}부터",
+                Modifier.weight(1f).padding(start = 4.dp),
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
     }
 }
 
@@ -1625,6 +2698,8 @@ internal fun EditorSettingsPanel(
     onColumnsChange: (Int) -> Unit,
     model: NasFinderViewModel,
     modifier: Modifier = Modifier,
+    boardDisplayMode: BoardDisplayMode = BoardDisplayMode.DETAIL,
+    onBoardDisplayModeChange: ((BoardDisplayMode) -> Unit)? = null,
 ) {
     val project = session.editor ?: return
     val sourcesById = remember(session.sources) { session.sources.associateBy { it.id } }
@@ -1657,46 +2732,80 @@ internal fun EditorSettingsPanel(
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            // Row 1 (Info row): columns dropdown + compact count + photo importance toggle + 전체선택/선택해제 (when multiActive)
+            // Row 1 (Info row): columns dropdown + board display mode + compact count + photo importance toggle + 전체선택/선택해제 (when multiActive)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 var columnsMenu by remember { mutableStateOf(false) }
-                Box {
-                    TextButton(
-                        shape = EditorButtonShape,
-                        onClick = { columnsMenu = true },
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .heightIn(min = if (isTablet) 28.dp else 30.dp)
-                            .semantics(mergeDescendants = true) {
-                                contentDescription = "한 줄에 클립 ${fixedColumns}개"
-                            },
-                    ) {
-                        Text(
-                            "한 줄 ${fixedColumns}개",
-                            maxLines = 1,
-                            style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp),
-                        )
-                        Icon(Icons.Default.ArrowDropDown, null, Modifier.size(18.dp))
-                    }
-                    DropdownMenu(expanded = columnsMenu, onDismissRequest = { columnsMenu = false }) {
-                        (2..maxColumns.coerceAtLeast(2)).forEach { count ->
-                            DropdownMenuItem(
-                                text = { Text("한 줄 ${count}개", fontSize = 13.sp) },
-                                trailingIcon = {
-                                    if (count == fixedColumns) {
-                                        Icon(Icons.Default.Check, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
-                                    }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Box {
+                        TextButton(
+                            shape = EditorButtonShape,
+                            onClick = { columnsMenu = true },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .heightIn(min = if (isTablet) 28.dp else 30.dp)
+                                .semantics(mergeDescendants = true) {
+                                    contentDescription = "한 줄에 클립 ${fixedColumns}개"
                                 },
-                                onClick = {
-                                    columnsMenu = false
-                                    onColumnsChange(count)
-                                },
+                        ) {
+                            Text(
+                                "한 줄 ${fixedColumns}개",
+                                maxLines = 1,
+                                style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp),
                             )
+                            Icon(Icons.Default.ArrowDropDown, null, Modifier.size(18.dp))
+                        }
+                        DropdownMenu(expanded = columnsMenu, onDismissRequest = { columnsMenu = false }) {
+                            (2..maxColumns.coerceAtLeast(2)).forEach { count ->
+                                DropdownMenuItem(
+                                    text = { Text("한 줄 ${count}개", fontSize = 13.sp) },
+                                    trailingIcon = {
+                                        if (count == fixedColumns) {
+                                            Icon(Icons.Default.Check, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    },
+                                    onClick = {
+                                        columnsMenu = false
+                                        onColumnsChange(count)
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    if (onBoardDisplayModeChange != null) {
+                        var modeMenu by remember { mutableStateOf(false) }
+                        Box {
+                            TextButton(
+                                shape = EditorButtonShape,
+                                onClick = { modeMenu = true },
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .heightIn(min = if (isTablet) 28.dp else 30.dp),
+                            ) {
+                                Text(boardDisplayMode.title, fontSize = 12.sp)
+                                Icon(Icons.Default.ArrowDropDown, null, Modifier.size(18.dp))
+                            }
+                            DropdownMenu(expanded = modeMenu, onDismissRequest = { modeMenu = false }) {
+                                BoardDisplayMode.entries.forEach { mode ->
+                                    DropdownMenuItem(
+                                        text = { Text(mode.title, fontSize = 13.sp) },
+                                        trailingIcon = { if (mode == boardDisplayMode) Icon(Icons.Default.Check, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary) },
+                                        onClick = {
+                                            modeMenu = false
+                                            onBoardDisplayModeChange(mode)
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -2000,8 +3109,17 @@ private fun SceneBoard(
     showClips: Boolean = true,
     showToolbar: Boolean = true,
     page: (@Composable () -> Unit)? = null,
+    // Full-span item after the clips and 재료 추가 (미리보기 좌측: the settings group under the board).
+    footer: (@Composable () -> Unit)? = null,
+    // Tablet boards only: "클립 N" title above the 3-view selector; the phone page stays compact.
+    showTitle: Boolean = false,
+    // Tablet boards only: Mac clip management (info, 중요 사진, one row of 선택/복사/이동/삭제) and the connected 3-view control.
+    macStyle: Boolean = false,
+    onOpenCaption: ((Long) -> Unit)? = null,
     modifier: Modifier = Modifier,
     model: NasFinderViewModel? = null,
+    boardDisplayMode: BoardDisplayMode = BoardDisplayMode.DETAIL,
+    onBoardDisplayModeChange: ((BoardDisplayMode) -> Unit)? = null,
 ) {
     val project = session.editor ?: return
     val sourcesById = session.sources.associateBy { it.id }
@@ -2009,15 +3127,36 @@ private fun SceneBoard(
     val effectiveMultiSelectMode = if (onToggleMultiSelectMode != null) multiSelectMode else internalMultiSelectMode
     var menuSceneKey by remember { mutableStateOf<Long?>(null) }
     var columnsMenu by remember { mutableStateOf(false) }
-    var activeTitleCardSheet by rememberSaveable { mutableStateOf<Boolean?>(null) }
     val indexedScenes = remember(project.scenes) { project.scenes.mapIndexed { idx, s -> idx to s } }
+
+    val effectiveAspect = when (boardDisplayMode) {
+        BoardDisplayMode.DETAIL -> thumbnailAspect
+        BoardDisplayMode.THUMBNAIL -> 1.15f
+        BoardDisplayMode.POSTER -> 0.72f
+    }
+    val effectiveCompact = compactCells || boardDisplayMode == BoardDisplayMode.THUMBNAIL
 
     // Compact toolbar: one text toggle for multi-selection; count, 전체 선택 and the
     // move/clone/delete actions appear only while selecting several (a single scene uses its ⋮ menu).
-    val effectiveSelectedKeys = if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
+    // Tablet multi-select uses the selection exactly (even empty), so 전체 해제 never falls back to the focused clip.
+    val effectiveSelectedKeys = if (macStyle && effectiveMultiSelectMode) selectedKeys
+    else if (selectedKeys.isNotEmpty()) selectedKeys else setOfNotNull(selectedKey)
     val multiActive = effectiveMultiSelectMode || effectiveSelectedKeys.size > 1
-    val headerItems: @Composable RowScope.() -> Unit = {
-        Row(Modifier.align(Alignment.CenterVertically), verticalAlignment = Alignment.CenterVertically) {
+    val toggleMultiSelect: () -> Unit = {
+        if (onToggleMultiSelectMode != null) {
+            onToggleMultiSelectMode()
+        } else {
+            if (multiActive) {
+                internalMultiSelectMode = false
+                if (effectiveSelectedKeys.size > 1) onClearSelection()
+            } else {
+                internalMultiSelectMode = true
+            }
+        }
+    }
+    // The quiet 한 줄 N개 control, shared by the phone toolbar and the tablet clip management.
+    val columnsControl: @Composable () -> Unit = {
+        Row(verticalAlignment = Alignment.CenterVertically) {
             // Clips per row (thumbnail size): UI only, so order, selection, scroll and the project stay as they are.
             if (fixedColumns != null && onColumnsChange != null) {
                 Box {
@@ -2027,7 +3166,7 @@ private fun SceneBoard(
                         contentPadding = PaddingValues(horizontal = 8.dp),
                         modifier = Modifier.heightIn(min = IconHitTarget).semantics(mergeDescendants = true) { contentDescription = "한 줄에 클립 ${fixedColumns}개" },
                     ) {
-                        Text("한 줄 ${fixedColumns}개", maxLines = 1)
+                        Text(if (macStyle) "${fixedColumns}열" else "한 줄 ${fixedColumns}개", maxLines = 1)
                         Icon(Icons.Default.ArrowDropDown, null, Modifier.size(20.dp))
                     }
                     DropdownMenu(expanded = columnsMenu, onDismissRequest = { columnsMenu = false }) {
@@ -2042,19 +3181,11 @@ private fun SceneBoard(
                 }
             }
         }
+    }
+    val headerItems: @Composable RowScope.() -> Unit = {
+        Row(Modifier.align(Alignment.CenterVertically), verticalAlignment = Alignment.CenterVertically) { columnsControl() }
         val toggleLabel = if (multiActive) "선택 완료" else "선택"
-        val toggle: () -> Unit = {
-            if (onToggleMultiSelectMode != null) {
-                onToggleMultiSelectMode()
-            } else {
-                if (multiActive) {
-                    internalMultiSelectMode = false
-                    if (effectiveSelectedKeys.size > 1) onClearSelection()
-                } else {
-                    internalMultiSelectMode = true
-                }
-            }
-        }
+        val toggle = toggleMultiSelect
         val configuration = LocalConfiguration.current
         val isTablet = configuration.smallestScreenWidthDp >= 600
         val toggleHeightMod = Modifier
@@ -2103,31 +3234,164 @@ private fun SceneBoard(
     }
     val showSelection = multiActive && effectiveSelectedKeys.isNotEmpty()
 
+    // Tablet clip management (as on Mac): an info row (position or selection count, 중요 사진, the quiet 한 줄 N개) above ONE
+    // always-visible row of four outlined actions on the current clip or the selected clips. Same callbacks as the phone toolbar.
+    val macToolbar: @Composable () -> Unit = {
+        val selectedScenes = project.scenes.filter { it.key in effectiveSelectedKeys }
+        val photoKeys = selectedScenes.filter { sourcesById[it.sourceId]?.isImage == true }.map { it.key }.toSet()
+        val allPhotosImportant = photoKeys.isNotEmpty() &&
+            selectedScenes.filter { it.key in photoKeys }.all { sourcesById[it.sourceId]?.isImportant == true }
+        val hasSelection = effectiveSelectedKeys.isNotEmpty()
+        val currentIndex = project.scenes.indexOfFirst { it.key == selectedKey }
+        val infoText = when {
+            multiActive -> "${effectiveSelectedKeys.size}/${project.scenes.size}개 선택"
+            currentIndex >= 0 -> "${currentIndex + 1}/${project.scenes.size}번"
+            else -> "전체 ${project.scenes.size}개"
+        }
+        val important = Color(0xFFFFB300)
+        val actionModifier = Modifier.minimumInteractiveComponentSize().heightIn(min = 34.dp)
+        val actionPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+        val actionText = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp)
+        Surface(
+            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(10.dp),
+        ) {
+            Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                FlowRow(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        infoText,
+                        Modifier.align(Alignment.CenterVertically),
+                        style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp, fontWeight = FontWeight.SemiBold),
+                        color = if (showSelection) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                    )
+                    Box(Modifier.align(Alignment.CenterVertically)) { columnsControl() }
+                    // 중요 사진 applies to the photos among the current/selected clips; a video-only selection disables it.
+                    if (onMarkImportant != null) {
+                        OutlinedButton(
+                            shape = EditorButtonShape,
+                            onClick = { onMarkImportant(photoKeys, !allPhotosImportant) },
+                            enabled = photoKeys.isNotEmpty(),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = if (allPhotosImportant) important else MaterialTheme.colorScheme.onSurfaceVariant,
+                            ),
+                            border = BorderStroke(
+                                1.dp,
+                                (if (allPhotosImportant) important else MaterialTheme.colorScheme.outlineVariant).copy(alpha = if (photoKeys.isNotEmpty()) 1f else 0.4f),
+                            ),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .align(Alignment.CenterVertically)
+                                .then(actionModifier)
+                                .semantics { contentDescription = if (allPhotosImportant) "중요 사진 해제" else "중요 사진 설정" },
+                        ) {
+                            Icon(if (allPhotosImportant) Icons.Default.Star else Icons.Default.StarBorder, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("중요 사진", style = actionText, fontWeight = if (allPhotosImportant) FontWeight.Bold else FontWeight.Normal, maxLines = 1)
+                        }
+                    }
+                    if (multiActive) {
+                        val allSelected = project.scenes.isNotEmpty() && effectiveSelectedKeys.size == project.scenes.size
+                        TextButton(
+                            shape = EditorButtonShape,
+                            onClick = { if (allSelected) onClearSelection() else onSelectAll() },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier.align(Alignment.CenterVertically).then(actionModifier),
+                        ) { Text(if (allSelected) "선택 해제" else "전체 선택", style = actionText, maxLines = 1) }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        shape = EditorButtonShape,
+                        onClick = toggleMultiSelect,
+                        contentPadding = actionPadding,
+                        modifier = Modifier.weight(1f).then(actionModifier).semantics { contentDescription = if (multiActive) "선택 완료" else "여러 클립 선택" },
+                    ) { Text(if (multiActive) "완료" else "선택", style = actionText, fontWeight = if (multiActive) FontWeight.Bold else FontWeight.Normal, maxLines = 1) }
+                    OutlinedButton(
+                        shape = EditorButtonShape,
+                        onClick = { onDuplicate(effectiveSelectedKeys) },
+                        enabled = hasSelection,
+                        contentPadding = actionPadding,
+                        modifier = Modifier.weight(1f).then(actionModifier).semantics { contentDescription = "클립 복제" },
+                    ) { Text("복사", style = actionText, maxLines = 1) }
+                    OutlinedButton(
+                        shape = EditorButtonShape,
+                        onClick = { onRequestMoveDialog(effectiveSelectedKeys) },
+                        enabled = hasSelection,
+                        contentPadding = actionPadding,
+                        modifier = Modifier.weight(1f).then(actionModifier).semantics { contentDescription = "위치 이동" },
+                    ) { Text("이동", style = actionText, maxLines = 1) }
+                    OutlinedButton(
+                        shape = EditorButtonShape,
+                        onClick = { onRemove(effectiveSelectedKeys) },
+                        enabled = hasSelection,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                            disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                        ),
+                        contentPadding = actionPadding,
+                        modifier = Modifier.weight(1f).then(actionModifier).semantics { contentDescription = "클립 삭제 (원본 파일은 유지)" },
+                    ) { Text("삭제", style = actionText, maxLines = 1) }
+                }
+            }
+        }
+    }
+
     // Multirow LazyVerticalGrid: the page item (when given), then (클립 only) the toolbar and the clips.
     val minCellSize = 136.dp
     LazyVerticalGrid(
-        columns = if (fixedColumns != null) GridCells.Fixed(fixedColumns) else GridCells.Adaptive(minSize = minCellSize),
+        // 자세히 is a vertical list (thumbnail left, text right) whatever the per-row setting; 썸네일/포스터 keep the grid.
+        columns = if (boardDisplayMode == BoardDisplayMode.DETAIL) GridCells.Fixed(1)
+        else if (fixedColumns != null) GridCells.Fixed(fixedColumns) else GridCells.Adaptive(minSize = minCellSize),
         state = gridState,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = if (macStyle) 6.dp else 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(if (macStyle) 8.dp else 6.dp),
         modifier = modifier,
     ) {
         if (page != null) item(key = "page", span = { GridItemSpan(maxLineSpan) }) { page() }
         if (!showClips) return@LazyVerticalGrid
-        if (showToolbar) {
+        if (showTitle) {
+            item(key = "clips_title", span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    "클립 ${project.scenes.size}",
+                    Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+            }
+        }
+        if (onBoardDisplayModeChange != null) {
+            item(key = "board_display_mode_selector", span = { GridItemSpan(maxLineSpan) }) {
+                // Phone and tablet share the same connected capsule (min 48dp touch targets).
+                MacSegmentedControl(
+                    options = BoardDisplayMode.entries.map { it to it.title },
+                    selected = boardDisplayMode,
+                    onSelect = onBoardDisplayModeChange,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = if (macStyle) 2.dp else 0.dp),
+                )
+            }
+        }
+        if (showToolbar && macStyle) item(key = "toolbar", span = { GridItemSpan(maxLineSpan) }) { macToolbar() }
+        if (showToolbar && !macStyle) {
             item(key = "toolbar", span = { GridItemSpan(maxLineSpan) }) {
                 // Wrapping rows keep every toolbar action visible, however narrow the page.
                 Surface(
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    Modifier.fillMaxWidth().padding(vertical = 0.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                     shape = RoundedCornerShape(10.dp),
                 ) {
-                    Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(Modifier.padding(horizontal = 8.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         FlowRow(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
                         ) { headerItems() }
                         if (showSelection) {
                             // Selection count and the actions on it share one wrapping row instead of shrinking.
@@ -2140,13 +3404,6 @@ private fun SceneBoard(
                     }
                 }
             }
-        }
-        item(key = "intro_card_item", span = { GridItemSpan(maxLineSpan) }) {
-            TitleCardBanner(
-                isIntro = true,
-                card = project.introCard,
-                onOpenSettings = { activeTitleCardSheet = true },
-            )
         }
         itemsIndexed(indexedScenes, key = { _, item -> item.second.key }) { _, (originalIndex, scene) ->
             val source = sourcesById[scene.sourceId] ?: return@itemsIndexed
@@ -2161,7 +3418,7 @@ private fun SceneBoard(
             val cellAction: @Composable (Modifier) -> Unit = { actionModifier ->
                 if (effectiveMultiSelectMode) {
                     Checkbox(
-                        checked = isSelected,
+                        checked = if (macStyle) scene.key in effectiveSelectedKeys else isSelected,
                         onCheckedChange = { onToggleSelectKey(scene.key) },
                         modifier = actionModifier.size(IconHitTarget),
                     )
@@ -2221,6 +3478,12 @@ private fun SceneBoard(
                                     },
                                 )
                             }
+                            if (onOpenCaption != null) {
+                                DropdownMenuItem(
+                                    text = { Text("자막·구간") },
+                                    onClick = { menuSceneKey = null; onOpenCaption(scene.key) },
+                                )
+                            }
                         }
                     }
                 }
@@ -2251,11 +3514,80 @@ private fun SceneBoard(
                 color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface,
                 tonalElevation = if (isSelected) 3.dp else 0.dp,
             ) {
-                Column(Modifier.fillMaxWidth()) {
+                if (boardDisplayMode == BoardDisplayMode.DETAIL) {
+                    val captionText = scene.caption?.text?.trim()?.takeIf { it.isNotEmpty() }
+                    val kindText = if (source.isImage) (if (source.isImportant) "★ 중요 사진" else "사진") else "영상"
+                    val lengthText = if (source.isImage) {
+                        "재생 ${seconds1(scene.length)}"
+                    } else {
+                        "${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} (${seconds1(scene.length)})"
+                    }
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier
+                                .size(64.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                        ) {
+                            thumb?.let {
+                                Image(
+                                    it.asImageBitmap(),
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop,
+                                )
+                            }
+                            if (isImportantPhoto) {
+                                Icon(
+                                    Icons.Default.Star,
+                                    contentDescription = "중요 사진",
+                                    tint = Color(0xFFFFB300),
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(14.dp),
+                                )
+                            }
+                        }
+                        Text(
+                            "${originalIndex + 1}",
+                            Modifier.widthIn(min = 24.dp),
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                        )
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text(
+                                source.name,
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "$kindText · $lengthText",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (captionText != null) {
+                                Text(
+                                    captionText,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                        cellAction(Modifier)
+                    }
+                } else Column(Modifier.fillMaxWidth()) {
                     Box(
                         Modifier
                             .fillMaxWidth()
-                            .aspectRatio(thumbnailAspect)
+                            .aspectRatio(effectiveAspect)
                             .background(MaterialTheme.colorScheme.surfaceVariant),
                     ) {
                         thumb?.let {
@@ -2297,49 +3629,100 @@ private fun SceneBoard(
                                 }
                             }
                         }
-                        if (!compactCells) {
+                        if (boardDisplayMode == BoardDisplayMode.POSTER) {
                             cellAction(Modifier.align(Alignment.TopEnd))
-                            // Media Kind tag (bottom-left)
-                            val tagBg = if (isImportantPhoto) Color(0xFFE65100).copy(alpha = 0.85f) else Color.Black.copy(alpha = 0.65f)
-                            val tagText = if (source.isImage) (if (source.isImportant) "★ 중요" else "사진") else "영상"
-                            Text(
-                                tagText,
+                            Box(
                                 Modifier
-                                    .align(Alignment.BottomStart)
+                                    .fillMaxWidth()
+                                    .align(Alignment.BottomCenter)
+                                    .background(
+                                        androidx.compose.ui.graphics.Brush.verticalGradient(
+                                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+                                        )
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                            ) {
+                                Column {
+                                    Text(
+                                        source.name,
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold, fontSize = 11.sp),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        seconds1(scene.length),
+                                        color = Color.White.copy(alpha = 0.85f),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    )
+                                }
+                            }
+                        } else {
+                            if (!effectiveCompact) {
+                                cellAction(Modifier.align(Alignment.TopEnd))
+                                // Media Kind tag (bottom-left)
+                                val tagBg = if (isImportantPhoto) Color(0xFFE65100).copy(alpha = 0.85f) else Color.Black.copy(alpha = 0.65f)
+                                val tagText = if (source.isImage) (if (source.isImportant) "★ 중요" else "사진") else "영상"
+                                Text(
+                                    tagText,
+                                    Modifier
+                                        .align(Alignment.BottomStart)
+                                        .padding(4.dp)
+                                        .background(tagBg, RoundedCornerShape(3.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = 10.sp,
+                                        fontWeight = if (isImportantPhoto) FontWeight.Bold else FontWeight.Normal,
+                                    ),
+                                )
+                            }
+                            // Duration badge (bottom-right)
+                            Text(
+                                seconds1(scene.length),
+                                Modifier
+                                    .align(Alignment.BottomEnd)
                                     .padding(4.dp)
-                                    .background(tagBg, RoundedCornerShape(3.dp))
+                                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(3.dp))
                                     .padding(horizontal = 4.dp, vertical = 1.dp),
                                 color = Color.White,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 10.sp,
-                                    fontWeight = if (isImportantPhoto) FontWeight.Bold else FontWeight.Normal,
-                                ),
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium, fontSize = 10.sp),
                             )
                         }
-                        // Duration badge (bottom-right)
-                        Text(
-                            seconds1(scene.length),
-                            Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(4.dp)
-                                .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(3.dp))
-                                .padding(horizontal = 4.dp, vertical = 1.dp),
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium, fontSize = 10.sp),
-                        )
                     }
-                    if (compactCells) {
-                        // The thumbnail stays a clear tap target; the 48dp ⋮/checkbox gets its own row under it.
-                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { cellAction(Modifier) }
-                    } else {
-                        // Source Filename below thumbnail
-                        Text(
-                            source.name,
-                            Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                    if (boardDisplayMode == BoardDisplayMode.DETAIL) {
+                        Column(Modifier.padding(horizontal = 6.dp, vertical = 4.dp)) {
+                            Text(
+                                source.name,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            val detailText = if (source.isImage) {
+                                "사진 · 재생 ${seconds1(scene.length)}"
+                            } else {
+                                "영상 · 구간 ${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} (선택 ${seconds1(scene.length)})"
+                            }
+                            Text(
+                                detailText,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    } else if (boardDisplayMode == BoardDisplayMode.THUMBNAIL) {
+                        if (effectiveCompact) {
+                            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { cellAction(Modifier) }
+                        } else {
+                            Text(
+                                source.name,
+                                Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                 }
             }
@@ -2349,7 +3732,7 @@ private fun SceneBoard(
                 onClick = onAddMaterial,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(thumbnailAspect)
+                    .then(if (boardDisplayMode == BoardDisplayMode.DETAIL) Modifier.height(72.dp) else Modifier.aspectRatio(effectiveAspect))
                     .semantics { contentDescription = "재료 추가" },
                 shape = EditorButtonShape,
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
@@ -2365,117 +3748,22 @@ private fun SceneBoard(
                 }
             }
         }
-        item(key = "outro_card_item", span = { GridItemSpan(maxLineSpan) }) {
-            TitleCardBanner(
-                isIntro = false,
-                card = project.outroCard,
-                onOpenSettings = { activeTitleCardSheet = false },
-            )
-        }
-    }
-
-    activeTitleCardSheet?.let { isIntro ->
-        TitleCardSettingsSheet(
-            isIntro = isIntro,
-            card = if (isIntro) project.introCard else project.outroCard,
-            session = session,
-            model = model ?: return@let,
-            onDismiss = { activeTitleCardSheet = null },
-        )
+        if (footer != null) item(key = "footer", span = { GridItemSpan(maxLineSpan) }) { footer() }
     }
 }
 
+/**
+ * 시작 화면/마지막 화면 editor shown inline in the 자막 inspector. It edits the same [TrailerTitleCard] through
+ * editorSetIntroCard/editorSetOutroCard as the former sheet did; the time/background fields appear only while the
+ * card is on. The card has no typography fields of its own; it renders with the project's shared body caption
+ * typography (first scene caption with text), falling back to the legacy look when no scene has a caption.
+ */
 @Composable
-private fun TitleCardBanner(
-    isIntro: Boolean,
-    card: TrailerTitleCard,
-    onOpenSettings: () -> Unit,
-) {
-    val configuration = LocalConfiguration.current
-    val isTablet = configuration.smallestScreenWidthDp >= 600
-    val label = if (isIntro) "시작 화면" else "마지막 화면"
-    val settingButtonLabel = if (isIntro) "시작 화면 설정" else "마지막 화면 설정"
-
-    Surface(
-        onClick = onOpenSettings,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp)
-            .semantics(mergeDescendants = true) {
-                contentDescription = "$label, ${if (card.enabled) "사용 중, ${seconds1(card.duration)}" else "사용 안 함"}"
-            },
-        shape = EditorButtonShape,
-        color = if (card.enabled) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        border = BorderStroke(
-            1.dp,
-            if (card.enabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-        ),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = if (isTablet) 6.dp else 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Column(
-                modifier = Modifier.weight(1f).padding(end = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(1.dp),
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        label,
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = if (isTablet) 14.sp else 13.sp,
-                        ),
-                    )
-                    Text(
-                        if (card.enabled) "사용 중 · ${seconds1(card.duration)}" else "사용 안 함",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 11.sp,
-                            fontWeight = if (card.enabled) FontWeight.SemiBold else FontWeight.Normal,
-                        ),
-                        color = if (card.enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                if (card.enabled && (card.title.isNotBlank() || card.subtitle.isNotBlank())) {
-                    val previewText = listOf(card.title.trim(), card.subtitle.trim()).filter { it.isNotBlank() }.joinToString(" · ")
-                    Text(
-                        previewText,
-                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            OutlinedButton(
-                shape = EditorButtonShape,
-                onClick = onOpenSettings,
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = if (isTablet) 4.dp else 6.dp),
-                modifier = Modifier.heightIn(min = if (isTablet) 32.dp else 36.dp),
-            ) {
-                Text(
-                    settingButtonLabel,
-                    style = MaterialTheme.typography.labelMedium.copy(fontSize = if (isTablet) 12.sp else 11.sp),
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun TitleCardSettingsSheet(
+private fun TitleCardInlineEditor(
     isIntro: Boolean,
     card: TrailerTitleCard,
     session: TrailerSession,
     model: NasFinderViewModel,
-    onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
     var draftCard by remember(card) { mutableStateOf(card) }
@@ -2485,7 +3773,13 @@ private fun TitleCardSettingsSheet(
 
     val scenes = session.scenes
     val targetScene = if (isIntro) scenes.firstOrNull() else scenes.lastOrNull()
-    val backgroundBitmap by produceState<Bitmap?>(null, isIntro, draftCard.usesFirstOrLastImage, targetScene) {
+    val photoChoices = remember(session.scenes) { session.scenes.map { it.source }.filter { it.isImage }.distinctBy { it.id } }
+    val chosenPhoto = draftCard.resolveBackgroundSource(photoChoices)
+    val backgroundBitmap by produceState<Bitmap?>(null, isIntro, draftCard.usesFirstOrLastImage, targetScene, chosenPhoto) {
+        if (chosenPhoto != null) {
+            value = withContext(Dispatchers.IO) { loadFrame(chosenPhoto.file, true, 0.0, 480, exact = true) }
+            return@produceState
+        }
         if (!draftCard.usesFirstOrLastImage || targetScene == null) {
             value = null
             return@produceState
@@ -2501,9 +3795,10 @@ private fun TitleCardSettingsSheet(
     val previewW = (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2)
     val previewH = (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
 
-    val previewBitmap by produceState<Bitmap?>(null, draftCard, backgroundBitmap, previewW, previewH) {
+    val bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(scenes.map { it.caption })
+    val previewBitmap by produceState<Bitmap?>(null, draftCard, backgroundBitmap, previewW, previewH, bodyCaption) {
         value = withContext(Dispatchers.Default) {
-            TrailerTitleCardRenderer.renderCardBitmap(context, draftCard, backgroundBitmap, previewW, previewH)
+            TrailerTitleCardRenderer.renderCardBitmap(context, draftCard, backgroundBitmap, previewW, previewH, bodyCaption)
         }
     }
 
@@ -2513,71 +3808,25 @@ private fun TitleCardSettingsSheet(
         else model.editorSetOutroCard(updated)
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // Toggle: 시작 화면 사용 / 마지막 화면 사용
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(sheetName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                IconButton(onClick = onDismiss) {
-                    Icon(Icons.Default.Close, contentDescription = "닫기")
-                }
+            Column(Modifier.weight(1f)) {
+                Text(toggleLabel, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                Text("영상의 시작/끝에 타이틀 카드를 넣습니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            Switch(
+                checked = draftCard.enabled,
+                onCheckedChange = { commit(draftCard.copy(enabled = it)) },
+                modifier = Modifier.semantics { contentDescription = toggleLabel },
+            )
+        }
 
-            // LIVE Preview box using the same renderer
-            val aspect = if (outputHeight > 0) outputWidth.toFloat() / outputHeight.toFloat() else 16f / 9f
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 220.dp)
-                    .aspectRatio(aspect, matchHeightConstraintsFirst = true)
-                    .align(Alignment.CenterHorizontally)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.Black),
-                contentAlignment = Alignment.Center,
-            ) {
-                val bmp = previewBitmap
-                if (bmp != null) {
-                    Image(
-                        bitmap = bmp.asImageBitmap(),
-                        contentDescription = "$sheetName 실시간 미리보기",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
-                    )
-                } else {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                }
-            }
-
-            // Toggle: 시작 화면 사용 / 마지막 화면 사용
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(toggleLabel, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
-                    Text("영상의 시작/끝에 타이틀 카드를 넣습니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Switch(
-                    checked = draftCard.enabled,
-                    onCheckedChange = { commit(draftCard.copy(enabled = it)) },
-                )
-            }
-
-            HorizontalDivider()
-
+        if (draftCard.enabled) {
             // Title and Subtitle fields
             OutlinedTextField(
                 value = draftCard.title,
@@ -2616,8 +3865,6 @@ private fun TitleCardSettingsSheet(
                 )
             }
 
-            HorizontalDivider()
-
             // Background toggle: 첫/마지막 사진/영상 배경 사용
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -2631,12 +3878,63 @@ private fun TitleCardSettingsSheet(
                 Switch(
                     checked = draftCard.usesFirstOrLastImage,
                     onCheckedChange = { commit(draftCard.copy(usesFirstOrLastImage = it)) },
+                    modifier = Modifier.semantics { contentDescription = bgToggleLabel },
                 )
             }
 
-            Spacer(Modifier.height(16.dp))
+            // Optional project photo as the background; "기본" keeps the first/last frame. A missing photo falls back silently.
+            if (draftCard.usesFirstOrLastImage && photoChoices.isNotEmpty()) {
+                Text("배경 사진", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = chosenPhoto == null,
+                        onClick = { commit(draftCard.copy(backgroundSourceId = null)) },
+                        label = { Text(if (isIntro) "첫 장면" else "마지막 장면") },
+                    )
+                    photoChoices.forEachIndexed { index, photo ->
+                        FilterChip(
+                            selected = chosenPhoto?.id == photo.id,
+                            onClick = { commit(draftCard.copy(backgroundSourceId = photo.id)) },
+                            label = { Text("사진 ${index + 1}") },
+                            modifier = Modifier.semantics { contentDescription = "배경 사진 ${index + 1}: ${photo.name}" },
+                        )
+                    }
+                }
+            }
+
+            // LIVE preview of the card itself (the stage preview keeps showing the selected clip)
+            val aspect = if (outputHeight > 0) outputWidth.toFloat() / outputHeight.toFloat() else 16f / 9f
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 160.dp)
+                    .aspectRatio(aspect, matchHeightConstraintsFirst = true)
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                val bmp = previewBitmap
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = "$sheetName 실시간 미리보기",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+            }
         }
     }
+}
+
+/** Which part of the video the 자막 inspector edits: the clips' body captions, or the 시작/마지막 화면 title card. */
+private enum class CaptionTarget(val title: String) {
+    BODY("본문 자막"),
+    INTRO("시작 화면"),
+    OUTRO("마지막 화면"),
 }
 
 private fun Modifier.graphicsOffset(x: Float): Modifier = this.then(Modifier.offset { androidx.compose.ui.unit.IntOffset(x.roundToInt(), 0) })
@@ -2691,10 +3989,65 @@ private fun editorInspectorColumns(
     model: NasFinderViewModel,
     onSelectScene: (Long) -> Unit,
     onOpenMusicPicker: () -> Unit,
-): InspectorColumns = when (if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab) {
+): InspectorColumns {
+    // Saved here (not inside the caption section) so the choice survives tab switches and relayouts.
+    var captionTarget by rememberSaveable { mutableStateOf(CaptionTarget.BODY) }
+    var pendingScope by rememberSaveable { mutableStateOf<CaptionScope?>(null) }
+    return when (if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab) {
     // 클립: only the selected clip's compact length/range, so the clip grid below stays in the first viewport.
     InspectorTab.SCENE, InspectorTab.PLAN -> InspectorColumns(left = { SceneSection(session, scene, source, model, onSelectScene) })
-    InspectorTab.CAPTION -> sceneCaptionColumns(session, scene, selectedKeys, captionDraft, onCaptionDraftChange, model, onSelectScene)
+    InspectorTab.CAPTION -> {
+        // 본문 keeps the unchanged caption inspector (its own 현재/선택/전체 scopes and pending draft); 시작 화면/마지막 화면
+        // swap only the body below this selector for the title card controls, so no caption or card data is touched.
+        // 시작/마지막 화면 선택지. 범위 3개와 같은 줄(CaptionScopeChoices)에 이어 붙여 한 번만 렌더된다.
+        val cardChoices: @Composable () -> Unit = {
+            val chip = Modifier.width(80.dp)
+            CompactChoice("시작 화면", captionTarget == CaptionTarget.INTRO, { captionTarget = CaptionTarget.INTRO }, chip)
+            CompactChoice("마지막 화면", captionTarget == CaptionTarget.OUTRO, { captionTarget = CaptionTarget.OUTRO }, chip)
+        }
+        val project = session.editor
+        if (captionTarget == CaptionTarget.BODY || project == null) {
+            val body = sceneCaptionColumns(
+                session, scene, selectedKeys, captionDraft, onCaptionDraftChange, model, onSelectScene,
+                scopeExtras = cardChoices,
+                pendingScope = pendingScope,
+                onPendingScopeHandled = { pendingScope = null },
+            )
+            val bodySingle = body.single
+            val singleWithTiming: (@Composable () -> Unit)? = if (bodySingle == null) null else {
+                {
+                    SceneSection(session, scene, source, model, onSelectScene)
+                    HorizontalDivider()
+                    bodySingle()
+                }
+            }
+            // As on Mac the scene timing leads the body-caption inspector; it joins only the route that is shown
+            // (single, or left + right), so it is never composed twice. Title card targets below get none.
+            InspectorColumns(
+                left = {
+                    SceneSection(session, scene, source, model, onSelectScene)
+                    HorizontalDivider()
+                    body.left()
+                },
+                right = body.right,
+                dividerBetween = body.dividerBetween,
+                single = singleWithTiming,
+            )
+        } else {
+            val isIntro = captionTarget == CaptionTarget.INTRO
+            val sceneKeys = project.scenes.map { it.key }.toSet()
+            val selectedCount = selectedKeys.count { it in sceneKeys }
+            InspectorColumns(left = {
+                CaptionScopeChoices(
+                    scope = null,
+                    selectedCount = selectedCount,
+                    onChoose = { pendingScope = it; captionTarget = CaptionTarget.BODY },
+                    extra = cardChoices,
+                )
+                TitleCardInlineEditor(isIntro, if (isIntro) project.introCard else project.outroCard, session, model)
+            })
+        }
+    }
     InspectorTab.SOUND -> InspectorColumns(
         left = { SoundClipSection(scene, source, model) },
         right = { SoundMusicSection(session, model, onOpenMusicPicker) },
@@ -2723,6 +4076,7 @@ private fun editorInspectorColumns(
             PlanOptionsSection(session, model, onOpenMusicPicker)
         },
     )
+    }
 }
 
 /**
@@ -2748,13 +4102,25 @@ private fun InspectorBody(modifier: Modifier, content: @Composable () -> Unit) {
  * also offers the TalkBack resize actions.
  */
 @Composable
-private fun InspectorTabs(tab: InspectorTab, onTab: (InspectorTab) -> Unit, resizeActions: List<CustomAccessibilityAction>, modifier: Modifier) {
-    val shownTab = if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab
-    val tabs = InspectorTab.entries - InspectorTab.PLAN
+private fun InspectorTabs(tab: InspectorTab, onTab: (InspectorTab) -> Unit, resizeActions: List<CustomAccessibilityAction>, modifier: Modifier, settingsPane: Boolean = false, connected: Boolean = false) {
+    // settingsPane (tablet/portrait settings, as on Mac): 자막·구간/음악/화면 only; a legacy 클립/PLAN shows as 자막·구간.
+    val legacy = tab == InspectorTab.SCENE || tab == InspectorTab.PLAN
+    val shownTab = if (settingsPane && legacy) InspectorTab.CAPTION else if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab
+    val tabs = if (settingsPane) InspectorTab.entries - InspectorTab.PLAN - InspectorTab.SCENE else InspectorTab.entries - InspectorTab.PLAN
     val tabModifier = if (resizeActions.isEmpty()) Modifier else Modifier.semantics { customActions = resizeActions }
     val configuration = LocalConfiguration.current
     val isTablet = configuration.smallestScreenWidthDp >= 600
     val tabHeightMod = if (isTablet) Modifier.minimumInteractiveComponentSize().heightIn(min = 34.dp) else Modifier.heightIn(min = IconHitTarget)
+    if (settingsPane) {
+        // Tablet inspector (as on Mac): the three tabs are connected segments that always share one row (panes are ≥ 240dp).
+        MacSegmentedControl(tabs.map { it to it.title }, shownTab, onTab, modifier.fillMaxWidth(), itemModifier = tabModifier)
+        return
+    }
+    if (connected) {
+        // Phone: the four tabs share the Mac connected capsule instead of separate outlined blocks (min 48dp targets).
+        MacSegmentedControl(tabs.map { it to it.title }, shownTab, onTab, modifier.fillMaxWidth(), itemModifier = tabModifier)
+        return
+    }
     // Four tabs share one row; only a very narrow pane (large text) wraps them into two rows.
     BoxWithConstraints(modifier.fillMaxWidth()) {
         FlowRow(
@@ -2765,6 +4131,66 @@ private fun InspectorTabs(tab: InspectorTab, onTab: (InspectorTab) -> Unit, resi
         ) {
             tabs.forEach { entry ->
                 TrailerChoice(entry.title, shownTab == entry, Modifier.weight(1f).then(tabHeightMod).then(tabModifier)) { onTab(entry) }
+            }
+        }
+    }
+}
+
+/** The 클립/설정 switch under the fixed portrait preview; its row also carries the vertical preview-resize drag. */
+@Composable
+private fun PortraitPaneSwitch(pane: PortraitPane, onPane: (PortraitPane) -> Unit, resizeActions: List<CustomAccessibilityAction>, modifier: Modifier) {
+    val tabModifier = if (resizeActions.isEmpty()) Modifier else Modifier.semantics { customActions = resizeActions }
+    Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        PortraitPane.entries.forEach { entry ->
+            TrailerChoice(entry.title, pane == entry, Modifier.weight(1f).heightIn(min = IconHitTarget).then(tabModifier)) { onPane(entry) }
+        }
+    }
+}
+
+/**
+ * Mac-style connected segmented control for the tablet choosers (pane roles, board view modes, inspector tabs): one
+ * rounded neutral track, the selected segment a neutral light surface with dark text — no accent outline, check icon or
+ * gaps between segments. Colors come from the theme (dark mode lifts the selected segment instead of whitening it).
+ * Phone, export and music options keep TrailerChoice. [itemModifier] is applied to every segment (e.g. resize actions).
+ */
+@Composable
+private fun <T> MacSegmentedControl(
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelect: (T) -> Unit,
+    modifier: Modifier = Modifier,
+    itemModifier: Modifier = Modifier,
+) {
+    val colors = MaterialTheme.colorScheme
+    val dark = colors.background.luminance() < 0.5f
+    val trackColor = colors.onSurface.copy(alpha = if (dark) 0.14f else 0.08f)
+    val selectedColor = if (dark) colors.onSurface.copy(alpha = 0.26f) else colors.surface
+    Row(
+        modifier.clip(RoundedCornerShape(50)).background(trackColor).padding(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        options.forEach { (value, label) ->
+            val isSelected = value == selected
+            Box(
+                Modifier
+                    .weight(1f)
+                    .then(itemModifier)
+                    .minimumInteractiveComponentSize()
+                    .heightIn(min = 40.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(if (isSelected) selectedColor else Color.Transparent)
+                    .selectable(selected = isSelected, role = Role.Tab, onClick = { onSelect(value) })
+                    .padding(horizontal = 4.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp),
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    color = if (isSelected) colors.onSurface else colors.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }

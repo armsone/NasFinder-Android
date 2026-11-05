@@ -15,7 +15,17 @@ data class TrailerTitleCard(
     val subtitle: String = "",
     val duration: Double = 3.0,
     val usesFirstOrLastImage: Boolean = true,
+    // Optional existing project photo (TrailerSource.id) used as the background instead of the first/last frame;
+    // null (old saves) = first/last frame. Ignored while usesFirstOrLastImage is off or the source is gone.
+    val backgroundSourceId: Int? = null,
 ) {
+    /** The chosen photo among [candidates], or null (missing/not a readable photo) so callers fall back to first/last frame. */
+    fun resolveBackgroundSource(candidates: Iterable<TrailerSource>): TrailerSource? {
+        val id = backgroundSourceId ?: return null
+        if (!usesFirstOrLastImage) return null
+        return candidates.firstOrNull { it.id == id && it.isImage && it.file.isFile }
+    }
+
     fun clampedDuration(): Double {
         if (!duration.isFinite()) return 3.0
         return duration.coerceIn(1.0, 10.0)
@@ -26,6 +36,7 @@ data class TrailerTitleCard(
         subtitle = subtitle,
         duration = clampedDuration(),
         usesFirstOrLastImage = usesFirstOrLastImage,
+        backgroundSourceId = backgroundSourceId,
     )
 
     fun toJson(): JSONObject = JSONObject().apply {
@@ -34,6 +45,7 @@ data class TrailerTitleCard(
         put("subtitle", subtitle)
         put("duration", clampedDuration())
         put("usesFirstOrLastImage", usesFirstOrLastImage)
+        if (backgroundSourceId != null) put("backgroundSourceId", backgroundSourceId)
     }
 
     companion object {
@@ -46,6 +58,7 @@ data class TrailerTitleCard(
                 subtitle = obj.optString("subtitle", ""),
                 duration = if (rawDuration.isFinite()) rawDuration.coerceIn(1.0, 10.0) else 3.0,
                 usesFirstOrLastImage = obj.optBoolean("usesFirstOrLastImage", true),
+                backgroundSourceId = if (obj.has("backgroundSourceId") && !obj.isNull("backgroundSourceId")) obj.optInt("backgroundSourceId") else null,
             )
         }
     }
@@ -53,10 +66,18 @@ data class TrailerTitleCard(
 
 object TrailerTitleCardRenderer {
     /**
+     * The project's shared body caption style: the first scene caption (in timeline order) that has text, or null
+     * when no scene has one. Used by preview and export so both resolve the same style.
+     */
+    fun bodyCaptionOf(sceneCaptions: Iterable<SceneCaption?>): SceneCaption? =
+        sceneCaptions.firstOrNull { it != null && it.text.isNotBlank() }?.clamped()
+
+    /**
      * Renders a title card to a bitmap of size [width] x [height].
      * Aspect-fills [sourceBitmap] if [card.usesFirstOrLastImage] and [sourceBitmap] is non-null.
      * Applies a 48% black overlay (NORMAL alpha), then draws white bold centered title/subtitle
-     * using SceneCaptionRenderer style (XLARGE, Pretendard Bold, centered).
+     * using SceneCaptionRenderer style (XLARGE, Pretendard Bold, centered), or the typography of [bodyCaption]
+     * when given (card text, centered layout and background are unchanged).
      * If sourceBitmap is null or usesFirstOrLastImage is false, fills with dark charcoal/black (#141417).
      */
     fun renderCardBitmap(
@@ -65,6 +86,7 @@ object TrailerTitleCardRenderer {
         sourceBitmap: Bitmap?,
         width: Int,
         height: Int,
+        bodyCaption: SceneCaption? = null,
     ): Bitmap? {
         if (width <= 0 || height <= 0) return null
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -110,7 +132,7 @@ object TrailerTitleCardRenderer {
             else -> subtitleText
         }
 
-        val caption = SceneCaption(
+        val legacyCaption = SceneCaption(
             text = combinedText,
             font = CaptionFont.PRETENDARD_BOLD,
             fontName = "pretendard_bold",
@@ -122,6 +144,18 @@ object TrailerTitleCardRenderer {
             lineSpacing = 1.25f,
             column = 2,
             row = 2,
+        )
+        // Shared body caption typography: font/size/color/shadow/line spacing come from the body caption, while the
+        // card keeps its own text, centered layout (column/row), time and background. No body caption = legacy look.
+        val caption = if (bodyCaption == null) legacyCaption else legacyCaption.copy(
+            font = bodyCaption.font,
+            fontName = bodyCaption.effectiveFontName,
+            size = bodyCaption.size,
+            textColor = bodyCaption.textColor,
+            shadowEnabled = bodyCaption.shadowEnabled,
+            shadowColor = bodyCaption.shadowColor,
+            shadowOpacity = bodyCaption.shadowOpacity,
+            lineSpacing = bodyCaption.lineSpacing,
         )
 
         val captionBitmap = SceneCaptionRenderer.render(context, caption, width, height)

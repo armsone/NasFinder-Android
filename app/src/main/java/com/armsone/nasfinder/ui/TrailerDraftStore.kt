@@ -81,6 +81,12 @@ object TrailerDraftStore {
     private var persistBlocked = false
     // Answers whether another store (collections) still points at a file inside a directory.
     private var externalReferenceGuard: ((File) -> Boolean)? = null
+    private const val RECOVERY_BACKUP_DIR = "trailer_recovery_backups"
+    private const val MAX_RECOVERIES_PER_RUN = 16
+    // 로드 시점에 id를 차지한 개정본의 지문. 이후 이름 변경 등과 무관하게 "원래 로드된 개정본"을 식별한다.
+    private val loadedFingerprints = mutableMapOf<String, String>()
+    // 목록 파일 자체가 복원/격리된 경우(신뢰할 수 없음). 이때는 중복 복구를 하지 않는다.
+    private var metadataUntrusted = false
 
     @Synchronized
     fun configureTrailersRoot(cacheDir: File, durableFilesDir: File? = null) {
@@ -325,7 +331,7 @@ object TrailerDraftStore {
      */
     @Synchronized
     fun cleanupInterruptedMigrations() {
-        if (metadataProblem != null || persistBlocked) return
+        if (metadataUntrusted || persistBlocked) return
         val root = canonicalDurableRoot?.let(::File) ?: return
         root.listFiles()?.forEach { candidate ->
             val marker = File(candidate, MIGRATION_MARKER)
@@ -437,6 +443,159 @@ object TrailerDraftStore {
         if (!sameDirectory(original.directory, migrated.directory) && runCatching { !inUse(original.directory) }.getOrDefault(false)) {
             safeDeletePrivateTrailerDirectory(original.directory)
         }
+        return true
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Duplicate-id revision recovery.
+    // ---------------------------------------------------------------------------------------------
+
+    class DuplicateRecoveryResult(val recovered: Int, val failed: Int, val exactDuplicatesLeftRaw: Int)
+
+    private class RecoveryPlan(val raw: JSONObject, val parsed: TrailerDraft, val fingerprint: String)
+
+    private fun fingerprintOf(draft: TrailerDraft): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(draftJson(draft).toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    /**
+     * Recovers raw records whose id is already held by another draft but whose content differs: each is copied into its
+     * own new project folder and listed as a new draft ("(복구)"). Run on a background thread, after
+     * [cleanupInterruptedMigrations]. Exact duplicates of the loaded revision are left in raw untouched. A raw record is
+     * removed only after an exact copy was written to a separate recovery backup file and the metadata commit succeeded;
+     * any failure keeps the raw record and original media as they were. Original media are never deleted.
+     */
+    fun recoverDuplicateRevisions(inUse: (File) -> Boolean): DuplicateRecoveryResult {
+        val root: File
+        val plans: List<RecoveryPlan>
+        var exactLeft = 0
+        synchronized(this) {
+            if (metadataUntrusted || persistBlocked || draftsStorageDir == null) return DuplicateRecoveryResult(0, 0, 0)
+            root = canonicalDurableRoot?.let(::File) ?: return DuplicateRecoveryResult(0, 0, 0)
+            val seen = mutableMapOf<String, MutableSet<String>>()
+            loadedFingerprints.forEach { (id, fp) -> if (drafts.containsKey(id)) seen[id] = mutableSetOf(fp) }
+            val candidates = mutableListOf<RecoveryPlan>()
+            for (raw in preservedRawRecords) {
+                val obj = raw as? JSONObject ?: continue
+                val parsed = runCatching { parseDraft(obj, -1) }.getOrNull() ?: continue
+                val known = seen[parsed.id] ?: continue
+                val fp = fingerprintOf(parsed)
+                if (known.add(fp)) candidates += RecoveryPlan(obj, parsed, fp) else exactLeft++
+            }
+            plans = candidates.take(MAX_RECOVERIES_PER_RUN)
+        }
+        var recovered = 0
+        var failed = 0
+        plans.forEach { plan ->
+            if (runCatching { recoverOne(plan, root, inUse) }.getOrDefault(false)) recovered++ else failed++
+        }
+        return DuplicateRecoveryResult(recovered, failed, exactLeft)
+    }
+
+    private fun recoverOne(plan: RecoveryPlan, root: File, inUse: (File) -> Boolean): Boolean {
+        val newId = UUID.nameUUIDFromBytes("recovered:${plan.fingerprint}".toByteArray()).toString()
+        val dirName = UUID.nameUUIDFromBytes("recovered-dir:${plan.fingerprint}".toByteArray()).toString()
+        // Already committed earlier (raw not yet removed): no second copy, only the raw bookkeeping.
+        if (synchronized(this) { drafts.containsKey(newId) }) return commitRecovery(plan, null, newId)
+        if (runCatching { inUse(plan.parsed.directory) }.getOrDefault(true)) return false
+        if (!plan.parsed.isValid()) return false
+        val newDir = File(root, dirName)
+        // A leftover folder of an interrupted attempt is removed by cleanupInterruptedMigrations; never reuse it here.
+        if (newDir.exists()) return false
+        val copied = copyDraftForRecovery(plan.parsed.copy(id = newId), newDir) ?: return false
+        return commitRecovery(plan, copied, newId)
+    }
+
+    /** Copies the owned files (those inside the old folder, nested paths kept) into a NEW marked folder; null on any failure. */
+    private fun copyDraftForRecovery(original: TrailerDraft, newDir: File): TrailerDraft? {
+        if (!newDir.mkdirs()) return null
+        return try {
+            File(newDir, MIGRATION_MARKER).writeText(original.id)
+            val oldRoot = original.directory.canonicalFile
+            val newRoot = newDir.canonicalFile
+            val usedPaths = mutableSetOf(MIGRATION_MARKER)
+            val copiedBySource = mutableMapOf<String, File>()
+            fun copyOwned(file: File): File {
+                if (!isInside(file, original.directory)) return file
+                val canonical = file.canonicalFile
+                copiedBySource[canonical.path]?.let { return it }
+                var relative = canonical.relativeTo(oldRoot).path
+                if (relative.isBlank() || relative.startsWith("..")) return file
+                if (relative.endsWith(".part")) relative += ".media"
+                var index = 1
+                while (!usedPaths.add(relative)) {
+                    val parent = canonical.relativeTo(oldRoot).parent
+                    relative = (if (parent != null) parent + File.separator else "") + "${index++}-${canonical.name.removeSuffix(".part")}"
+                }
+                val destination = File(newRoot, relative)
+                check(destination.canonicalPath.startsWith(newRoot.path + File.separator)) { "복사 경로가 폴더를 벗어납니다: $relative" }
+                destination.parentFile?.let { check(it.isDirectory || it.mkdirs()) { "하위 폴더를 만들지 못했습니다." } }
+                return copyValidated(canonical, destination).also { copiedBySource[canonical.path] = it }
+            }
+            val sources = original.sources.map { it.copy(file = copyOwned(it.file)) }
+            val output = original.output?.let { out ->
+                when {
+                    !isInside(out, original.directory) -> out
+                    out.isFile && out.length() > 0L -> copyOwned(out)
+                    else -> null
+                }
+            }
+            val music = original.musicTrack?.let { track ->
+                if (track.file.isFile && track.file.length() > 0L) track.copy(file = copyOwned(track.file)) else track
+            }
+            original.copy(
+                directory = newDir, sources = sources, output = output, musicTrack = music,
+                outputRevision = if (output != null) original.outputRevision else null,
+                migrationIssue = null,
+            )
+        } catch (_: Exception) {
+            synchronized(this) { safeDeletePrivateTrailerDirectory(newDir) }
+            null
+        }
+    }
+
+    /** Writes the exact raw record to its own backup file (never overwritten with different content). */
+    private fun writeRecoveryBackup(raw: JSONObject, name: String): Boolean = runCatching {
+        val storage = draftsStorageDir ?: return@runCatching false
+        val dir = File(storage, RECOVERY_BACKUP_DIR).also { it.mkdirs() }
+        val target = File(dir, "$name.json")
+        val content = JSONArray().put(raw).toString(2)
+        if (target.exists()) return@runCatching target.readText(Charsets.UTF_8) == content
+        val temp = File(dir, "$name.json.tmp")
+        FileOutputStream(temp).use { fos ->
+            fos.write(content.toByteArray(Charsets.UTF_8))
+            fos.flush()
+            fos.fd.sync()
+        }
+        if (temp.renameTo(target)) true else { temp.delete(); false }
+    }.getOrDefault(false)
+
+    @Synchronized
+    private fun commitRecovery(plan: RecoveryPlan, copied: TrailerDraft?, newId: String): Boolean {
+        fun discardCopy() { copied?.let { safeDeletePrivateTrailerDirectory(it.directory) } }
+        val rawIndex = preservedRawRecords.indexOfFirst { it === plan.raw }
+        val winner = drafts[plan.parsed.id]
+        if (rawIndex < 0 || winner == null || (copied == null && !drafts.containsKey(newId))) { discardCopy(); return false }
+        // Exact backup first; without it the raw record stays and nothing is replaced.
+        if (!writeRecoveryBackup(plan.raw, "$newId-${plan.fingerprint.take(16)}")) { discardCopy(); return false }
+        val previousDrafts = drafts.toMap()
+        val previousRaw = preservedRawRecords.toList()
+        if (copied != null) {
+            val sharesPrivateFolder = drafts.values.any { sameDirectory(it.directory, plan.parsed.directory) && it.isPrivate }
+            drafts[newId] = copied.copy(
+                customTitle = "${plan.parsed.displayTitle} (복구)",
+                isPrivate = plan.parsed.isPrivate || winner.isPrivate || sharesPrivateFolder,
+            )
+        }
+        preservedRawRecords.removeAt(rawIndex)
+        if (!persistDraftsToDisk()) {
+            drafts.clear(); drafts.putAll(previousDrafts)
+            preservedRawRecords.clear(); preservedRawRecords.addAll(previousRaw)
+            discardCopy() // only the folder this call created; no draft references it after the rollback
+            return false
+        }
+        copied?.let { File(it.directory, MIGRATION_MARKER).delete() }
         return true
     }
 
@@ -581,11 +740,13 @@ object TrailerDraftStore {
                 val keptMain = if (mainUnreadable) quarantine(file) else null
                 if (mainUnreadable && keptMain == null) {
                     persistBlocked = true
+                    metadataUntrusted = true
                     metadataProblem = "편집본 목록 파일을 읽지 못했습니다. 파일을 덮어쓰지 않도록 저장을 멈췄습니다. 저장 공간을 확인한 뒤 앱을 다시 열어 주세요."
                     return
                 }
                 if (!file.exists() && !backup.renameTo(file)) runCatching { backup.copyTo(file, overwrite = false) }
                 array = fromBackup
+                if (keptMain != null) metadataUntrusted = true
                 if (keptMain != null) metadataProblem = "최근 편집본 목록 파일이 손상되어 직전 백업으로 복원했습니다. 손상된 파일은 $keptMain 이름으로 보존했습니다."
             } else if (!mainPresent) {
                 mainUnreadable = true
@@ -593,6 +754,7 @@ object TrailerDraftStore {
         }
         if (array == null) {
             if (!mainUnreadable) return // No metadata at all: a genuinely empty library.
+            metadataUntrusted = true
             // Neither the file nor its backup is readable: keep both aside and say so; nothing is treated as deleted.
             val keptMain = if (file.exists()) quarantine(file) else null
             val keptBackup = if (backup.exists()) quarantine(backup) else null
@@ -605,18 +767,22 @@ object TrailerDraftStore {
             return
         }
         var unparsed = 0
+        var duplicateIds = 0
         for (i in 0 until array.length()) {
             val raw = array.opt(i) ?: continue
             val parsed = (raw as? JSONObject)?.let { obj -> runCatching { parseDraft(obj, i) }.getOrNull() }
             if (parsed == null || drafts.containsKey(parsed.id)) {
                 preservedRawRecords += raw
-                unparsed++
+                if (parsed == null) unparsed++ else duplicateIds++
             } else {
                 drafts[parsed.id] = parsed
+                loadedFingerprints[parsed.id] = fingerprintOf(parsed)
             }
         }
         if (unparsed > 0 && metadataProblem == null) {
             metadataProblem = "편집본 ${unparsed}개의 정보를 이 버전에서 읽지 못했습니다. 해당 정보는 지우지 않고 원래 내용 그대로 보관합니다."
+        } else if (duplicateIds > 0 && metadataProblem == null) {
+            metadataProblem = "같은 식별자를 가진 편집본 기록 ${duplicateIds}개를 따로 보관했습니다."
         }
     }
 

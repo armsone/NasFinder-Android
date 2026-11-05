@@ -1365,19 +1365,11 @@ internal fun PorcelainVideoHub(state: AppState, model: NasFinderViewModel, modif
             Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
                 PorcelainSection(title = "영상 만들기") {
                     PorcelainPanel(Modifier.fillMaxWidth()) {
-                        PorcelainRow("미디어 고르기", PackGlyph.GRID, subtitle = "미디어·폰하드·NAS에서 골라 바로 제작합니다") { model.chooseMediaForVideo() }
+                        PorcelainRow("미디어 고르기", PackGlyph.GRID) { model.chooseMediaForVideo() }
                         PorcelainDivider()
-                        PorcelainRow(
-                            "작업대에서 가져오기",
-                            PackGlyph.VIDEO,
-                            subtitle = if (workbenchCount == 0) "작업대가 비어 있습니다 · 항목을 담은 뒤 포켓에서 영상 제작" else "포켓에서 항목을 골라 영상 제작 · 참조 ${workbenchCount}개",
-                        ) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
+                        PorcelainRow("작업대에서 가져오기", PackGlyph.VIDEO) { model.selectMainDestination(MainNavigationDestination.WORKBENCH) }
                         PorcelainDivider()
-                        PorcelainRow(
-                            "뮤직비디오",
-                            PackGlyph.VIDEO,
-                            subtitle = "사진·영상에 음악을 입혀 뮤직비디오를 만듭니다",
-                        ) { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.MUSIC)) }
+                        PorcelainRow("뮤직비디오", PackGlyph.VIDEO) { model.show(Screen.LocalPhotoLibrary(LocalMediaEditIntent.MUSIC)) }
                     }
                 }
             }
@@ -1676,7 +1668,8 @@ internal fun PorcelainNavigationSidebar(
                     beforeNavigate = beforeNavigate,
                 )
             } else {
-                PorcelainCompactRail(navigationState, model, { model.setSidebarExpanded(true) }, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate = beforeNavigate)
+                PorcelainCompactRail(navigationState, model, { model.setSidebarExpanded(true) }, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected, beforeNavigate = beforeNavigate,
+                    onAddNetwork = { addingNetwork = true }, onImportFiles = { importer.launch(arrayOf("*/*")) })
             }
         }
         if (navExpanded) SidebarResizeStrip(
@@ -2006,6 +1999,13 @@ private fun SidebarItem(
     }
 }
 
+/**
+ * Collapsed-rail popover that is still pending. Hoisted out of PorcelainCompactRail because each root screen
+ * recreates the sidebar, which would otherwise drop a local `open` flag right after the root navigation.
+ * Consumed/cleared on dismissal, child click, other rail navigation and sidebar expansion.
+ */
+private val pendingRailPopup = mutableStateOf<MainNavigationDestination?>(null)
+
 @Composable
 private fun PorcelainCompactRail(
     state: AppState,
@@ -2017,6 +2017,8 @@ private fun PorcelainCompactRail(
     favoritesSelected: Boolean = false,
     modifier: Modifier = Modifier,
     beforeNavigate: () -> Unit = {},
+    onAddNetwork: () -> Unit = {},
+    onImportFiles: () -> Unit = {},
 ) {
     val section = sidebarSectionFor(state, selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected)
 
@@ -2030,7 +2032,7 @@ private fun PorcelainCompactRail(
     ) {
         // Fixed outside the scrolling list: selected app icon, then the expand target, so neither overlaps or clips.
         MainAppBrand(state, showText = false)
-        IconButton(onClick = onExpand, modifier = Modifier.size(IconHitTarget)) {
+        IconButton(onClick = { pendingRailPopup.value = null; onExpand() }, modifier = Modifier.size(IconHitTarget)) {
             PackIcon(PackGlyph.ARROW_RIGHT, "사이드바 펼치기", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurface)
         }
         Spacer(Modifier.height(4.dp))
@@ -2040,25 +2042,45 @@ private fun PorcelainCompactRail(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
         CompactRailItem("홈", PackGlyph.HOME, selected = section == MainNavigationDestination.HOME) {
+            pendingRailPopup.value = null
             beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.HOME)
         }
-        CompactRailItem("파인더", PackGlyph.FOLDER, selected = section == MainNavigationDestination.FINDER) {
-            beforeNavigate()
-            model.selectMainDestination(MainNavigationDestination.FINDER)
-        }
-        CompactRailItem("만들기", PackGlyph.VIDEO, selected = section == MainNavigationDestination.VIDEO) {
-            beforeNavigate()
-            model.selectMainDestination(MainNavigationDestination.VIDEO)
-        }
-        CompactRailItem("도구", PackGlyph.TRANSFER, selected = section == MainNavigationDestination.TOOLS) {
-            beforeNavigate()
-            model.selectMainDestination(MainNavigationDestination.TOOLS)
+        // Mac parity: collapsed 파인더/만들기/도구 open an anchored popover with the same children as the expanded sidebar.
+        listOf(
+            Triple("파인더", PackGlyph.FOLDER, MainNavigationDestination.FINDER),
+            Triple("만들기", PackGlyph.VIDEO, MainNavigationDestination.VIDEO),
+            Triple("도구", PackGlyph.TRANSFER, MainNavigationDestination.TOOLS),
+        ).forEach { (label, glyph, group) ->
+            val open = pendingRailPopup.value == group
+            val close = { if (pendingRailPopup.value == group) pendingRailPopup.value = null }
+            Box {
+                CompactRailItem(label, glyph, selected = section == group) {
+                    // Mac parity: select the destination root first, then open the popover; `open` survives the recomposition.
+                    if (section != group) {
+                        beforeNavigate()
+                        model.selectMainDestination(group)
+                    }
+                    pendingRailPopup.value = group
+                }
+                DropdownMenu(expanded = open, onDismissRequest = { close() }, modifier = Modifier.widthIn(min = 220.dp, max = 300.dp)) {
+                    Column(Modifier.padding(horizontal = 6.dp)) {
+                        SidebarChildren(
+                            group, state, model,
+                            onAddNetwork = { close(); onAddNetwork() },
+                            onImportFiles = { close(); onImportFiles() },
+                            selectedConnectionId, phoneHardSelected, activeRoot, favoritesSelected,
+                            beforeNavigate = { close(); beforeNavigate() },
+                        )
+                    }
+                }
+            }
         }
         CompactRailItem(
             "설정", PackGlyph.SETTINGS, selected = section == MainNavigationDestination.SETTINGS,
             onLongClick = model::togglePrivacyMode,
         ) {
+            pendingRailPopup.value = null
             beforeNavigate()
             model.selectMainDestination(MainNavigationDestination.SETTINGS)
         }

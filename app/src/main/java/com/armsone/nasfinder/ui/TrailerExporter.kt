@@ -1230,6 +1230,8 @@ internal object TrailerExporter {
         musicVolume: Float = 1f,
         introCard: TrailerTitleCard? = null,
         outroCard: TrailerTitleCard? = null,
+        // Photos a card's chosen background may come from (same candidates the editor offers); missing = first/last frame.
+        cardBackgroundSources: List<TrailerSource> = scenes.map { it.source },
         onSuccess: ((recoveredScenes: Int, excludedScenes: Int) -> Unit)? = null,
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
@@ -1339,10 +1341,22 @@ internal object TrailerExporter {
 
             val firstIncludedScene = effectiveScenes.firstOrNull()
             val lastIncludedScene = effectiveScenes.lastOrNull()
+            val bodyCaptionStyle = TrailerTitleCardRenderer.bodyCaptionOf(effectiveScenes.map { it.caption })
 
             if (introCardEnabled && introCard != null) {
                 val introDur = introCard.clampedDuration()
-                val introBgBitmap = if (introCard.usesFirstOrLastImage && firstIncludedScene != null) {
+                val introChosen = introCard.resolveBackgroundSource(cardBackgroundSources)
+                val introBgBitmap = if (introChosen != null) {
+                    withContext(Dispatchers.IO) {
+                        loadFrame(
+                            file = introChosen.file,
+                            isImage = true,
+                            atSeconds = 0.0,
+                            maxDimension = maxOf(exportWidth, exportHeight),
+                            exact = true,
+                        )
+                    }
+                } else if (introCard.usesFirstOrLastImage && firstIncludedScene != null) {
                     withContext(Dispatchers.IO) {
                         loadFrame(
                             file = firstIncludedScene.source.file,
@@ -1361,6 +1375,7 @@ internal object TrailerExporter {
                         sourceBitmap = introBgBitmap,
                         width = exportWidth,
                         height = exportHeight,
+                        bodyCaption = bodyCaptionStyle,
                     )
                 }
                 introBgBitmap?.recycle()
@@ -1393,7 +1408,18 @@ internal object TrailerExporter {
 
             if (outroCardEnabled && outroCard != null) {
                 val outroDur = outroCard.clampedDuration()
-                val outroBgBitmap = if (outroCard.usesFirstOrLastImage && lastIncludedScene != null) {
+                val outroChosen = outroCard.resolveBackgroundSource(cardBackgroundSources)
+                val outroBgBitmap = if (outroChosen != null) {
+                    withContext(Dispatchers.IO) {
+                        loadFrame(
+                            file = outroChosen.file,
+                            isImage = true,
+                            atSeconds = 0.0,
+                            maxDimension = maxOf(exportWidth, exportHeight),
+                            exact = true,
+                        )
+                    }
+                } else if (outroCard.usesFirstOrLastImage && lastIncludedScene != null) {
                     withContext(Dispatchers.IO) {
                         val atTime = maxOf(lastIncludedScene.start, lastIncludedScene.start + lastIncludedScene.length - 0.5)
                         loadFrame(
@@ -1413,6 +1439,7 @@ internal object TrailerExporter {
                         sourceBitmap = outroBgBitmap,
                         width = exportWidth,
                         height = exportHeight,
+                        bodyCaption = bodyCaptionStyle,
                     )
                 }
                 outroBgBitmap?.recycle()
@@ -1511,8 +1538,39 @@ internal object TrailerExporter {
                 val reader = MediaMetadataRetriever()
                 try {
                     reader.setDataSource(destination.absolutePath)
-                    val duration = reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
-                    check(reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes" && abs(duration - effectiveTotalDuration) <= maxOf(.5, allIntermediateFiles.size * .05)) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
+                    val containerDuration = reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull()?.div(1000) ?: 0.0
+                    val hasVideo = reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
+                    var videoTrackDuration = -1.0
+                    var audioTrackDuration = -1.0
+                    runCatching {
+                        val extractor = android.media.MediaExtractor()
+                        try {
+                            extractor.setDataSource(destination.absolutePath)
+                            for (index in 0 until extractor.trackCount) {
+                                val format = extractor.getTrackFormat(index)
+                                val mime = format.getString(android.media.MediaFormat.KEY_MIME).orEmpty()
+                                if (!format.containsKey(android.media.MediaFormat.KEY_DURATION)) continue
+                                val seconds = format.getLong(android.media.MediaFormat.KEY_DURATION) / 1_000_000.0
+                                if (mime.startsWith("video/") && videoTrackDuration < 0) videoTrackDuration = seconds
+                                else if (mime.startsWith("audio/") && audioTrackDuration < 0) audioTrackDuration = seconds
+                            }
+                        } finally { extractor.release() }
+                    }
+                    val videoDuration = if (videoTrackDuration > 0) videoTrackDuration else containerDuration
+                    val videoTolerance = maxOf(.5, allIntermediateFiles.size * .05)
+                    // AAC 프레임 패딩이 청크마다 누적되므로 오디오/컨테이너는 비디오보다 넓은 한계를 허용한다.
+                    val audioTolerance = maxOf(1.0, allIntermediateFiles.size * .1)
+                    val videoOk = hasVideo && abs(videoDuration - effectiveTotalDuration) <= videoTolerance
+                    val containerOk = abs(containerDuration - effectiveTotalDuration) <= audioTolerance &&
+                        (audioTrackDuration < 0 || abs(audioTrackDuration - effectiveTotalDuration) <= audioTolerance)
+                    if (!videoOk || !containerOk) {
+                        android.util.Log.w(
+                            "TrailerExporter",
+                            "duration check failed expected=${"%.2f".format(effectiveTotalDuration)} video=${"%.2f".format(videoDuration)} " +
+                                "audio=${"%.2f".format(audioTrackDuration)} container=${"%.2f".format(containerDuration)} chunks=${allIntermediateFiles.size}",
+                        )
+                    }
+                    check(videoOk && containerOk) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
                 } finally { reader.release() }
             }
 
