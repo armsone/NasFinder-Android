@@ -324,6 +324,23 @@ object DurableMaterialStore {
     }
 
     @Synchronized
+    fun removeItems(ids: Set<String>): Boolean {
+        if (ids.isEmpty()) return true
+        if (persistBlocked) return false
+        val targets = items.filter { it.id in ids && isVisibleItem(it) }
+        if (targets.isEmpty()) return true
+        val backup = items.toList()
+        val targetIds = targets.map { it.id }.toSet()
+        items.removeAll { it.id in targetIds }
+        if (!persistToDisk()) {
+            items.clear()
+            items.addAll(backup)
+            return false
+        }
+        return true
+    }
+
+    @Synchronized
     fun reorder(fromIndex: Int, toIndex: Int): Boolean {
         // 인덱스는 보이는 항목 기준이다. 숨겨진 항목은 제자리에 둔다.
         val visible = items.filter(::isVisibleItem)

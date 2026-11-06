@@ -68,6 +68,8 @@ internal fun WorkbenchScreen(
     var creatingPocket by remember { mutableStateOf(false) }
     var renamingPocket by remember { mutableStateOf(false) }
     var deletingPocket by remember { mutableStateOf(false) }
+    var emptyingPocketTargets by remember { mutableStateOf<Set<String>?>(null) }
+    var removingSelectedTargets by remember { mutableStateOf<Set<String>?>(null) }
     var addMenu by remember { mutableStateOf(false) }
     var filesOrFolder by remember { mutableStateOf(false) }
     var finderSources by remember { mutableStateOf(false) }
@@ -144,6 +146,26 @@ internal fun WorkbenchScreen(
             Box {
                 IconButton(onClick = { pocketMenu = true }) { Icon(Icons.Default.MoreVert, "포켓 메뉴") }
                 DropdownMenu(expanded = pocketMenu, onDismissRequest = { pocketMenu = false }) {
+                    val currentSelectedRefs = items.filter { it.id in state.workbenchSelected }.map { it.id }.toSet()
+                    val canRemoveSelected = currentSelectedRefs.isNotEmpty() && state.workbenchRun == null
+                    DropdownMenuItem(
+                        text = { Text("선택한 재료 삭제 (${currentSelectedRefs.size})") },
+                        enabled = canRemoveSelected,
+                        onClick = {
+                            pocketMenu = false
+                            removingSelectedTargets = currentSelectedRefs
+                        },
+                    )
+                    val canEmptyPocket = items.isNotEmpty() && state.workbenchRun == null
+                    DropdownMenuItem(
+                        text = { Text("포켓 비우기 (${items.size})") },
+                        enabled = canEmptyPocket,
+                        onClick = {
+                            pocketMenu = false
+                            emptyingPocketTargets = items.map { it.id }.toSet()
+                        },
+                    )
+                    HorizontalDivider()
                     DropdownMenuItem(text = { Text("포켓 이름 바꾸기") }, onClick = { pocketMenu = false; renamingPocket = true })
                     // 이 앱의 목록에서만 숨긴다(잠금·암호화 아님). 일반 모드에서 비공개로 바꾸면 이 포켓은 곧바로 목록에서 사라진다.
                     if (pocket.id != DEFAULT_POCKET_ID) DropdownMenuItem(
@@ -242,6 +264,46 @@ internal fun WorkbenchScreen(
             text = { Text("이 포켓에 담긴 참조 ${items.size}개만 목록에서 지워집니다. 미디어·파일 원본, 기존 재료 사본, 다른 포켓의 같은 항목은 그대로 남습니다.") },
             confirmButton = { TextButton(onClick = { deletingPocket = false; model.deleteWorkbenchPocket(pocket.id) }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("참조만 삭제") } },
             dismissButton = { TextButton(onClick = { deletingPocket = false }) { Text("취소") } },
+        )
+    }
+    emptyingPocketTargets?.let { targetIds ->
+        val latestVisibleInPocket = items.filter { it.id in targetIds }.map { it.id }.toSet()
+        AlertDialog(
+            onDismissRequest = { emptyingPocketTargets = null },
+            title = { Text("‘${pocket.name}’ 포켓을 비울까요?") },
+            text = { Text("‘${pocket.name}’ 포켓의 재료 ${latestVisibleInPocket.size}개 참조가 모두 목록에서 지워집니다.\n포켓은 유지되며 원본 파일과 다른 포켓의 재료는 그대로 안전하게 남습니다.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        emptyingPocketTargets = null
+                        if (latestVisibleInPocket.isNotEmpty()) {
+                            model.removeMaterialItems(latestVisibleInPocket, pocket.id)
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("포켓 비우기") }
+            },
+            dismissButton = { TextButton(onClick = { emptyingPocketTargets = null }) { Text("취소") } },
+        )
+    }
+    removingSelectedTargets?.let { targetIds ->
+        val latestVisibleSelected = items.filter { it.id in targetIds }.map { it.id }.toSet()
+        AlertDialog(
+            onDismissRequest = { removingSelectedTargets = null },
+            title = { Text("선택한 재료를 삭제할까요?") },
+            text = { Text("‘${pocket.name}’ 포켓에서 선택한 재료 ${latestVisibleSelected.size}개의 참조만 목록에서 지워집니다.\n포켓은 유지되며 원본 파일과 다른 포켓의 재료는 그대로 안전하게 남습니다.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        removingSelectedTargets = null
+                        if (latestVisibleSelected.isNotEmpty()) {
+                            model.removeMaterialItems(latestVisibleSelected, pocket.id)
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("재료 삭제") }
+            },
+            dismissButton = { TextButton(onClick = { removingSelectedTargets = null }) { Text("취소") } },
         )
     }
     previewItem?.let { item -> WorkbenchPreviewDialog(item) { previewItem = null } }
@@ -403,28 +465,41 @@ internal fun WorkbenchItemRow(
             }
             val hasActions = onRemove != null || onReconnect != null || onMoveUp != null || onMoveDown != null || onExclude != null || onTogglePrivate != null
             if (hasActions) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
-                    if (needsReconnect && onReconnect != null) {
-                        TextButton(onClick = onReconnect) { Text("다시 연결", fontSize = 13.sp, color = palette.accent) }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.weight(1f, fill = false),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        if (needsReconnect && onReconnect != null) {
+                            TextButton(onClick = onReconnect) { Text("다시 연결", fontSize = 13.sp, color = palette.accent) }
+                        }
+                        if (item.state == MaterialPreparationState.MISSING && onRecheck != null) {
+                            TextButton(onClick = onRecheck) { Text("다시 확인", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        }
+                        if (onExclude != null && (item.state == MaterialPreparationState.EXCLUDED || item.state == MaterialPreparationState.MISSING)) {
+                            TextButton(onClick = onExclude) { Text(if (item.state == MaterialPreparationState.EXCLUDED) "포함" else "제외", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        }
+                        if (onTogglePrivate != null) IconButton(onClick = onTogglePrivate) {
+                            Icon(
+                                if (item.isPrivate) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                if (item.isPrivate) "${item.displayLabel} 공개로 전환" else "${item.displayLabel} 비공개로 전환",
+                                Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (onMoveUp != null) IconButton(onClick = onMoveUp) { Icon(Icons.Default.KeyboardArrowUp, "${item.displayLabel} 위로", Modifier.size(22.dp)) }
+                        if (onMoveDown != null) IconButton(onClick = onMoveDown) { Icon(Icons.Default.KeyboardArrowDown, "${item.displayLabel} 아래로", Modifier.size(22.dp)) }
                     }
-                    if (item.state == MaterialPreparationState.MISSING && onRecheck != null) {
-                        TextButton(onClick = onRecheck) { Text("다시 확인", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    }
-                    if (onExclude != null && (item.state == MaterialPreparationState.EXCLUDED || item.state == MaterialPreparationState.MISSING)) {
-                        TextButton(onClick = onExclude) { Text(if (item.state == MaterialPreparationState.EXCLUDED) "포함" else "제외", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    }
-                    Spacer(Modifier.weight(1f))
-                    if (onTogglePrivate != null) IconButton(onClick = onTogglePrivate) {
-                        Icon(
-                            if (item.isPrivate) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                            if (item.isPrivate) "${item.displayLabel} 공개로 전환" else "${item.displayLabel} 비공개로 전환",
-                            Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    if (onMoveUp != null) IconButton(onClick = onMoveUp) { Icon(Icons.Default.KeyboardArrowUp, "${item.displayLabel} 위로", Modifier.size(22.dp)) }
-                    if (onMoveDown != null) IconButton(onClick = onMoveDown) { Icon(Icons.Default.KeyboardArrowDown, "${item.displayLabel} 아래로", Modifier.size(22.dp)) }
-                    if (onRemove != null) IconButton(onClick = onRemove, modifier = Modifier.semantics { contentDescription = "${item.displayLabel} 작업대에서 빼기 (원본은 그대로)" }) {
-                        PackIcon(PackGlyph.CLOSE, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (onRemove != null) {
+                        TextButton(
+                            onClick = onRemove,
+                            modifier = Modifier.semantics { contentDescription = "${item.displayLabel} 작업대에서 빼기 (원본은 그대로)" },
+                            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        ) {
+                            PackIcon(PackGlyph.CLOSE, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
+                            Spacer(Modifier.width(4.dp))
+                            Text("삭제", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        }
                     }
                 }
             }

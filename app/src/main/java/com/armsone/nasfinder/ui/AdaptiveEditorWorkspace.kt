@@ -81,6 +81,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.selected
@@ -3752,11 +3753,27 @@ private fun SceneBoard(
     }
 }
 
+private enum class TitleCardStyleTarget(val title: String) {
+    TITLE("제목"),
+    SUBTITLE("부제목"),
+}
+
+private val TITLE_CARD_COLOR_SWATCHES = listOf(
+    "흰색" to 0xFFFFFFFF.toInt(),
+    "검정" to 0xFF111111.toInt(),
+    "노랑" to 0xFFFFE45C.toInt(),
+    "하늘" to 0xFF8FD3FF.toInt(),
+    "분홍" to 0xFFFF9EC7.toInt(),
+    "민트" to 0xFF8EF0C8.toInt(),
+)
+
+private val TITLE_CARD_ROW_NAMES = listOf("맨 위", "위", "가운데", "아래", "맨 아래")
+private val TITLE_CARD_COLUMN_NAMES = listOf("왼쪽", "왼쪽 안쪽", "가운데", "오른쪽 안쪽", "오른쪽")
+
 /**
  * 시작 화면/마지막 화면 editor shown inline in the 자막 inspector. It edits the same [TrailerTitleCard] through
  * editorSetIntroCard/editorSetOutroCard as the former sheet did; the time/background fields appear only while the
- * card is on. The card has no typography fields of its own; it renders with the project's shared body caption
- * typography (first scene caption with text), falling back to the legacy look when no scene has a caption.
+ * card is on. Title and subtitle have independently editable size, font, color, shadow and 5x5 position.
  */
 @Composable
 private fun TitleCardInlineEditor(
@@ -3767,6 +3784,8 @@ private fun TitleCardInlineEditor(
 ) {
     val context = LocalContext.current
     var draftCard by remember(card) { mutableStateOf(card) }
+    var selectedStyleTarget by rememberSaveable { mutableStateOf(TitleCardStyleTarget.TITLE) }
+    var fontListExpanded by rememberSaveable { mutableStateOf(false) }
     val sheetName = if (isIntro) "시작 화면 설정" else "마지막 화면 설정"
     val toggleLabel = if (isIntro) "시작 화면 사용" else "마지막 화면 사용"
     val bgToggleLabel = if (isIntro) "첫 사진/영상 배경 사용" else "마지막 사진/영상 배경 사용"
@@ -3808,6 +3827,36 @@ private fun TitleCardInlineEditor(
         else model.editorSetOutroCard(updated)
     }
 
+    val activeStyle = remember(draftCard.titleStyle, draftCard.subtitleStyle, selectedStyleTarget, bodyCaption) {
+        if (selectedStyleTarget == TitleCardStyleTarget.TITLE) {
+            draftCard.titleStyle ?: TrailerTitleCardRenderer.defaultTitleStyle(bodyCaption)
+        } else {
+            draftCard.subtitleStyle ?: TrailerTitleCardRenderer.defaultSubtitleStyle(bodyCaption)
+        }
+    }
+
+    val hasCustomStyle = if (selectedStyleTarget == TitleCardStyleTarget.TITLE) {
+        draftCard.titleStyle != null
+    } else {
+        draftCard.subtitleStyle != null
+    }
+
+    fun updateActiveStyle(newStyle: SceneCaption) {
+        val clamped = newStyle.clamped().copy(text = "")
+        val updated = if (selectedStyleTarget == TitleCardStyleTarget.TITLE) {
+            draftCard.copy(
+                titleStyle = clamped,
+                subtitleStyle = draftCard.subtitleStyle ?: TrailerTitleCardRenderer.defaultSubtitleStyle(bodyCaption),
+            )
+        } else {
+            draftCard.copy(
+                titleStyle = draftCard.titleStyle ?: TrailerTitleCardRenderer.defaultTitleStyle(bodyCaption),
+                subtitleStyle = clamped,
+            )
+        }
+        commit(updated)
+    }
+
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // Toggle: 시작 화면 사용 / 마지막 화면 사용
         Row(
@@ -3845,6 +3894,444 @@ private fun TitleCardInlineEditor(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+
+            // Independent typography, colors and 5x5 position editor
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
+                border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    // Target selector: 제목 스타일 vs 부제목 스타일 + 초기화 버튼
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CompactChoice(
+                            text = "제목 스타일",
+                            selected = selectedStyleTarget == TitleCardStyleTarget.TITLE,
+                            onClick = { selectedStyleTarget = TitleCardStyleTarget.TITLE },
+                            modifier = Modifier.weight(1f),
+                        )
+                        CompactChoice(
+                            text = "부제목 스타일",
+                            selected = selectedStyleTarget == TitleCardStyleTarget.SUBTITLE,
+                            onClick = { selectedStyleTarget = TitleCardStyleTarget.SUBTITLE },
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            onClick = {
+                                val updated = if (selectedStyleTarget == TitleCardStyleTarget.TITLE) {
+                                    draftCard.copy(titleStyle = null)
+                                } else {
+                                    draftCard.copy(subtitleStyle = null)
+                                }
+                                commit(updated)
+                            },
+                            enabled = hasCustomStyle,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier.height(32.dp),
+                        ) {
+                            Text(
+                                "초기화",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (hasCustomStyle) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+                    val targetTitle = selectedStyleTarget.title
+
+                    // Position (5x5 grid) & Size
+                    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                        val useRow = maxWidth >= 320.dp
+                        val positionGrid: @Composable () -> Unit = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    "$targetTitle 위치: ${TITLE_CARD_ROW_NAMES[activeStyle.row.coerceIn(0, 4)]} ${TITLE_CARD_COLUMN_NAMES[activeStyle.column.coerceIn(0, 4)]}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Surface(
+                                    modifier = Modifier.size(160.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
+                                    border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.fillMaxSize(),
+                                        verticalArrangement = Arrangement.SpaceEvenly,
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        for (r in 0..4) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(32.dp),
+                                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                for (c in 0..4) {
+                                                    val isSelected = activeStyle.row == r && activeStyle.column == c
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(32.dp)
+                                                            .semantics {
+                                                                contentDescription = "$targetTitle 위치 ${TITLE_CARD_ROW_NAMES[r]} ${TITLE_CARD_COLUMN_NAMES[c]}"
+                                                                this.selected = isSelected
+                                                            }
+                                                            .clickable { updateActiveStyle(activeStyle.copy(row = r, column = c)) },
+                                                        contentAlignment = Alignment.Center,
+                                                    ) {
+                                                        if (isSelected) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .size(24.dp)
+                                                                    .clip(RoundedCornerShape(6.dp))
+                                                                    .background(MaterialTheme.colorScheme.primary),
+                                                                contentAlignment = Alignment.Center,
+                                                            ) {
+                                                                Text(
+                                                                    if (selectedStyleTarget == TitleCardStyleTarget.TITLE) "제" else "부",
+                                                                    color = MaterialTheme.colorScheme.onPrimary,
+                                                                    fontWeight = FontWeight.Black,
+                                                                    fontSize = 12.sp,
+                                                                )
+                                                            }
+                                                        } else {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .size(4.dp)
+                                                                    .clip(CircleShape)
+                                                                    .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)),
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        val sizeControls: @Composable () -> Unit = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("$targetTitle 크기", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    CaptionSize.entries.forEach { size ->
+                                        CompactChoice(
+                                            text = size.title,
+                                            selected = activeStyle.size == size,
+                                            onClick = { updateActiveStyle(activeStyle.copy(size = size)) },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (useRow) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                positionGrid()
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    sizeControls()
+                                }
+                            }
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                positionGrid()
+                                sizeControls()
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+                    // Font Selection with Sample
+                    val currentFontFamily = remember(activeStyle.effectiveFontName) {
+                        CaptionFontStore.fontFamilyForName(context, activeStyle.effectiveFontName)
+                    }
+                    val currentFontDisplayName = CaptionFontStore.displayName(activeStyle.effectiveFontName)
+
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { fontListExpanded = !fontListExpanded }
+                                .semantics {
+                                    role = Role.Button
+                                    stateDescription = if (fontListExpanded) "펼쳐짐" else "접힘"
+                                    contentDescription = "$targetTitle 글꼴 선택, 현재 $currentFontDisplayName"
+                                },
+                            shape = RoundedCornerShape(8.dp),
+                            color = Color.Transparent,
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text("글꼴", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        currentFontDisplayName,
+                                        fontFamily = currentFontFamily,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(30.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text("Aa", fontFamily = currentFontFamily, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    }
+                                    Icon(
+                                        if (fontListExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp),
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+
+                        if (fontListExpanded) {
+                            val bundledFonts = remember { CaptionFontStore.BUNDLED_FONTS }
+                            val importedFonts = remember(context) { CaptionFontStore.list(context) }
+                            data class FontOption(val id: String, val name: String)
+                            val allFonts = remember(bundledFonts, importedFonts) {
+                                bundledFonts.map { FontOption(it.id, it.displayName) } +
+                                    importedFonts.map { FontOption(it.id, it.displayName) }
+                            }
+
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 180.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    allFonts.chunked(2).forEach { rowFonts ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        ) {
+                                            rowFonts.forEach { fontOpt ->
+                                                val isSelected = activeStyle.effectiveFontName == fontOpt.id
+                                                val optFamily = remember(fontOpt.id) {
+                                                    CaptionFontStore.fontFamilyForName(context, fontOpt.id)
+                                                }
+                                                Surface(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .height(40.dp)
+                                                        .clip(RoundedCornerShape(6.dp))
+                                                        .clickable {
+                                                            updateActiveStyle(activeStyle.withFont(fontOpt.id))
+                                                            fontListExpanded = false
+                                                        },
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                                    border = if (isSelected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxSize()
+                                                            .padding(horizontal = 8.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                    ) {
+                                                        Text(
+                                                            fontOpt.name,
+                                                            fontFamily = optFamily,
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            modifier = Modifier.weight(1f),
+                                                        )
+                                                        if (isSelected) {
+                                                            Text("✓", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if (rowFonts.size == 1) {
+                                                Spacer(Modifier.weight(1f))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+                    // Color Swatches & Custom Hex Input
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("$targetTitle 색상", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TITLE_CARD_COLOR_SWATCHES.forEach { (name, colorInt) ->
+                                val isSelected = (activeStyle.textColor and 0xFFFFFF) == (colorInt and 0xFFFFFF)
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(colorInt or 0xFF000000.toInt()))
+                                        .border(
+                                            width = if (isSelected) 2.5.dp else 1.dp,
+                                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                            shape = CircleShape,
+                                        )
+                                        .clickable {
+                                            updateActiveStyle(activeStyle.copy(textColor = colorInt or 0xFF000000.toInt()))
+                                        }
+                                        .semantics {
+                                            contentDescription = "$name 색상"
+                                            this.selected = isSelected
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (isSelected) {
+                                        val isBright = (Color(colorInt).luminance() > 0.5f)
+                                        Text(
+                                            "✓",
+                                            color = if (isBright) Color.Black else Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        var hexText by remember(activeStyle.textColor) {
+                            mutableStateOf(captionHex(activeStyle.textColor))
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedTextField(
+                                value = hexText,
+                                onValueChange = { input ->
+                                    val clean = input.trim().uppercase()
+                                    if (clean.length <= 7) {
+                                        hexText = clean
+                                        val parsed = parseCaptionHex(clean)
+                                        if (parsed != null) {
+                                            updateActiveStyle(activeStyle.copy(textColor = parsed))
+                                        }
+                                    }
+                                },
+                                label = { Text("색상 코드", style = MaterialTheme.typography.labelSmall) },
+                                singleLine = true,
+                                modifier = Modifier.width(130.dp),
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(activeStyle.textColor or 0xFF000000.toInt()))
+                                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp)),
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+                    // Shadow Toggle & Opacity Slider
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("$targetTitle 그림자", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            Text("글자에 음영을 넣어 배경과 구분합니다", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = activeStyle.shadowEnabled,
+                            onCheckedChange = { enabled ->
+                                val nextOpacity = if (enabled && activeStyle.shadowOpacity <= 0f) 0.75f else activeStyle.shadowOpacity
+                                updateActiveStyle(activeStyle.copy(shadowEnabled = enabled, shadowOpacity = nextOpacity))
+                            },
+                            modifier = Modifier.semantics { contentDescription = "$targetTitle 그림자 효과 사용" },
+                        )
+                    }
+
+                    if (activeStyle.shadowEnabled) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("진하기", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Slider(
+                                value = activeStyle.shadowOpacity.coerceIn(0f, 1f),
+                                onValueChange = { opacity ->
+                                    val snapped = (opacity * 20).roundToInt() / 20f
+                                    updateActiveStyle(activeStyle.copy(shadowOpacity = snapped))
+                                },
+                                valueRange = 0f..1f,
+                                steps = 19,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text("${(activeStyle.shadowOpacity * 100).roundToInt()}%", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
 
             // 1..10s slider
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {

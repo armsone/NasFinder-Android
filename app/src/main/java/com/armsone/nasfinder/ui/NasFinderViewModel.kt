@@ -8100,6 +8100,25 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         if (!removed) _state.update { it.copy(message = "항목을 빼지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
     }
 
+    /** Removes multiple REFERENCES only; originals and copies stay intact. */
+    fun removeMaterialItems(ids: Set<String>, pocketId: String? = null) {
+        if (_state.value.workbenchRun != null) return
+        if (ids.isEmpty()) return
+        val visibleItems = if (pocketId == null) DurableMaterialStore.getItems() else DurableMaterialStore.itemsIn(pocketId)
+        val targetIds = visibleItems
+            .filter { it.id in ids }
+            .map { it.id }
+            .toSet()
+        if (targetIds.isEmpty()) return
+        val removed = DurableMaterialStore.removeItems(targetIds)
+        publishMaterials()
+        if (!removed) {
+            _state.update { it.copy(message = "항목을 빼지 못했습니다. ${MATERIAL_SAVE_ERROR}") }
+        } else {
+            _state.update { it.copy(message = "${targetIds.size}개 항목의 참조를 작업대에서 뺐습니다. 원본 파일은 그대로 남습니다.") }
+        }
+    }
+
     fun reorderMaterialItem(from: Int, to: Int) {
         val moved = DurableMaterialStore.reorder(from, to)
         publishMaterials()

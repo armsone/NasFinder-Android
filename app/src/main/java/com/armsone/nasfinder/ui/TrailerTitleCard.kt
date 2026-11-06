@@ -18,6 +18,8 @@ data class TrailerTitleCard(
     // Optional existing project photo (TrailerSource.id) used as the background instead of the first/last frame;
     // null (old saves) = first/last frame. Ignored while usesFirstOrLastImage is off or the source is gone.
     val backgroundSourceId: Int? = null,
+    val titleStyle: SceneCaption? = null,
+    val subtitleStyle: SceneCaption? = null,
 ) {
     /** The chosen photo among [candidates], or null (missing/not a readable photo) so callers fall back to first/last frame. */
     fun resolveBackgroundSource(candidates: Iterable<TrailerSource>): TrailerSource? {
@@ -37,6 +39,8 @@ data class TrailerTitleCard(
         duration = clampedDuration(),
         usesFirstOrLastImage = usesFirstOrLastImage,
         backgroundSourceId = backgroundSourceId,
+        titleStyle = titleStyle?.clamped()?.copy(text = ""),
+        subtitleStyle = subtitleStyle?.clamped()?.copy(text = ""),
     )
 
     fun toJson(): JSONObject = JSONObject().apply {
@@ -46,12 +50,16 @@ data class TrailerTitleCard(
         put("duration", clampedDuration())
         put("usesFirstOrLastImage", usesFirstOrLastImage)
         if (backgroundSourceId != null) put("backgroundSourceId", backgroundSourceId)
+        titleStyle?.let { put("titleStyle", it.copy(text = "").toJson()) }
+        subtitleStyle?.let { put("subtitleStyle", it.copy(text = "").toJson()) }
     }
 
     companion object {
         fun fromJson(obj: JSONObject?): TrailerTitleCard {
             if (obj == null) return TrailerTitleCard()
             val rawDuration = if (obj.has("duration")) obj.optDouble("duration", 3.0) else 3.0
+            val titleStyle = sceneCaptionFromJson(obj.optJSONObject("titleStyle"), allowBlank = true)?.copy(text = "")
+            val subtitleStyle = sceneCaptionFromJson(obj.optJSONObject("subtitleStyle"), allowBlank = true)?.copy(text = "")
             return TrailerTitleCard(
                 enabled = obj.optBoolean("enabled", false),
                 title = obj.optString("title", ""),
@@ -59,6 +67,8 @@ data class TrailerTitleCard(
                 duration = if (rawDuration.isFinite()) rawDuration.coerceIn(1.0, 10.0) else 3.0,
                 usesFirstOrLastImage = obj.optBoolean("usesFirstOrLastImage", true),
                 backgroundSourceId = if (obj.has("backgroundSourceId") && !obj.isNull("backgroundSourceId")) obj.optInt("backgroundSourceId") else null,
+                titleStyle = titleStyle,
+                subtitleStyle = subtitleStyle,
             )
         }
     }
@@ -71,6 +81,58 @@ object TrailerTitleCardRenderer {
      */
     fun bodyCaptionOf(sceneCaptions: Iterable<SceneCaption?>): SceneCaption? =
         sceneCaptions.firstOrNull { it != null && it.text.isNotBlank() }?.clamped()
+
+    fun defaultTitleStyle(bodyCaption: SceneCaption? = null): SceneCaption {
+        val legacy = SceneCaption(
+            text = "",
+            font = CaptionFont.PRETENDARD_BOLD,
+            fontName = "pretendard_bold",
+            size = CaptionSize.XLARGE,
+            textColor = 0xFFFFFFFF.toInt(),
+            shadowEnabled = true,
+            shadowColor = 0xFF000000.toInt(),
+            shadowOpacity = 0.75f,
+            lineSpacing = 1.25f,
+            column = 2,
+            row = 1,
+        )
+        return if (bodyCaption == null) legacy else legacy.copy(
+            font = bodyCaption.font,
+            fontName = bodyCaption.effectiveFontName,
+            size = bodyCaption.size,
+            textColor = bodyCaption.textColor,
+            shadowEnabled = bodyCaption.shadowEnabled,
+            shadowColor = bodyCaption.shadowColor,
+            shadowOpacity = bodyCaption.shadowOpacity,
+            lineSpacing = bodyCaption.lineSpacing,
+        )
+    }
+
+    fun defaultSubtitleStyle(bodyCaption: SceneCaption? = null): SceneCaption {
+        val legacy = SceneCaption(
+            text = "",
+            font = CaptionFont.PRETENDARD_BOLD,
+            fontName = "pretendard_bold",
+            size = CaptionSize.LARGE,
+            textColor = 0xFFFFFFFF.toInt(),
+            shadowEnabled = true,
+            shadowColor = 0xFF000000.toInt(),
+            shadowOpacity = 0.75f,
+            lineSpacing = 1.25f,
+            column = 2,
+            row = 3,
+        )
+        return if (bodyCaption == null) legacy else legacy.copy(
+            font = bodyCaption.font,
+            fontName = bodyCaption.effectiveFontName,
+            size = bodyCaption.size,
+            textColor = bodyCaption.textColor,
+            shadowEnabled = bodyCaption.shadowEnabled,
+            shadowColor = bodyCaption.shadowColor,
+            shadowOpacity = bodyCaption.shadowOpacity,
+            lineSpacing = bodyCaption.lineSpacing,
+        )
+    }
 
     /**
      * Renders a title card to a bitmap of size [width] x [height].
@@ -126,42 +188,66 @@ object TrailerTitleCardRenderer {
             return bitmap
         }
 
-        val combinedText = when {
-            titleText.isNotEmpty() && subtitleText.isNotEmpty() -> "$titleText\n$subtitleText"
-            titleText.isNotEmpty() -> titleText
-            else -> subtitleText
+        val hasCustomStyles = card.titleStyle != null || card.subtitleStyle != null
+        if (!hasCustomStyles) {
+            val combinedText = when {
+                titleText.isNotEmpty() && subtitleText.isNotEmpty() -> "$titleText\n$subtitleText"
+                titleText.isNotEmpty() -> titleText
+                else -> subtitleText
+            }
+
+            val legacyCaption = SceneCaption(
+                text = combinedText,
+                font = CaptionFont.PRETENDARD_BOLD,
+                fontName = "pretendard_bold",
+                size = CaptionSize.XLARGE,
+                textColor = 0xFFFFFFFF.toInt(),
+                shadowEnabled = true,
+                shadowColor = 0xFF000000.toInt(),
+                shadowOpacity = 0.75f,
+                lineSpacing = 1.25f,
+                column = 2,
+                row = 2,
+            )
+            // Shared body caption typography: font/size/color/shadow/line spacing come from the body caption, while the
+            // card keeps its own text, centered layout (column/row), time and background. No body caption = legacy look.
+            val caption = if (bodyCaption == null) legacyCaption else legacyCaption.copy(
+                font = bodyCaption.font,
+                fontName = bodyCaption.effectiveFontName,
+                size = bodyCaption.size,
+                textColor = bodyCaption.textColor,
+                shadowEnabled = bodyCaption.shadowEnabled,
+                shadowColor = bodyCaption.shadowColor,
+                shadowOpacity = bodyCaption.shadowOpacity,
+                lineSpacing = bodyCaption.lineSpacing,
+            )
+
+            val captionBitmap = SceneCaptionRenderer.render(context, caption, width, height)
+            if (captionBitmap != null) {
+                canvas.drawBitmap(captionBitmap, 0f, 0f, null)
+                captionBitmap.recycle()
+            }
+
+            return bitmap
         }
 
-        val legacyCaption = SceneCaption(
-            text = combinedText,
-            font = CaptionFont.PRETENDARD_BOLD,
-            fontName = "pretendard_bold",
-            size = CaptionSize.XLARGE,
-            textColor = 0xFFFFFFFF.toInt(),
-            shadowEnabled = true,
-            shadowColor = 0xFF000000.toInt(),
-            shadowOpacity = 0.75f,
-            lineSpacing = 1.25f,
-            column = 2,
-            row = 2,
-        )
-        // Shared body caption typography: font/size/color/shadow/line spacing come from the body caption, while the
-        // card keeps its own text, centered layout (column/row), time and background. No body caption = legacy look.
-        val caption = if (bodyCaption == null) legacyCaption else legacyCaption.copy(
-            font = bodyCaption.font,
-            fontName = bodyCaption.effectiveFontName,
-            size = bodyCaption.size,
-            textColor = bodyCaption.textColor,
-            shadowEnabled = bodyCaption.shadowEnabled,
-            shadowColor = bodyCaption.shadowColor,
-            shadowOpacity = bodyCaption.shadowOpacity,
-            lineSpacing = bodyCaption.lineSpacing,
-        )
+        // Independent custom styles for title and subtitle
+        if (titleText.isNotEmpty()) {
+            val tStyle = (card.titleStyle ?: defaultTitleStyle(bodyCaption)).copy(text = titleText)
+            val titleBitmap = SceneCaptionRenderer.render(context, tStyle, width, height)
+            if (titleBitmap != null) {
+                canvas.drawBitmap(titleBitmap, 0f, 0f, null)
+                titleBitmap.recycle()
+            }
+        }
 
-        val captionBitmap = SceneCaptionRenderer.render(context, caption, width, height)
-        if (captionBitmap != null) {
-            canvas.drawBitmap(captionBitmap, 0f, 0f, null)
-            captionBitmap.recycle()
+        if (subtitleText.isNotEmpty()) {
+            val sStyle = (card.subtitleStyle ?: defaultSubtitleStyle(bodyCaption)).copy(text = subtitleText)
+            val subtitleBitmap = SceneCaptionRenderer.render(context, sStyle, width, height)
+            if (subtitleBitmap != null) {
+                canvas.drawBitmap(subtitleBitmap, 0f, 0f, null)
+                subtitleBitmap.recycle()
+            }
         }
 
         return bitmap
