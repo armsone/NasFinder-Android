@@ -224,6 +224,65 @@ private fun Modifier.appRootSafeArea(): Modifier = windowInsetsPadding(
         .union(WindowInsets.ime),
 )
 
+internal val LocalTrailerReturnReminder = compositionLocalOf<(@Composable () -> Unit)?> { null }
+
+@Composable
+internal fun TrailerReturnReminder(
+    session: TrailerSession,
+    onResume: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+        shadowElevation = 6.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "편집으로 돌아가기",
+                        onClick = onResume,
+                    )
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                PackIcon(PackGlyph.VIDEO, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                Spacer(Modifier.width(8.dp))
+                val running = session.export?.running == true
+                Text(
+                    "편집으로 돌아가기 · ${session.displayTitle}${if (running) " (내보내는 중)" else ""}",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onPrimary,
+                )
+            }
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.size(48.dp),
+            ) {
+                PackIcon(
+                    PackGlyph.CLOSE,
+                    contentDescription = "편집 복귀 안내 닫기 (편집본 유지)",
+                    tint = MaterialTheme.colorScheme.onPrimary,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun NasFinderApp(
     model: NasFinderViewModel,
@@ -308,8 +367,35 @@ fun NasFinderApp(
     // Presentation-only flag reported by BrowserScreen while its existing CoverFlow is showing; the whole app screen is then used.
     var browserCoverFlowFullscreen by remember { mutableStateOf(false) }
     val coverFlowFullscreen = browserCoverFlowFullscreen && state.screen is Screen.Browser && state.imagePreview == null && state.trailer == null
+
+    var dismissedTrailerPath by rememberSaveable { mutableStateOf<String?>(null) }
+    val activeTrailerSession = state.trailer?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }
+
+    LaunchedEffect(activeTrailerSession?.directory?.absolutePath, state.trailerMinimized, state.screen) {
+        if (activeTrailerSession == null || (!state.trailerMinimized && state.screen != Screen.WebBrowser)) {
+            dismissedTrailerPath = null
+        }
+    }
+
+    val showTrailerReminder = activeTrailerSession != null &&
+        (state.trailerMinimized || state.screen == Screen.WebBrowser) &&
+        state.imagePreview == null &&
+        !coverFlowFullscreen &&
+        dismissedTrailerPath != activeTrailerSession.directory.absolutePath
+
+    val trailerReminderSlot: (@Composable () -> Unit)? = if (showTrailerReminder) {
+        {
+            TrailerReturnReminder(
+                session = activeTrailerSession!!,
+                onResume = model::restoreEditor,
+                onDismiss = { dismissedTrailerPath = activeTrailerSession.directory.absolutePath },
+            )
+        }
+    } else null
+
     NasFinderTheme(state.theme, state.iconPack) {
-        Box(
+        CompositionLocalProvider(LocalTrailerReturnReminder provides trailerReminderSlot) {
+            Box(
             Modifier.fillMaxSize()
                 .then(if (coverFlowFullscreen) Modifier.background(Color.Black) else Modifier.background(skyBrush(state.theme)))
                 .then(
@@ -450,30 +536,10 @@ fun NasFinderApp(
             WorkbenchReconnectDialog(state, model)
             // 일반 모드에서는 비공개 출처 편집 세션의 화면도 '편집으로 돌아가기' 알약(제목 노출)도 만들지 않는다.
             // 세션은 그대로 살아 있어 내보내기·자동 저장은 계속되고, 프라이버시 모드로 돌아오면 다시 나타난다.
+            // 복귀 안내 알약은 루트 오버레이 대신 LocalTrailerReturnReminder 슬롯을 통해 하단 바/푸터에서 실측 공간을 확보하여 렌더링된다.
             state.trailer?.takeIf { com.armsone.nasfinder.data.PrivacyMode.isVisible(it.originPrivate) }?.let { session ->
                 if (!state.trailerMinimized && state.screen != Screen.WebBrowser) {
                     VideoTrailerScreen(session, model, browsingForMusic = false)
-                } else {
-                    // The project stays open (export/adds keep running) while another destination is visited.
-                    Surface(
-                        onClick = model::restoreEditor,
-                        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 88.dp, start = 16.dp, end = 16.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                        shadowElevation = 6.dp,
-                    ) {
-                        Row(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            PackIcon(PackGlyph.VIDEO, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onPrimary)
-                            Spacer(Modifier.width(8.dp))
-                            val running = session.export?.running == true
-                            Text(
-                                "편집으로 돌아가기 · ${session.displayTitle}${if (running) " (내보내는 중)" else ""}",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
                 }
             }
             state.imagePreview?.let { preview ->
@@ -509,6 +575,7 @@ fun NasFinderApp(
                     DownloadProgressBanner(download, Modifier.align(Alignment.BottomCenter))
                 }
             }
+        }
         }
         state.message?.let { message ->
             AlertDialog(onDismissRequest = model::dismissMessage, confirmButton = { TextButton(onClick = model::dismissMessage) { Text("확인") } }, title = { Text("알림") }, text = { Text(message) })
@@ -2699,7 +2766,11 @@ internal fun MainTabBar(
     )
     // The 작업대 is shown under 만들기, so that tab stays highlighted while it is open.
     val current = if (selected == MainNavigationDestination.WORKBENCH) MainNavigationDestination.VIDEO else selected
+    val reminder = LocalTrailerReturnReminder.current
     Column(Modifier.background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)).navigationBarsPadding()) {
+        if (reminder != null) {
+            reminder()
+        }
         HorizontalDivider(thickness = .5.dp, color = MaterialTheme.colorScheme.outlineVariant)
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).selectableGroup()) {
             tabs.forEach { (tab, label, glyph) ->
@@ -2765,7 +2836,16 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
         MainAppHeader(state, model)
     }, bottomBar = {
         // Wide windows navigate with the persistent sidebar only; the bottom tabs would repeat the same five destinations.
-        if (!rememberWideShell()) MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode) { model.selectMainDestination(it) }
+        if (!rememberWideShell()) {
+            MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode) { model.selectMainDestination(it) }
+        } else {
+            val reminder = LocalTrailerReturnReminder.current
+            if (reminder != null) {
+                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)).navigationBarsPadding()) {
+                    reminder()
+                }
+            }
+        }
     }) { padding ->
         val favoritesItems: LazyListScope.() -> Unit = {
             item { SectionTitle("즐겨찾기", Icons.Default.Star) }
@@ -2934,23 +3014,23 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
             }
         }
         if (toolsTab) {
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.TOOLS) { PorcelainTools(state, model) }
             }
         } else if (videoTab) {
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.VIDEO) { PorcelainVideoHub(state, model) }
             }
         } else if (workbenchTab) {
             // Wide windows keep the persistent sidebar (작업대 selected); narrow windows render the content alone.
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.WORKBENCH) {
                     WorkbenchScreen(state, model, embedded = false, onBack = { model.closeWorkbench() })
                 }
             }
         } else if (homeRoot) {
             // Wide windows keep the existing persistent sidebar beside the 홈 root; narrow windows render the content alone.
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.HOME) {
                     PorcelainPhoneHome(
                         state = state,
@@ -2965,7 +3045,7 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 }
             }
         } else if (finderRoot) {
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 PorcelainWideHost(state, model, activeRoot = MainNavigationDestination.FINDER) {
                     PorcelainFinder(
                         state, model,
@@ -2987,9 +3067,9 @@ private fun DashboardScreen(state: AppState, model: NasFinderViewModel) {
                 onDeleteConnection = { connectionPendingDeletion = it },
                 onRemoveFavorite = { favoritePendingDeletion = it },
                 onImportFiles = { fileImporter.launch(arrayOf("*/*")) },
-                modifier = Modifier.padding(padding),
+                modifier = Modifier.padding(padding).consumeWindowInsets(padding),
             )
-        } else BoxWithConstraints(Modifier.padding(padding).fillMaxSize()) {
+        } else BoxWithConstraints(Modifier.padding(padding).consumeWindowInsets(padding).fillMaxSize()) {
             val contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 16.dp)
             if (maxWidth >= 720.dp) {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {

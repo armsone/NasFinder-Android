@@ -652,13 +652,28 @@ internal fun PorcelainWideHost(
             if (fullscreen || state.screen == Screen.Dashboard) movableContent()
             else androidx.compose.material3.Scaffold(containerColor = Color.Transparent, bottomBar = {
                 MainTabBar(state.activeMainTab, onTogglePrivacy = model::togglePrivacyMode, onSelect = model::selectMainDestination)
-            }) { padding -> Box(Modifier.padding(padding)) { movableContent() } }
+            }) { padding -> Box(Modifier.padding(padding).consumeWindowInsets(padding)) { movableContent() } }
         } else {
             Box(Modifier.fillMaxSize()) {
                 Row(Modifier.fillMaxSize()) {
                     PorcelainNavigationSidebar(state, model, totalWidth, selectedConnectionId = selectedConnectionId, phoneHardSelected = phoneHardSelected, activeRoot = activeRoot, favoritesSelected = favoritesSelected)
                     VerticalDividerLine()
-                    Box(Modifier.weight(1f).fillMaxHeight()) { movableContent() }
+                    val wideReminder = if (state.screen != Screen.Dashboard && !fullscreen) LocalTrailerReturnReminder.current else null
+                    if (wideReminder != null) {
+                        androidx.compose.material3.Scaffold(
+                            modifier = Modifier.weight(1f).fillMaxHeight(),
+                            containerColor = Color.Transparent,
+                            bottomBar = {
+                                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)).navigationBarsPadding()) {
+                                    wideReminder()
+                                }
+                            },
+                        ) { padding ->
+                            Box(Modifier.padding(padding).consumeWindowInsets(padding)) { movableContent() }
+                        }
+                    } else {
+                        Box(Modifier.weight(1f).fillMaxHeight()) { movableContent() }
+                    }
                     if (showWorkbenchPanel) {
                         VerticalDividerLine()
                         if (wideWorkbenchExpanded) {
