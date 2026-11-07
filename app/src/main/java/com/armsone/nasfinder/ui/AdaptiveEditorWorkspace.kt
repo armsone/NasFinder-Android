@@ -363,23 +363,31 @@ internal fun AdaptiveEditorWorkspace(
                 .also { jobs -> jobs.forEach { TitleCardBitmapCache.lookup(cacheDir, it.key) } }
         }
 
-        // Phase 1: Hydrate cache misses from persistent disk cache off-main without showing progress
-        withContext(Dispatchers.IO) {
+        // Phase 1: Hydrate cache misses from persistent disk cache off-main without showing progress,
+        // snapshotting scenes whose required assets are ready (in-memory or validated on disk).
+        val readySceneKeys = withContext(Dispatchers.IO) {
+            val ready = mutableSetOf<Long>()
             for (scene in scenes) {
                 if (!coroutineContext.isActive) break
                 val src = session.sources.firstOrNull { it.id == scene.sourceId } ?: continue
                 if (!src.file.exists()) continue
 
                 val frameKey = PreviewFrameCache.initialFrameKey(src, scene)
-                if (PreviewFrameCache.get(frameKey) == null) {
+                val frameReady = if (PreviewFrameCache.get(frameKey) != null) {
+                    true
+                } else {
                     val pKey = PreviewFrameCache.persistentKey(projectDraftId, src, scene.start)
                     val diskFrame = PreviewFrameCache.loadFromDisk(cacheDir, pKey)
                     if (diskFrame != null) {
                         PreviewFrameCache.put(frameKey, diskFrame)
+                        true
+                    } else {
+                        false
                     }
                 }
+                if (!frameReady) continue
 
-                if (src.isImage) {
+                val planReady = if (src.isImage) {
                     val planKey = PhotoPlanKey(
                         filePath = src.file.absolutePath,
                         lastModified = src.file.lastModified(),
@@ -392,59 +400,53 @@ internal fun AdaptiveEditorWorkspace(
                         outputHeight = outputHeight,
                         duration = scene.length,
                     )
-                    if (PhotoMotionPlanCache.get(planKey) == null) {
+                    if (PhotoMotionPlanCache.get(planKey) != null) {
+                        true
+                    } else {
                         val pKey = planKey.persistentKey(projectDraftId, src.name)
                         val diskPlan = PhotoMotionPlanCache.loadFromDisk(cacheDir, pKey)
                         if (diskPlan != null) {
                             PhotoMotionPlanCache.put(planKey, diskPlan)
+                            true
+                        } else {
+                            false
                         }
                     }
+                } else {
+                    true
                 }
+                if (!planReady) continue
 
-                scene.caption?.let { cap ->
+                val captionReady = scene.caption?.takeIf { it.normalizedOrNull() != null }?.let { cap ->
                     val capKey = CaptionBitmapCache.key(cap, outputWidth, outputHeight)
-                    if (CaptionBitmapCache.get(capKey) == null) {
+                    if (CaptionBitmapCache.get(capKey) != null) {
+                        true
+                    } else {
                         val diskCap = CaptionBitmapCache.loadFromDisk(cacheDir, capKey)
                         if (diskCap != null) {
                             CaptionBitmapCache.put(capKey, diskCap)
+                            true
+                        } else {
+                            false
                         }
                     }
-                }
+                } ?: true
+                if (!captionReady) continue
+
+                ready.add(scene.key)
             }
+            ready
         }
 
         if (!coroutineContext.isActive || token != previewPrepState.runId + 1) return@LaunchedEffect
 
-        val uncachedScenes = scenes.filter { scene ->
-            val src = session.sources.firstOrNull { it.id == scene.sourceId } ?: return@filter true
-            if (!src.file.exists()) return@filter true
-            val frameCached = PreviewFrameCache.get(PreviewFrameCache.initialFrameKey(src, scene)) != null
-            val planCached = if (src.isImage) {
-                val key = PhotoPlanKey(
-                    filePath = src.file.absolutePath,
-                    lastModified = src.file.lastModified(),
-                    length = src.file.length(),
-                    sourceId = src.id,
-                    fit = scene.fit,
-                    focusX = scene.focusX,
-                    focusY = scene.focusY,
-                    outputWidth = outputWidth,
-                    outputHeight = outputHeight,
-                    duration = scene.length,
-                )
-                PhotoMotionPlanCache.get(key) != null
-            } else true
-            val captionCached = scene.caption?.let { cap ->
-                CaptionBitmapCache.get(CaptionBitmapCache.key(cap, outputWidth, outputHeight)) != null
-            } ?: true
-            !frameCached || !planCached || !captionCached
-        }
+        val uncachedScenes = scenes.filter { scene -> scene.key !in readySceneKeys }
 
         val missingCards = cardJobs.filter { TitleCardBitmapCache.get(it.key) == null }
 
         if (uncachedScenes.isEmpty() && missingCards.isEmpty()) {
-            previewPrepState.preparedDirectoryKey = currentDir
-            previewPrepState.finish(token)
+            // Claim this generation (total 0 clears any cancelled run's overlay); finish(token) alone would be ignored.
+            previewPrepState.reset(0, currentDir, token)
             return@LaunchedEffect
         }
 
@@ -517,7 +519,7 @@ internal fun AdaptiveEditorWorkspace(
                     }
 
                     if (sceneSuccess) {
-                        scene.caption?.let { cap ->
+                        scene.caption?.takeIf { it.normalizedOrNull() != null }?.let { cap ->
                             val capKey = CaptionBitmapCache.key(cap, outputWidth, outputHeight)
                             if (CaptionBitmapCache.get(capKey) == null) {
                                 val diskCap = withContext(Dispatchers.IO) {
@@ -2008,7 +2010,7 @@ internal data class PhotoPlanKey(
 
 internal object PreviewDiskCache {
     private const val MAX_BYTES = 120L * 1024L * 1024L
-    private const val MAX_FILES = 400
+    private const val MAX_FILES = 4096
 
     fun sha256Hex(input: String): String = runCatching {
         val md = MessageDigest.getInstance("SHA-256")
@@ -3881,10 +3883,17 @@ internal fun loadFrame(file: File, isImage: Boolean, atSeconds: Double, maxDimen
         try {
             retriever.setDataSource(file.absolutePath)
             val timeUs = (atSeconds.coerceAtLeast(0.0) * 1_000_000).toLong()
+            fun decodeVideoFrame(option: Int): Bitmap? =
+                if (Build.VERSION.SDK_INT >= 27) retriever.getScaledFrameAtTime(timeUs, option, maxDimension, maxDimension)
+                else retriever.getFrameAtTime(timeUs, option)
+
             // exact=true는 선택 장면 미리보기용: 키프레임이 드문 영상에서도 실제 자르는 지점의 프레임을 보여준다.
-            val option = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-            if (Build.VERSION.SDK_INT >= 27) retriever.getScaledFrameAtTime(timeUs, option, maxDimension, maxDimension)
-            else retriever.getFrameAtTime(timeUs, option)
+            if (exact) {
+                runCatching { decodeVideoFrame(MediaMetadataRetriever.OPTION_CLOSEST) }.getOrNull()
+                    ?: runCatching { decodeVideoFrame(MediaMetadataRetriever.OPTION_CLOSEST_SYNC) }.getOrNull()
+            } else {
+                decodeVideoFrame(MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            }
         } finally {
             runCatching { retriever.release() }
         }
