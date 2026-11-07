@@ -219,6 +219,7 @@ internal fun AdaptiveEditorWorkspace(
     var tabletColumns by rememberSaveable { mutableIntStateOf(4) }
     var renameOpen by remember { mutableStateOf(false) }
     var exportSheet by remember { mutableStateOf(false) }
+    var editingFullscreen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     // Keeps the editing screen's saveable state (e.g. the inspector scroll) while the made video is shown.
     val editStateHolder = rememberSaveableStateHolder()
     // Finder selections are held in the view model so route changes, web roundtrips and minimization preserve them.
@@ -252,6 +253,8 @@ internal fun AdaptiveEditorWorkspace(
     val saveReady = outputCurrent && !rendering && !session.busy
     val fullscreenAllowed = phase == EditorPhase.EXPORT && outputCurrent && !rendering
     LaunchedEffect(fullscreenPlayback, fullscreenAllowed) { if (fullscreenPlayback && !fullscreenAllowed) onFullscreenChange(false) }
+    val editingFullscreenAllowed = phase == EditorPhase.EDIT && project.scenes.isNotEmpty() && !rendering
+    LaunchedEffect(editingFullscreen, editingFullscreenAllowed) { if (editingFullscreen && !editingFullscreenAllowed) editingFullscreen = false }
     // A cancelled render (or one outdated by edits) leaves nothing to show: the made-video screen returns to 편집.
     val resultEmpty = !rendering && session.export?.error == null && !outputCurrent
     LaunchedEffect(phase, resultEmpty) { if (phase == EditorPhase.EXPORT && resultEmpty) phase = EditorPhase.EDIT }
@@ -399,6 +402,7 @@ internal fun AdaptiveEditorWorkspace(
 
     BackHandler(enabled = !fullscreenPlayback) {
         when {
+            editingFullscreen -> editingFullscreen = false
             finderOpen -> finderOpen = false
             phase != EditorPhase.EDIT -> phase = EditorPhase.EDIT
             else -> onRequestClose()
@@ -415,9 +419,15 @@ internal fun AdaptiveEditorWorkspace(
                     // Undo/redo belong to 편집; the made-video screen never changes the project underneath.
                     phase == EditorPhase.EDIT && event.isCtrlPressed && event.key == Key.Z && !event.isShiftPressed -> { model.editorUndo(); true }
                     phase == EditorPhase.EDIT && event.isCtrlPressed && (event.key == Key.Y || (event.isShiftPressed && event.key == Key.Z)) -> { model.editorRedo(); true }
-                    (event.key == Key.F11 || (event.isCtrlPressed && event.isShiftPressed && event.key == Key.F)) && fullscreenAllowed -> {
-                        onFullscreenChange(!fullscreenPlayback); true
+                    (event.key == Key.F11 || (event.isCtrlPressed && event.isShiftPressed && event.key == Key.F)) -> {
+                        when {
+                            editingFullscreen -> { editingFullscreen = false; true }
+                            fullscreenAllowed -> { onFullscreenChange(!fullscreenPlayback); true }
+                            editingFullscreenAllowed -> { editingFullscreen = true; true }
+                            else -> false
+                        }
                     }
+                    editingFullscreen && event.key == Key.Escape -> { editingFullscreen = false; true }
                     else -> false
                 }
             },
@@ -608,11 +618,13 @@ internal fun AdaptiveEditorWorkspace(
                     previewScale = previewScale,
                     onPreviewScaleChange = { previewScale = it },
                     showControls = !imeVisible,
-                    inlinePlaybackAllowed = !fullscreenPlayback,
+                    inlinePlaybackAllowed = !fullscreenPlayback && !editingFullscreen,
+                    pauseOnDisallow = !editingFullscreen,
                     clipPlayback = clipPlayback,
                     titleScenes = project.scenes,
                     introCard = project.introCard,
                     outroCard = project.outroCard,
+                    onTogglePlay = ::toggleProjectPlay,
                     timeline = { sizeRatio ->
                         ProjectTimeline(
                             sizeRatio = sizeRatio,
@@ -623,6 +635,8 @@ internal fun AdaptiveEditorWorkspace(
                             clipPlayback = clipPlayback,
                             onSelectScene = ::selectOnly,
                             onTogglePlay = ::toggleProjectPlay,
+                            onToggleFullscreen = { editingFullscreen = true },
+                            fullscreenEnabled = editingFullscreenAllowed,
                         )
                     },
                     modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
@@ -1093,6 +1107,133 @@ internal fun AdaptiveEditorWorkspace(
             }
         }
 
+        if (editingFullscreen && editingFullscreenAllowed) {
+            val handleToggle = {
+                if (clipPlayback.playing) clipPlayback.playing = false else toggleProjectPlay()
+            }
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+            ) {
+                BoxWithConstraints(
+                    Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    val aspect = outputAspect(session)
+                    val boxWidth = minOf(maxWidth, maxHeight * aspect)
+                    Box(
+                        Modifier
+                            .width(boxWidth)
+                            .aspectRatio(aspect),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        EditingPreviewBox(
+                            session = session,
+                            scene = selectedScene,
+                            source = selectedSource,
+                            caption = previewCaption,
+                            playbackAllowed = true,
+                            pauseOnDisallow = false,
+                            clipPlayback = clipPlayback,
+                            titleScenes = project.scenes,
+                            introCard = project.introCard,
+                            outroCard = project.outroCard,
+                            modifier = Modifier.fillMaxSize(),
+                            timelineShown = true,
+                        )
+                    }
+
+                    val dismissThresholdPx = with(LocalDensity.current) { 120.dp.toPx() }
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = true)
+                                    var totalDragY = 0f
+                                    var isDownward = false
+                                    var isDrag = false
+                                    var directionLocked = false
+
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (!change.pressed) {
+                                            if (!isDrag && !change.isConsumed) {
+                                                handleToggle()
+                                            } else if (isDownward && totalDragY >= dismissThresholdPx) {
+                                                editingFullscreen = false
+                                            }
+                                            break
+                                        }
+                                        val dx = change.position.x - down.position.x
+                                        val dy = change.position.y - down.position.y
+                                        totalDragY = dy
+
+                                        val dist = kotlin.math.hypot(dx, dy)
+                                        if (!directionLocked && dist > viewConfiguration.touchSlop) {
+                                            directionLocked = true
+                                            isDrag = true
+                                            if (dy > 0f && dy > kotlin.math.abs(dx)) {
+                                                isDownward = true
+                                            }
+                                        } else if (dist > viewConfiguration.touchSlop) {
+                                            isDrag = true
+                                        }
+
+                                        if (isDownward && totalDragY > 0f) {
+                                            change.consume()
+                                        }
+                                    }
+                                }
+                            }
+                    )
+
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(12.dp),
+                    ) {
+                        IconButton(
+                            onClick = { editingFullscreen = false },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(IconHitTarget)
+                                .clip(EditorButtonShape)
+                                .background(Color.Black.copy(alpha = 0.55f)),
+                        ) {
+                            Icon(
+                                Icons.Default.FullscreenExit,
+                                contentDescription = "전체화면 종료",
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp),
+                            )
+                        }
+
+                        val isPlaying = clipPlayback.playing
+                        IconButton(
+                            onClick = handleToggle,
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .size(IconHitTarget)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.55f)),
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (isPlaying) "일시정지" else "재생",
+                                tint = Color.White,
+                                modifier = Modifier.size(28.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         // Temporary Finder: beside the rail at 760..919, full-screen picker below 760. The editor stays composed
         // underneath, so the project, selected scene, playback position and Finder selections are preserved.
         val finderFullScreen = tier == EditorTier.FOCUSED || isPhone
@@ -1494,6 +1635,93 @@ private fun scaledStageHeight(session: TrailerSession, paneWidth: Dp, cap: Dp, m
     return (base * scale).coerceIn(minOf(base, 48.dp), limit)
 }
 
+@Composable
+private fun PreviewProgressOverlay(
+    loading: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (!loading) return
+    Box(
+        modifier = modifier
+            .padding(8.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.Black.copy(alpha = 0.70f))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "미리보기 준비 중…",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+            )
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .width(96.dp)
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(1.dp)),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = Color.White.copy(alpha = 0.25f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun EditingPreviewBox(
+    session: TrailerSession,
+    scene: EditorScene?,
+    source: TrailerSource?,
+    caption: SceneCaption?,
+    playbackAllowed: Boolean,
+    pauseOnDisallow: Boolean,
+    clipPlayback: ClipPlaybackState,
+    titleScenes: List<EditorScene>,
+    introCard: TrailerTitleCard,
+    outroCard: TrailerTitleCard,
+    modifier: Modifier = Modifier,
+    timelineShown: Boolean = true,
+) {
+    val cardSlot = clipPlayback.card?.takeIf { scene != null && clipPlayback.sceneKey == scene.key }
+    if (cardSlot != null) {
+        val isIntro = cardSlot == TitleSlot.INTRO
+        val card = if (isIntro) introCard else outroCard
+        val holder = if (isIntro) titleScenes.firstOrNull() else titleScenes.lastOrNull()
+        val dims = rememberOutputDims(session)
+        val cardState = rememberTitleCardBitmap(
+            card, isIntro, holder, holder?.let { h -> session.sources.firstOrNull { it.id == h.sourceId } }, dims.first, dims.second, 720,
+            bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(titleScenes.map { it.caption }),
+            backgroundCandidates = session.scenes.map { it.source },
+        )
+        TitleCardPreview(
+            bitmap = cardState.value,
+            loading = cardState.isLoading,
+            label = (if (isIntro) "시작 화면" else "마지막 화면") + " · ${seconds1(card.clampedDuration())}",
+            aspect = outputAspect(session),
+            modifier = modifier,
+        )
+    } else if (scene != null && source != null) {
+        ScenePreview(
+            session = session,
+            scene = scene,
+            source = source,
+            caption = caption,
+            playbackAllowed = playbackAllowed,
+            clipPlayback = clipPlayback,
+            modifier = modifier,
+            timelineShown = timelineShown,
+            pauseOnDisallow = pauseOnDisallow,
+        )
+    } else {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text("클립을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun EditorStage(
@@ -1510,11 +1738,13 @@ private fun EditorStage(
     maxVisualHeight: Dp = visualHeight,
     // False while the fullscreen viewer is open: inline players pause (and stay paused on return) so only one plays.
     inlinePlaybackAllowed: Boolean = true,
+    pauseOnDisallow: Boolean = true,
     clipPlayback: ClipPlaybackState,
     // Scenes and cards for the timeline's start/end card segments (shown in place of the scene while one is active).
     titleScenes: List<EditorScene> = emptyList(),
     introCard: TrailerTitleCard = TrailerTitleCard(),
     outroCard: TrailerTitleCard = TrailerTitleCard(),
+    onTogglePlay: (() -> Unit)? = null,
     // Connected project timeline row between the picture and the tabs; hidden while typing.
     // It receives the shown picture height relative to its default (1 = default), so the whole preview group shrinks together.
     timeline: (@Composable (sizeRatio: Float) -> Unit)? = null,
@@ -1527,27 +1757,50 @@ private fun EditorStage(
     // picture and the tabs stay, without resizing.
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box(Modifier.fillMaxWidth().height(visualHeight), contentAlignment = Alignment.Center) {
-            val cardSlot = clipPlayback.card?.takeIf { scene != null && clipPlayback.sceneKey == scene.key }
-            if (cardSlot != null) {
-                val isIntro = cardSlot == TitleSlot.INTRO
-                val card = if (isIntro) introCard else outroCard
-                val holder = if (isIntro) titleScenes.firstOrNull() else titleScenes.lastOrNull()
-                val dims = rememberOutputDims(session)
-                val cardBitmap by rememberTitleCardBitmap(
-                    card, isIntro, holder, holder?.let { h -> session.sources.firstOrNull { it.id == h.sourceId } }, dims.first, dims.second, 720,
-                    bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(titleScenes.map { it.caption }),
-                    backgroundCandidates = session.scenes.map { it.source },
-                )
-                TitleCardPreview(
-                    bitmap = cardBitmap,
-                    label = (if (isIntro) "시작 화면" else "마지막 화면") + " · ${seconds1(card.clampedDuration())}",
-                    aspect = outputAspect(session),
+            if (inlinePlaybackAllowed) {
+                EditingPreviewBox(
+                    session = session,
+                    scene = scene,
+                    source = source,
+                    caption = caption,
+                    playbackAllowed = inlinePlaybackAllowed,
+                    pauseOnDisallow = pauseOnDisallow,
+                    clipPlayback = clipPlayback,
+                    titleScenes = titleScenes,
+                    introCard = introCard,
+                    outroCard = outroCard,
                     modifier = Modifier.fillMaxSize(),
+                    timelineShown = timeline != null && showControls,
                 )
-            } else if (scene != null && source != null) {
-                ScenePreview(session, scene, source, caption, inlinePlaybackAllowed, clipPlayback, Modifier.fillMaxSize(), timelineShown = timeline != null && showControls)
-            } else {
-                Text("클립을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (onTogglePlay != null && scene != null && showControls) {
+                    val handleToggle = {
+                        if (clipPlayback.playing) clipPlayback.playing = false else onTogglePlay()
+                    }
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectTapGestures { handleToggle() }
+                            }
+                    )
+                    val isPlaying = clipPlayback.playing
+                    IconButton(
+                        onClick = handleToggle,
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(8.dp)
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.55f)),
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (isPlaying) "일시정지" else "재생",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
             }
         }
         // Ratio of the height actually shown (already clamped by the pane), not the persisted scale.
@@ -1809,6 +2062,16 @@ private fun rememberOutputDims(session: TrailerSession): Pair<Int, Int> =
  * export (first scene's first frame / last scene's frame 0.5s before its end, only while 첫/마지막 사진 배경 is on),
  * drawn by [TrailerTitleCardRenderer].
  */
+@Stable
+private class TitleCardBitmapState(
+    initialBitmap: Bitmap? = null,
+    initialLoading: Boolean = false,
+) : State<Bitmap?> {
+    var bitmap by mutableStateOf(initialBitmap)
+    var isLoading by mutableStateOf(initialLoading)
+    override val value: Bitmap? get() = bitmap
+}
+
 @Composable
 private fun rememberTitleCardBitmap(
     card: TrailerTitleCard,
@@ -1821,32 +2084,56 @@ private fun rememberTitleCardBitmap(
     active: Boolean = true,
     bodyCaption: SceneCaption? = null,
     backgroundCandidates: List<TrailerSource> = emptyList(),
-): State<Bitmap?> {
+): TitleCardBitmapState {
     val context = LocalContext.current
     val scale = maxSide.toFloat() / maxOf(outputWidth, outputHeight).coerceAtLeast(1)
     val w = (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2)
     val h = (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
     val chosen = card.resolveBackgroundSource(backgroundCandidates)
-    return produceState<Bitmap?>(null, card, isIntro, holder, holderSource, w, h, active, bodyCaption, chosen) {
+    val state = remember(isIntro) { TitleCardBitmapState(initialBitmap = null, initialLoading = active) }
+
+    LaunchedEffect(card, isIntro, holder, holderSource, w, h, active, bodyCaption, chosen) {
         if (!active) {
-            value = null
-            return@produceState
+            state.bitmap = null
+            state.isLoading = false
+            return@LaunchedEffect
         }
-        value = withContext(Dispatchers.Default) {
-            val background = if (chosen != null) {
-                loadFrame(chosen.file, true, 0.0, maxSide, exact = true)
-            } else if (card.usesFirstOrLastImage && holder != null && holderSource != null) {
-                val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
-                val at = if (isIntro) start else maxOf(start, start + length - 0.5)
-                loadFrame(holderSource.file, holderSource.isImage, at, maxSide, exact = true)
-            } else null
-            TrailerTitleCardRenderer.renderCardBitmap(context, card, background, w, h, bodyCaption)
+        state.isLoading = true
+        try {
+            val rendered = withContext(Dispatchers.Default) {
+                val background = if (chosen != null) {
+                    loadFrame(chosen.file, true, 0.0, maxSide, exact = true)
+                } else if (card.usesFirstOrLastImage && holder != null && holderSource != null) {
+                    val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
+                    val at = if (isIntro) start else maxOf(start, start + length - 0.5)
+                    loadFrame(holderSource.file, holderSource.isImage, at, maxSide, exact = true)
+                } else null
+                TrailerTitleCardRenderer.renderCardBitmap(context, card, background, w, h, bodyCaption)
+            }
+            if (coroutineContext.isActive) {
+                state.bitmap = rendered
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // failed render
+        } finally {
+            if (coroutineContext.isActive) {
+                state.isLoading = false
+            }
         }
     }
+    return state
 }
 
 @Composable
-private fun TitleCardPreview(bitmap: Bitmap?, label: String, aspect: Float, modifier: Modifier) {
+private fun TitleCardPreview(
+    bitmap: Bitmap?,
+    label: String,
+    aspect: Float,
+    modifier: Modifier,
+    loading: Boolean = false,
+) {
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             val boxWidth = minOf(maxWidth, maxHeight * aspect)
@@ -1854,10 +2141,17 @@ private fun TitleCardPreview(bitmap: Bitmap?, label: String, aspect: Float, modi
                 Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
                 contentAlignment = Alignment.Center,
             ) {
-                bitmap?.let {
-                    val image = remember(it) { it.asImageBitmap() }
+                if (bitmap != null) {
+                    val image = remember(bitmap) { bitmap.asImageBitmap() }
                     Image(image, contentDescription = label, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
-                } ?: CircularProgressIndicator(Modifier.size(28.dp))
+                } else if (!loading) {
+                    Text(
+                        "미리보기를 불러올 수 없습니다",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                PreviewProgressOverlay(loading = loading, modifier = Modifier.align(Alignment.Center))
                 Text(
                     label,
                     Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
@@ -1893,6 +2187,8 @@ private fun ProjectTimeline(
     onTogglePlay: () -> Unit,
     sizeRatio: Float,
     compactPhone: Boolean = false,
+    onToggleFullscreen: (() -> Unit)? = null,
+    fullscreenEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     if (segments.isEmpty()) return
@@ -1942,6 +2238,21 @@ private fun ProjectTimeline(
                     color = Color.White,
                     maxLines = 1,
                 )
+            }
+            if (onToggleFullscreen != null) {
+                Spacer(Modifier.weight(1f))
+                IconButton(
+                    onClick = onToggleFullscreen,
+                    enabled = fullscreenEnabled,
+                    modifier = Modifier.size(if (compactPhone) 32.dp else if (compact) 30.dp else 36.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Fullscreen,
+                        contentDescription = "편집 전체화면",
+                        modifier = Modifier.size(if (compact) 18.dp else 20.dp),
+                        tint = if (fullscreenEnabled) Color.White else Color.White.copy(alpha = 0.38f),
+                    )
+                }
             }
         }
       }
@@ -2279,13 +2590,23 @@ private data class PhotoPlanKey(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: TrailerSource, caption: SceneCaption?, playbackAllowed: Boolean, clipPlayback: ClipPlaybackState, modifier: Modifier, timelineShown: Boolean = false) {
+private fun ScenePreview(
+    session: TrailerSession,
+    scene: EditorScene,
+    source: TrailerSource,
+    caption: SceneCaption?,
+    playbackAllowed: Boolean,
+    clipPlayback: ClipPlaybackState,
+    modifier: Modifier,
+    timelineShown: Boolean = false,
+    pauseOnDisallow: Boolean = true,
+) {
     val context = LocalContext.current
     val aspect = outputAspect(session)
     val playing = clipPlayback.isPlaying(scene.key)
     // Fullscreen opened: the clip player leaves composition this frame (released) and play is paused, so returning
     // shows the paused preview instead of auto-resuming. The clip position and photo progress are kept.
-    if (!playbackAllowed && playing) SideEffect { clipPlayback.playing = false }
+    if (!playbackAllowed && playing && pauseOnDisallow) SideEffect { clipPlayback.playing = false }
     val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
     val planKey = if (source.isImage) {
         PhotoPlanKey(
@@ -2305,12 +2626,18 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
     val pendingPlan = if (planKey == null) null else {
         TrailerPhotoMotionPlanner.pendingPlan(source, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight, scene.length)
     }
-    val photoPlanEntry by produceState<Pair<PhotoPlanKey, PhotoMotionPlan>?>(
-        initialValue = planKey?.let { k -> pendingPlan?.let { p -> k to p } },
-        key1 = planKey,
-    ) {
-        value = planKey?.let { k -> pendingPlan?.let { p -> k to p } }
-        if (planKey != null) {
+    var photoAnalysisLoading by remember(source.file.absolutePath) { mutableStateOf(planKey != null) }
+    var photoPlanEntry by remember(source.file.absolutePath) { mutableStateOf<Pair<PhotoPlanKey, PhotoMotionPlan>?>(null) }
+    LaunchedEffect(planKey) {
+        if (planKey == null) {
+            photoAnalysisLoading = false
+            photoPlanEntry = null
+            return@LaunchedEffect
+        }
+        if (photoPlanEntry?.first != planKey) {
+            photoAnalysisLoading = true
+        }
+        try {
             val computed = withContext(Dispatchers.Default) {
                 TrailerPhotoMotionPlanner.planMotion(
                     source = source,
@@ -2322,7 +2649,17 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                     durationSeconds = scene.length,
                 )
             }
-            value = planKey to computed
+            if (coroutineContext.isActive) {
+                photoPlanEntry = planKey to computed
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // failed
+        } finally {
+            if (coroutineContext.isActive) {
+                photoAnalysisLoading = false
+            }
         }
     }
     val photoPlan = if (photoPlanEntry?.first == planKey) photoPlanEntry?.second else pendingPlan
@@ -2356,20 +2693,81 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
         }
     }
     // A paused video shows the frame at the held position (timeline/slider seek), in 0.1s steps; a playing one uses its player.
+    val isPlayerActive = playing && playbackAllowed && !source.isImage
     val frameAt = if (source.isImage || playing) scene.start
     else scene.start + (clipPlayback.positionFor(scene.key).coerceIn(0L, (scene.length * 1000).toLong()) / 100) / 10.0
-    val frame by produceState<Bitmap?>(null, source.file, frameAt, source.isImage) {
-        value = withContext(Dispatchers.IO) { loadFrame(source.file, source.isImage, frameAt, 960, exact = true) }
+
+    val frameTargetKey = remember(source.file.absolutePath, frameAt, source.isImage) {
+        "${source.file.absolutePath}|${source.isImage}|${(frameAt * 10).toLong()}"
     }
-    // The exporter's own caption bitmap (exact output size, same layout) scaled into this output-shaped box.
-    val captionBitmap by produceState<Bitmap?>(null, caption, outputWidth, outputHeight) {
-        if (caption == null) {
-            value = null
-            return@produceState
+    var frameLoading by remember(source.file.absolutePath) { mutableStateOf(!isPlayerActive) }
+    var frameBitmap by remember(source.file.absolutePath) { mutableStateOf<Bitmap?>(null) }
+    var frameLoadedKey by remember(source.file.absolutePath) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(frameTargetKey, isPlayerActive) {
+        if (isPlayerActive) {
+            frameLoading = false
+            return@LaunchedEffect
         }
-        delay(120)
-        value = withContext(Dispatchers.Default) { SceneCaptionRenderer.render(context, caption, outputWidth, outputHeight) }
+        if (frameLoadedKey != frameTargetKey) {
+            frameLoading = true
+        }
+        try {
+            val loaded = withContext(Dispatchers.IO) {
+                loadFrame(source.file, source.isImage, frameAt, 960, exact = true)
+            }
+            if (coroutineContext.isActive) {
+                frameBitmap = loaded
+                frameLoadedKey = frameTargetKey
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // failed
+        } finally {
+            if (coroutineContext.isActive) {
+                frameLoading = false
+            }
+        }
     }
+
+    var captionLoading by remember { mutableStateOf(false) }
+    var captionBitmapState by remember { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(caption, outputWidth, outputHeight) {
+        if (caption == null) {
+            captionBitmapState = null
+            captionLoading = false
+            return@LaunchedEffect
+        }
+        captionLoading = true
+        try {
+            delay(120)
+            val rendered = withContext(Dispatchers.Default) {
+                SceneCaptionRenderer.render(context, caption, outputWidth, outputHeight)
+            }
+            if (coroutineContext.isActive) {
+                captionBitmapState = rendered
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // failed render
+        } finally {
+            if (coroutineContext.isActive) {
+                captionLoading = false
+            }
+        }
+    }
+
+    var playerBuffering by remember(scene.key) { mutableStateOf(false) }
+    val isPreviewLoading = if (isPlayerActive) {
+        playerBuffering || captionLoading
+    } else if (source.isImage) {
+        photoAnalysisLoading || frameLoading || captionLoading
+    } else {
+        frameLoading || captionLoading
+    }
+
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
     BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
         val boxWidth = minOf(maxWidth, maxHeight * aspect)
@@ -2389,7 +2787,11 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                             }.onFailure { framingEffectsFailed = true }
                         }
                         addListener(object : Player.Listener {
+                            override fun onPlaybackStateChanged(playbackState: Int) {
+                                playerBuffering = (playbackState == Player.STATE_BUFFERING)
+                            }
                             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                                playerBuffering = false
                                 if (!framingEffectsFailed) framingEffectsFailed = true
                             }
                         })
@@ -2406,6 +2808,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                         repeatMode = Player.REPEAT_MODE_ONE
                         playWhenReady = true
                         prepare()
+                        playerBuffering = (playbackState == Player.STATE_BUFFERING)
                     }
                 }
                 LaunchedEffect(player, scene.sourceVolume) { player.volume = scene.sourceVolume.coerceIn(0f, 1f) }
@@ -2424,6 +2827,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 }
                 DisposableEffect(player) {
                     onDispose {
+                        playerBuffering = false
                         // The last known clip position; the next player (this or another layout) continues from it.
                         runCatching { if (clipPlayback.sceneKey == scene.key) clipPlayback.positionMs = player.currentPosition.coerceAtLeast(0L) }
                         player.release()
@@ -2460,7 +2864,7 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 // Same camera path, easing and timing as the exporter's PhotoMotionGlTransformation: the viewport
                 // (photo coordinates) is mapped onto this output-aspect box, so zoom and pan preview exactly.
                 val plan = photoPlan
-                val bitmap = frame
+                val bitmap = frameBitmap
                 if (bitmap != null && plan != null) {
                     val image = remember(bitmap) { bitmap.asImageBitmap() }
                     Canvas(Modifier.fillMaxSize()) {
@@ -2479,8 +2883,12 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                             filterQuality = FilterQuality.Medium,
                         )
                     }
-                } else {
-                    CircularProgressIndicator(Modifier.size(28.dp))
+                } else if (!isPreviewLoading) {
+                    Text(
+                        "미리보기를 불러올 수 없습니다",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
                 val statusText = when (plan?.mode) {
                     PhotoMotionMode.PAN_HORIZONTAL -> "가로 무빙·확대축소 · ${plan.reason}"
@@ -2501,20 +2909,28 @@ private fun ScenePreview(session: TrailerSession, scene: EditorScene, source: Tr
                 }
             } else {
                 val isFit = scene.fit == SceneFit.FIT
-                frame?.let {
+                val bitmap = frameBitmap
+                if (bitmap != null) {
                     Image(
-                        it.asImageBitmap(),
+                        bitmap.asImageBitmap(),
                         contentDescription = "${source.name} 클립 화면",
                         modifier = Modifier.fillMaxSize(),
                         contentScale = if (isFit) ContentScale.Fit else ContentScale.Crop,
                         alignment = if (isFit) Alignment.Center else BiasAlignment(scene.focusX.coerceIn(-1f, 1f), scene.focusY.coerceIn(-1f, 1f)),
                     )
-                } ?: CircularProgressIndicator(Modifier.size(28.dp))
+                } else if (!isPreviewLoading) {
+                    Text(
+                        "미리보기를 불러올 수 없습니다",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
-            captionBitmap?.let { bitmap ->
+            captionBitmapState?.let { bitmap ->
                 val captionImage = remember(bitmap) { bitmap.asImageBitmap() }
                 Image(captionImage, contentDescription = caption?.text, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
             }
+            PreviewProgressOverlay(loading = isPreviewLoading, modifier = Modifier.align(Alignment.Center))
         }
     }
     // Enhanced preview controls: scrubber slider, play/pause, replay from start, and stepping.

@@ -1,0 +1,40 @@
+{
+  "version": "2.39.71",
+  "build": "202611070910",
+  "versionCode": 446950,
+  "apkSha256": "30e45c03de9a87edeb51e94a329a9509a079b2628926a43b899c4f15ec6cc61a",
+  "fixture": "previewcheck_23971_synthetic_v1",
+  "runtimeDeviceClass": "Samsung Fold6 phone",
+  "observed": [
+    "timeline rightmost fullscreen and explicit onscreen play/pause visible",
+    "first inline and fullscreen media tap pauses before natural end; held position remains0.5s",
+    "downward650px swipe returns to same fixture editor at0.5s without closing project",
+    "duplicate fullscreen clip controls removed and rechecked on final APK",
+    "actual preview preparation message and indeterminate horizontal bar visible, then absent after real media becomes ready"
+  ],
+  "installation": "Same signed final APK data-preserving installed/relaunched/hash-matched on TriFold, Fold6 and SM-T500",
+  "cleanup": "Own uniquely named fixture project and three synthetic inputs removed; existing three drafts preserved",
+  "limits": [
+    "No connected Google TV",
+    "Apple counterpart runtime verification still in progress",
+    "No full product visual parity claim"
+  ],
+  "captures": [
+    {
+      "path": ".parity/evidence/preview-2.39.71/android/fold6-final-fullscreen.png",
+      "sha256": "d3a7b078f9b903ad6c91df7892533b5db423a1e50da75a7c08b949c1efa931df"
+    },
+    {
+      "path": ".parity/evidence/preview-2.39.71/android/fold6-final-progress-visible.png",
+      "sha256": "7b3d8d563b83d1086fe92432b3aef748bee89ba8243e2c94facf17a71611220c"
+    },
+    {
+      "path": ".parity/evidence/preview-2.39.71/android/fold6-final-progress-settled.png",
+      "sha256": "9e285d7e31cdbeab2d67fac8df23fe3abc065a3d883c32ce18270795f95e6bf7"
+    },
+    {
+      "path": ".parity/evidence/preview-2.39.71/android/gesture-trace.json",
+      "sha256": "0cd621806e7412e166a5dab3b7c1ca382c24a1f2eb9ed0daf996ba60db216ef9"
+    }
+  ]
+}
