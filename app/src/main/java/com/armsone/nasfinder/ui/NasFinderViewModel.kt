@@ -6979,6 +6979,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     musicVolume = musicVolume,
                     introCard = session.editor?.introCard?.takeIf { it.enabled },
                     outroCard = session.editor?.outroCard?.takeIf { it.enabled },
+                    cardBackgroundSources = (session.scenes.map { it.source } + session.sources).distinctBy { it.id },
                     onSuccess = { recovered, excluded ->
                         exportRecoveredScenes = recovered
                         exportExcludedScenes = excluded

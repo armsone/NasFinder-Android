@@ -419,7 +419,7 @@ internal fun AdaptiveEditorWorkspace(
 
         // Enabled start/end cards, in the same keys/render size (720px) the editor and fullscreen preview use.
         val cardBody = TrailerTitleCardRenderer.bodyCaptionOf(scenes.map { it.caption })
-        val cardCandidates = session.scenes.map { it.source }
+        val cardCandidates = (session.scenes.map { it.source } + session.sources).distinctBy { it.id }
         val (cardW, cardH) = titleCardRenderSize(outputWidth, outputHeight, 720)
         val cardJobs = withContext(Dispatchers.IO) {
             listOf(true to project.introCard, false to project.outroCard)
