@@ -111,6 +111,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -319,13 +325,16 @@ internal fun AdaptiveEditorWorkspace(
                 fit = scene.fit,
                 focusX = scene.focusX,
                 focusY = scene.focusY,
-                captionSignature = scene.caption?.let { "${it.text}|${it.hashCode()}" },
+                captionSignature = scene.caption?.let { CaptionBitmapCache.key(it, outputWidth, outputHeight) },
             )
         }
-        val introSig = if (project.introCard.enabled) "${project.introCard.title}|${project.introCard.subtitle}|${project.introCard.usesFirstOrLastImage}|${project.introCard.backgroundSourceId}|${project.introCard.clampedDuration()}" else null
-        val outroSig = if (project.outroCard.enabled) "${project.outroCard.title}|${project.outroCard.subtitle}|${project.outroCard.usesFirstOrLastImage}|${project.outroCard.backgroundSourceId}|${project.outroCard.clampedDuration()}" else null
+        val introSig = if (project.introCard.enabled) project.introCard.toJson().toString() else null
+        val outroSig = if (project.outroCard.enabled) project.outroCard.toJson().toString() else null
         ProjectPrepSignature(outputWidth, outputHeight, sceneKeys, introSig, outroSig)
     }
+
+    val cacheDir = remember(context) { File(context.cacheDir, "preview-cache-v1").apply { if (!exists()) mkdirs() } }
+    val projectDraftId = session.draftId ?: session.directory.name
 
     LaunchedEffect(directoryKey, scenesPrepSignature) {
         val currentDir = directoryKey
@@ -336,7 +345,76 @@ internal fun AdaptiveEditorWorkspace(
         }
 
         val token = previewPrepState.runId + 1
-        val isFirstOpen = previewPrepState.preparedDirectoryKey != currentDir
+
+        // Enabled start/end cards, in the same keys/render size (720px) the editor and fullscreen preview use.
+        val cardBody = TrailerTitleCardRenderer.bodyCaptionOf(scenes.map { it.caption })
+        val cardCandidates = session.scenes.map { it.source }
+        val (cardW, cardH) = titleCardRenderSize(outputWidth, outputHeight, 720)
+        val cardJobs = withContext(Dispatchers.IO) {
+            listOf(true to project.introCard, false to project.outroCard)
+                .filter { (_, card) -> card.enabled }
+                .map { (isIntro, card) ->
+                    val holder = if (isIntro) scenes.first() else scenes.last()
+                    val holderSource = session.sources.firstOrNull { it.id == holder.sourceId }
+                    val bg = TitleCardBitmapCache.background(card, isIntro, holder, holderSource, card.resolveBackgroundSource(cardCandidates))
+                    val key = TitleCardBitmapCache.key(projectDraftId, card, isIntro, bg, cardW, cardH, 720, cardBody)
+                    TitleCardPrepJob(card, bg, key)
+                }
+                .also { jobs -> jobs.forEach { TitleCardBitmapCache.lookup(cacheDir, it.key) } }
+        }
+
+        // Phase 1: Hydrate cache misses from persistent disk cache off-main without showing progress
+        withContext(Dispatchers.IO) {
+            for (scene in scenes) {
+                if (!coroutineContext.isActive) break
+                val src = session.sources.firstOrNull { it.id == scene.sourceId } ?: continue
+                if (!src.file.exists()) continue
+
+                val frameKey = PreviewFrameCache.initialFrameKey(src, scene)
+                if (PreviewFrameCache.get(frameKey) == null) {
+                    val pKey = PreviewFrameCache.persistentKey(projectDraftId, src, scene.start)
+                    val diskFrame = PreviewFrameCache.loadFromDisk(cacheDir, pKey)
+                    if (diskFrame != null) {
+                        PreviewFrameCache.put(frameKey, diskFrame)
+                    }
+                }
+
+                if (src.isImage) {
+                    val planKey = PhotoPlanKey(
+                        filePath = src.file.absolutePath,
+                        lastModified = src.file.lastModified(),
+                        length = src.file.length(),
+                        sourceId = src.id,
+                        fit = scene.fit,
+                        focusX = scene.focusX,
+                        focusY = scene.focusY,
+                        outputWidth = outputWidth,
+                        outputHeight = outputHeight,
+                        duration = scene.length,
+                    )
+                    if (PhotoMotionPlanCache.get(planKey) == null) {
+                        val pKey = planKey.persistentKey(projectDraftId, src.name)
+                        val diskPlan = PhotoMotionPlanCache.loadFromDisk(cacheDir, pKey)
+                        if (diskPlan != null) {
+                            PhotoMotionPlanCache.put(planKey, diskPlan)
+                        }
+                    }
+                }
+
+                scene.caption?.let { cap ->
+                    val capKey = CaptionBitmapCache.key(cap, outputWidth, outputHeight)
+                    if (CaptionBitmapCache.get(capKey) == null) {
+                        val diskCap = CaptionBitmapCache.loadFromDisk(cacheDir, capKey)
+                        if (diskCap != null) {
+                            CaptionBitmapCache.put(capKey, diskCap)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!coroutineContext.isActive || token != previewPrepState.runId + 1) return@LaunchedEffect
+
         val uncachedScenes = scenes.filter { scene ->
             val src = session.sources.firstOrNull { it.id == scene.sourceId } ?: return@filter true
             if (!src.file.exists()) return@filter true
@@ -362,17 +440,17 @@ internal fun AdaptiveEditorWorkspace(
             !frameCached || !planCached || !captionCached
         }
 
-        if (uncachedScenes.isEmpty()) {
+        val missingCards = cardJobs.filter { TitleCardBitmapCache.get(it.key) == null }
+
+        if (uncachedScenes.isEmpty() && missingCards.isEmpty()) {
             previewPrepState.preparedDirectoryKey = currentDir
             previewPrepState.finish(token)
             return@LaunchedEffect
         }
 
-        val totalToPrepare = if (isFirstOpen) scenes.size else uncachedScenes.size
-        previewPrepState.reset(totalToPrepare, currentDir, token)
+        previewPrepState.reset(uncachedScenes.size + missingCards.size, currentDir, token)
 
-        val targetList = if (isFirstOpen) scenes else uncachedScenes
-        for (scene in targetList) {
+        for (scene in uncachedScenes) {
             if (!coroutineContext.isActive || session.directory.absolutePath != currentDir || token != previewPrepState.runId) break
             var sceneSuccess = true
             var failureReason: String? = null
@@ -383,12 +461,17 @@ internal fun AdaptiveEditorWorkspace(
                     failureReason = "재료 파일 없음"
                 } else {
                     val frameKey = PreviewFrameCache.initialFrameKey(src, scene)
+                    val framePersistentKey = PreviewFrameCache.persistentKey(projectDraftId, src, scene.start)
                     if (PreviewFrameCache.get(frameKey) == null) {
                         val frame = withContext(Dispatchers.IO) {
-                            loadFrame(src.file, src.isImage, scene.start, 960, exact = true)
+                            PreviewFrameCache.loadFromDisk(cacheDir, framePersistentKey)
+                                ?: loadFrame(src.file, src.isImage, scene.start, 960, exact = true)
                         }
                         if (frame != null) {
                             PreviewFrameCache.put(frameKey, frame)
+                            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                                PreviewFrameCache.saveToDisk(cacheDir, framePersistentKey, frame, src.isImage)
+                            }
                         } else {
                             sceneSuccess = false
                             failureReason = "프레임 로드 실패"
@@ -408,8 +491,12 @@ internal fun AdaptiveEditorWorkspace(
                             outputHeight = outputHeight,
                             duration = scene.length,
                         )
+                        val planPersistentKey = planKey.persistentKey(projectDraftId, src.name)
                         if (PhotoMotionPlanCache.get(planKey) == null) {
-                            val plan = withContext(Dispatchers.Default) {
+                            val diskPlan = withContext(Dispatchers.IO) {
+                                PhotoMotionPlanCache.loadFromDisk(cacheDir, planPersistentKey)
+                            }
+                            val plan = diskPlan ?: withContext(Dispatchers.Default) {
                                 TrailerPhotoMotionPlanner.planMotion(
                                     source = src,
                                     fit = scene.fit,
@@ -421,6 +508,11 @@ internal fun AdaptiveEditorWorkspace(
                                 )
                             }
                             PhotoMotionPlanCache.put(planKey, plan)
+                            if (diskPlan == null) {
+                                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                                    PhotoMotionPlanCache.saveToDisk(cacheDir, planPersistentKey, plan)
+                                }
+                            }
                         }
                     }
 
@@ -428,11 +520,19 @@ internal fun AdaptiveEditorWorkspace(
                         scene.caption?.let { cap ->
                             val capKey = CaptionBitmapCache.key(cap, outputWidth, outputHeight)
                             if (CaptionBitmapCache.get(capKey) == null) {
-                                val capBitmap = withContext(Dispatchers.Default) {
+                                val diskCap = withContext(Dispatchers.IO) {
+                                    CaptionBitmapCache.loadFromDisk(cacheDir, capKey)
+                                }
+                                val capBitmap = diskCap ?: withContext(Dispatchers.Default) {
                                     SceneCaptionRenderer.render(context, cap, outputWidth, outputHeight)
                                 }
                                 if (capBitmap != null) {
                                     CaptionBitmapCache.put(capKey, capBitmap)
+                                    if (diskCap == null) {
+                                        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                                            CaptionBitmapCache.saveToDisk(cacheDir, capKey, capBitmap)
+                                        }
+                                    }
                                 } else {
                                     sceneSuccess = false
                                     failureReason = "자막 렌더링 실패"
@@ -457,6 +557,19 @@ internal fun AdaptiveEditorWorkspace(
             }
         }
 
+        for (job in missingCards) {
+            if (!coroutineContext.isActive || token != previewPrepState.runId) break
+            val rendered = try {
+                TitleCardBitmapCache.renderAndStore(context, cacheDir, job.key, job.card, job.bg, cardW, cardH, 720, cardBody)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (_: Throwable) {
+                null
+            }
+            if (!coroutineContext.isActive || token != previewPrepState.runId) break
+            if (rendered != null) previewPrepState.recordSuccess(token) else previewPrepState.recordFailure(token, "시작/마지막 화면 렌더링 실패")
+        }
+
         // Start/end card asset prewarming if practical
         if (coroutineContext.isActive && token == previewPrepState.runId && project.outroCard.enabled && project.outroCard.usesFirstOrLastImage) {
             val lastScene = scenes.lastOrNull()
@@ -465,12 +578,19 @@ internal fun AdaptiveEditorWorkspace(
                 val (start, length) = clampSceneWindow(lastSource, lastScene.start, lastScene.length)
                 val at = maxOf(start, start + length - 0.5)
                 val outroFrameKey = PreviewFrameCache.seekFrameKey(lastSource, at)
+                val outroPersistentKey = PreviewFrameCache.persistentKey(projectDraftId, lastSource, at)
                 if (PreviewFrameCache.get(outroFrameKey) == null) {
                     runCatching {
                         val frame = withContext(Dispatchers.IO) {
-                            loadFrame(lastSource.file, lastSource.isImage, at, 960, exact = true)
+                            PreviewFrameCache.loadFromDisk(cacheDir, outroPersistentKey)
+                                ?: loadFrame(lastSource.file, lastSource.isImage, at, 960, exact = true)
                         }
-                        if (frame != null) PreviewFrameCache.put(outroFrameKey, frame)
+                        if (frame != null) {
+                            PreviewFrameCache.put(outroFrameKey, frame)
+                            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                                PreviewFrameCache.saveToDisk(cacheDir, outroPersistentKey, frame, lastSource.isImage)
+                            }
+                        }
                     }
                 }
             }
@@ -1881,9 +2001,142 @@ internal data class PhotoPlanKey(
     val outputWidth: Int,
     val outputHeight: Int,
     val duration: Double,
-)
+) {
+    fun persistentKey(draftId: String, sourceName: String = File(filePath).name): String =
+        "plan|d=$draftId|s=${sourceId}_$sourceName|len=$length|mtime=$lastModified|fit=${fit.name}|fx=$focusX|fy=$focusY|w=$outputWidth|h=$outputHeight|dur=${(duration * 100).toLong()}"
+}
 
-/** Bounded LRU cache of 960px preview frames for scenes and seeks (max 24MB). */
+internal object PreviewDiskCache {
+    private const val MAX_BYTES = 120L * 1024L * 1024L
+    private const val MAX_FILES = 400
+
+    fun sha256Hex(input: String): String = runCatching {
+        val md = MessageDigest.getInstance("SHA-256")
+        val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
+        bytes.joinToString("") { "%02x".format(it) }
+    }.getOrDefault(input.hashCode().toString())
+
+    fun writeBitmapAtomically(dir: File, fileName: String, bitmap: Bitmap, format: Bitmap.CompressFormat, quality: Int) {
+        if (!dir.exists()) dir.mkdirs()
+        val target = File(dir, fileName)
+        val temp = File(dir, "$fileName.tmp_${System.nanoTime()}")
+        try {
+            FileOutputStream(temp).use { fos ->
+                bitmap.compress(format, quality, fos)
+                fos.flush()
+            }
+            if (!temp.renameTo(target)) {
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            }
+            trim(dir)
+        } catch (_: Throwable) {
+            temp.delete()
+        }
+    }
+
+    fun readBitmapSafely(dir: File, fileName: String): Bitmap? {
+        val file = File(dir, fileName)
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            BitmapFactory.decodeFile(file.absolutePath)?.also {
+                file.setLastModified(System.currentTimeMillis())
+            } ?: run { file.delete(); null }
+        } catch (_: Throwable) {
+            file.delete()
+            null
+        }
+    }
+
+    fun writeTextAtomically(dir: File, fileName: String, text: String) {
+        if (!dir.exists()) dir.mkdirs()
+        val target = File(dir, fileName)
+        val temp = File(dir, "$fileName.tmp_${System.nanoTime()}")
+        try {
+            FileOutputStream(temp).use { fos ->
+                fos.write(text.toByteArray(Charsets.UTF_8))
+                fos.flush()
+            }
+            if (!temp.renameTo(target)) {
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            }
+            trim(dir)
+        } catch (_: Throwable) {
+            temp.delete()
+        }
+    }
+
+    fun readTextSafely(dir: File, fileName: String): String? {
+        val file = File(dir, fileName)
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            file.setLastModified(System.currentTimeMillis())
+            file.readText(Charsets.UTF_8)
+        } catch (_: Throwable) {
+            file.delete()
+            null
+        }
+    }
+
+    fun trim(dir: File, maxBytes: Long = MAX_BYTES, maxFiles: Int = MAX_FILES) {
+        val files = dir.listFiles() ?: return
+        if (files.size <= maxFiles && files.sumOf { it.length() } <= maxBytes) return
+        val sorted = files.sortedBy { it.lastModified() }
+        var totalSize = files.sumOf { it.length() }
+        var count = files.size
+        for (f in sorted) {
+            if (count <= (maxFiles * 0.8).toInt() && totalSize <= (maxBytes * 0.8).toLong()) break
+            val len = f.length()
+            if (f.delete()) {
+                totalSize -= len
+                count--
+            }
+        }
+    }
+}
+
+private fun photoMotionPlanToJson(plan: PhotoMotionPlan): JSONObject = JSONObject().apply {
+    put("mode", plan.mode.name)
+    put("cover", plan.cover)
+    put("reason", plan.reason)
+    val arr = JSONArray()
+    for (kf in plan.keyframes) {
+        val o = JSONObject().apply {
+            put("time", kf.time.toDouble())
+            put("centerX", kf.centerX.toDouble())
+            put("centerY", kf.centerY.toDouble())
+            put("width", kf.width.toDouble())
+            put("pull", kf.pull.toDouble())
+        }
+        arr.put(o)
+    }
+    put("keyframes", arr)
+}
+
+private fun photoMotionPlanFromJson(obj: JSONObject): PhotoMotionPlan? = runCatching {
+    val mode = PhotoMotionMode.valueOf(obj.getString("mode"))
+    val cover = obj.getBoolean("cover")
+    val reason = obj.optString("reason", "")
+    val arr = obj.getJSONArray("keyframes")
+    val keyframes = ArrayList<PhotoKeyframe>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.getJSONObject(i)
+        keyframes.add(
+            PhotoKeyframe(
+                time = o.getDouble("time").toFloat(),
+                centerX = o.getDouble("centerX").toFloat(),
+                centerY = o.getDouble("centerY").toFloat(),
+                width = o.getDouble("width").toFloat(),
+                pull = o.optDouble("pull", 0.0).toFloat(),
+            )
+        )
+    }
+    val finite = keyframes.all {
+        it.time.isFinite() && it.centerX.isFinite() && it.centerY.isFinite() && it.width.isFinite() && it.pull.isFinite()
+    }
+    if (keyframes.isEmpty() || !finite) null else PhotoMotionPlan(mode, keyframes, cover, reason)
+}.getOrNull()
+
+/** Bounded LRU cache of 960px preview frames for scenes and seeks (max 24MB in-memory tier + bounded disk tier). */
 internal object PreviewFrameCache {
     private val cache = object : android.util.LruCache<String, Bitmap>(24 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
@@ -1899,6 +2152,11 @@ internal object PreviewFrameCache {
         return "${file.absolutePath}|${file.lastModified()}|${file.length()}|${source.isImage}|${(atSeconds * 10).toLong()}"
     }
 
+    fun persistentKey(draftId: String, source: TrailerSource, atSeconds: Double): String {
+        val file = source.file
+        return "frame|d=$draftId|s=${source.id}_${source.name}|len=${file.length()}|mtime=${file.lastModified()}|img=${source.isImage}|t=${(atSeconds * 10).toLong()}|dim=960"
+    }
+
     @Synchronized
     fun get(key: String): Bitmap? = cache.get(key)?.takeIf { !it.isRecycled }
 
@@ -1908,9 +2166,20 @@ internal object PreviewFrameCache {
             cache.put(key, bitmap)
         }
     }
+
+    fun loadFromDisk(dir: File, persistentKey: String): Bitmap? {
+        val fileName = "frame_" + PreviewDiskCache.sha256Hex(persistentKey) + ".dat"
+        return PreviewDiskCache.readBitmapSafely(dir, fileName)
+    }
+
+    fun saveToDisk(dir: File, persistentKey: String, bitmap: Bitmap, isImage: Boolean) {
+        val fileName = "frame_" + PreviewDiskCache.sha256Hex(persistentKey) + ".dat"
+        val format = if (isImage && bitmap.hasAlpha()) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+        PreviewDiskCache.writeBitmapAtomically(dir, fileName, bitmap, format, 90)
+    }
 }
 
-/** Cache of planned photo motion keyframes per photo parameter set. */
+/** Cache of planned photo motion keyframes per photo parameter set (in-memory LRU tier + JSON disk tier). */
 internal object PhotoMotionPlanCache {
     private val cache = android.util.LruCache<PhotoPlanKey, PhotoMotionPlan>(120)
 
@@ -1921,15 +2190,33 @@ internal object PhotoMotionPlanCache {
     fun put(key: PhotoPlanKey, plan: PhotoMotionPlan) {
         cache.put(key, plan)
     }
+
+    fun loadFromDisk(dir: File, persistentKey: String): PhotoMotionPlan? {
+        val fileName = "plan_" + PreviewDiskCache.sha256Hex(persistentKey) + ".json"
+        val text = PreviewDiskCache.readTextSafely(dir, fileName) ?: return null
+        return try {
+            photoMotionPlanFromJson(JSONObject(text))
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun saveToDisk(dir: File, persistentKey: String, plan: PhotoMotionPlan) {
+        val fileName = "plan_" + PreviewDiskCache.sha256Hex(persistentKey) + ".json"
+        if (photoMotionPlanFromJson(runCatching { photoMotionPlanToJson(plan) }.getOrNull() ?: return) == null) return
+        val json = photoMotionPlanToJson(plan).toString()
+        PreviewDiskCache.writeTextAtomically(dir, fileName, json)
+    }
 }
 
-/** Bounded cache of rendered caption overlays (max 8MB). */
+/** Bounded cache of rendered caption overlays (max 8MB in-memory tier + PNG disk tier). */
 internal object CaptionBitmapCache {
     private val cache = object : android.util.LruCache<String, Bitmap>(8 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
 
-    fun key(caption: SceneCaption, w: Int, h: Int): String = "${caption.text}|${caption.hashCode()}|$w|$h"
+    fun key(caption: SceneCaption, w: Int, h: Int): String =
+        "caption|${caption.toJson()}|w=$w|h=$h"
 
     @Synchronized
     fun get(key: String): Bitmap? = cache.get(key)?.takeIf { !it.isRecycled }
@@ -1939,6 +2226,99 @@ internal object CaptionBitmapCache {
         if (!bitmap.isRecycled) {
             cache.put(key, bitmap)
         }
+    }
+
+    fun loadFromDisk(dir: File, key: String): Bitmap? {
+        val fileName = "caption_" + PreviewDiskCache.sha256Hex(key) + ".png"
+        return PreviewDiskCache.readBitmapSafely(dir, fileName)
+    }
+
+    fun saveToDisk(dir: File, key: String, bitmap: Bitmap) {
+        val fileName = "caption_" + PreviewDiskCache.sha256Hex(key) + ".png"
+        PreviewDiskCache.writeBitmapAtomically(dir, fileName, bitmap, Bitmap.CompressFormat.PNG, 100)
+    }
+}
+
+/** Output size a title card is rendered at for [maxSide] (even dimensions, same math for editor, fullscreen and prewarm). */
+private class TitleCardPrepJob(val card: TrailerTitleCard, val bg: Pair<TrailerSource, Double>?, val key: String)
+
+private fun titleCardRenderSize(outputWidth: Int, outputHeight: Int, maxSide: Int): Pair<Int, Int> {
+    val scale = maxSide.toFloat() / maxOf(outputWidth, outputHeight).coerceAtLeast(1)
+    return (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2) to (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
+}
+
+/** Bounded cache of rendered start/end cards (16MB in-memory tier + PNG disk tier), keyed by every visual input. */
+internal object TitleCardBitmapCache {
+    private val cache = object : android.util.LruCache<String, Bitmap>(16 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    /** Background photo and frame position the card is drawn over, or null for a plain card. */
+    fun background(
+        card: TrailerTitleCard,
+        isIntro: Boolean,
+        holder: EditorScene?,
+        holderSource: TrailerSource?,
+        chosen: TrailerSource?,
+    ): Pair<TrailerSource, Double>? {
+        if (chosen != null) return chosen to 0.0
+        if (!card.usesFirstOrLastImage || holder == null || holderSource == null) return null
+        val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
+        return holderSource to (if (isIntro) start else maxOf(start, start + length - 0.5))
+    }
+
+    fun key(
+        draftId: String,
+        card: TrailerTitleCard,
+        isIntro: Boolean,
+        bg: Pair<TrailerSource, Double>?,
+        w: Int,
+        h: Int,
+        maxSide: Int,
+        bodyCaption: SceneCaption?,
+    ): String {
+        val bgPart = bg?.let { (src, at) ->
+            "${src.id}_${src.name}|len=${src.file.length()}|mtime=${src.file.lastModified()}|img=${src.isImage}|t=${(at * 10).toLong()}"
+        } ?: "none"
+        return "card|d=$draftId|intro=$isIntro|card=${card.toJson()}|body=${bodyCaption?.toJson()}|bg=$bgPart|w=$w|h=$h|max=$maxSide"
+    }
+
+    @Synchronized
+    fun get(key: String): Bitmap? = cache.get(key)?.takeIf { !it.isRecycled }
+
+    @Synchronized
+    fun put(key: String, bitmap: Bitmap) {
+        if (!bitmap.isRecycled) cache.put(key, bitmap)
+    }
+
+    /** Memory, then bounded disk read (call off the main thread). */
+    fun lookup(dir: File, key: String): Bitmap? {
+        get(key)?.let { return it }
+        val fileName = "card_" + PreviewDiskCache.sha256Hex(key) + ".png"
+        return PreviewDiskCache.readBitmapSafely(dir, fileName)?.also { put(key, it) }
+    }
+
+    /** Renders a miss, then stores it in memory and on disk. */
+    suspend fun renderAndStore(
+        context: android.content.Context,
+        dir: File,
+        key: String,
+        card: TrailerTitleCard,
+        bg: Pair<TrailerSource, Double>?,
+        w: Int,
+        h: Int,
+        maxSide: Int,
+        bodyCaption: SceneCaption?,
+    ): Bitmap? {
+        val rendered = withContext(Dispatchers.Default) {
+            val background = bg?.let { (src, at) -> loadFrame(src.file, src.isImage, at, maxSide, exact = true) }
+            TrailerTitleCardRenderer.renderCardBitmap(context, card, background, w, h, bodyCaption)
+        } ?: return null
+        put(key, rendered)
+        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+            PreviewDiskCache.writeBitmapAtomically(dir, "card_" + PreviewDiskCache.sha256Hex(key) + ".png", rendered, Bitmap.CompressFormat.PNG, 100)
+        }
+        return rendered
     }
 }
 
@@ -2076,6 +2456,7 @@ private fun EditingPreviewBox(
                 card, isIntro, holder, holder?.let { h -> session.sources.firstOrNull { it.id == h.sourceId } }, dims.first, dims.second, 720,
                 bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(titleScenes.map { it.caption }),
                 backgroundCandidates = session.scenes.map { it.source },
+                draftId = session.draftId ?: session.directory.name,
             )
             TitleCardPreview(
                 bitmap = cardState.value,
@@ -2481,35 +2862,39 @@ private fun rememberTitleCardBitmap(
     active: Boolean = true,
     bodyCaption: SceneCaption? = null,
     backgroundCandidates: List<TrailerSource> = emptyList(),
+    draftId: String = "",
 ): TitleCardBitmapState {
     val context = LocalContext.current
-    val scale = maxSide.toFloat() / maxOf(outputWidth, outputHeight).coerceAtLeast(1)
-    val w = (((outputWidth * scale).toInt() / 2) * 2).coerceAtLeast(2)
-    val h = (((outputHeight * scale).toInt() / 2) * 2).coerceAtLeast(2)
+    val cacheDir = remember(context) { File(context.cacheDir, "preview-cache-v1").apply { if (!exists()) mkdirs() } }
+    val (w, h) = titleCardRenderSize(outputWidth, outputHeight, maxSide)
     val chosen = card.resolveBackgroundSource(backgroundCandidates)
-    val state = remember(isIntro) { TitleCardBitmapState(initialBitmap = null, initialLoading = active) }
+    val bg = remember(card, isIntro, holder, holderSource, chosen) {
+        TitleCardBitmapCache.background(card, isIntro, holder, holderSource, chosen)
+    }
+    val cacheKey = remember(draftId, card, isIntro, bg, w, h, maxSide, bodyCaption, active) {
+        if (active) TitleCardBitmapCache.key(draftId, card, isIntro, bg, w, h, maxSide, bodyCaption) else null
+    }
+    val state = remember(isIntro) {
+        val hit = cacheKey?.let { TitleCardBitmapCache.get(it) }
+        TitleCardBitmapState(initialBitmap = hit, initialLoading = active && hit == null)
+    }
 
-    LaunchedEffect(card, isIntro, holder, holderSource, w, h, active, bodyCaption, chosen) {
-        if (!active) {
+    LaunchedEffect(cacheKey) {
+        if (cacheKey == null) {
             state.bitmap = null
             state.isLoading = false
             return@LaunchedEffect
         }
-        state.isLoading = true
         try {
-            val rendered = withContext(Dispatchers.Default) {
-                val background = if (chosen != null) {
-                    loadFrame(chosen.file, true, 0.0, maxSide, exact = true)
-                } else if (card.usesFirstOrLastImage && holder != null && holderSource != null) {
-                    val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
-                    val at = if (isIntro) start else maxOf(start, start + length - 0.5)
-                    loadFrame(holderSource.file, holderSource.isImage, at, maxSide, exact = true)
-                } else null
-                TrailerTitleCardRenderer.renderCardBitmap(context, card, background, w, h, bodyCaption)
+            val cached = TitleCardBitmapCache.get(cacheKey)
+                ?: withContext(Dispatchers.IO) { TitleCardBitmapCache.lookup(cacheDir, cacheKey) }
+            if (cached != null) {
+                state.bitmap = cached
+                return@LaunchedEffect
             }
-            if (coroutineContext.isActive) {
-                state.bitmap = rendered
-            }
+            state.isLoading = true
+            val rendered = TitleCardBitmapCache.renderAndStore(context, cacheDir, cacheKey, card, bg, w, h, maxSide, bodyCaption)
+            if (coroutineContext.isActive) state.bitmap = rendered
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
@@ -2737,11 +3122,11 @@ private fun TimelineFilmstrip(
     val bgCandidates = remember(session.revision, session.scenes) { session.scenes.map { it.source } }
     val introThumb by rememberTitleCardBitmap(
         introSeg?.card ?: TrailerTitleCard(), true, firstScene, firstScene?.let { sourcesById[it.sourceId] }, dims.first, dims.second, 160, active = introSeg != null,
-        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates,
+        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates, draftId = session.draftId ?: session.directory.name,
     )
     val outroThumb by rememberTitleCardBitmap(
         outroSeg?.card ?: TrailerTitleCard(), false, lastScene, lastScene?.let { sourcesById[it.sourceId] }, dims.first, dims.second, 160, active = outroSeg != null,
-        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates,
+        bodyCaption = bodyCaption, backgroundCandidates = bgCandidates, draftId = session.draftId ?: session.directory.name,
     )
     Box(Modifier.fillMaxSize()) {
         Canvas(Modifier.fillMaxSize()) {
@@ -2989,6 +3374,8 @@ private fun ScenePreview(
     val context = LocalContext.current
     val aspect = outputAspect(session)
     val playing = clipPlayback.isPlaying(scene.key)
+    val cacheDir = remember(context) { File(context.cacheDir, "preview-cache-v1").apply { if (!exists()) mkdirs() } }
+    val projectDraftId = session.draftId ?: session.directory.name
     // Fullscreen opened: the clip player leaves composition this frame (released) and play is paused, so returning
     // shows the paused preview instead of auto-resuming. The clip position and photo progress are kept.
     if (!playbackAllowed && playing && pauseOnDisallow) SideEffect { clipPlayback.playing = false }
@@ -3026,7 +3413,16 @@ private fun ScenePreview(
             photoPlanEntry = planKey to cached
             return@LaunchedEffect
         }
+        val planPersistentKey = planKey.persistentKey(projectDraftId, source.name)
         try {
+            val diskPlan = withContext(Dispatchers.IO) {
+                PhotoMotionPlanCache.loadFromDisk(cacheDir, planPersistentKey)
+            }
+            if (diskPlan != null) {
+                PhotoMotionPlanCache.put(planKey, diskPlan)
+                photoPlanEntry = planKey to diskPlan
+                return@LaunchedEffect
+            }
             val computed = withContext(Dispatchers.Default) {
                 TrailerPhotoMotionPlanner.planMotion(
                     source = source,
@@ -3041,6 +3437,9 @@ private fun ScenePreview(
             if (coroutineContext.isActive) {
                 PhotoMotionPlanCache.put(planKey, computed)
                 photoPlanEntry = planKey to computed
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    PhotoMotionPlanCache.saveToDisk(cacheDir, planPersistentKey, computed)
+                }
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
@@ -3108,14 +3507,21 @@ private fun ScenePreview(
             frameLoadedKey = currentFrameKey
             return@LaunchedEffect
         }
+        val framePersistentKey = PreviewFrameCache.persistentKey(projectDraftId, source, frameAt)
+        val initialPersistentKey = PreviewFrameCache.persistentKey(projectDraftId, source, scene.start)
         try {
             val loaded = withContext(Dispatchers.IO) {
-                loadFrame(source.file, source.isImage, frameAt, 960, exact = true)
+                val diskFrame = PreviewFrameCache.loadFromDisk(cacheDir, framePersistentKey)
+                    ?: if (frameAt == scene.start) PreviewFrameCache.loadFromDisk(cacheDir, initialPersistentKey) else null
+                diskFrame ?: loadFrame(source.file, source.isImage, frameAt, 960, exact = true)
             }
             if (coroutineContext.isActive && loaded != null) {
                 PreviewFrameCache.put(currentFrameKey, loaded)
                 frameBitmap = loaded
                 frameLoadedKey = currentFrameKey
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    PreviewFrameCache.saveToDisk(cacheDir, framePersistentKey, loaded, source.isImage)
+                }
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
@@ -3139,6 +3545,14 @@ private fun ScenePreview(
             return@LaunchedEffect
         }
         try {
+            val diskCap = withContext(Dispatchers.IO) {
+                CaptionBitmapCache.loadFromDisk(cacheDir, key)
+            }
+            if (diskCap != null) {
+                CaptionBitmapCache.put(key, diskCap)
+                captionBitmapState = diskCap
+                return@LaunchedEffect
+            }
             delay(120)
             val rendered = withContext(Dispatchers.Default) {
                 SceneCaptionRenderer.render(context, caption, outputWidth, outputHeight)
@@ -3146,6 +3560,9 @@ private fun ScenePreview(
             if (coroutineContext.isActive && rendered != null) {
                 CaptionBitmapCache.put(key, rendered)
                 captionBitmapState = rendered
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    CaptionBitmapCache.saveToDisk(cacheDir, key, rendered)
+                }
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled

@@ -11,9 +11,9 @@ android {
         applicationId = "com.armsone.nasfinder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 446951
-        versionName = "2.39.72"
-        buildConfigField("String", "BUILD_NUMBER", "\"202611071540\"")
+        versionCode = 447406
+        versionName = "2.39.73"
+        buildConfigField("String", "BUILD_NUMBER", "\"202611071646\"")
         testInstrumentationRunner = "com.armsone.nasfinder.smoke.PhoneSmokeInstrumentation"
         vectorDrawables.useSupportLibrary = true
     }
