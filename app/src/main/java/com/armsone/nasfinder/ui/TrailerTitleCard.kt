@@ -15,17 +15,28 @@ data class TrailerTitleCard(
     val subtitle: String = "",
     val duration: Double = 3.0,
     val usesFirstOrLastImage: Boolean = true,
-    // Optional existing project photo (TrailerSource.id) used as the background instead of the first/last frame;
+    // Optional existing project photo or video (TrailerSource.id) used as the background instead of the first/last frame;
     // null (old saves) = first/last frame. Ignored while usesFirstOrLastImage is off or the source is gone.
     val backgroundSourceId: Int? = null,
+    // Optional still timestamp (seconds) within the chosen video source; null for photo sources or old saves.
+    val backgroundTimestamp: Double? = null,
     val titleStyle: SceneCaption? = null,
     val subtitleStyle: SceneCaption? = null,
 ) {
-    /** The chosen photo among [candidates], or null (missing/not a readable photo) so callers fall back to first/last frame. */
+    /** The chosen source among [candidates], or null (missing/not readable) so callers fall back to first/last frame. */
     fun resolveBackgroundSource(candidates: Iterable<TrailerSource>): TrailerSource? {
         val id = backgroundSourceId ?: return null
         if (!usesFirstOrLastImage) return null
-        return candidates.firstOrNull { it.id == id && it.isImage && it.file.isFile }
+        return candidates.firstOrNull { it.id == id && it.file.isFile }
+    }
+
+    /** Clamps [backgroundTimestamp] to valid source duration [0.0..duration], or 0.0 for photos / missing timestamp. */
+    fun clampedBackgroundTimestamp(source: TrailerSource?): Double {
+        if (source == null || source.isImage) return 0.0
+        val ts = backgroundTimestamp ?: 0.0
+        if (!ts.isFinite()) return 0.0
+        val maxDur = maxOf(0.0, source.duration)
+        return if (maxDur > 0.0) ts.coerceIn(0.0, maxDur) else ts.coerceAtLeast(0.0)
     }
 
     fun clampedDuration(): Double {
@@ -39,6 +50,7 @@ data class TrailerTitleCard(
         duration = clampedDuration(),
         usesFirstOrLastImage = usesFirstOrLastImage,
         backgroundSourceId = backgroundSourceId,
+        backgroundTimestamp = backgroundTimestamp?.takeIf { it.isFinite() },
         titleStyle = titleStyle?.clamped()?.copy(text = ""),
         subtitleStyle = subtitleStyle?.clamped()?.copy(text = ""),
     )
@@ -50,6 +62,7 @@ data class TrailerTitleCard(
         put("duration", clampedDuration())
         put("usesFirstOrLastImage", usesFirstOrLastImage)
         if (backgroundSourceId != null) put("backgroundSourceId", backgroundSourceId)
+        if (backgroundTimestamp != null && backgroundTimestamp.isFinite()) put("backgroundTimestamp", backgroundTimestamp)
         titleStyle?.let { put("titleStyle", it.copy(text = "").toJson()) }
         subtitleStyle?.let { put("subtitleStyle", it.copy(text = "").toJson()) }
     }
@@ -60,6 +73,10 @@ data class TrailerTitleCard(
             val rawDuration = if (obj.has("duration")) obj.optDouble("duration", 3.0) else 3.0
             val titleStyle = sceneCaptionFromJson(obj.optJSONObject("titleStyle"), allowBlank = true)?.copy(text = "")
             val subtitleStyle = sceneCaptionFromJson(obj.optJSONObject("subtitleStyle"), allowBlank = true)?.copy(text = "")
+            val bgTimestamp = if (obj.has("backgroundTimestamp") && !obj.isNull("backgroundTimestamp")) {
+                val rawTs = obj.optDouble("backgroundTimestamp")
+                if (rawTs.isFinite()) rawTs else null
+            } else null
             return TrailerTitleCard(
                 enabled = obj.optBoolean("enabled", false),
                 title = obj.optString("title", ""),
@@ -67,6 +84,7 @@ data class TrailerTitleCard(
                 duration = if (rawDuration.isFinite()) rawDuration.coerceIn(1.0, 10.0) else 3.0,
                 usesFirstOrLastImage = obj.optBoolean("usesFirstOrLastImage", true),
                 backgroundSourceId = if (obj.has("backgroundSourceId") && !obj.isNull("backgroundSourceId")) obj.optInt("backgroundSourceId") else null,
+                backgroundTimestamp = bgTimestamp,
                 titleStyle = titleStyle,
                 subtitleStyle = subtitleStyle,
             )
@@ -231,7 +249,73 @@ object TrailerTitleCardRenderer {
             return bitmap
         }
 
-        // Independent custom styles for title and subtitle
+        // When both title and subtitle resolve to the exact same row and column, draw subtitle beneath
+        // title bounds with a small scaled gap, shifting the pair upward if the bottom would clip.
+        if (titleText.isNotEmpty() && subtitleText.isNotEmpty()) {
+            val tStyle = (card.titleStyle ?: defaultTitleStyle(bodyCaption)).copy(text = titleText)
+            val sStyle = (card.subtitleStyle ?: defaultSubtitleStyle(bodyCaption)).copy(text = subtitleText)
+            val tCap = tStyle.clamped()
+            val sCap = sStyle.clamped()
+
+            if (tCap.row == sCap.row && tCap.column == sCap.column) {
+                val titleBitmap = SceneCaptionRenderer.render(context, tStyle, width, height)
+                val subtitleBitmap = SceneCaptionRenderer.render(context, sStyle, width, height)
+
+                if (titleBitmap != null && subtitleBitmap != null) {
+                    val titleBounds = findVerticalAlphaBounds(titleBitmap)
+                    val subBounds = findVerticalAlphaBounds(subtitleBitmap)
+
+                    if (titleBounds != null && subBounds != null) {
+                        val titleTop = titleBounds.first
+                        val titleBottom = titleBounds.second
+                        val subTop = subBounds.first
+                        val subBottom = subBounds.second
+
+                        val gap = maxOf(4f, minOf(width, height) * 0.018f)
+                        val desiredSubTop = titleBottom + gap
+                        val subOffsetY = desiredSubTop - subTop
+                        val newSubBottom = subBottom + subOffsetY
+
+                        val safeMargin = height * 0.08f
+                        val safeBottom = height - safeMargin
+                        val safeTop = safeMargin
+
+                        var shiftUp = (newSubBottom - safeBottom).coerceAtLeast(0f)
+                        if (titleTop - shiftUp < safeTop && (newSubBottom - shiftUp) <= height) {
+                            val maxShift = (titleTop - safeTop).coerceAtLeast(0f)
+                            shiftUp = minOf(shiftUp, maxShift)
+                            if (newSubBottom - shiftUp > height) {
+                                shiftUp = (newSubBottom - height.toFloat()).coerceAtLeast(0f)
+                            }
+                        }
+
+                        val titleDrawY = -shiftUp
+                        val subDrawY = subOffsetY - shiftUp
+
+                        canvas.drawBitmap(titleBitmap, 0f, titleDrawY, null)
+                        canvas.drawBitmap(subtitleBitmap, 0f, subDrawY, null)
+                    } else {
+                        canvas.drawBitmap(titleBitmap, 0f, 0f, null)
+                        canvas.drawBitmap(subtitleBitmap, 0f, 0f, null)
+                    }
+                    titleBitmap.recycle()
+                    subtitleBitmap.recycle()
+                    return bitmap
+                } else {
+                    if (titleBitmap != null) {
+                        canvas.drawBitmap(titleBitmap, 0f, 0f, null)
+                        titleBitmap.recycle()
+                    }
+                    if (subtitleBitmap != null) {
+                        canvas.drawBitmap(subtitleBitmap, 0f, 0f, null)
+                        subtitleBitmap.recycle()
+                    }
+                    return bitmap
+                }
+            }
+        }
+
+        // Independent custom styles for title and subtitle (different row/column or single text)
         if (titleText.isNotEmpty()) {
             val tStyle = (card.titleStyle ?: defaultTitleStyle(bodyCaption)).copy(text = titleText)
             val titleBitmap = SceneCaptionRenderer.render(context, tStyle, width, height)
@@ -251,5 +335,39 @@ object TrailerTitleCardRenderer {
         }
 
         return bitmap
+    }
+
+    private fun findVerticalAlphaBounds(bitmap: Bitmap, alphaThreshold: Int = 10): Pair<Int, Int>? {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) return null
+        val row = IntArray(width)
+        var top = -1
+        for (y in 0 until height) {
+            bitmap.getPixels(row, 0, width, 0, y, width, 1)
+            for (x in 0 until width) {
+                if ((row[x] ushr 24) >= alphaThreshold) {
+                    top = y
+                    break
+                }
+            }
+            if (top != -1) break
+        }
+        if (top == -1) return null
+
+        var bottom = top
+        for (y in height - 1 downTo top) {
+            bitmap.getPixels(row, 0, width, 0, y, width, 1)
+            var found = false
+            for (x in 0 until width) {
+                if ((row[x] ushr 24) >= alphaThreshold) {
+                    bottom = y
+                    found = true
+                    break
+                }
+            }
+            if (found) break
+        }
+        return Pair(top, bottom)
     }
 }

@@ -1350,8 +1350,8 @@ internal object TrailerExporter {
                     withContext(Dispatchers.IO) {
                         loadFrame(
                             file = introChosen.file,
-                            isImage = true,
-                            atSeconds = 0.0,
+                            isImage = introChosen.isImage,
+                            atSeconds = introCard.clampedBackgroundTimestamp(introChosen),
                             maxDimension = maxOf(exportWidth, exportHeight),
                             exact = true,
                         )
@@ -1413,8 +1413,8 @@ internal object TrailerExporter {
                     withContext(Dispatchers.IO) {
                         loadFrame(
                             file = outroChosen.file,
-                            isImage = true,
-                            atSeconds = 0.0,
+                            isImage = outroChosen.isImage,
+                            atSeconds = outroCard.clampedBackgroundTimestamp(outroChosen),
                             maxDimension = maxOf(exportWidth, exportHeight),
                             exact = true,
                         )

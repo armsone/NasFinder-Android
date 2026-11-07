@@ -106,7 +106,9 @@ import com.armsone.nasfinder.model.RemoteConnection
 import com.armsone.nasfinder.model.RemoteFileItem
 import com.armsone.nasfinder.ui.theme.themePalette
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -331,6 +333,75 @@ internal fun AdaptiveEditorWorkspace(
         val introSig = if (project.introCard.enabled) project.introCard.toJson().toString() else null
         val outroSig = if (project.outroCard.enabled) project.outroCard.toJson().toString() else null
         ProjectPrepSignature(outputWidth, outputHeight, sceneKeys, introSig, outroSig)
+    }
+
+    val titleCardCandidatesKey = remember(
+        directoryKey,
+        project.scenes,
+        session.sources,
+    ) {
+        val sb = java.lang.StringBuilder()
+        sb.append(directoryKey).append(";")
+        for (scene in project.scenes) {
+            val src = session.sources.firstOrNull { it.id == scene.sourceId }
+            sb.append(scene.key).append(",")
+                .append(scene.sourceId).append(",")
+                .append(src?.file?.absolutePath).append(",")
+                .append(src?.file?.lastModified()).append(",")
+                .append(src?.file?.length()).append(",")
+                .append(src?.duration).append(",")
+                .append(src?.isImage).append(",")
+                .append((scene.start * 100).toLong()).append(",")
+                .append((scene.length * 100).toLong()).append(";")
+        }
+        sb.toString()
+    }
+
+    var rankedBackgroundChoices by remember(directoryKey) { mutableStateOf<List<RankedBackgroundChoice>>(emptyList()) }
+    var isRankingBackgroundChoices by remember(directoryKey) { mutableStateOf(false) }
+
+    LaunchedEffect(directoryKey, titleCardCandidatesKey) {
+        val currentKey = titleCardCandidatesKey
+        val cached = TitleCardRankingCache.get(currentKey)
+        if (cached != null) {
+            rankedBackgroundChoices = cached
+            isRankingBackgroundChoices = false
+            val rec1 = cached.firstOrNull()?.choice
+            if (rec1 != null) {
+                val live = model.state.value.trailer?.editor ?: project
+                if (live.introCard.enabled && live.introCard.usesFirstOrLastImage && live.introCard.backgroundSourceId == null) {
+                    model.editorSetIntroCard(live.introCard.copy(backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp))
+                }
+                if (live.outroCard.enabled && live.outroCard.usesFirstOrLastImage && live.outroCard.backgroundSourceId == null) {
+                    model.editorSetOutroCard(live.outroCard.copy(backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp))
+                }
+            }
+            return@LaunchedEffect
+        }
+
+        isRankingBackgroundChoices = true
+        try {
+            val ranked = rankTitleCardBackgroundChoices(session.scenes, session.sources)
+            if (!coroutineContext.isActive || titleCardCandidatesKey != currentKey) return@LaunchedEffect
+            TitleCardRankingCache.put(currentKey, ranked)
+            rankedBackgroundChoices = ranked
+            isRankingBackgroundChoices = false
+
+            val rec1 = ranked.firstOrNull()?.choice
+            if (rec1 != null) {
+                val live = model.state.value.trailer?.editor ?: project
+                if (live.introCard.enabled && live.introCard.usesFirstOrLastImage && live.introCard.backgroundSourceId == null) {
+                    model.editorSetIntroCard(live.introCard.copy(backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp))
+                }
+                if (live.outroCard.enabled && live.outroCard.usesFirstOrLastImage && live.outroCard.backgroundSourceId == null) {
+                    model.editorSetOutroCard(live.outroCard.copy(backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp))
+                }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            isRankingBackgroundChoices = false
+        }
     }
 
     val cacheDir = remember(context) { File(context.cacheDir, "preview-cache-v1").apply { if (!exists()) mkdirs() } }
@@ -972,6 +1043,8 @@ internal fun AdaptiveEditorWorkspace(
                     selectedSceneKeys = setOf(key)
                 },
                 onOpenMusicPicker = { showMusicPicker = true },
+                rankedBackgroundChoices = rankedBackgroundChoices,
+                isRankingBackgroundChoices = isRankingBackgroundChoices,
             )
 
         // The made video of the current revision: while rendering, the snapshot scene the progress has reached (still
@@ -2263,7 +2336,7 @@ internal object TitleCardBitmapCache {
         holderSource: TrailerSource?,
         chosen: TrailerSource?,
     ): Pair<TrailerSource, Double>? {
-        if (chosen != null) return chosen to 0.0
+        if (chosen != null) return chosen to card.clampedBackgroundTimestamp(chosen)
         if (!card.usesFirstOrLastImage || holder == null || holderSource == null) return null
         val (start, length) = clampSceneWindow(holderSource, holder.start, holder.length)
         return holderSource to (if (isIntro) start else maxOf(start, start + length - 0.5))
@@ -2457,7 +2530,7 @@ private fun EditingPreviewBox(
             val cardState = rememberTitleCardBitmap(
                 card, isIntro, holder, holder?.let { h -> session.sources.firstOrNull { it.id == h.sourceId } }, dims.first, dims.second, 720,
                 bodyCaption = TrailerTitleCardRenderer.bodyCaptionOf(titleScenes.map { it.caption }),
-                backgroundCandidates = session.scenes.map { it.source },
+                backgroundCandidates = session.scenes.map { it.source } + session.sources,
                 draftId = session.draftId ?: session.directory.name,
             )
             TitleCardPreview(
@@ -4999,6 +5072,179 @@ private val TITLE_CARD_COLOR_SWATCHES = listOf(
 private val TITLE_CARD_ROW_NAMES = listOf("맨 위", "위", "가운데", "아래", "맨 아래")
 private val TITLE_CARD_COLUMN_NAMES = listOf("왼쪽", "왼쪽 안쪽", "가운데", "오른쪽 안쪽", "오른쪽")
 
+internal data class TitleCardBackgroundChoice(
+    val source: TrailerSource,
+    val timestamp: Double?,
+    val label: String,
+    val contentDescription: String,
+)
+
+private fun buildTitleCardBackgroundChoices(
+    scenes: List<TrailerScene>,
+    sources: List<TrailerSource>,
+): List<TitleCardBackgroundChoice> {
+    val photoSources = (scenes.map { it.source } + sources)
+        .filter { it.isImage && it.file.isFile }
+        .distinctBy { it.id }
+    val photoChoices = photoSources.mapIndexed { index, photo ->
+        TitleCardBackgroundChoice(
+            source = photo,
+            timestamp = null,
+            label = "사진 ${index + 1}",
+            contentDescription = "배경 사진 ${index + 1}: ${photo.name}",
+        )
+    }
+
+    val videoScenes = scenes.filter { !it.source.isImage && it.source.file.isFile }
+    val perClipStills = videoScenes.mapIndexed { clipIndex, scene ->
+        val clipNum = clipIndex + 1
+        val src = scene.source
+        val duration = if (src.duration > 0.0) src.duration else 0.0
+        val trimStart = if (duration > 0.0) scene.start.coerceIn(0.0, duration) else maxOf(0.0, scene.start)
+        val trimEnd = if (duration > 0.0) (scene.start + scene.length).coerceIn(trimStart, duration) else maxOf(trimStart, scene.start + scene.length)
+        val trimLength = trimEnd - trimStart
+
+        val fractions = when {
+            trimLength <= 0.001 -> listOf(0.0)
+            else -> listOf(0.15, 0.50, 0.85)
+        }
+        fractions.mapIndexed { frameIndex, fraction ->
+            val rawTs = trimStart + fraction * trimLength
+            val clampedTs = if (duration > 0.0) rawTs.coerceIn(0.0, maxOf(0.0, duration - 0.05)) else maxOf(0.0, rawTs)
+            val ts = round(clampedTs * 100.0) / 100.0
+            TitleCardBackgroundChoice(
+                source = src,
+                timestamp = ts,
+                label = if (fractions.size == 1) "클립 $clipNum" else "클립 $clipNum-${frameIndex + 1}",
+                contentDescription = "배경 클립 $clipNum 스틸 ${frameIndex + 1}: ${src.name} (${seconds1(ts)})",
+            )
+        }
+    }
+
+    val maxStills = perClipStills.maxOfOrNull { it.size } ?: 0
+    val videoChoices = ArrayList<TitleCardBackgroundChoice>(videoScenes.size * maxStills)
+    for (frameIndex in 0 until maxStills) {
+        for (clipStills in perClipStills) {
+            if (frameIndex < clipStills.size) {
+                videoChoices.add(clipStills[frameIndex])
+            }
+        }
+    }
+
+    return photoChoices + videoChoices
+}
+
+private data class ScoredBackgroundCandidate(
+    val choice: TitleCardBackgroundChoice,
+    val originalIndex: Int,
+    val score: Double,
+    val metrics: PhotoSelectionMetrics,
+    val aspect: Double,
+)
+
+internal data class RankedBackgroundChoice(
+    val choice: TitleCardBackgroundChoice,
+    val rank: Int,
+    val score: Double,
+    val metrics: PhotoSelectionMetrics?,
+)
+
+private object TitleCardRankingCache {
+    private val cache = android.util.LruCache<String, List<RankedBackgroundChoice>>(10)
+    fun get(key: String): List<RankedBackgroundChoice>? = cache.get(key)
+    fun put(key: String, list: List<RankedBackgroundChoice>) { cache.put(key, list) }
+}
+
+private enum class TitleCardBackgroundViewMode(val title: String) {
+    THUMBNAIL("썸네일"),
+    POSTER("포스터"),
+}
+
+private suspend fun rankTitleCardBackgroundChoices(
+    scenes: List<TrailerScene>,
+    sources: List<TrailerSource>,
+): List<RankedBackgroundChoice> = withContext(Dispatchers.IO) {
+    val rawChoices = buildTitleCardBackgroundChoices(scenes, sources)
+    if (rawChoices.isEmpty()) return@withContext emptyList()
+
+    val scored = ArrayList<ScoredBackgroundCandidate>(rawChoices.size)
+    for ((index, choice) in rawChoices.withIndex()) {
+        currentCoroutineContext().ensureActive()
+        val file = choice.source.file
+        if (!file.isFile || file.length() <= 0L) continue
+        val isImage = choice.source.isImage
+        val atSeconds = choice.timestamp ?: 0.0
+
+        val bmp = loadFrame(file, isImage, atSeconds, 200, exact = true) ?: continue
+
+        val (metrics, aspect) = withContext(Dispatchers.Default) {
+            try {
+                val m = measurePhotoSelectionBitmap(bmp)
+                val asp = bmp.width.toDouble() / bmp.height.coerceAtLeast(1)
+                m to asp
+            } finally {
+                if (choice.source.thumbnail !== bmp) {
+                    bmp.recycle()
+                }
+            }
+        }
+
+        var score = 0.65 * metrics.sharpness + 0.35 * metrics.exposure
+        val meanBrightness = if (metrics.fingerprint.isNotEmpty()) {
+            metrics.fingerprint.sum().toDouble() / (metrics.fingerprint.size * 255.0)
+        } else 0.5
+
+        if (meanBrightness < 0.05 || meanBrightness > 0.95) {
+            score -= 0.60
+        }
+        if (metrics.sharpness < 0.05) {
+            score -= 0.50
+        }
+
+        scored.add(
+            ScoredBackgroundCandidate(
+                choice = choice,
+                originalIndex = index,
+                score = score,
+                metrics = metrics,
+                aspect = aspect,
+            )
+        )
+    }
+
+    if (scored.isEmpty()) return@withContext emptyList()
+
+    val sorted = scored.sortedWith(
+        compareByDescending<ScoredBackgroundCandidate> { it.score }
+            .thenBy { it.originalIndex }
+    )
+
+    val accepted = ArrayList<ScoredBackgroundCandidate>(minOf(30, sorted.size))
+    for (candidate in sorted) {
+        val isDuplicate = accepted.any { prior ->
+            photoSelectionCloseness(
+                candidate.metrics,
+                candidate.aspect,
+                prior.metrics,
+                prior.aspect,
+            ) != null
+        }
+        if (!isDuplicate) {
+            accepted.add(candidate)
+            if (accepted.size >= 30) break
+        }
+    }
+
+    accepted.mapIndexed { rankIdx, sc ->
+        RankedBackgroundChoice(
+            choice = sc.choice,
+            rank = rankIdx + 1,
+            score = sc.score,
+            metrics = sc.metrics,
+        )
+    }
+}
+
 /**
  * 시작 화면/마지막 화면 editor shown inline in the 자막 inspector. It edits the same [TrailerTitleCard] through
  * editorSetIntroCard/editorSetOutroCard as the former sheet did; the time/background fields appear only while the
@@ -5010,6 +5256,8 @@ private fun TitleCardInlineEditor(
     card: TrailerTitleCard,
     session: TrailerSession,
     model: NasFinderViewModel,
+    rankedBackgroundChoices: List<RankedBackgroundChoice> = emptyList(),
+    isRankingBackgroundChoices: Boolean = false,
 ) {
     val context = LocalContext.current
     var draftCard by remember(card) { mutableStateOf(card) }
@@ -5019,13 +5267,29 @@ private fun TitleCardInlineEditor(
     val toggleLabel = if (isIntro) "시작 화면 사용" else "마지막 화면 사용"
     val bgToggleLabel = if (isIntro) "첫 사진/영상 배경 사용" else "마지막 사진/영상 배경 사용"
 
+    LaunchedEffect(rankedBackgroundChoices, draftCard.enabled, draftCard.usesFirstOrLastImage) {
+        if (draftCard.enabled && draftCard.usesFirstOrLastImage && draftCard.backgroundSourceId == null) {
+            val rec1 = rankedBackgroundChoices.firstOrNull()?.choice
+            if (rec1 != null) {
+                val updated = draftCard.copy(backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp)
+                draftCard = updated
+                if (isIntro) model.editorSetIntroCard(updated) else model.editorSetOutroCard(updated)
+            }
+        }
+    }
+
     val scenes = session.scenes
     val targetScene = if (isIntro) scenes.firstOrNull() else scenes.lastOrNull()
-    val photoChoices = remember(session.scenes) { session.scenes.map { it.source }.filter { it.isImage }.distinctBy { it.id } }
-    val chosenPhoto = draftCard.resolveBackgroundSource(photoChoices)
-    val backgroundBitmap by produceState<Bitmap?>(null, isIntro, draftCard.usesFirstOrLastImage, targetScene, chosenPhoto) {
-        if (chosenPhoto != null) {
-            value = withContext(Dispatchers.IO) { loadFrame(chosenPhoto.file, true, 0.0, 480, exact = true) }
+    val allBackgroundSources = remember(session.scenes, session.sources) {
+        (session.scenes.map { it.source } + session.sources).distinctBy { it.id }
+    }
+    val chosenSource = draftCard.resolveBackgroundSource(allBackgroundSources)
+    val backgroundBitmap by produceState<Bitmap?>(null, isIntro, draftCard.usesFirstOrLastImage, targetScene, chosenSource, draftCard.backgroundTimestamp) {
+        if (chosenSource != null) {
+            val atSeconds = draftCard.clampedBackgroundTimestamp(chosenSource)
+            value = withContext(Dispatchers.IO) {
+                loadFrame(chosenSource.file, chosenSource.isImage, atSeconds, 480, exact = true)
+            }
             return@produceState
         }
         if (!draftCard.usesFirstOrLastImage || targetScene == null) {
@@ -5099,7 +5363,19 @@ private fun TitleCardInlineEditor(
             }
             Switch(
                 checked = draftCard.enabled,
-                onCheckedChange = { commit(draftCard.copy(enabled = it)) },
+                onCheckedChange = { enabled ->
+                    val updated = if (enabled && draftCard.usesFirstOrLastImage && draftCard.backgroundSourceId == null) {
+                        val rec1 = rankedBackgroundChoices.firstOrNull()?.choice
+                        if (rec1 != null) {
+                            draftCard.copy(enabled = true, backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp)
+                        } else {
+                            draftCard.copy(enabled = true)
+                        }
+                    } else {
+                        draftCard.copy(enabled = enabled)
+                    }
+                    commit(updated)
+                },
                 modifier = Modifier.semantics { contentDescription = toggleLabel },
             )
         }
@@ -5593,29 +5869,21 @@ private fun TitleCardInlineEditor(
                 }
                 Switch(
                     checked = draftCard.usesFirstOrLastImage,
-                    onCheckedChange = { commit(draftCard.copy(usesFirstOrLastImage = it)) },
+                    onCheckedChange = { usesBg ->
+                        val updated = if (usesBg && draftCard.backgroundSourceId == null) {
+                            val rec1 = rankedBackgroundChoices.firstOrNull()?.choice
+                            if (rec1 != null) {
+                                draftCard.copy(usesFirstOrLastImage = true, backgroundSourceId = rec1.source.id, backgroundTimestamp = rec1.timestamp)
+                            } else {
+                                draftCard.copy(usesFirstOrLastImage = true)
+                            }
+                        } else {
+                            draftCard.copy(usesFirstOrLastImage = usesBg)
+                        }
+                        commit(updated)
+                    },
                     modifier = Modifier.semantics { contentDescription = bgToggleLabel },
                 )
-            }
-
-            // Optional project photo as the background; "기본" keeps the first/last frame. A missing photo falls back silently.
-            if (draftCard.usesFirstOrLastImage && photoChoices.isNotEmpty()) {
-                Text("배경 사진", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = chosenPhoto == null,
-                        onClick = { commit(draftCard.copy(backgroundSourceId = null)) },
-                        label = { Text(if (isIntro) "첫 장면" else "마지막 장면") },
-                    )
-                    photoChoices.forEachIndexed { index, photo ->
-                        FilterChip(
-                            selected = chosenPhoto?.id == photo.id,
-                            onClick = { commit(draftCard.copy(backgroundSourceId = photo.id)) },
-                            label = { Text("사진 ${index + 1}") },
-                            modifier = Modifier.semantics { contentDescription = "배경 사진 ${index + 1}: ${photo.name}" },
-                        )
-                    }
-                }
             }
 
             // LIVE preview of the card itself (the stage preview keeps showing the selected clip)
@@ -5623,7 +5891,7 @@ private fun TitleCardInlineEditor(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 160.dp)
+                    .heightIn(max = 180.dp)
                     .aspectRatio(aspect, matchHeightConstraintsFirst = true)
                     .align(Alignment.CenterHorizontally)
                     .clip(RoundedCornerShape(8.dp))
@@ -5640,6 +5908,247 @@ private fun TitleCardInlineEditor(
                     )
                 } else {
                     CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+            }
+
+            // Optional project photo or video still as the background
+            if (draftCard.usesFirstOrLastImage) {
+                val prefs = remember(context) { context.getSharedPreferences("adaptive_editor_title_card_prefs", android.content.Context.MODE_PRIVATE) }
+                var viewMode by remember {
+                    val saved = prefs.getString("title_card_bg_view_mode", "THUMBNAIL")
+                    mutableStateOf(if (saved == "POSTER") TitleCardBackgroundViewMode.POSTER else TitleCardBackgroundViewMode.THUMBNAIL)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("배경 사진", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                        if (isRankingBackgroundChoices) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        }
+                    }
+
+                    // VIEW modes: labeled 썸네일 / 포스터 controls beside background grid heading
+                    MacSegmentedControl(
+                        options = listOf(
+                            TitleCardBackgroundViewMode.THUMBNAIL to "썸네일",
+                            TitleCardBackgroundViewMode.POSTER to "포스터",
+                        ),
+                        selected = viewMode,
+                        onSelect = { nextMode ->
+                            viewMode = nextMode
+                            prefs.edit().putString("title_card_bg_view_mode", nextMode.name).apply()
+                        },
+                        modifier = Modifier.width(140.dp),
+                    )
+                }
+
+                if (isRankingBackgroundChoices && rankedBackgroundChoices.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(96.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text(
+                                "배경 화면 품질 분석 및 추천 중…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else if (rankedBackgroundChoices.isNotEmpty()) {
+                    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                        val isPoster = viewMode == TitleCardBackgroundViewMode.POSTER
+                        val itemAspect = if (isPoster) 0.72f else aspect
+                        val columns = if (isPoster) {
+                            (maxWidth / 120.dp).toInt().coerceIn(2, 4)
+                        } else {
+                            (maxWidth / 88.dp).toInt().coerceIn(3, 6)
+                        }
+                        val spacing = 8.dp
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(spacing),
+                        ) {
+                            rankedBackgroundChoices.chunked(columns).forEach { rowChoices ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(spacing),
+                                ) {
+                                    rowChoices.forEach { rankedChoice ->
+                                        val choice = rankedChoice.choice
+                                        val isSelected = draftCard.backgroundSourceId == choice.source.id && (
+                                            if (choice.source.isImage) {
+                                                draftCard.backgroundTimestamp == null || draftCard.backgroundTimestamp == 0.0
+                                            } else {
+                                                draftCard.backgroundTimestamp != null && abs(draftCard.backgroundTimestamp!! - (choice.timestamp ?: 0.0)) < 0.01
+                                            }
+                                        )
+                                        TitleCardCandidateItem(
+                                            rankedChoice = rankedChoice,
+                                            isSelected = isSelected,
+                                            aspect = itemAspect,
+                                            onClick = {
+                                                commit(draftCard.copy(
+                                                    backgroundSourceId = choice.source.id,
+                                                    backgroundTimestamp = choice.timestamp,
+                                                ))
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                    }
+                                    repeat(columns - rowChoices.size) {
+                                        Spacer(modifier = Modifier.weight(1f))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TitleCardCandidateItem(
+    rankedChoice: RankedBackgroundChoice,
+    isSelected: Boolean,
+    aspect: Float,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val choice = rankedChoice.choice
+    val rank = rankedChoice.rank
+    val isTopRecommended = rank == 1
+
+    Surface(
+        modifier = modifier
+            .aspectRatio(aspect)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .semantics {
+                contentDescription = if (isTopRecommended) "추천 1위 배경 후보: ${choice.contentDescription}"
+                else "${rank}위 배경 후보: ${choice.contentDescription}"
+                this.selected = isSelected
+                this.role = Role.Button
+            },
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+        border = if (isSelected) {
+            BorderStroke(2.5.dp, MaterialTheme.colorScheme.primary)
+        } else {
+            BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
+        },
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            val desiredBound = if (aspect < 1f) 768 else 320
+            val thumb by produceState<Bitmap?>(null, choice.source.file, choice.source.isImage, choice.timestamp, desiredBound) {
+                value = withContext(Dispatchers.IO) {
+                    loadFrame(choice.source.file, choice.source.isImage, choice.timestamp ?: 0.0, desiredBound)
+                }
+            }
+            if (thumb != null) {
+                Image(
+                    bitmap = thumb!!.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                }
+            }
+
+            if (isTopRecommended) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(4.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.92f))
+                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Star,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(10.dp),
+                    )
+                    Text(
+                        text = "추천 1",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(4.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color.Black.copy(alpha = 0.72f))
+                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = "$rank",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                        color = Color.White,
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(4.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = choice.label,
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            if (isSelected) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(4.dp)
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(14.dp),
+                    )
                 }
             }
         }
@@ -5705,6 +6214,8 @@ private fun editorInspectorColumns(
     model: NasFinderViewModel,
     onSelectScene: (Long) -> Unit,
     onOpenMusicPicker: () -> Unit,
+    rankedBackgroundChoices: List<RankedBackgroundChoice> = emptyList(),
+    isRankingBackgroundChoices: Boolean = false,
 ): InspectorColumns {
     // Saved here (not inside the caption section) so the choice survives tab switches and relayouts.
     var captionTarget by rememberSaveable { mutableStateOf(CaptionTarget.BODY) }
@@ -5760,7 +6271,14 @@ private fun editorInspectorColumns(
                     onChoose = { pendingScope = it; captionTarget = CaptionTarget.BODY },
                     extra = cardChoices,
                 )
-                TitleCardInlineEditor(isIntro, if (isIntro) project.introCard else project.outroCard, session, model)
+                TitleCardInlineEditor(
+                    isIntro = isIntro,
+                    card = if (isIntro) project.introCard else project.outroCard,
+                    session = session,
+                    model = model,
+                    rankedBackgroundChoices = rankedBackgroundChoices,
+                    isRankingBackgroundChoices = isRankingBackgroundChoices,
+                )
             })
         }
     }

@@ -645,10 +645,10 @@ object TrailerDraftStore {
                 put("musicVolume", editor.musicVolume.toDouble())
                 put("nextKey", editor.nextKey)
                 put("scenes", JSONArray().apply { editor.scenes.forEach { put(sceneJson(it)) } })
-                if (editor.introCard.enabled || editor.introCard.title.isNotEmpty() || editor.introCard.subtitle.isNotEmpty() || editor.introCard.duration != 3.0 || !editor.introCard.usesFirstOrLastImage) {
+                if (editor.introCard.enabled || editor.introCard.title.isNotEmpty() || editor.introCard.subtitle.isNotEmpty() || editor.introCard.duration != 3.0 || !editor.introCard.usesFirstOrLastImage || editor.introCard.backgroundSourceId != null || editor.introCard.backgroundTimestamp != null || editor.introCard.titleStyle != null || editor.introCard.subtitleStyle != null) {
                     put("introCard", editor.introCard.toJson())
                 }
-                if (editor.outroCard.enabled || editor.outroCard.title.isNotEmpty() || editor.outroCard.subtitle.isNotEmpty() || editor.outroCard.duration != 3.0 || !editor.outroCard.usesFirstOrLastImage) {
+                if (editor.outroCard.enabled || editor.outroCard.title.isNotEmpty() || editor.outroCard.subtitle.isNotEmpty() || editor.outroCard.duration != 3.0 || !editor.outroCard.usesFirstOrLastImage || editor.outroCard.backgroundSourceId != null || editor.outroCard.backgroundTimestamp != null || editor.outroCard.titleStyle != null || editor.outroCard.subtitleStyle != null) {
                     put("outroCard", editor.outroCard.toJson())
                 }
             })
