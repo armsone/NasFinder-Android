@@ -107,6 +107,7 @@ internal fun sceneFramingVideoEffects(
 @androidx.annotation.OptIn(UnstableApi::class)
 internal object TrailerExporter {
     private const val MAX_GROUP_SIZE = 8
+    private const val OUTPUT_FPS = 30.0
     // H.264 레벨 4.1이 허용하는 최대 프레임 크기(8192 매크로블록 = 2,097,152 화소). 1920x1080/1080x1920 모두 이 안에 든다.
     private const val H264_LEVEL_41_MAX_PIXELS = 2_097_152L
 
@@ -114,6 +115,8 @@ internal object TrailerExporter {
 
     private data class GroupExportResult(
         val files: List<File>,
+        // files와 같은 순서로, 각 파일이 담아야 할 계획 길이(초). 이어 붙일 때 파일 끝의 인코더/AAC 꼬리를 잘라내는 기준이다.
+        val fileDurations: List<Double>,
         val effectiveScenes: List<TrailerScene>,
         val recoveredCount: Int = 0,
         val excludedCount: Int = 0,
@@ -685,7 +688,6 @@ internal object TrailerExporter {
         copiedMusicFile: File,
         musicTrack: TrailerMusicTrack,
         musicPolicy: TrailerMusicPolicy,
-        musicFitCount: Int,
         autoDucking: Boolean,
         musicGain: Float,
         totalVideoDurationSeconds: Double,
@@ -733,32 +735,10 @@ internal object TrailerExporter {
         val musicUri = Uri.fromFile(copiedMusicFile)
         val musicItems = mutableListOf<EditedMediaItem>()
 
-        if (musicPolicy == TrailerMusicPolicy.LOOP_MUSIC) {
+        // 음악 길이 맞춤도 반복 재생이다: 영상이 음악×반복 횟수와 같으면 정확히 끝나고, 직접 편집으로 더 길어져도 음악이 끝까지 이어진다.
+        if (musicPolicy != TrailerMusicPolicy.SINGLE) {
             var accumulated = 0.0
             while (accumulated < totalVideoDurationSeconds - 0.05) {
-                val remaining = totalVideoDurationSeconds - accumulated
-                val clipDuration = min(musicDurationSeconds, remaining)
-                val input = MediaItem.Builder()
-                    .setUri(musicUri)
-                    .setClippingConfiguration(
-                        MediaItem.ClippingConfiguration.Builder()
-                            .setStartPositionMs(0L)
-                            .setEndPositionMs((clipDuration * 1000).toLong())
-                            .build()
-                    ).build()
-                val musicEffects = makeMusicEffects(startOffsetSeconds = accumulated)
-                musicItems.add(
-                    EditedMediaItem.Builder(input)
-                        .setEffects(musicEffects)
-                        .build()
-                )
-                accumulated += clipDuration
-            }
-        } else if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
-            val count = musicFitCount.coerceAtLeast(1)
-            var accumulated = 0.0
-            for (rep in 0 until count) {
-                if (accumulated >= totalVideoDurationSeconds - 0.05) break
                 val remaining = totalVideoDurationSeconds - accumulated
                 val clipDuration = min(musicDurationSeconds, remaining)
                 val input = MediaItem.Builder()
@@ -1011,6 +991,7 @@ internal object TrailerExporter {
             }
             return GroupExportResult(
                 files = listOf(chunkFile),
+                fileDurations = listOf(scenes.sumOf { it.length }),
                 effectiveScenes = scenes,
                 recoveredCount = fallbackRecoveries,
                 excludedCount = 0,
@@ -1082,6 +1063,7 @@ internal object TrailerExporter {
 
                 return GroupExportResult(
                     files = leftResult.files + rightResult.files,
+                    fileDurations = leftResult.fileDurations + rightResult.fileDurations,
                     effectiveScenes = leftResult.effectiveScenes + rightResult.effectiveScenes,
                     recoveredCount = leftResult.recoveredCount + rightResult.recoveredCount,
                     excludedCount = leftResult.excludedCount + rightResult.excludedCount,
@@ -1111,6 +1093,7 @@ internal object TrailerExporter {
                 if (recoveredScene == null) {
                     return GroupExportResult(
                         files = emptyList(),
+                        fileDurations = emptyList(),
                         effectiveScenes = emptyList(),
                         recoveredCount = 0,
                         excludedCount = 1,
@@ -1142,6 +1125,7 @@ internal object TrailerExporter {
                     )
                     return GroupExportResult(
                         files = listOf(recoveredChunkFile),
+                        fileDurations = listOf(recoveredScene.length),
                         effectiveScenes = listOf(recoveredScene),
                         recoveredCount = 1,
                         excludedCount = 0,
@@ -1158,6 +1142,7 @@ internal object TrailerExporter {
                     }
                     return GroupExportResult(
                         files = emptyList(),
+                        fileDurations = emptyList(),
                         effectiveScenes = emptyList(),
                         recoveredCount = 0,
                         excludedCount = 1,
@@ -1217,6 +1202,28 @@ internal object TrailerExporter {
         )
     }
 
+    /**
+     * 장면 끝 시각을 30fps 프레임 격자에 누적 반올림한다. 인코더는 장면마다 프레임 단위로 길이를 맞추므로, 계획 길이를 그대로 쓰면
+     * 장면 수만큼 오차가 쌓여 영상 끝·비트 전환·음악 길이에서 벗어난다(Media3 이미지 프레임 수는 장면마다 Math.round(fps×길이)).
+     * 누적 반올림은 모든 전환을 계획 시각의 반 프레임 안에 둔다. 영상 장면은 시작 위치부터 원본 끝을 넘지 않도록 내림해 남은 오차를 다음 장면이 흡수한다.
+     */
+    private fun snapSceneLengthsToFrames(scenes: List<TrailerScene>): List<TrailerScene> {
+        var plannedEnd = 0.0
+        var snappedFrames = 0L
+        return scenes.map { scene ->
+            plannedEnd += scene.length
+            var endFrame = Math.round(plannedEnd * OUTPUT_FPS).coerceAtLeast(snappedFrames + 1)
+            val source = scene.source
+            if (!source.isImage && source.duration.isFinite() && source.duration > 0.0) {
+                val sourceFrames = Math.floor((source.duration - scene.start) * OUTPUT_FPS + 1e-6).toLong()
+                if (endFrame - snappedFrames > sourceFrames) endFrame = snappedFrames + sourceFrames.coerceAtLeast(1)
+            }
+            val snappedLength = (endFrame - snappedFrames) / OUTPUT_FPS
+            snappedFrames = endFrame
+            if (abs(snappedLength - scene.length) < 1e-9) scene else scene.copy(length = snappedLength)
+        }
+    }
+
     suspend fun export(
         context: Context,
         scenes: List<TrailerScene>,
@@ -1236,7 +1243,8 @@ internal object TrailerExporter {
         progress: (status: String, progress: Float?) -> Unit,
     ): File = withContext(Dispatchers.Main.immediate) {
         require(scenes.isNotEmpty()) { "이 장면 길이로 만들 수 있는 영상이 없습니다. 장면 길이를 줄여 주세요." }
-        val totalClips = scenes.size
+        val framedScenes = snapSceneLengthsToFrames(scenes)
+        val totalClips = framedScenes.size
         val random = Random()
         val (exportWidth, exportHeight) = format.resolveDimensions(aspectSources)
         val musicGain = musicVolume.coerceIn(0f, 2f)
@@ -1282,11 +1290,12 @@ internal object TrailerExporter {
 
         try {
             val maxGroupSize = MAX_GROUP_SIZE
-            val groups = scenes.chunked(maxGroupSize)
+            val groups = framedScenes.chunked(maxGroupSize)
             val totalGroups = groups.size
             val chunkPhaseEnd = if (totalGroups == 1 && copiedMusicFile == null) 1.0f else 0.85f
 
             val intermediateFiles = mutableListOf<File>()
+            val intermediateDurations = mutableListOf<Double>()
             val effectiveScenes = mutableListOf<TrailerScene>()
             var clipOffset = 0
 
@@ -1321,6 +1330,7 @@ internal object TrailerExporter {
                     onTransformerCreated = { currentTransformer = it },
                 )
                 intermediateFiles.addAll(groupResult.files)
+                intermediateDurations.addAll(groupResult.fileDurations)
                 effectiveScenes.addAll(groupResult.effectiveScenes)
                 totalRecoveredScenes += groupResult.recoveredCount
                 totalExcludedScenes += groupResult.excludedCount
@@ -1482,9 +1492,19 @@ internal object TrailerExporter {
                 }
                 safeProgress("영상으로 저장 중 (${effectiveScenes.size}/${effectiveScenes.size}개 연결 완료)", 1.0f)
             } else {
-                val concatEditedItems = allIntermediateFiles.map { chunkFile ->
+                // 청크 파일은 인코더/AAC 꼬리 때문에 계획보다 조금 길다(청크당 약 0.07초). Media3는 이어 붙일 때 파일 길이만큼 다음 항목을 밀기 때문에
+                // 그대로 두면 청크 수만큼 쌓여 영상·음악이 계획 길이를 넘는다. 각 청크를 계획 길이로 잘라 연결 시각을 계획과 일치시킨다.
+                val allIntermediateDurations = listOfNotNull(introChunkFile?.let { introDuration }) + intermediateDurations + listOfNotNull(outroChunkFile?.let { outroDuration })
+                check(allIntermediateDurations.size == allIntermediateFiles.size) { "예고편 청크 길이 정보가 맞지 않습니다." }
+                val concatEditedItems = allIntermediateFiles.mapIndexed { index, chunkFile ->
                     val inputUri = Uri.fromFile(chunkFile)
-                    val input = MediaItem.Builder().setUri(inputUri).build()
+                    val input = MediaItem.Builder().setUri(inputUri)
+                        .setClippingConfiguration(
+                            MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs(0L)
+                                .setEndPositionMs(Math.round(allIntermediateDurations[index] * 1000.0))
+                                .build()
+                        ).build()
                     EditedMediaItem.Builder(input)
                         .setFrameRate(30)
                         .build()
@@ -1504,7 +1524,6 @@ internal object TrailerExporter {
                         copiedMusicFile = copiedMusicFile,
                         musicTrack = musicTrack,
                         musicPolicy = musicPolicy,
-                        musicFitCount = musicFitCount,
                         autoDucking = autoDucking,
                         musicGain = musicGain,
                         totalVideoDurationSeconds = effectiveTotalDuration,
@@ -1560,17 +1579,27 @@ internal object TrailerExporter {
                     val videoTolerance = maxOf(.5, allIntermediateFiles.size * .05)
                     // AAC 프레임 패딩이 청크마다 누적되므로 오디오/컨테이너는 비디오보다 넓은 한계를 허용한다.
                     val audioTolerance = maxOf(1.0, allIntermediateFiles.size * .1)
+                    // 음악 한 번 재생은 음악이 영상보다 짧으면 거기서 끝나는 것이 정상이다. 반복·길이 맞춤은 영상 끝까지 이어져야 한다.
+                    val expectedAudioMin = if (musicTrack != null && musicPolicy == TrailerMusicPolicy.SINGLE) {
+                        min(musicTrack.durationSeconds, effectiveTotalDuration)
+                    } else {
+                        effectiveTotalDuration
+                    }
                     val videoOk = hasVideo && abs(videoDuration - effectiveTotalDuration) <= videoTolerance
-                    val containerOk = abs(containerDuration - effectiveTotalDuration) <= audioTolerance &&
-                        (audioTrackDuration < 0 || abs(audioTrackDuration - effectiveTotalDuration) <= audioTolerance)
-                    if (!videoOk || !containerOk) {
+                    val containerOk = abs(containerDuration - effectiveTotalDuration) <= audioTolerance
+                    val audioOk = audioTrackDuration < 0 ||
+                        (audioTrackDuration >= expectedAudioMin - audioTolerance && audioTrackDuration <= effectiveTotalDuration + audioTolerance)
+                    if (!videoOk || !containerOk || !audioOk) {
                         android.util.Log.w(
                             "TrailerExporter",
-                            "duration check failed expected=${"%.2f".format(effectiveTotalDuration)} video=${"%.2f".format(videoDuration)} " +
-                                "audio=${"%.2f".format(audioTrackDuration)} container=${"%.2f".format(containerDuration)} chunks=${allIntermediateFiles.size}",
+                            "duration check failed videoOk=$videoOk containerOk=$containerOk audioOk=$audioOk " +
+                                "expected=${"%.2f".format(effectiveTotalDuration)} expectedAudioMin=${"%.2f".format(expectedAudioMin)} " +
+                                "video=${"%.2f".format(videoDuration)}(tol ${"%.2f".format(videoTolerance)}) " +
+                                "audio=${"%.2f".format(audioTrackDuration)} container=${"%.2f".format(containerDuration)}(tol ${"%.2f".format(audioTolerance)}) " +
+                                "chunks=${allIntermediateFiles.size} scenes=${effectiveScenes.size} policy=$musicPolicy",
                         )
                     }
-                    check(videoOk && containerOk) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
+                    check(videoOk && containerOk && audioOk) { "완성 영상의 길이를 확인하지 못했습니다. 다시 만들어 주세요." }
                 } finally { reader.release() }
             }
 

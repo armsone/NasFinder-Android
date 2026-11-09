@@ -579,7 +579,7 @@ private class SmokeRun(private val inst: Instrumentation) {
         // --- 0 eligible (all unreadable): independent session, no UI
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
-            val zero = PhotoSelectionSession(app, scope) { _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
+            val zero = PhotoSelectionSession(app, scope) { _, _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
             zero.start(uris(listOf(bad, missing)))
             val zs = waitPhase(zero, setOf(PhotoSelectionPhase.BLOCKED, PhotoSelectionPhase.SETUP, PhotoSelectionPhase.PREVIEW))
             analysisJson.put("zeroEligible", JSONObject().put("state", stateJson(zs)).put("failures", JSONArray(zs.analysis?.failures.orEmpty().map { it.name + ": " + it.reason })))
@@ -594,7 +594,7 @@ private class SmokeRun(private val inst: Instrumentation) {
                 zr.phase == PhotoSelectionPhase.BLOCKED && zero.state.value.phase == PhotoSelectionPhase.BLOCKED && shareFiles == null && zero.state.value.outcome == null,
                 "afterRetry=${zr.phase} afterPreview=${zero.state.value.phase} share=$shareFiles")
             val videoFixture = File(fixtureDir, "v01-synthetic-video.mp4").apply { writeBytes(ByteArray(1024)) }
-            val zeroVideo = PhotoSelectionSession(app, scope) { _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
+            val zeroVideo = PhotoSelectionSession(app, scope) { _, _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
             zeroVideo.start(listOf(com.armsone.nasfinder.ui.PhotoSelectionSource(Uri.fromFile(videoFixture), "v01-synthetic-video.mp4")))
             val zvs = waitPhase(zeroVideo, setOf(PhotoSelectionPhase.BLOCKED, PhotoSelectionPhase.SETUP, PhotoSelectionPhase.PREVIEW))
             zeroVideo.retryAnalysis()
@@ -615,7 +615,7 @@ private class SmokeRun(private val inst: Instrumentation) {
             cleanup.put("zeroBatchId", zeroBatch); zeroBatch?.let { ownBatchIds += it }
 
             // --- 1 photo
-            val one = PhotoSelectionSession(app, scope) { _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
+            val one = PhotoSelectionSession(app, scope) { _, _, _ -> Result.failure(IllegalStateException("not used in smoke")) }
             one.start(uris(listOf(lone.file)))
             val os = waitPhase(one, setOf(PhotoSelectionPhase.BLOCKED, PhotoSelectionPhase.SETUP))
             analysisJson.put("onePhoto", JSONObject().put("state", stateJson(os)).put("analysis", os.analysis?.let { describeAnalysis("one", it) }))
@@ -735,7 +735,7 @@ private class SmokeRun(private val inst: Instrumentation) {
                 pass("sel.main.order.n$n", "selected photos preserve input order", selected == selected.sorted() && selected.distinct().size == n, "indices=$selected")
                 if (n == 4) {
                     val noLowSelected = selected.none { it in rec.lowQualityIndices }
-                    val forestSelected = selectedNames?.any { it.startsWith("f02") } == true
+                    val forestSelected = selectedNames?.any { it?.startsWith("f02") == true } == true
                     pass("sel.main.n4.priority", "explicit N=4 selects normal representatives including forest and excludes low-quality f08",
                         noLowSelected && forestSelected, "selected=$selectedNames lowIndices=${rec.lowQualityIndices}")
                 }

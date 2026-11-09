@@ -6544,7 +6544,7 @@ private fun SoundMusicSection(session: TrailerSession, model: NasFinderViewModel
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             TrailerChoice(
-                "음악길이",
+                if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) "길이 ${session.musicFitCount}회" else "음악길이",
                 session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH,
                 Modifier.weight(1f),
                 compact = true,
@@ -6578,11 +6578,18 @@ private fun SoundMusicSection(session: TrailerSession, model: NasFinderViewModel
                 model.analyzeAndAlignMusicTempo()
             }
         }
-        if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.musicFitCount > 1) {
-            Text("음악 길이에 맞춰 ${session.musicFitCount}번 반복합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
+            val fitCount = session.musicFitCount.coerceAtLeast(1)
+            val trackSeconds = session.musicTrack?.durationSeconds ?: 0.0
+            Text("${fitCount}회 재생 · 총 ${trailerLengthTitle(trackSeconds * fitCount)}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            Text(
+                "‘길이 ${fitCount}회’를 다시 누르면 ${fitCount + 1}회 재생 · 총 ${trailerLengthTitle(trackSeconds * (fitCount + 1))}로 늘어납니다. 다른 방식을 눌렀다가 돌아오면 1회부터 시작합니다.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         if (project.autoPlan.not() && session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH) {
-            Text("직접 편집한 클립은 그대로 두고, 음악을 영상 길이에 맞춰 자릅니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("직접 편집한 클립의 순서와 구성은 유지하고, 장면 길이를 음악 총 길이에 맞게 다시 나눕니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         var musicVolume by remember(project.musicVolume) { mutableFloatStateOf(project.musicVolume) }
         Row(verticalAlignment = Alignment.CenterVertically) {

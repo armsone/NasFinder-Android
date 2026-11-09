@@ -5249,7 +5249,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 TrailerMusicTrack(
                     file = item.file,
                     name = item.originalFilename,
-                    durationSeconds = duration,
+                    durationSeconds = AudioAnalysisService.playableMusicSeconds(item.file, duration),
                 )
             }.getOrNull()
         }
@@ -5364,7 +5364,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             TrailerMusicTrack(
                 file = destination,
                 name = record.originalFilename,
-                durationSeconds = duration,
+                durationSeconds = AudioAnalysisService.playableMusicSeconds(destination, duration),
             )
         }
         }
@@ -6067,6 +6067,19 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         )
     }
 
+    /**
+     * 직접 편집한 프로젝트에서 음악 길이 맞춤: 컷·순서·자막은 그대로 두고 장면 길이만 (음악 길이 × 반복 − 시작/마지막 카드)에
+     * 맞춰 다시 나눈다. 장면 길이 한계로 못 맞추면 가능한 만큼만 바뀌고, 내보낼 때 음악이 영상 끝까지 이어진다.
+     */
+    private fun TrailerSession.withManualMusicFit(): TrailerSession {
+        val project = editor ?: return this
+        val music = plannedMusic ?: return this
+        if (project.autoPlan || musicPolicy != TrailerMusicPolicy.FIT_MUSIC_LENGTH || music.durationSeconds <= 0.0 || project.scenes.isEmpty()) return this
+        val target = (music.durationSeconds * musicFitCount.coerceAtLeast(1) - cardDuration).coerceAtLeast(0.1)
+        val (fitted, actual) = redistributeManualTotal(project, sources, target)
+        return copy(total = actual, editor = project.copy(scenes = fitted))
+    }
+
     private fun TrailerSession.defaultSceneFor(source: TrailerSource, key: Long): EditorScene {
         val (start, length) = when {
             source.isImage -> 0.0 to if (isMusicOverlayMode) 1.0 else source.weightedPhotoLength(clipLength)
@@ -6318,7 +6331,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
                 next = next.copy(total = (track.durationSeconds * count - s.cardDuration).coerceAtLeast(0.1))
             }
-            if (s.editor?.autoPlan == true) next.withRegeneratedPlan() else next
+            if (s.editor?.autoPlan == true) next.withRegeneratedPlan() else next.withManualMusicFit()
+        }
+        val fitted = _state.value.trailer
+        val fittedScenes = fitted?.editor?.takeIf { !it.autoPlan }?.scenes
+        if (fitted != null && fittedScenes != null && track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
+            val gap = track.durationSeconds * count - fitted.cardDuration - fittedScenes.sumOf { it.length }
+            if (kotlin.math.abs(gap) > 0.1) {
+                _state.update { it.copy(message = "장면 길이 한계 때문에 음악 길이에 ${"%.1f".format(kotlin.math.abs(gap))}초 ${if (gap > 0) "모자랍니다" else "넘칩니다"}. 장면을 ${if (gap > 0) "추가" else "삭제"}하거나 음악 반복 횟수를 조절해 주세요.") }
+            }
         }
     }
 
@@ -6345,6 +6366,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val timingChanged = p.introCard.enabled != clamped.enabled || (clamped.enabled && p.introCard.clampedDuration() != clamped.clampedDuration())
             if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
                 updated.withRegeneratedPlan()
+            } else if (timingChanged) {
+                updated.withManualMusicFit()
             } else {
                 updated
             }
@@ -6374,6 +6397,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val timingChanged = p.outroCard.enabled != clamped.enabled || (clamped.enabled && p.outroCard.clampedDuration() != clamped.clampedDuration())
             if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
                 updated.withRegeneratedPlan()
+            } else if (timingChanged) {
+                updated.withManualMusicFit()
             } else {
                 updated
             }
@@ -6389,11 +6414,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             _state.update { it.copy(message = "배경음악이 없습니다. 먼저 음악을 선택해 주세요.") }
             return
         }
-        val hasPhotos = session.sources.any { src ->
-            src.isImage && project.scenes.any { it.sourceId == src.id }
-        }
-        if (!hasPhotos) {
-            _state.update { it.copy(message = "길이를 맞출 사진 장면이 없습니다.") }
+        if (project.scenes.isEmpty()) {
+            _state.update { it.copy(message = "비트에 맞출 장면이 없습니다.") }
             return
         }
 
@@ -6413,6 +6435,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         tempoAnalysisJob = viewModelScope.launch {
             var applied = false
             var adjustedCount = 0
+            var fitResidual = 0.0
+            var unalignedCount = 0
             try {
                 val beats = withContext(Dispatchers.Default) {
                     AudioAnalysisService.extractBeatOnsets(
@@ -6461,6 +6485,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         return@editProject null
                     }
                     adjustedCount = syncResult.adjustedCount
+                    fitResidual = syncResult.fitResidual
+                    unalignedCount = syncResult.unalignedCount
                     applied = true
                     live.copy(
                         editor = liveProj.copy(
@@ -6474,13 +6500,15 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     updateTrailer(directory) {
                         it.copy(
                             busy = false,
-                            status = if (applied) "${adjustedCount}개 사진 클립을 음악 비트에 맞췄습니다." else "비트에 맞게 조절할 사진이 없거나 이미 맞춰져 있습니다."
+                            status = if (applied) "${adjustedCount}개 클립을 음악 비트에 맞췄습니다." else "비트에 맞게 조절할 클립이 없거나 이미 맞춰져 있습니다."
                         )
                     }
                     if (applied) {
-                        _state.update { it.copy(message = "${adjustedCount}개 사진 클립을 음악 비트에 맞췄습니다.") }
+                        val unalignedNote = if (unalignedCount > 0) " ${unalignedCount}개는 원본 길이 안에서 닿는 비트가 없어 그대로 두었습니다." else ""
+                        val residualNote = if (fitResidual != 0.0) " 음악 길이와 ${"%.1f".format(kotlin.math.abs(fitResidual))}초 차이가 남았습니다." else ""
+                        _state.update { it.copy(message = "${adjustedCount}개 클립을 원본 길이 범위 안에서 음악 비트에 맞췄습니다.$unalignedNote$residualNote") }
                     } else {
-                        _state.update { it.copy(message = "비트에 맞게 조절할 사진이 없거나 이미 맞춰져 있습니다.") }
+                        _state.update { it.copy(message = "비트에 맞게 조절할 클립이 없거나 이미 맞춰져 있습니다.") }
                     }
                 }
             } catch (e: CancellationException) {

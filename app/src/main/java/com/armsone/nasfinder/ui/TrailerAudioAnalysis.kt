@@ -368,6 +368,33 @@ internal object AudioAnalysisService {
         }
     }
 
+    /** 인코더 지연·패딩을 반영한, 반복해도 끊김 없는 음악 재생 길이(초). 헤더에 지연/패딩이 없으면 null. */
+    internal fun gaplessPlayableSecondsOf(format: MediaFormat): Double? {
+        if (!format.containsKey(MediaFormat.KEY_DURATION) || !format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) return null
+        val hasDelay = format.containsKey("encoder-delay")
+        val hasPadding = format.containsKey("encoder-padding")
+        if (!hasDelay && !hasPadding) return null
+        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE).takeIf { it > 0 } ?: return null
+        val delay = if (hasDelay) format.getInteger("encoder-delay").coerceAtLeast(0) else 0
+        val padding = if (hasPadding) format.getInteger("encoder-padding").coerceAtLeast(0) else 0
+        val containerSeconds = format.getLong(MediaFormat.KEY_DURATION) / 1_000_000.0
+        val playable = containerSeconds - (delay + padding).toDouble() / sampleRate
+        if (!playable.isFinite() || playable < 0.5 || playable > containerSeconds) return null
+        return playable
+    }
+
+    /** 헤더에 인코더 지연/패딩이 있으면 반복해도 끊김 없는 실제 재생 길이를, 없으면 [fallbackSeconds]를 돌려준다. */
+    fun playableMusicSeconds(file: java.io.File, fallbackSeconds: Double): Double = runCatching {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.absolutePath)
+            val index = (0 until extractor.trackCount).firstOrNull {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+            } ?: return@runCatching fallbackSeconds
+            gaplessPlayableSecondsOf(extractor.getTrackFormat(index)) ?: fallbackSeconds
+        } finally { extractor.release() }
+    }.getOrDefault(fallbackSeconds)
+
     suspend fun extractBeatOnsets(
         context: Context,
         uri: Uri,
@@ -392,11 +419,12 @@ internal object AudioAnalysisService {
                 val durationSeconds = if (durationUs > 0) durationUs / 1_000_000.0 else boundedMaxDuration
                 if (!durationSeconds.isFinite() || durationSeconds <= 0.5) return@runCatching emptyList()
                 val analyzeDuration = min(durationSeconds, boundedMaxDuration)
-
-                val bucketInterval = 0.025
-                val totalBuckets = max(1, (analyzeDuration / bucketInterval).toInt())
-                val energyTotals = DoubleArray(totalBuckets)
-                val sampleCounts = IntArray(totalBuckets)
+                // 5ms 구간별 RMS. 디코더는 포맷의 encoder-delay/padding을 직접 잘라 내므로(Galaxy c2.sec.mp3 실측: 누적 프레임 기준 첫 킥이 정답과 일치,
+                // 출력 버퍼 pts는 샘플 정확하지 않음) 시각은 pts가 아니라 출력된 PCM 프레임 누적 수 / 샘플레이트로 계산한다.
+                val binSeconds = 0.005
+                val totalBins = max(1, (analyzeDuration / binSeconds).toInt() + 1)
+                val squareSums = DoubleArray(totalBins)
+                val sampleCounts = IntArray(totalBins)
 
                 val decoder = MediaCodec.createDecoderByType(mime)
                 val info = MediaCodec.BufferInfo()
@@ -407,6 +435,7 @@ internal object AudioAnalysisService {
 
                     var inputDone = false
                     var outputDone = false
+                    var decodedFrames = 0L
                     var outputPcmEncoding = AudioFormat.ENCODING_PCM_16BIT
                     var outputSampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
                     var outputChannelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
@@ -468,68 +497,27 @@ internal object AudioAnalysisService {
                                     buffer.position(info.offset)
                                     buffer.limit(info.offset + info.size)
                                     val pcmBuffer = buffer.slice().order(ByteOrder.LITTLE_ENDIAN)
-                                    val startTime = info.presentationTimeUs / 1_000_000.0
-
-                                    if (startTime.isFinite() && startTime >= 0.0 && startTime < analyzeDuration) {
+                                    run {
                                         val isFloat = outputPcmEncoding == AudioFormat.ENCODING_PCM_FLOAT
-                                        val bytesPerSample = if (isFloat) 4 else 2
-                                        val sampleCount = info.size / bytesPerSample
-                                        val frames = if (outputChannelCount > 0) sampleCount / outputChannelCount else sampleCount
-                                        val totalDuration = if (outputSampleRate > 0 && frames > 0) {
-                                            frames.toDouble() / outputSampleRate.toDouble()
-                                        } else {
-                                            sampleCount.toDouble() / 44100.0
-                                        }
-
-                                        val subChunkCount = min(8, max(1, kotlin.math.ceil(totalDuration / bucketInterval).toInt()))
-                                        val step = max(1, sampleCount / subChunkCount)
-                                        var offset = 0
-
-                                        if (isFloat) {
-                                            val floatBuf = pcmBuffer.asFloatBuffer()
-                                            val floatArr = FloatArray(sampleCount)
-                                            floatBuf.get(floatArr)
-                                            while (offset < sampleCount) {
-                                                val chunkEnd = min(sampleCount, offset + step)
-                                                val chunkSize = chunkEnd - offset
-                                                var sum = 0.0
-                                                for (i in offset until chunkEnd) {
-                                                    val v = floatArr[i].toDouble().coerceIn(-1.0, 1.0)
-                                                    sum += v * v
-                                                }
-                                                val rms = sqrt(sum / max(1, chunkSize).toDouble())
-                                                val fraction = (offset.toDouble() + chunkSize.toDouble() / 2.0) / max(1, sampleCount).toDouble()
-                                                val chunkTime = startTime + fraction * totalDuration
-                                                if (chunkTime >= 0.0 && chunkTime < analyzeDuration) {
-                                                    val bucket = min(totalBuckets - 1, max(0, (chunkTime / bucketInterval).toInt()))
-                                                    energyTotals[bucket] += rms
-                                                    sampleCounts[bucket] += 1
-                                                }
-                                                offset = chunkEnd
+                                        val channels = max(1, outputChannelCount)
+                                        val frames = info.size / (if (isFloat) 4 else 2) / channels
+                                        val rate = if (outputSampleRate > 0) outputSampleRate.toDouble() else 44100.0
+                                        val floatBuf = if (isFloat) pcmBuffer.asFloatBuffer() else null
+                                        val shortBuf = if (isFloat) null else pcmBuffer.asShortBuffer()
+                                        for (frame in 0 until frames) {
+                                            val bin = ((decodedFrames + frame) / rate / binSeconds).toInt()
+                                            if (bin >= totalBins) break
+                                            var sum = 0.0
+                                            for (channel in 0 until channels) {
+                                                val index = frame * channels + channel
+                                                val v = if (floatBuf != null) floatBuf.get(index).toDouble().coerceIn(-1.0, 1.0)
+                                                else shortBuf!!.get(index).toDouble() / Short.MAX_VALUE.toDouble()
+                                                sum += v * v
                                             }
-                                        } else {
-                                            val shortBuf = pcmBuffer.asShortBuffer()
-                                            val shortArr = ShortArray(sampleCount)
-                                            shortBuf.get(shortArr)
-                                            while (offset < sampleCount) {
-                                                val chunkEnd = min(sampleCount, offset + step)
-                                                val chunkSize = chunkEnd - offset
-                                                var sum = 0.0
-                                                for (i in offset until chunkEnd) {
-                                                    val v = shortArr[i].toDouble() / Short.MAX_VALUE.toDouble()
-                                                    sum += v * v
-                                                }
-                                                val rms = sqrt(sum / max(1, chunkSize).toDouble())
-                                                val fraction = (offset.toDouble() + chunkSize.toDouble() / 2.0) / max(1, sampleCount).toDouble()
-                                                val chunkTime = startTime + fraction * totalDuration
-                                                if (chunkTime >= 0.0 && chunkTime < analyzeDuration) {
-                                                    val bucket = min(totalBuckets - 1, max(0, (chunkTime / bucketInterval).toInt()))
-                                                    energyTotals[bucket] += rms
-                                                    sampleCounts[bucket] += 1
-                                                }
-                                                offset = chunkEnd
-                                            }
+                                            squareSums[bin] += sum
+                                            sampleCounts[bin] += channels
                                         }
+                                        decodedFrames += frames
                                     }
                                 }
                                 outputDone = outputDone ||
@@ -543,47 +531,10 @@ internal object AudioAnalysisService {
                     decoder.release()
                 }
 
-                val energyCurve = DoubleArray(totalBuckets) { i ->
-                    if (sampleCounts[i] > 0) energyTotals[i] / sampleCounts[i].toDouble() else 0.0
+                val energyCurve = DoubleArray(totalBins) { i ->
+                    if (sampleCounts[i] > 0) sqrt(squareSums[i] / sampleCounts[i].toDouble()) else 0.0
                 }
-                val maxEnergy = energyCurve.maxOrNull() ?: 0.0
-                if (maxEnergy <= 0.005) return@runCatching emptyList()
-
-                // Positive Energy Flux (에너지 온셋)
-                val flux = DoubleArray(totalBuckets)
-                for (i in 1 until totalBuckets) {
-                    val diff = energyCurve[i] - energyCurve[i - 1]
-                    flux[i] = max(0.0, diff)
-                }
-
-                // 로컬 이동 평균 적응형 임계값 계산 (윈도우 ±10 버킷 = ±0.25초)
-                val windowRadius = 10
-                val beats = mutableListOf<Double>()
-                var lastBeatTime = -1.0
-                val minInterval = 0.22 // 최소 비트 간격 (최대 270 BPM)
-
-                for (i in 1 until totalBuckets - 1) {
-                    val currentFlux = flux[i]
-                    if (currentFlux <= 0.001) continue
-                    if (currentFlux < flux[i - 1] || currentFlux < flux[i + 1]) continue
-
-                    val wStart = max(0, i - windowRadius)
-                    val wEnd = min(totalBuckets - 1, i + windowRadius)
-                    var localSum = 0.0
-                    for (k in wStart..wEnd) { localSum += flux[k] }
-                    val localAvg = localSum / max(1, wEnd - wStart + 1).toDouble()
-                    val threshold = localAvg * 1.35 + 0.004
-
-                    if (currentFlux > threshold) {
-                        val beatTime = (i.toDouble() + 0.5) * bucketInterval
-                        if (beatTime - lastBeatTime >= minInterval) {
-                            beats.add(beatTime)
-                            lastBeatTime = beatTime
-                        }
-                    }
-                }
-
-                beats
+                pickPercussiveBeats(energyCurve, binSeconds)
             } finally {
                 extractor.release()
             }
@@ -598,6 +549,53 @@ internal object AudioAnalysisService {
         file: java.io.File,
         maxDuration: Double = 3600.0,
     ): List<Double> = extractBeatOnsets(context, Uri.fromFile(file), maxDuration)
+
+    /**
+     * 5ms RMS 곡선에서 타악기처럼 갑자기 커지는 지점을 비트로 고른다. 온셋 세기는 직전 40ms 평균 대비 이후 20ms 평균의 증가량이고,
+     * 근처 1초 평균의 1.5배 이상(지역 임계값)이면서 전체 상위 1% 세기의 20% 이상(전역 하한)인 극대점만 세기 순으로 0.15초 간격을 두고 남긴다.
+     */
+    private fun pickPercussiveBeats(energy: DoubleArray, binSeconds: Double): List<Double> {
+        if ((energy.maxOrNull() ?: 0.0) <= 0.005) return emptyList()
+        val size = energy.size
+        val prefix = DoubleArray(size + 1)
+        for (i in 0 until size) prefix[i + 1] = prefix[i] + energy[i]
+        fun mean(from: Int, to: Int): Double {
+            val a = max(0, from)
+            val b = min(size, to)
+            return if (b > a) (prefix[b] - prefix[a]) / (b - a).toDouble() else 0.0
+        }
+        val strength = DoubleArray(size)
+        for (i in 1 until size) strength[i] = max(0.0, mean(i, i + 4) - mean(i - 8, i))
+        val sorted = strength.sortedArray()
+        val floor = sorted[min(size - 1, (size * 0.99).toInt())] * 0.20
+        if (floor <= 0.0) return emptyList()
+
+        val strengthPrefix = DoubleArray(size + 1)
+        for (i in 0 until size) strengthPrefix[i + 1] = strengthPrefix[i] + strength[i]
+        val localRadius = (0.5 / binSeconds).toInt()
+        val peakRadius = 4
+        val candidates = ArrayList<Int>()
+        for (i in 1 until size - 1) {
+            val value = strength[i]
+            if (value < floor) continue
+            var isPeak = true
+            for (k in max(0, i - peakRadius)..min(size - 1, i + peakRadius)) {
+                if (strength[k] > value) { isPeak = false; break }
+            }
+            if (!isPeak) continue
+            val from = max(0, i - localRadius)
+            val to = min(size, i + localRadius + 1)
+            val localAverage = (strengthPrefix[to] - strengthPrefix[from]) / (to - from).toDouble()
+            if (value > localAverage * 1.5) candidates.add(i)
+        }
+        val minGap = (0.15 / binSeconds).toInt()
+        val taken = ArrayList<Int>()
+        for (i in candidates.sortedByDescending { strength[it] }) {
+            if (taken.none { abs(it - i) < minGap }) taken.add(i)
+        }
+        // 온셋이 시작된 구간의 시작 시각이 비트 시각이다(+0.5 구간이면 전환이 비트보다 늦는다).
+        return taken.sorted().map { it * binSeconds }
+    }
 
     private fun analyzePcm(
         context: Context,

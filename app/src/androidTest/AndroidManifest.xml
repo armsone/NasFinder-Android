@@ -5,4 +5,8 @@
         android:name="com.armsone.nasfinder.smoke.PhoneSmokeInstrumentation"
         android:label="NasFinder phone smoke"
         android:targetPackage="com.armsone.nasfinder" />
+    <instrumentation
+        android:name="com.armsone.nasfinder.smoke.BeatAuditInstrumentation"
+        android:label="NasFinder beat audit"
+        android:targetPackage="com.armsone.nasfinder" />
 </manifest>

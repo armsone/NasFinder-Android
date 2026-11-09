@@ -655,11 +655,17 @@ data class BeatSyncResult(
     val adjustedCount: Int,
     val averageShift: Double,
     val unalignedCount: Int,
+    // 음악 길이 맞춤에서 비트 조절 뒤에도 흡수하지 못한 길이(초). 0이면 음악 길이에 정확히 맞는다.
+    val fitResidual: Double = 0.0,
 )
 
 /**
- * 음악 비트 온셋에 맞춰 사진 장면들의 길이를 미세 조절한다.
- * 영상 컷, 시작 위치, 자막, 프레이밍, 순서는 100% 보존된다.
+ * 음악 비트 온셋에 맞춰 장면 길이(전환 시점)를 조절한다. 제한은 resolveSceneDurationBounds가 주는 실제 원본 범위
+ * (영상은 시작 위치부터 남은 원본 길이, 사진은 사진 최소/최대 길이)뿐이며, 원래 컷 시각에 가장 가까운 비트를 우선하되
+ * 무음 구간처럼 가까운 비트가 없으면 범위 안에서 더 먼 비트를 쓴다. 다음 장면이 어떤 비트에도 닿지 못하게 되는 후보는 피한다.
+ * 영상은 시작 위치를 그대로 두고, 자막, 프레이밍, 순서는 보존된다.
+ * 음악 길이 맞춤이면 남은 장면들의 최소/최대 길이 합으로 끝점을 미리 제한해 마지막 장면이 남은 시간을 받아 음악 끝에 정확히 닿게 하며,
+ * 이미 맞춘 중간 컷은 다시 옮기지 않는다. 범위상 불가능한 장면은 그대로 두고 unalignedCount/fitResidual로 알린다.
  */
 fun syncPhotoScenesToBeatOnsets(
     scenes: List<EditorScene>,
@@ -673,95 +679,124 @@ fun syncPhotoScenesToBeatOnsets(
     if (scenes.isEmpty() || beatOnsets.isEmpty() || !musicDuration.isFinite() || musicDuration <= 0.0) {
         return scenes to BeatSyncResult(0, 0.0, 0)
     }
+    val single = musicPolicy == TrailerMusicPolicy.SINGLE
+    // 음악 반복과 음악 길이 맞춤은 같은 반복 타임라인을 쓴다. 반복에서는 길이 끝 비트가 다음 반복 첫 비트와 겹치므로 뺀다.
+    val beats = beatOnsets.filter { it.isFinite() && it >= 0.0 && (if (single) it <= musicDuration else it < musicDuration) }.distinct().sorted()
+    if (beats.isEmpty()) return scenes to BeatSyncResult(0, 0.0, 0)
 
+    val eps = 1e-6
     val byId = sources.associateBy { it.id }
-    var timelineCursor = max(0.0, introOffset)
+    val n = scenes.size
+    val bounds = scenes.map { resolveSceneDurationBounds(it, byId[it.sourceId]) }
+    val minLen = DoubleArray(n) { bounds[it].minLen }
+    val maxLen = DoubleArray(n) { bounds[it].maxLen }
+    val origLen = DoubleArray(n) { bounds[it].currentLen }
+    // i번째 이후 장면들이 낼 수 있는 최소/최대 길이 합. softMin은 "여유 있게" 남겨 둘 시간(원래 길이의 절반 이상)이다.
+    val tailMin = DoubleArray(n + 1)
+    val tailMax = DoubleArray(n + 1)
+    val tailSoft = DoubleArray(n + 1)
+    for (i in n - 1 downTo 0) {
+        tailMin[i] = tailMin[i + 1] + minLen[i]
+        tailMax[i] = tailMax[i + 1] + maxLen[i]
+        tailSoft[i] = tailSoft[i + 1] + if (bounds[i].isFixed) minLen[i] else min(maxLen[i], max(minLen[i], origLen[i] * 0.5))
+    }
+    val start = max(0.0, introOffset)
+    // 음악 끝을 맞춰야 하고 길이 범위상 가능할 때만 예산 제약을 쓴다. 불가능하면 비트만 맞추고 차이는 fitResidual로 알린다.
+    val budget = maxBudget?.takeIf {
+        musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && it.isFinite() &&
+            start + tailMin[0] <= it + eps && start + tailMax[0] >= it - eps
+    }
+    val lastAdjustable = bounds.indexOfLast { !it.isFixed }
+
+    fun beatsIn(lo: Double, hi: Double): List<Double> {
+        if (hi < lo) return emptyList()
+        if (single) return beats.filter { it >= lo && it <= hi }
+        val out = mutableListOf<Double>()
+        for (loop in floor(max(0.0, lo) / musicDuration).toLong()..floor(hi / musicDuration).toLong()) {
+            val base = loop * musicDuration
+            for (b in beats) if (base + b >= lo && base + b <= hi) out.add(base + b)
+        }
+        return out
+    }
+
+    fun firstBeatFrom(x: Double): Double? {
+        if (single) return beats.firstOrNull { it >= x }
+        val base = floor(max(0.0, x) / musicDuration) * musicDuration
+        return beats.firstOrNull { base + it >= x }?.let { base + it } ?: (base + musicDuration + beats.first())
+    }
+
+    // 시작 s에서 i번째 장면의 끝점이 가질 수 있는 실제 범위(원본 길이 범위 + 남은 장면이 음악 끝을 채울 수 있는 범위)
+    fun endWindow(i: Int, s: Double): Pair<Double, Double> {
+        var lo = s + minLen[i]
+        var hi = s + maxLen[i]
+        if (budget != null) {
+            lo = max(lo, budget - tailMax[i + 1])
+            hi = min(hi, budget - tailMin[i + 1])
+        } else if (maxBudget != null) {
+            hi = min(hi, maxBudget)
+        }
+        return lo to hi
+    }
+
+    // i번째 장면이 e에서 끝날 때 다음 조절 대상 장면이 범위 안에서 닿을 비트가 하나라도 있는지(음악 끝을 채우는 마지막 장면은 예외)
+    fun nextCanReachBeat(i: Int, e: Double): Boolean {
+        var s = e
+        var j = i + 1
+        while (j < n && bounds[j].isFixed) { s += minLen[j]; j++ }
+        if (j >= n || (budget != null && j == lastAdjustable)) return true
+        val (lo, hi) = endWindow(j, s)
+        val first = firstBeatFrom(lo - eps) ?: return false
+        return first <= hi + eps
+    }
+
+    val resultScenes = scenes.toMutableList()
+    var cursor = start
+    var origCursor = start
     var adjustedCount = 0
     var unalignedCount = 0
     var totalShift = 0.0
-    val resultScenes = scenes.toMutableList()
 
-    for (index in resultScenes.indices) {
-        val scene = resultScenes[index]
-        val source = byId[scene.sourceId]
-        if (source == null || !source.isImage) {
-            // 영상 컷/길이는 원본 의도 및 소리 싱크를 위해 100% 보존
-            timelineCursor += max(0.001, scene.length)
+    for (i in 0 until n) {
+        val scene = resultScenes[i]
+        val origEnd = origCursor + origLen[i]
+        origCursor = origEnd
+        if (bounds[i].isFixed) {
+            cursor += minLen[i]
             continue
         }
 
-        val bounds = resolveSceneDurationBounds(scene, source)
-        val currentLen = scene.length
-        val targetTransitionTime = timelineCursor + currentLen
-
-        // 타임라인 상의 비트 후보군 생성 (음악 반복 여부 반영)
-        val candidateBeats = mutableListOf<Double>()
-        when (musicPolicy) {
-            TrailerMusicPolicy.LOOP_MUSIC -> {
-                val currentLoop = (max(0.0, targetTransitionTime) / musicDuration).toInt()
-                for (loop in max(0, currentLoop - 1)..(currentLoop + 2)) {
-                    val loopBase = loop.toDouble() * musicDuration
-                    for (b in beatOnsets) {
-                        candidateBeats.add(loopBase + b)
-                    }
-                }
-            }
-            TrailerMusicPolicy.SINGLE -> {
-                if (timelineCursor < musicDuration) {
-                    for (b in beatOnsets) {
-                        if (b >= timelineCursor && b <= musicDuration) {
-                            candidateBeats.add(b)
-                        }
-                    }
-                }
-            }
-            TrailerMusicPolicy.FIT_MUSIC_LENGTH -> {
-                val currentLoop = (max(0.0, targetTransitionTime) / musicDuration).toInt()
-                for (loop in max(0, currentLoop - 1)..(currentLoop + 2)) {
-                    val loopBase = loop.toDouble() * musicDuration
-                    for (b in beatOnsets) {
-                        candidateBeats.add(loopBase + b)
-                    }
-                }
-            }
-        }
-
-        // fitMusic의 마지막 예산끝 이후 후보는 적용되지 않도록 제한
-        val filteredBeats = if (maxBudget != null) candidateBeats.filter { it <= maxBudget } else candidateBeats
-
-        // 사진이 가질 수 있는 최소/최대 길이 범위 안의 비트들 중 targetTransitionTime과 가장 가까운 비트 탐색
-        val minAllowed = max(bounds.minLen, 0.8)
-        val maxAllowed = min(bounds.maxLen, 15.0)
-
-        var bestBeat: Double? = null
-        var smallestDiff = Double.MAX_VALUE
-
-        for (beatTime in filteredBeats) {
-            val candidateLen = beatTime - timelineCursor
-            if (candidateLen < minAllowed || candidateLen > maxAllowed) continue
-            val diff = abs(beatTime - targetTransitionTime)
-            if (diff < smallestDiff) {
-                smallestDiff = diff
-                bestBeat = beatTime
-            }
-        }
-
-        // 1.8초 이내의 가장 가까운 비트가 유효하면 사진 길이를 비트 전환 시점에 맞춤
-        if (bestBeat != null && smallestDiff <= 1.8) {
-            val newLen = bestBeat - timelineCursor
-            val shift = abs(newLen - currentLen)
-            if (shift > 0.02) {
-                resultScenes[index] = scene.copy(length = newLen)
-                adjustedCount++
-                totalShift += shift
-            }
-            timelineCursor += resultScenes[index].length
-        } else {
+        val (lo, hi) = endWindow(i, cursor)
+        val currentEnd = cursor + origLen[i]
+        var pick: Double? = null
+        val end: Double
+        if (lo > hi + eps) {
             unalignedCount++
-            timelineCursor += currentLen
+            end = currentEnd
+        } else if (budget != null && i == lastAdjustable) {
+            // 마지막 장면은 비트가 아니라 음악 끝에 맞추는 장면: 남은 시간을 그대로 받는다.
+            end = currentEnd.coerceIn(lo, hi)
+        } else {
+            // 원래 컷 시각에 가까운 비트부터. 남은 장면이 너무 짧아지지 않고(소프트) 다음 장면이 닿을 수 있는 후보를 먼저 쓴다.
+            val ordered = beatsIn(lo - eps, hi + eps).sortedBy { abs(it - origEnd) }
+            pick = ordered.firstOrNull { (budget == null || it <= budget - tailSoft[i + 1] + eps) && nextCanReachBeat(i, it) }
+                ?: ordered.firstOrNull { nextCanReachBeat(i, it) }
+                ?: ordered.firstOrNull()
+            if (pick == null) unalignedCount++
+            end = pick ?: currentEnd.coerceIn(lo, hi)
         }
+
+        var newLen = (end - cursor).coerceIn(minLen[i], maxLen[i])
+        // 이미 비트에서 20ms 이내이고 예산 범위 안이면 길이를 건드리지 않는다.
+        if (pick != null && abs(newLen - origLen[i]) <= 0.02 && currentEnd >= lo - eps && currentEnd <= hi + eps) newLen = origLen[i]
+        if (abs(newLen - scene.length) > 1e-9) resultScenes[i] = scene.copy(length = newLen)
+        if (pick != null && abs(newLen - origLen[i]) > 0.02) {
+            adjustedCount++
+            totalShift += abs(newLen - origLen[i])
+        }
+        cursor += newLen
     }
 
+    val fitResidual = if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && maxBudget != null) maxBudget - cursor else 0.0
     val avgShift = if (adjustedCount > 0) totalShift / adjustedCount.toDouble() else 0.0
-    return resultScenes to BeatSyncResult(adjustedCount, avgShift, unalignedCount)
+    return resultScenes to BeatSyncResult(adjustedCount, avgShift, unalignedCount, if (abs(fitResidual) <= 0.01) 0.0 else fitResidual)
 }

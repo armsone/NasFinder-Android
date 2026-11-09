@@ -793,7 +793,7 @@ object TrailerDraftStore {
         val directory = File(dirPath)
         val outPath = obj.optString("output")
         val musicTrack = obj.optString("musicFile").takeIf { it.isNotBlank() }?.let(::File)
-            ?.let { TrailerMusicTrack(it, obj.optString("musicName", it.name), obj.optDouble("musicDuration", 0.0)) }
+            ?.let { TrailerMusicTrack(it, obj.optString("musicName", it.name), AudioAnalysisService.playableMusicSeconds(it, obj.optDouble("musicDuration", 0.0))) }
 
         val sourcesArr = obj.optJSONArray("sources") ?: return null
         val sources = mutableListOf<TrailerSource>()
