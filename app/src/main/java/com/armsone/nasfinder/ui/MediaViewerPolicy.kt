@@ -32,6 +32,43 @@ enum class MediaPlaybackMode(val title: String) {
     }
 }
 
+enum class VideoEOSAction {
+    REPEAT,
+    ADVANCE,
+    STOP,
+}
+
+object MediaPlaybackPolicy {
+    fun exoPlayerRepeatMode(
+        hasPlaylist: Boolean,
+        mode: MediaPlaybackMode,
+        singleItemRepeat: Boolean,
+    ): Int {
+        return if (hasPlaylist) {
+            if (mode == MediaPlaybackMode.ONE_REPEAT) 1 else 0
+        } else {
+            if (singleItemRepeat) 1 else 0
+        }
+    }
+
+    fun videoEOSAction(
+        hasPlaylist: Boolean,
+        mode: MediaPlaybackMode,
+        singleItemRepeat: Boolean,
+    ): VideoEOSAction {
+        return if (hasPlaylist) {
+            when (mode) {
+                MediaPlaybackMode.ONE_REPEAT -> VideoEOSAction.REPEAT
+                MediaPlaybackMode.ALL_REPEAT,
+                MediaPlaybackMode.SHUFFLE -> VideoEOSAction.ADVANCE
+                MediaPlaybackMode.ONCE -> VideoEOSAction.STOP
+            }
+        } else {
+            if (singleItemRepeat) VideoEOSAction.REPEAT else VideoEOSAction.STOP
+        }
+    }
+}
+
 internal object BuiltInPreviewPolicy {
     private val externalOnlyVideoExtensions = setOf("avi", "asf", "wmv")
     private val imageExtensions = setOf(

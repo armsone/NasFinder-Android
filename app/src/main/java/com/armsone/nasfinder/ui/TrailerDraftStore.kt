@@ -22,7 +22,7 @@ data class TrailerDraft(
     val autoDucking: Boolean = true,
     val output: File?,
     val showingSettings: Boolean = false,
-    val orderMode: String? = "추가순",
+    val orderMode: String? = "촬영순",
     val timestamp: Long = System.currentTimeMillis(),
     val customTitle: String? = null,
     // Explicit scene state; null for drafts saved before scenes were persisted (then derived from the plan).
@@ -613,6 +613,12 @@ object TrailerDraftStore {
         put("focusY", scene.focusY.toDouble())
         put("sourceVolume", scene.sourceVolume.toDouble())
         scene.caption?.normalizedOrNull()?.let { put("caption", it.toJson()) }
+        // Marks scenes saved after protection existed, so a manual trim (no anchors) is never re-protected on reload.
+        put("actionAnchored", true)
+        if (scene.actionStart != null && scene.actionEnd != null) {
+            put("actionStart", scene.actionStart)
+            put("actionEnd", scene.actionEnd)
+        }
     }
 
     private fun draftJson(draft: TrailerDraft) = JSONObject().apply {
@@ -645,6 +651,12 @@ object TrailerDraftStore {
                 put("musicVolume", editor.musicVolume.toDouble())
                 put("nextKey", editor.nextKey)
                 put("scenes", JSONArray().apply { editor.scenes.forEach { put(sceneJson(it)) } })
+                editor.budgetTarget?.let { put("budgetTarget", it) }
+                if (editor.clipChoiceExplicit) put("clipChoiceExplicit", true)
+                if (editor.budgetReserve.isNotEmpty()) {
+                    put("budgetReserve", JSONArray().apply { editor.budgetReserve.forEach { put(sceneJson(it)) } })
+                    put("budgetOrder", JSONArray().apply { editor.budgetOrder.forEach { put(it) } })
+                }
                 if (editor.introCard.enabled || editor.introCard.title.isNotEmpty() || editor.introCard.subtitle.isNotEmpty() || editor.introCard.duration != 3.0 || !editor.introCard.usesFirstOrLastImage || editor.introCard.backgroundSourceId != null || editor.introCard.backgroundTimestamp != null || editor.introCard.titleStyle != null || editor.introCard.subtitleStyle != null) {
                     put("introCard", editor.introCard.toJson())
                 }
@@ -668,6 +680,7 @@ object TrailerDraftStore {
                 put("photoPolicyVersion", src.photoPolicyVersion)
                 src.originKey?.let { put("originKey", it) }
                 if (src.isImportant) put("isImportant", true)
+                storedAnalysisJson(src.analysis)?.let { put("analysis", it) }
             })
         }
         put("sources", sourcesArr)
@@ -724,6 +737,11 @@ object TrailerDraftStore {
 
     private fun loadDraftsFromDisk() {
         val storage = draftsStorageDir ?: return
+        // A repeated configure (a new activity/view model in the same process) reloads the saved list instead of treating every
+        // record as a duplicate of the copy already in memory (which would then be written back twice on the next save).
+        drafts.clear()
+        preservedRawRecords.clear()
+        loadedFingerprints.clear()
         val file = File(storage, DRAFTS_META_FILE)
         val backup = File(storage, "$DRAFTS_META_FILE.bak")
         val mainPresent = file.isFile && file.length() > 0L
@@ -808,7 +826,7 @@ object TrailerDraftStore {
                     duration = sObj.optDouble("duration", 0.0),
                     width = sObj.optInt("width", 0),
                     height = sObj.optInt("height", 0),
-                    analysis = AudioAnalysisResult(emptyList(), 0.0),
+                    analysis = storedAnalysis(sObj),
                     thumbnail = null,
                     isImage = sObj.optBoolean("isImage", false),
                     captureTimeMillis = sObj.optLong("captureTimeMillis", 0L),
@@ -822,9 +840,8 @@ object TrailerDraftStore {
         if (sources.isEmpty()) return null
 
         val editor = obj.optJSONObject("editor")?.let { editorObj ->
-            val scenesArr = editorObj.optJSONArray("scenes") ?: JSONArray()
             val sourceIds = sources.map { it.id }.toSet()
-            val scenes = (0 until scenesArr.length()).mapNotNull { sceneIndex ->
+            fun scenesFrom(scenesArr: JSONArray) = (0 until scenesArr.length()).mapNotNull { sceneIndex ->
                 val sc = scenesArr.optJSONObject(sceneIndex) ?: return@mapNotNull null
                 val sourceId = sc.optInt("sourceId", -1)
                 if (sourceId !in sourceIds) return@mapNotNull null
@@ -838,8 +855,20 @@ object TrailerDraftStore {
                     focusY = sc.optDouble("focusY", 0.0).toFloat(),
                     sourceVolume = sc.optDouble("sourceVolume", 1.0).toFloat(),
                     caption = sceneCaptionFromJson(sc.optJSONObject("caption")),
-                )
+                    actionStart = storedActionInterval(sc)?.first,
+                    actionEnd = storedActionInterval(sc)?.second,
+                ).let { scene ->
+                    // 레거시 초안(보호 구간 필드 없음)의 영상 장면은 저장된 창 전체를 보호 구간으로 이관한다(수동 트림 포함, 보수적).
+                    if (!sc.has("actionAnchored") && scene.actionStart == null && scene.actionEnd == null && sources.firstOrNull { it.id == sourceId }?.isImage == false &&
+                        scene.start.isFinite() && scene.length.isFinite() && scene.length > 0.0
+                    ) scene.copy(actionStart = scene.start, actionEnd = scene.start + scene.length) else scene
+                }
             }
+            val scenes = scenesFrom(editorObj.optJSONArray("scenes") ?: JSONArray())
+            // Scenes a budget fit left out (2.39.82+); older drafts have none. Keys must stay unique next to the scenes.
+            val sceneKeys = scenes.map { it.key }.toSet()
+            val budgetReserve = scenesFrom(editorObj.optJSONArray("budgetReserve") ?: JSONArray()).filter { it.key !in sceneKeys }.distinctBy { it.key }
+            val budgetOrder = editorObj.optJSONArray("budgetOrder")?.let { arr -> (0 until arr.length()).map { arr.optLong(it, -1L) } }.orEmpty()
             val introCard = editorObj.optJSONObject("introCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
             val outroCard = editorObj.optJSONObject("outroCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
             if (scenes.isEmpty()) null
@@ -847,9 +876,13 @@ object TrailerDraftStore {
                 scenes = scenes,
                 autoPlan = editorObj.optBoolean("autoPlan", true),
                 musicVolume = editorObj.optDouble("musicVolume", 1.0).toFloat(),
-                nextKey = maxOf(editorObj.optLong("nextKey", 1L), (scenes.maxOf { it.key }) + 1L),
+                nextKey = maxOf(editorObj.optLong("nextKey", 1L), ((scenes + budgetReserve).maxOf { it.key }) + 1L),
                 introCard = introCard,
                 outroCard = outroCard,
+                budgetReserve = budgetReserve,
+                budgetOrder = if (budgetReserve.isEmpty()) emptyList() else budgetOrder,
+                budgetTarget = editorObj.optDouble("budgetTarget", Double.NaN).takeIf { it.isFinite() && it > 0.0 },
+                clipChoiceExplicit = editorObj.optBoolean("clipChoiceExplicit", false),
             )
         }
 
@@ -868,7 +901,7 @@ object TrailerDraftStore {
             autoDucking = obj.optBoolean("autoDucking", true),
             output = outPath.takeIf { it.isNotBlank() }?.let(::File),
             showingSettings = obj.optBoolean("showingSettings", false),
-            orderMode = obj.optString("orderMode", "추가순"),
+            orderMode = obj.optString("orderMode", "촬영순"),
             timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
             customTitle = obj.optString("customTitle").takeIf { it.isNotBlank() },
             editor = editor,
@@ -877,4 +910,66 @@ object TrailerDraftStore {
             isPrivate = obj.optBoolean("isPrivate", false),
         )
     }
+}
+
+/** 저장된 동작 구간은 둘 다 있고 유한하며 순서가 맞을 때만 읽는다. 아니면 보호 없음(구버전과 같음). */
+private fun storedActionInterval(scene: JSONObject): Pair<Double, Double>? {
+    if (!scene.has("actionStart") || !scene.has("actionEnd")) return null
+    val start = scene.optDouble("actionStart", Double.NaN)
+    val end = scene.optDouble("actionEnd", Double.NaN)
+    return if (start.isFinite() && end.isFinite() && start >= 0.0 && end > start) start to end else null
+}
+
+// 소스 분석(파형·피크·검증 피크·고립 타격)을 함께 저장해, 다시 열자마자 재추천/초기화해도 조용한 타격 증거가 살아 있게 한다.
+// 파형은 줄바꿈 들여쓰기로 파일이 부풀지 않게 쉼표 문자열로 쓴다. 유한하지 않은 값이 있으면 저장하지 않는다(레거시와 같이 재분석).
+private const val MAX_STORED_WAVEFORM = 4096
+
+private fun storedAnalysisJson(analysis: AudioAnalysisResult): JSONObject? {
+    val lists = listOf(analysis.peakTimesSeconds, analysis.verifiedPeakTimesSeconds, analysis.transientTimesSeconds)
+    if (analysis.waveform.isEmpty() || analysis.waveform.size > MAX_STORED_WAVEFORM) return null
+    if (!analysis.peakTimeSeconds.isFinite() || analysis.waveform.any { !it.isFinite() } || lists.any { l -> l.any { !it.isFinite() } }) return null
+    fun rounded(value: Double) = Math.round(value * 1e4) / 1e4
+    fun times(values: List<Double>) = JSONArray().apply { values.forEach { put(rounded(it)) } }
+    return JSONObject().apply {
+        put("waveform", analysis.waveform.joinToString(",") { rounded(it).toString() })
+        put("peakTime", rounded(analysis.peakTimeSeconds))
+        put("peakTimes", times(analysis.peakTimesSeconds))
+        put("verifiedPeakTimes", times(analysis.verifiedPeakTimesSeconds))
+        put("transientTimes", times(analysis.transientTimesSeconds))
+        put("audioAvailability", analysis.audioAvailability.name)
+        put("highlightSource", analysis.highlightSource.name)
+    }
+}
+
+/** 저장된 분석은 전부 유효할 때만 쓴다. 없거나(레거시) 깨졌으면 빈 분석 = 열린 뒤 다시 분석(needsAnalysis). */
+private fun storedAnalysis(source: JSONObject): AudioAnalysisResult {
+    val none = AudioAnalysisResult(emptyList(), 0.0)
+    val stored = source.optJSONObject("analysis") ?: return none
+    val duration = source.optDouble("duration", 0.0)
+    if (!duration.isFinite() || duration <= 0.0) return none
+    val waveform = stored.optString("waveform").takeIf { it.isNotEmpty() }?.split(',')?.map { it.toDoubleOrNull() ?: return none }
+        ?: return none
+    if (waveform.size > MAX_STORED_WAVEFORM || waveform.any { !it.isFinite() || it < 0.0 }) return none
+    fun times(key: String): List<Double>? {
+        val array = stored.optJSONArray(key) ?: return emptyList()
+        if (array.length() > MAX_STORED_WAVEFORM) return null
+        return (0 until array.length()).map { i ->
+            array.optDouble(i, Double.NaN).takeIf { it.isFinite() && it >= 0.0 && it <= duration + 1e-6 } ?: return null
+        }
+    }
+    val peakTime = stored.optDouble("peakTime", Double.NaN).takeIf { it.isFinite() && it >= 0.0 && it <= duration + 1e-6 } ?: return none
+    val peakTimes = times("peakTimes") ?: return none
+    val verified = times("verifiedPeakTimes") ?: return none
+    val transients = times("transientTimes") ?: return none
+    val availability = runCatching { ClipAudioAvailability.valueOf(stored.optString("audioAvailability")) }.getOrNull() ?: return none
+    val highlight = runCatching { ClipHighlightSource.valueOf(stored.optString("highlightSource")) }.getOrNull() ?: return none
+    return AudioAnalysisResult(
+        waveform = waveform,
+        peakTimeSeconds = peakTime,
+        peakTimesSeconds = peakTimes.ifEmpty { listOf(peakTime) },
+        audioAvailability = availability,
+        highlightSource = highlight,
+        verifiedPeakTimesSeconds = verified,
+        transientTimesSeconds = transients,
+    )
 }

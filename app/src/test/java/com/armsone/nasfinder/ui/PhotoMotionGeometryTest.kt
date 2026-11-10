@@ -5,6 +5,7 @@ import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -402,5 +403,246 @@ class PhotoMotionGeometryTest {
         // Week-based year must not leak in around New Year (2026-12-31 belongs to ISO week-year 2027 in some calendars).
         val newYearsEve = java.time.ZonedDateTime.of(2026, 12, 31, 23, 59, 59, 0, seoul).toInstant().toEpochMilli()
         assertEquals("261231-235959-뮤비", trailerTimestampName(music = true, epochMillis = newYearsEve, zone = seoul))
+    }
+
+    @Test
+    fun protectedActionWindowsSurviveMusicBudgetShrink() {
+        val video = TrailerSource(1, "a.mp4", java.io.File("a.mp4"), 20.0, 1920, 1080, AudioAnalysisResult(emptyList(), 0.0), null)
+        val last = video.copy(id = 2, name = "b.mp4")
+        val project = EditorProject(
+            listOf(
+                EditorScene(1, 1, 4.0, 6.0, actionStart = 4.0, actionEnd = 10.0),
+                EditorScene(2, 2, 2.0, 6.0, actionStart = 2.0, actionEnd = 8.0),
+            ),
+        )
+        // 음악 예산 5초보다 보호 구간(12초)이 길어도 마지막 샷까지 잘리지 않고 최소(보호) 길이로 남는다.
+        val (scenes, total) = redistributeManualTotal(project, listOf(video, last), 5.0)
+        assertEquals(listOf(1, 2), scenes.map { it.sourceId })
+        assertTrue(scenes.all { it.length >= 6.0 - 1e-6 })
+        assertEquals(12.0, total, 1e-6)
+        // 앵커 없는 수동 트림은 기존대로 줄어든다.
+        val manual = redistributeManualTotal(EditorProject(project.scenes.map { it.copy(actionStart = null, actionEnd = null) }), listOf(video, last), 5.0)
+        assertTrue(manual.second < 12.0)
+    }
+
+    @Test
+    fun quietImpactBeforeLouderSustainedPeakStaysInsideProtectedWindow() {
+        // 22.7s source: quiet isolated club click at 3.61s, then a loud sustained noise whose verified peak is at 5.63s.
+        val wave = List(192) { if (it in 40..57) 0.8 else 0.04 }
+        fun source(transients: List<Double>) = TrailerSource(
+            1, "a.mp4", java.io.File("a.mp4"), 22.749, 1920, 1080,
+            AudioAnalysisResult(wave, 5.628, listOf(5.628, 3.614), verifiedPeakTimesSeconds = listOf(5.628), transientTimesSeconds = transients), null
+        )
+        val withClick = recommendTrailerPlan(listOf(source(listOf(3.614))))!!.scenes.single()
+        assertTrue(withClick.start <= 3.614 - ACTION_LEAD_SECONDS + 1e-6)
+        assertTrue(withClick.start + withClick.length >= 5.628 + ACTION_FOLLOW_SECONDS - 1e-6)
+        assertEquals(3.614 - ACTION_LEAD_SECONDS, withClick.actionStart!!, 1e-6)
+        assertEquals(5.628 + ACTION_FOLLOW_SECONDS, withClick.actionEnd!!, 1e-6)
+        // 앞선 임팩트 근거가 없으면 기존 피크 기준 보호 구간, 클릭 없는 소리라 뒤(소리 없는 실제 스트로크·결과)는 더 길게.
+        val plain = recommendTrailerPlan(listOf(source(emptyList())))!!.scenes.single()
+        assertEquals(5.628 - ACTION_LEAD_SECONDS, plain.actionStart!!, 1e-6)
+        assertEquals(5.628 + WEAK_ACTION_FOLLOW_SECONDS, plain.actionEnd!!, 1e-6)
+    }
+
+    @Test
+    fun rebuiltCopyKeepsEverySeparateVerifiedActionOfASingleClipSource() {
+        // 22.7s source with two putts: quiet click 3.61s + verified 5.63s, then a click at 16.16s followed by verified 18.29/18.76s.
+        // An unverified loud sound at 12.0s must not become a scene. The original project has ONE scene (around the first putt).
+        val wave = List(192) { if (it in 40..57 || it in 150..160 || it in 98..104) 0.8 else 0.04 }
+        val analysis = AudioAnalysisResult(
+            wave, 5.628, listOf(5.628, 3.614, 18.29, 18.76, 12.0),
+            verifiedPeakTimesSeconds = listOf(5.628, 18.29, 18.76), transientTimesSeconds = listOf(3.614, 16.16),
+        )
+        val putts = TrailerSource(1, "a.mp4", java.io.File("a.mp4"), 22.749, 1920, 1080, analysis, null)
+        val other = putts.copy(id = 2, name = "b.mp4", duration = 9.0, analysis = AudioAnalysisResult(emptyList(), 0.0))
+        val caption = SceneCaption("퍼팅")
+        val original = EditorProject(
+            listOf(
+                EditorScene(1, 1, 3.0, 4.0, fit = SceneFit.FIT, sourceVolume = 0.5f, caption = caption),
+                EditorScene(2, 2, 0.0, 3.0),
+            ),
+        )
+        val rebuilt = original.rebuiltFromRecommendation(listOf(putts, other))
+        // Original is untouched; the copy has the source's two actions in source order, then the other source's scene.
+        assertEquals(2, original.scenes.size)
+        assertEquals(listOf(1, 1, 2), rebuilt.scenes.map { it.sourceId })
+        val (first, second) = rebuilt.scenes.take(2)
+        assertEquals(1L, first.key)
+        assertEquals(caption, first.caption)
+        // The added action scene inherits framing/volume, has its own key and no duplicated caption.
+        assertTrue(second.key != first.key && rebuilt.scenes.map { it.key }.distinct().size == 3 && rebuilt.nextKey > rebuilt.scenes.maxOf { it.key })
+        assertEquals(SceneFit.FIT, second.fit)
+        assertEquals(0.5f, second.sourceVolume, 0f)
+        assertEquals(null, second.caption)
+        // Each scene holds its whole protected action: first putt from the quiet click, second from its click through the verified hit.
+        assertEquals(3.614 - ACTION_LEAD_SECONDS, first.actionStart!!, 1e-6)
+        assertEquals(16.16 - ACTION_LEAD_SECONDS, second.actionStart!!, 1e-6)
+        assertTrue(first.actionEnd!! >= 5.628 + ACTION_FOLLOW_SECONDS - 1e-6)
+        assertTrue(second.actionEnd!! >= 18.29 + ACTION_FOLLOW_SECONDS - 1e-6)
+        for (scene in rebuilt.scenes.take(2)) {
+            assertTrue(scene.start <= scene.actionStart!! + 1e-6 && scene.start + scene.length >= scene.actionEnd!! - 1e-6)
+        }
+        assertTrue(first.start + first.length <= second.start + 1e-6)
+        // Redistributing the length (music fit shorter than the protected total) never cuts either action.
+        val (fitted, total) = redistributeManualTotal(rebuilt, listOf(putts, other), 5.0)
+        assertTrue(fitted.take(2).all { it.length >= (it.actionEnd!! - it.actionStart!!) - 1e-6 })
+        assertTrue(total >= (first.actionEnd!! - first.actionStart!!) + (second.actionEnd!! - second.actionStart!!) - 1e-6)
+        // A project that already has a scene per action gets no extra scene (counts only grow for omitted actions).
+        val both = EditorProject(listOf(EditorScene(1, 1, 3.0, 4.0), EditorScene(2, 1, 15.0, 4.0)))
+        assertEquals(2, both.rebuiltFromRecommendation(listOf(putts)).scenes.size)
+        val single = EditorProject(listOf(EditorScene(1, 1, 3.0, 4.0)))
+        // A merely loud second sound (not verified, no isolated click leading into it) adds nothing.
+        val loudOnly = putts.copy(analysis = analysis.copy(verifiedPeakTimesSeconds = listOf(5.628), transientTimesSeconds = listOf(3.614)))
+        assertEquals(1, single.rebuiltFromRecommendation(listOf(loudOnly)).scenes.size)
+        // The isolated click before the second hit alone is enough independent support.
+        val clickOnly = putts.copy(analysis = analysis.copy(verifiedPeakTimesSeconds = listOf(5.628)))
+        assertEquals(2, single.rebuiltFromRecommendation(listOf(clickOnly)).scenes.size)
+    }
+
+    @Test
+    fun everyIsolatedHitOfALongRoundIsKeptBeyondThePerSourceLimit() {
+        // 300s first-person round: 12 quiet isolated clicks (shots) the loudness ranking does not list, plus loud wind/cart peaks.
+        val hits = (0 until 12).map { 10.0 + it * 24.0 }
+        val loud = (0 until 12).map { 21.0 + it * 24.0 }
+        val wave = List(600) { i -> if (loud.any { kotlin.math.abs(i / 2.0 - it) < 0.6 }) 0.9 else 0.05 }
+        val round = TrailerSource(
+            1, "round.mp4", java.io.File("round.mp4"), 300.0, 1080, 1920,
+            AudioAnalysisResult(wave, loud.first(), loud, transientTimesSeconds = hits), null,
+        )
+        val scenes = recommendTrailerPlan(listOf(round))!!.scenes
+        // Each hit keeps its lead-in and follow-through; the loud peaks only fill up to the old per-source limit (8).
+        hits.forEach { t -> assertTrue("hit $t", scenes.any { it.start <= t - ACTION_LEAD_SECONDS + 1e-6 && it.start + it.length >= t + ACTION_FOLLOW_SECONDS - 1e-6 }) }
+        assertEquals(12, scenes.size)
+        assertTrue(scenes.zipWithNext().all { (a, b) -> a.start + a.length <= b.start + 1e-6 })
+        // The rebuilt copy of a one-scene project gets the same actions (the original scene keeps the first in time).
+        val rebuilt = EditorProject(listOf(EditorScene(1, 1, 0.0, 4.0))).rebuiltFromRecommendation(listOf(round))
+        assertEquals(12, rebuilt.scenes.size)
+        hits.forEach { t -> assertTrue("rebuilt hit $t", rebuilt.scenes.any { it.start <= t - 1.0 && it.start + it.length >= t + 1.0 }) }
+        // Without the clicks it is the old loudness plan: at most 8 cuts.
+        val windy = round.copy(analysis = round.analysis.copy(transientTimesSeconds = emptyList()))
+        assertTrue(recommendTrailerPlan(listOf(windy))!!.scenes.size <= 8)
+    }
+
+    @Test
+    fun automaticRegenerationWithAShortBudgetKeepsWholeShotsWithinIt() {
+        // Two 22.7s sources with two putts each (click + verified hit); the user's 18s budget holds only two of their ~8s protected putts.
+        fun putts(id: Int) = TrailerSource(
+            id, "p$id.mp4", java.io.File("p$id.mp4"), 22.749, 1920, 1080,
+            AudioAnalysisResult(List(192) { if (it in 40..57 || it in 150..160) 0.8 else 0.04 }, 5.628, listOf(5.628, 18.29),
+                verifiedPeakTimesSeconds = listOf(5.628, 18.29), transientTimesSeconds = listOf(3.614, 16.16)), null,
+        )
+        val sources = listOf(putts(1), putts(2))
+        val session = TrailerSession(
+            // The recommended clip keeps whole protected actions (a chosen number would cut each to exactly that long).
+            directory = java.io.File("."), sources = sources, total = 18.0, clipLength = recommendTrailerPlan(sources)!!.clipLength, busy = false, prepared = true,
+            musicPolicy = TrailerMusicPolicy.LOOP_MUSIC, editor = EditorProject(listOf(EditorScene(1, 1, 0.0, 6.0)), autoPlan = true, budgetTarget = 18.0),
+        )
+        // No chosen length (an older automatic total of 18s, e.g. before sources were added): every shot stays.
+        val unbudgeted = session.copy(editor = session.editor!!.copy(budgetTarget = null)).withRegeneratedPlan()
+        assertEquals(4, unbudgeted.editor!!.scenes.size)
+        assertTrue(unbudgeted.editor!!.budgetReserve.isEmpty())
+        assertEquals(unbudgeted.editor!!.scenes.sumOf { it.length }, unbudgeted.total, 1e-6)
+        val regenerated = session.withRegeneratedPlan()
+        val project = regenerated.editor!!
+        // The budget is hard: whole less important scenes leave instead of the total growing, and every kept action stays whole.
+        assertTrue(regenerated.total <= 18.0 + 1e-6)
+        assertEquals(project.scenes.sumOf { it.length }, regenerated.total, 1e-6)
+        assertTrue(project.budgetReserve.isNotEmpty())
+        assertEquals(4, project.scenes.size + project.budgetReserve.size)
+        assertTrue(project.scenes.all { it.start <= it.actionStart!! + 1e-6 && it.start + it.length >= it.actionEnd!! - 1e-6 })
+        // Each source keeps one shot before any source loses its last.
+        assertEquals(setOf(1, 2), project.scenes.map { it.sourceId }.toSet())
+        assertTrue(regenerated.status.contains("뺐어요"))
+    }
+
+    @Test
+    fun budgetFitReservesWholeScenesAndRestoresThemWithTheirEdits() {
+        val video = TrailerSource(1, "a.mp4", java.io.File("a.mp4"), 100.0, 1920, 1080, AudioAnalysisResult(emptyList(), 0.0), null)
+        val scenes = (0 until 6).map {
+            EditorScene(it + 1L, 1, it * 15.0, 6.0, sourceVolume = 0.5f, caption = SceneCaption("s$it"), actionStart = it * 15.0, actionEnd = it * 15.0 + 5.0)
+        }
+        val full = EditorProject(scenes, autoPlan = false)
+        val short = fitEditorToBudget(full, listOf(video), 12.0)!!
+        assertEquals(2, short.included)
+        assertEquals(4, short.excluded)
+        assertTrue(short.total <= 12.0 + 1e-6)
+        assertTrue(short.project.scenes.all { it.length >= 5.0 - 1e-6 })
+        // Longer again: every reserved scene comes back in its own place with its caption/volume.
+        val long = fitEditorToBudget(short.project, listOf(video), 40.0)!!
+        assertEquals(0, long.excluded)
+        assertEquals(scenes.map { it.key }, long.project.scenes.map { it.key })
+        assertEquals(scenes.map { it.caption }, long.project.scenes.map { it.caption })
+        assertTrue(long.project.scenes.all { it.sourceVolume == 0.5f })
+        assertEquals(40.0, long.total, 1e-6)
+        // Short again: the same choice.
+        val again = fitEditorToBudget(long.project, listOf(video), 12.0)!!
+        assertEquals(short.project.scenes.map { it.key }, again.project.scenes.map { it.key })
+        // Not even one whole action fits: refused.
+        assertNull(fitEditorToBudget(full, listOf(video), 4.0))
+        assertEquals(5.0, budgetBodyBounds(short.project, listOf(video)).first, 1e-6)
+    }
+
+    @Test
+    fun verifiedHitNextToAKeptShotWidensItInsteadOfBeingDropped() {
+        // Classifier-verified swing at 5.17s, 3.45s before an isolated click at 8.62s: one action [5.17-1.8, 8.62+2.0], not one dropped.
+        val wave = List(100) { if (it in 16..18 || it in 33..35) 0.9 else 0.05 }
+        val source = TrailerSource(
+            1, "a.mp4", java.io.File("a.mp4"), 50.0, 1080, 1920,
+            AudioAnalysisResult(wave, 8.62, listOf(8.62, 5.17), verifiedPeakTimesSeconds = listOf(8.62, 5.17), transientTimesSeconds = listOf(8.62)), null,
+        )
+        val scene = recommendTrailerPlan(listOf(source))!!.scenes.single()
+        assertEquals(5.17 - ACTION_LEAD_SECONDS, scene.actionStart!!, 1e-6)
+        assertEquals(8.62 + ACTION_FOLLOW_SECONDS, scene.actionEnd!!, 1e-6)
+        assertTrue(scene.start <= scene.actionStart!! + 1e-6 && scene.start + scene.length >= scene.actionEnd!! - 1e-6)
+    }
+
+    @Test
+    fun beatFitKeepsTheChosenRepeatCountAndBudget() {
+        // 10s music, beats every 2s starting at 1s: five scenes whose protected length (2s) fills the one-repeat budget exactly.
+        val video = TrailerSource(1, "a.mp4", java.io.File("a.mp4"), 100.0, 1920, 1080, AudioAnalysisResult(emptyList(), 0.0), null)
+        val scenes = (0 until 5).map { EditorScene(it.toLong(), 1, it * 10.0, 2.0, actionStart = it * 10.0, actionEnd = it * 10.0 + 2.0) }
+        val beats = listOf(1.0, 3.0, 5.0, 7.0, 9.0)
+        val project = EditorProject(scenes)
+        val one = syncToBeatsWithMinimumRepeats(project, listOf(video), beats, 10.0, TrailerMusicPolicy.FIT_MUSIC_LENGTH, 1)
+        // 고른 반복 횟수 그대로이고 음악 길이를 넘지 않으며 보호 길이는 지켜진다.
+        assertEquals(1, one.repeatCount)
+        assertTrue(one.scenes.sumOf { it.length } <= 10.0 + 1e-6)
+        assertTrue(one.scenes.all { it.length >= 2.0 - 1e-6 })
+        // 다른 정책도 지금 총길이를 넘기지 않는다.
+        val loose = EditorProject(scenes.map { it.copy(length = 3.0, actionStart = null, actionEnd = null) })
+        val loop = syncToBeatsWithMinimumRepeats(loose, listOf(video), beats, 10.0, TrailerMusicPolicy.LOOP_MUSIC, 1)
+        assertEquals(1, loop.repeatCount)
+        assertTrue(loop.scenes.sumOf { it.length } <= 15.0 + 1e-6)
+    }
+
+    @Test
+    fun numericClipIsExactEvenWhenItEqualsTheRecommendationAndMusicFitOnlyCapsIt() {
+        // One putt source (click 3.614s + verified 5.628s): its whole protected action is longer than 4s.
+        val source = TrailerSource(
+            1, "p.mp4", java.io.File("p.mp4"), 22.749, 1920, 1080,
+            AudioAnalysisResult(List(192) { if (it in 40..57) 0.8 else 0.04 }, 5.628, listOf(5.628),
+                verifiedPeakTimesSeconds = listOf(5.628), transientTimesSeconds = listOf(3.614)), null,
+        )
+        val action = recommendTrailerPlan(listOf(source))!!.scenes.single()
+        val scene = EditorScene(1, 1, action.start, action.length, actionStart = action.actionStart, actionEnd = action.actionEnd)
+        // 추천 4 keeps the whole action; the number 4 is exactly 4s and still holds the impact (3.614s).
+        val recommended = clipLengthScenes(listOf(scene), listOf(source), 4.0, recommended = true).single()
+        val numeric = clipLengthScenes(listOf(scene), listOf(source), 4.0, recommended = false).single()
+        assertTrue(recommended.length >= action.actionEnd!! - action.actionStart!! - 1e-6)
+        assertEquals(4.0, numeric.length, 1e-9)
+        assertTrue(numeric.start <= 3.614 && numeric.start + numeric.length >= 3.614)
+        // Number 1 under a 10s music fit (1 repeat): the music only caps it, the 1s cut is not stretched back.
+        val one = clipLengthScenes(listOf(scene), listOf(source), 1.0, recommended = false)
+        val session = TrailerSession(
+            directory = java.io.File("."), sources = listOf(source), total = 1.0, clipLength = 1.0, busy = false, prepared = true,
+            musicTrack = TrailerMusicTrack(java.io.File("m.mp3"), "m", 10.0), musicPolicy = TrailerMusicPolicy.FIT_MUSIC_LENGTH, musicFitCount = 1,
+            editor = EditorProject(one, autoPlan = false, clipChoiceExplicit = true),
+        )
+        val fitted = session.withBudgetMusicFit()!!
+        assertEquals(1.0, fitted.editor!!.scenes.single().length, 1e-9)
+        assertEquals(1, fitted.musicFitCount)
+        // 추천 again: the music length is filled.
+        val filled = session.copy(editor = session.editor!!.copy(clipChoiceExplicit = false)).withBudgetMusicFit()!!
+        assertEquals(10.0, filled.totalDuration, 1e-6)
     }
 }

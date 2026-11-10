@@ -5841,8 +5841,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         initialMusicPolicy: TrailerMusicPolicy,
         initialMusicFitCount: Int,
     ) {
-                // Retain immutable original addition order as default
-                val sortedSources = stagedSources
+                // 촬영순 default: capture timestamp deterministic fallback (captureTimeMillis -> lastModified -> id)
+                val sortedSources = sortTrailerSources(stagedSources, "촬영순")
 
                 val preparedSources = if (!isMusicOverlayMode && sortedSources.any { it.isImage }) {
                     updateTrailer(directory) { it.copy(status = "사진을 비교하는 중…", progress = null) }
@@ -5874,7 +5874,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         clipLength = length,
                         photoClipLength = photoLength,
                         format = TrailerFormat.ORIGINAL,
-                        orderMode = "추가순",
+                        orderMode = "촬영순",
                         busy = false,
                         isMusicOverlayMode = isMusicOverlayMode,
                         musicTrack = initialMusicTrack,
@@ -5901,6 +5901,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     private val editorHistories = mutableMapOf<String, EditorHistory>()
     private val editorFinderSelections = mutableMapOf<String, SnapshotStateMap<String, EditorAddCandidate>>()
     private var editorAutosaveJob: Job? = null
+    private var restoredAnalysisJob: Job? = null
     private var editorExportJob: Job? = null
     private var editorAddJob: Job? = null
     private var tempoAnalysisJob: Job? = null
@@ -6049,37 +6050,6 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return copy(editor = project.copy(scenes = scenes, autoPlan = false))
     }
 
-    /** Regenerates the scenes from the recommended plan; only valid while the project is still automatic. */
-    private fun TrailerSession.withRegeneratedPlan(): TrailerSession {
-        val project = editor ?: return this
-        val genScenes = autoPlanScenes()
-        val actualSum = genScenes.sumOf { it.length }
-        return copy(
-            total = if (actualSum > 0.0) actualSum else total,
-            editor = EditorProject.fromPlan(
-                genScenes,
-                autoPlan = true,
-                musicVolume = project.musicVolume,
-                firstKey = project.nextKey,
-                introCard = project.introCard,
-                outroCard = project.outroCard,
-            ),
-        )
-    }
-
-    /**
-     * 직접 편집한 프로젝트에서 음악 길이 맞춤: 컷·순서·자막은 그대로 두고 장면 길이만 (음악 길이 × 반복 − 시작/마지막 카드)에
-     * 맞춰 다시 나눈다. 장면 길이 한계로 못 맞추면 가능한 만큼만 바뀌고, 내보낼 때 음악이 영상 끝까지 이어진다.
-     */
-    private fun TrailerSession.withManualMusicFit(): TrailerSession {
-        val project = editor ?: return this
-        val music = plannedMusic ?: return this
-        if (project.autoPlan || musicPolicy != TrailerMusicPolicy.FIT_MUSIC_LENGTH || music.durationSeconds <= 0.0 || project.scenes.isEmpty()) return this
-        val target = (music.durationSeconds * musicFitCount.coerceAtLeast(1) - cardDuration).coerceAtLeast(0.1)
-        val (fitted, actual) = redistributeManualTotal(project, sources, target)
-        return copy(total = actual, editor = project.copy(scenes = fitted))
-    }
-
     private fun TrailerSession.defaultSceneFor(source: TrailerSource, key: Long): EditorScene {
         val (start, length) = when {
             source.isImage -> 0.0 to if (isMusicOverlayMode) 1.0 else source.weightedPhotoLength(clipLength)
@@ -6090,7 +6060,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             }
         }
         val (safeStart, safeLength) = clampSceneWindow(source, start, length)
-        return EditorScene(key, source.id, safeStart, safeLength)
+        val recommended = if (source.isImage || isMusicOverlayMode) null else recommendTrailerPlan(listOf(source))?.scenes?.firstOrNull()
+        val keepsPlan = recommended != null && kotlin.math.abs(recommended.start - safeStart) < 1e-6
+        return EditorScene(key, source.id, safeStart, safeLength, actionStart = recommended?.actionStart.takeIf { keepsPlan }, actionEnd = recommended?.actionEnd.takeIf { keepsPlan })
     }
 
     fun editorMoveScene(key: Long, delta: Int) {
@@ -6208,7 +6180,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val scene = project.scene(key) ?: return@editProject null
             val source = session.sources.firstOrNull { it.id == scene.sourceId } ?: return@editProject null
             val (safeStart, safeLength) = clampSceneWindow(source, start, length)
-            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(start = safeStart, length = safeLength) else it })
+            // 사용자가 직접 자른 구간은 자동 보호 구간을 해제한다.
+            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(start = safeStart, length = safeLength, actionStart = null, actionEnd = null) else it })
         }
     }
 
@@ -6264,7 +6237,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val source = sourcesById[scene.sourceId]
                     if (source != null) {
                         val (safeStart, safeLength) = clampSceneWindow(source, start, length)
-                        scene.copy(start = safeStart, length = safeLength)
+                        scene.copy(start = safeStart, length = safeLength, actionStart = null, actionEnd = null)
                     } else scene
                 } else scene
             }
@@ -6309,6 +6282,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
     /** Explicit user choice (select, replace or remove): this is the only path that discards an unavailable stored music choice. */
     fun editorSetMusic(track: TrailerMusicTrack?, policy: TrailerMusicPolicy, fitCount: Int) {
         val session = _state.value.trailer ?: return
+        if (replanWaitsForAnalysis(session.editor?.autoPlan == true)) return
         val project = session.editor
         val count = fitCount.coerceAtLeast(1)
         if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
@@ -6320,23 +6294,17 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 return
             }
         }
-        editProject { s ->
-            var next = s.copy(
-                musicTrack = track,
-                unavailableMusic = null,
-                musicExportPrompt = false,
-                musicPolicy = policy,
-                musicFitCount = count,
-            )
-            if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
-                next = next.copy(total = (track.durationSeconds * count - s.cardDuration).coerceAtLeast(0.1))
-            }
-            if (s.editor?.autoPlan == true) next.withRegeneratedPlan() else next.withManualMusicFit()
-        }
+        editProject { s -> s.withMusicSelection(track, policy, count) }
         val fitted = _state.value.trailer
+        if (fitted?.editor != null && fitted.prepared && !fitted.busy && track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH &&
+            track.durationSeconds > 0.0 && (fitted.musicPolicy != policy || fitted.musicFitCount != count)
+        ) {
+            _state.update { it.copy(message = "음악 ${count}회(${trailerTime(track.durationSeconds * count)})로는 " + budgetTooShortMessage(fitted.editor, fitted.sources, fitted.cardDuration)) }
+            return
+        }
         val fittedScenes = fitted?.editor?.takeIf { !it.autoPlan }?.scenes
         if (fitted != null && fittedScenes != null && track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
-            val gap = track.durationSeconds * count - fitted.cardDuration - fittedScenes.sumOf { it.length }
+            val gap = track.durationSeconds * fitted.musicFitCount - fitted.cardDuration - fittedScenes.sumOf { it.length }
             if (kotlin.math.abs(gap) > 0.1) {
                 _state.update { it.copy(message = "장면 길이 한계 때문에 음악 길이에 ${"%.1f".format(kotlin.math.abs(gap))}초 ${if (gap > 0) "모자랍니다" else "넘칩니다"}. 장면을 ${if (gap > 0) "추가" else "삭제"}하거나 음악 반복 횟수를 조절해 주세요.") }
             }
@@ -6367,7 +6335,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
                 updated.withRegeneratedPlan()
             } else if (timingChanged) {
-                updated.withManualMusicFit()
+                // 정한 전체 길이(카드 포함)는 카드가 바뀌어도 그대로다.
+                updated.withManualMusicFit().withBudgetTargetRefit()
             } else {
                 updated
             }
@@ -6398,7 +6367,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             if (p.autoPlan && s.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && timingChanged) {
                 updated.withRegeneratedPlan()
             } else if (timingChanged) {
-                updated.withManualMusicFit()
+                // 정한 전체 길이(카드 포함)는 카드가 바뀌어도 그대로다.
+                updated.withManualMusicFit().withBudgetTargetRefit()
             } else {
                 updated
             }
@@ -6465,21 +6435,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val liveProj = live.editor ?: return@editProject null
                     if (liveProj.scenes != capturedScenes || liveProj.introCard != capturedIntroCard || liveProj.outroCard != capturedOutroCard) return@editProject null
 
-                    val introOffset = if (liveProj.introCard.enabled) liveProj.introCard.clampedDuration() else 0.0
-                    val maxBudget = if (live.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0) {
-                        val outroDur = if (liveProj.outroCard.enabled) liveProj.outroCard.clampedDuration() else 0.0
-                        (track.durationSeconds * live.musicFitCount) - outroDur
-                    } else null
-
-                    val (syncedScenes, syncResult) = syncPhotoScenesToBeatOnsets(
-                        scenes = liveProj.scenes,
+                    val fitted = syncToBeatsWithMinimumRepeats(
+                        project = liveProj,
                         sources = live.sources,
-                        beatOnsets = beats,
+                        beats = beats,
                         musicDuration = track.durationSeconds,
-                        introOffset = introOffset,
                         musicPolicy = live.musicPolicy,
-                        maxBudget = maxBudget,
+                        fitCount = live.musicFitCount,
                     )
+                    val syncedScenes = fitted.scenes
+                    val syncResult = fitted.sync
 
                     if (syncResult.adjustedCount == 0 && syncedScenes == liveProj.scenes) {
                         return@editProject null
@@ -6489,6 +6454,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     unalignedCount = syncResult.unalignedCount
                     applied = true
                     live.copy(
+                        total = syncedScenes.sumOf { it.length },
                         editor = liveProj.copy(
                             scenes = syncedScenes,
                             autoPlan = false,
@@ -6565,27 +6531,47 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         exportEditorProjectInternal(skipUnavailableMusic = true, onStarted = onStarted)
     }
 
-    /** Plan parameters regenerate scenes while automatic; manual mode proportionally retimes or adjusts existing scenes. */
+    /**
+     * [total] is the whole video including the title cards and is a hard budget. Automatic plans regenerate from the full
+     * recommendation; manual projects keep their scenes. Either way protected actions stay whole and less important whole scenes
+     * leave when they do not fit (and come back when the total grows). A total that cannot hold one whole scene changes nothing.
+     */
     fun editorSetPlanTotal(total: Double) {
+        if (replanWaitsForAnalysis(_state.value.trailer?.editor?.autoPlan == true)) return
+        var refused: String? = null
         editProject { session ->
             if (!total.isFinite() || total <= 0.0) return@editProject null
             val project = session.editor ?: return@editProject null
+            val body = total - session.cardDuration
             if (project.autoPlan) {
                 session.copy(
-                    total = total.coerceIn(1.0, 7200.0),
+                    total = body.coerceIn(1.0, 7200.0),
                     musicPolicy = if (session.musicTrack != null) TrailerMusicPolicy.SINGLE else session.musicPolicy,
-                ).withRegeneratedPlan()
+                    editor = project.copy(budgetTarget = total),
+                ).regeneratedPlanOrNull() ?: run {
+                    val seed = recommendTrailerPlan(session.sources, explicitClip = session.clipLength)?.scenes
+                    refused = budgetTooShortMessage(seed?.let { EditorProject.fromPlan(it) } ?: project, session.sources, session.cardDuration)
+                    null
+                }
             } else {
-                val (newScenes, actualTotal) = redistributeManualTotal(project, session.sources, total)
+                val fit = fitEditorToBudget(project, session.sources, body) ?: run {
+                    refused = budgetTooShortMessage(project, session.sources, session.cardDuration)
+                    return@editProject null
+                }
                 session.copy(
-                    total = actualTotal,
-                    editor = project.copy(scenes = newScenes, autoPlan = false),
+                    total = fit.total,
+                    musicPolicy = if (session.musicTrack != null) TrailerMusicPolicy.SINGLE else session.musicPolicy,
+                    editor = fit.project.copy(autoPlan = false, budgetTarget = total),
+                    status = budgetFitStatus(fit, session.cardDuration) ?: session.status,
                 )
             }
         }
+        refused?.let { message -> _state.update { it.copy(message = message) } }
     }
 
-    fun editorSetPlanClipLength(length: Double) {
+    /** [recommended] = the 추천 button (protection-aware); every other choice (numbers, −/+, slider) is applied exactly. */
+    fun editorSetPlanClipLength(length: Double, recommended: Boolean = false) {
+        if (replanWaitsForAnalysis(_state.value.trailer?.editor?.autoPlan == true)) return
         editProject { session ->
             if (!length.isFinite() || length <= 0.0) return@editProject null
             val project = session.editor ?: return@editProject null
@@ -6607,83 +6593,84 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
                     ).withRegeneratedPlan()
                 } else {
+                    // 1·2·4·6 (any number) is applied exactly around each impact; 추천 keeps whole protected actions.
                     val plan = recommendTrailerPlan(migratedSources, explicitClip = length)
-                    val newTotal = plan?.total ?: (length * migratedSources.size)
-                    val regeneratedScenes = plan?.scenes ?: emptyList()
-                    val newProject = EditorProject.fromPlan(
-                        regeneratedScenes,
+                    val regeneratedScenes = clipLengthScenes(
+                        EditorProject.fromPlan(plan?.scenes ?: emptyList()).scenes, migratedSources, length, recommended,
+                    )
+                    val newProject = EditorProject(
+                        regeneratedScenes.mapIndexed { i, scene -> scene.copy(key = project.nextKey + i) },
                         autoPlan = true,
                         musicVolume = project.musicVolume,
-                        firstKey = project.nextKey,
+                        nextKey = project.nextKey + regeneratedScenes.size,
                         introCard = project.introCard,
                         outroCard = project.outroCard,
+                        budgetTarget = project.budgetTarget,
+                        clipChoiceExplicit = !recommended,
                     )
-                    session.copy(
+                    val next = session.copy(
                         sources = migratedSources,
-                        total = newTotal,
+                        total = newProject.scenes.sumOf { it.length },
                         clipLength = length,
                         photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
                         editor = newProject,
                     )
+                    // The chosen music length or whole length still caps the video.
+                    if (next.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && next.plannedMusic != null) next.withBudgetMusicFit() ?: next
+                    else next.withBudgetTargetRefit(capOnly = true)
                 }
             } else {
-                val (newScenes, actualTotal) = applyManualClipLength(project, migratedSources, length)
-                session.copy(
+                // Reserved (budget-left-out) cuts take the same clip choice, so they come back consistent.
+                val clipped = project.copy(
+                    scenes = clipLengthScenes(project.scenes, migratedSources, length, recommended),
+                    budgetReserve = clipLengthScenes(project.budgetReserve, migratedSources, length, recommended),
+                    clipChoiceExplicit = !recommended,
+                )
+                val (newScenes, actualTotal) = applyManualClipLength(clipped, migratedSources, length)
+                val next = session.copy(
                     sources = migratedSources,
                     total = actualTotal,
                     clipLength = length,
                     photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
-                    editor = project.copy(scenes = newScenes, autoPlan = false),
+                    editor = clipped.copy(scenes = newScenes, autoPlan = false),
                 )
+                if (next.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && next.plannedMusic != null) next.withBudgetMusicFit() ?: next
+                else next.withBudgetTargetRefit(capOnly = true)
             }
         }
     }
 
     /** Order presets: regenerate the automatic plan, or reorder the explicit scenes keeping their trims. */
     fun editorApplyOrder(mode: String) {
+        if (replanWaitsForAnalysis(_state.value.trailer?.editor?.autoPlan == true)) return
         editProject { session ->
-            fun sorted(sources: List<TrailerSource>): List<TrailerSource> = when (mode) {
-                "추가순" -> sources.sortedBy { it.id }
-                "시간순" -> sources.sortedWith(compareBy<TrailerSource> {
-                    if (it.captureTimeMillis > 0L) it.captureTimeMillis else it.file.lastModified().takeIf { t -> t > 0L } ?: Long.MAX_VALUE
-                }.thenBy { it.id })
-                "가나다순" -> sources.sortedWith(compareBy<TrailerSource, String>(NaturalOrderComparator) { it.name }.thenBy { it.id })
-                "랜덤" -> sources.shuffled()
-                else -> sources
-            }
-            val orderedSources = sorted(session.sources)
+            val orderedSources = sortTrailerSources(session.sources, mode)
             val project = session.editor ?: return@editProject null
             if (project.autoPlan) {
                 session.copy(sources = orderedSources, orderMode = mode).withRegeneratedPlan()
             } else {
-                val rank = orderedSources.mapIndexed { index, source -> source.id to index }.toMap()
-                val scenes = if (mode == "랜덤") project.scenes.shuffled()
-                else project.scenes.sortedWith(compareBy<EditorScene> { rank[it.sourceId] ?: Int.MAX_VALUE }.thenBy { it.start })
-                session.copy(sources = orderedSources, orderMode = mode, editor = project.copy(scenes = scenes))
+                session.copy(
+                    sources = orderedSources,
+                    orderMode = mode,
+                    editor = project.withReorderedScenes(orderedSources),
+                )
             }
         }
     }
 
     /** Explicitly replaces manual scenes with a fresh recommendation (undoable). */
     fun editorResetToAutoPlan() {
+        if (replanWaitsForAnalysis(true)) return
         editProject { session ->
-            val project = session.editor ?: return@editProject null
+            session.editor ?: return@editProject null
             val defaults = if (session.isMusicOverlayMode) null else recommendedTrailerDefaults(session.sources)
             val base = if (defaults != null) session.copy(
                 clipLength = defaults.clipLength,
                 total = defaults.total,
                 photoClipLength = defaultPhotoClipLength(defaults.clipLength, session.hasVideos),
             ) else session
-            base.copy(
-                editor = EditorProject.fromPlan(
-                    base.autoPlanScenes(),
-                    autoPlan = true,
-                    musicVolume = project.musicVolume,
-                    firstKey = project.nextKey,
-                    introCard = project.introCard,
-                    outroCard = project.outroCard,
-                )
-            )
+            // Same protected full-recommendation / music-budget path as every other automatic re-plan (anchors kept, no tail cut).
+            base.withRegeneratedPlan()
         }
     }
 
@@ -7535,6 +7522,88 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                         "소리 탭에서 ‘다시 확인’하거나 다른 음악을 고를 수 있으며, 해결하기 전에는 내보낼 때 확인을 요청합니다."
                 } else it.message,
             )
+        }
+        reanalyzeRestoredSources(draft.directory)
+    }
+
+    private suspend fun analyzeVideoSource(source: TrailerSource): TrailerSource =
+        source.copy(analysis = AudioAnalysisService.analyze(application, Uri.fromFile(source.file), source.duration, (source.duration.coerceAtMost(1024.0) * 2).toInt().coerceIn(192, 2048)))
+
+    private fun TrailerSource.needsAnalysis(): Boolean = !isImage && hasValidDuration && file.isFile && analysis.waveform.isEmpty()
+
+    /**
+     * A legacy project reopened before its background analysis finished has no sound evidence yet; a recommendation made now
+     * would silently fall back to the first seconds of each clip. Say so and let the user retry instead of re-picking blind.
+     */
+    private fun replanWaitsForAnalysis(replans: Boolean): Boolean {
+        val session = _state.value.trailer ?: return false
+        if (!replans || session.isMusicOverlayMode || restoredAnalysisJob?.isActive != true || session.sources.none { it.needsAnalysis() }) return false
+        _state.update { it.copy(message = "소스 영상의 소리 분석이 아직 끝나지 않았습니다. 분석 없이 장면을 고르면 영상 앞부분으로 잘못 고르게 되므로, 잠시 후 다시 눌러 주세요.") }
+        return true
+    }
+
+    /**
+     * Drafts saved before analysis was stored (or with an unreadable analysis) reopen with empty evidence. Re-run the normal
+     * analysis in the background and keep it in memory only: opening never re-plans or rewrites the saved project; the user
+     * opts in with an explicit reset or 추천으로 다시 맞춘 사본 (both wait for this analysis). Later explicit saves store it.
+     */
+    private fun reanalyzeRestoredSources(directory: File) {
+        restoredAnalysisJob?.cancel()
+        val opened = _state.value.trailer?.takeIf { it.directory == directory && !it.isMusicOverlayMode } ?: return
+        val pending = opened.sources.filter { it.needsAnalysis() }
+        if (pending.isEmpty()) return
+        restoredAnalysisJob = viewModelScope.launch {
+            val analysed = HashMap<Int, AudioAnalysisResult>()
+            for (source in pending) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                runCatching { analyzeVideoSource(source).analysis }.getOrNull()?.let { analysed[source.id] = it }
+            }
+            if (analysed.isEmpty()) return@launch
+            _state.update { current ->
+                // Closed or switched project: drop the late result.
+                val live = current.trailer?.takeIf { it.directory == directory } ?: return@update current
+                val sources = live.sources.map { s -> analysed[s.id]?.takeIf { s.analysis.waveform.isEmpty() }?.let { s.copy(analysis = it) } ?: s }
+                // Analysis only: no revision bump, no re-plan, no autosave of the stored project.
+                current.copy(trailer = live.copy(sources = sources))
+            }
+        }
+    }
+
+    /** Opt-in repair: a new copy whose scenes are re-picked from fresh analysis; the original project is never touched. */
+    fun duplicateTrailerDraftRebuiltFromRecommendation(draft: TrailerDraft) {
+        viewModelScope.launch {
+            // 0 = no copy, 1 = plain copy only (nothing re-picked), 2 = re-picked copy saved
+            val outcome = withContext(Dispatchers.IO) {
+                val duplicated = TrailerDraftStore.duplicateDraft(draft) ?: return@withContext 0
+                val editor = duplicated.editor ?: return@withContext 1
+                val sources = duplicated.sources.map { s -> if (s.needsAnalysis()) runCatching { analyzeVideoSource(s) }.getOrDefault(s) else s }
+                val repicked = editor.rebuiltFromRecommendation(sources)
+                if (repicked.scenes == editor.scenes) return@withContext 1
+                // New cuts: the copied render belongs to the old cuts, so the copy must not present it (the original's file is untouched).
+                // The copy keeps the analysis it was re-picked from, so opening it needs no second analysis pass.
+                val rebuilt = duplicated.copy(
+                    sources = sources,
+                    editor = repicked,
+                    output = null,
+                    outputRevision = null,
+                    customTitle = "${draft.displayTitle} (추천 재선정 사본)",
+                    timestamp = System.currentTimeMillis(),
+                )
+                if (TrailerDraftStore.saveDraft(rebuilt)) 2 else 1
+            }
+            val remaining = TrailerDraftStore.getAllDrafts()
+            _state.update {
+                it.copy(
+                    trailerDraftCount = remaining.size,
+                    trailerDraftsVersion = it.trailerDraftsVersion + 1,
+                    trailerDraftPicker = it.trailerDraftPicker?.let { remaining },
+                    message = when (outcome) {
+                        2 -> "‘${draft.displayTitle}’을(를) 추천 장면으로 다시 고른 사본을 만들었습니다. 원래 편집본은 그대로입니다."
+                        1 -> "새로 고를 장면을 찾지 못해 일반 사본만 만들었습니다. 원래 편집본은 그대로입니다."
+                        else -> "사본을 만들지 못했습니다. 원래 편집본은 그대로입니다."
+                    },
+                )
+            }
         }
     }
 
@@ -9229,13 +9298,14 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
      * temporary working copy in cache (never recorded as the item's storage; the external original is only read).
      * Must be called off the main thread. Null when the video cannot be read now.
      */
-    private fun collectionReadableFile(item: CollectionItem): File? {
+    private fun collectionReadableFile(item: CollectionItem, allowCopy: Boolean = true): File? {
         if (!item.isContentReference) return File(item.localFilePath).takeIf { it.isFile && it.length() > 0L }
         if (!DurableCollectionStore.hasPersistedReadGrant(item.localFilePath)) return null
         runCatching { UUID.fromString(item.id) }.getOrNull() ?: return null
         val dir = File(application.cacheDir, "collection_reference_use").also { it.mkdirs() }
         val target = File(dir, "${item.id}.mp4")
         if (target.isFile && target.length() > 0L && item.fileSizeBytes > 0L && target.length() == item.fileSizeBytes) return target
+        if (!allowCopy) return null
         val partial = File(dir, "${item.id}.mp4.part")
         return runCatching {
             application.contentResolver.openInputStream(Uri.parse(item.localFilePath))?.use { input ->
@@ -9377,29 +9447,37 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         }
     }
 
-    fun previewCollectionVideo(item: CollectionItem) {
+    fun previewCollectionVideo(item: CollectionItem, playlist: List<CollectionItem> = emptyList()) {
         viewModelScope.launch {
-            val file = withContext(Dispatchers.IO) { collectionReadableFile(item) }
-            if (file == null) {
+            val activeList = if (playlist.isNotEmpty() && playlist.any { it.id == item.id }) playlist else listOf(item)
+            val filesWithItems = withContext(Dispatchers.IO) {
+                activeList.mapNotNull { col ->
+                    val isTarget = col.id == item.id
+                    val f = collectionReadableFile(col, allowCopy = isTarget)
+                    if (f != null && f.exists() && f.length() > 0L) col to f else null
+                }
+            }
+            val targetPair = filesWithItems.firstOrNull { it.first.id == item.id }
+            if (targetPair == null) {
                 _state.update { it.copy(message = collectionUnavailableMessage) }
                 return@launch
             }
-            previewCollectionFile(item, file)
+            val initialIndex = filesWithItems.indexOf(targetPair).coerceAtLeast(0)
+            val remotes = filesWithItems.map { (col, f) ->
+                RemoteFileItem(
+                    id = col.id,
+                    name = col.title + (if (col.title.endsWith(".mp4", ignoreCase = true)) "" else ".mp4"),
+                    path = f.absolutePath,
+                    isDirectory = false,
+                    size = f.length(),
+                    modifiedAt = java.time.Instant.ofEpochMilli(col.timestamp),
+                    mimeType = "video/mp4",
+                )
+            }
+            val files = filesWithItems.map { it.second }
+            stopInlineAudio()
+            prepareLocalPreview(remotes, files, initialIndex)
         }
-    }
-
-    private fun previewCollectionFile(item: CollectionItem, file: File) {
-        stopInlineAudio()
-        val remote = RemoteFileItem(
-            id = item.id,
-            name = item.title + (if (item.title.endsWith(".mp4", ignoreCase = true)) "" else ".mp4"),
-            path = file.absolutePath,
-            isDirectory = false,
-            size = file.length(),
-            modifiedAt = java.time.Instant.ofEpochMilli(item.timestamp),
-            mimeType = "video/mp4"
-        )
-        prepareLocalPreview(listOf(remote), listOf(file), 0)
     }
 
     fun importVideoUriToCollection(uri: Uri, copyToStorage: Boolean = true) {

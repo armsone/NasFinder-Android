@@ -26,7 +26,11 @@ data class AudioAnalysisResult(
     val peakTimeSeconds: Double,
     val peakTimesSeconds: List<Double> = listOf(peakTimeSeconds),
     val audioAvailability: ClipAudioAvailability = ClipAudioAvailability.Present,
-    val highlightSource: ClipHighlightSource = ClipHighlightSource.Audio
+    val highlightSource: ClipHighlightSource = ClipHighlightSource.Audio,
+    // Subset of peakTimesSeconds the impact classifier itself triggered on (a real hit); the rest are only the loudest/general sound.
+    val verifiedPeakTimesSeconds: List<Double> = emptyList(),
+    // Short, isolated sharp hits (quiet club/ball clicks included) that the loudness ranking can rank below later sustained noise.
+    val transientTimesSeconds: List<Double> = emptyList()
 )
 
 private data class AudioImpactMetrics(
@@ -867,11 +871,12 @@ internal object AudioAnalysisService {
         values.forEachIndexed { index, value ->
             candidates += index to value * 0.55
         }
-        AudioImpactClassifier.rankedImpactTimes(
+        val classified = AudioImpactClassifier.rankedImpacts(
             frames = frames,
             durationSeconds = durationSeconds,
             limit = 12
-        ).forEach { peak ->
+        )
+        classified.map { it.first }.forEach { peak ->
             val index = ((peak / durationSeconds) * bucketCount)
                 .toInt()
                 .coerceIn(0, bucketCount - 1)
@@ -898,14 +903,30 @@ internal object AudioAnalysisService {
         val peakTimes = selected.map { (index, _) ->
             (index + 0.5) / bucketCount.toDouble() * durationSeconds
         }
+        val verified = peakTimes.filter { time ->
+            classified.any { (t, triggered) -> triggered && abs(t - time) <= 0.5 / bucketsPerSecond + 0.25 }
+        }
         return AudioAnalysisResult(
             waveform = values,
             peakTimeSeconds = peakTimes.first(),
             peakTimesSeconds = peakTimes,
             audioAvailability = ClipAudioAvailability.Present,
-            highlightSource = ClipHighlightSource.Audio
+            highlightSource = ClipHighlightSource.Audio,
+            verifiedPeakTimesSeconds = verified,
+            transientTimesSeconds = isolatedTransientTimes(frames)
         )
     }
+
+    // A transient is a bucket whose peak is >= 6x the median peak of the 8 buckets before it, audible (>= 0.04), and that falls back
+    // to <= 35% of itself two buckets later (sustained wind/handling/speech never decays that fast).
+    private fun isolatedTransientTimes(frames: List<AudioImpactFrame>): List<Double> =
+        frames.indices.filter { index ->
+            val peak = frames[index].metrics.peak
+            val history = frames.subList(max(0, index - 8), index).map { it.metrics.peak }.sorted()
+            val median = if (history.isEmpty()) 0.0 else history[history.size / 2]
+            val after = (index + 2..index + 3).filter { it < frames.size }.map { frames[it].metrics.peak }
+            peak >= 0.04 && peak >= 6.0 * max(median, 0.004) && after.isNotEmpty() && after.max() <= 0.35 * peak
+        }.map { frames[it].timeSeconds }
 
     private object AudioImpactClassifier {
         private data class Thresholds(
@@ -937,12 +958,17 @@ internal object AudioAnalysisService {
             val confidence: Double
         )
 
-        fun rankedImpactTimes(
+        fun rankedImpactTimes(frames: List<AudioImpactFrame>, durationSeconds: Double, limit: Int): List<Double> =
+            rankedImpacts(frames, durationSeconds, limit).map { it.first }
+
+        // (time, classifier-triggered), strongest first.
+        fun rankedImpacts(
             frames: List<AudioImpactFrame>,
             durationSeconds: Double,
             limit: Int
-        ): List<Double> {
+        ): List<Pair<Double, Boolean>> {
             if (frames.isEmpty()) return emptyList()
+            val triggeredTimes = HashSet<Double>()
 
             var baseline = 0.008
             var recentLevel = 0.008
@@ -973,6 +999,7 @@ internal object AudioAnalysisService {
                     score * 0.12
 
                 fallback += frame.timeSeconds to combinedScore
+                if (decision.isTriggered) triggeredTimes += frame.timeSeconds
                 if (
                     decision.isTriggered ||
                     highlightScore > 0.82 ||
@@ -992,7 +1019,7 @@ internal object AudioAnalysisService {
                 }
                 if (selected.size >= limit) return@forEach
             }
-            return selected.map { it.first }
+            return selected.map { it.first to (it.first in triggeredTimes) }
         }
 
         private fun detectImpact(

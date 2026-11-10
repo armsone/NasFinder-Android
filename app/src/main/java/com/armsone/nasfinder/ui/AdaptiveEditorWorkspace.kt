@@ -6582,8 +6582,17 @@ private fun SoundMusicSection(session: TrailerSession, model: NasFinderViewModel
             val fitCount = session.musicFitCount.coerceAtLeast(1)
             val trackSeconds = session.musicTrack?.durationSeconds ?: 0.0
             Text("${fitCount}회 재생 · 총 ${trailerLengthTitle(trackSeconds * fitCount)}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            val reserved = project.budgetReserve.size
+            val whole = session.totalDuration
+            val shortOfMusic = trackSeconds * fitCount - whole > 0.5
             Text(
-                "‘길이 ${fitCount}회’를 다시 누르면 ${fitCount + 1}회 재생 · 총 ${trailerLengthTitle(trackSeconds * (fitCount + 1))}로 늘어납니다. 다른 방식을 눌렀다가 돌아오면 1회부터 시작합니다.",
+                "장면 ${project.scenes.size}개 사용" + (if (reserved > 0) " · 길이에 안 들어가는 덜 중요한 ${reserved}개는 통째로 뺐어요" else " · 모든 장면이 들어가요") +
+                    (if (shortOfMusic) " · 실제 영상 ${trailerLengthTitle(whole)}" + (if (project.clipChoiceExplicit) "(고른 클립 길이를 지켜 음악보다 짧아요)" else "(재료가 모자라 음악보다 짧아요)") else ""),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (reserved > 0) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "‘길이 ${fitCount}회’를 다시 누르면 ${fitCount + 1}회 재생 · 총 ${trailerLengthTitle(trackSeconds * (fitCount + 1))}로 늘어나고 뺀 장면이 다시 들어갑니다. 다른 방식을 눌렀다가 돌아오면 1회부터 시작합니다.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -6739,6 +6748,11 @@ private fun DurationControlRow(
     minValue: Double,
     maxValue: Double,
     recommendedValue: Double,
+    // Fixed choices around 추천 (total row: 3분 | 추천 | 5분; clip row: 1, 2 | 추천 | 4, 6); null = the adaptive one-step neighbours of 추천.
+    fixedChoices: Pair<List<Double>, List<Double>>? = null,
+    // The clip row tells 추천 apart from an equal number by what was pressed (null = by value, as before).
+    recommendedActive: Boolean? = null,
+    onRecommendedSelected: (() -> Unit)? = null,
     onValueSelected: (Double) -> Unit,
 ) {
     val hasVariation = maxValue > minValue + 1e-4
@@ -6769,8 +6783,22 @@ private fun DurationControlRow(
             },
         )
 
+        @Composable
+        fun fixedChoice(value: Double) {
+            val usable = value >= minValue - 1e-4 && value <= maxValue + 1e-4
+            DurationCandidateButton(
+                title = formatCandidateDuration(value),
+                accessibilityTitle = formatAdaptiveDurationTitle(value),
+                subtitle = null,
+                selected = usable && recommendedActive != true && abs(currentValue - value) < 0.05,
+                enabled = usable,
+                modifier = Modifier.weight(1f),
+                onClick = { onValueSelected(value) },
+            )
+        }
+
         val hasLower = hasVariation && lowerCandidate < recommendedValue - 1e-4
-        DurationCandidateButton(
+        if (fixedChoices != null) fixedChoices.first.forEach { fixedChoice(it) } else DurationCandidateButton(
             title = formatCandidateDuration(lowerCandidate),
             accessibilityTitle = formatAdaptiveDurationTitle(lowerCandidate),
             subtitle = null,
@@ -6784,14 +6812,14 @@ private fun DurationControlRow(
             title = formatCandidateDuration(recommendedValue),
             accessibilityTitle = "${formatAdaptiveDurationTitle(recommendedValue)} 추천",
             subtitle = "추천",
-            selected = hasVariation && abs(currentValue - recommendedValue) < 0.05,
+            selected = hasVariation && recommendedActive != false && abs(currentValue - recommendedValue) < 0.05,
             enabled = hasVariation,
             modifier = Modifier.weight(1.2f),
-            onClick = { onValueSelected(recommendedValue) },
+            onClick = { onRecommendedSelected?.invoke() ?: onValueSelected(recommendedValue) },
         )
 
         val hasHigher = hasVariation && higherCandidate > recommendedValue + 1e-4
-        DurationCandidateButton(
+        if (fixedChoices != null) fixedChoices.second.forEach { fixedChoice(it) } else DurationCandidateButton(
             title = formatCandidateDuration(higherCandidate),
             accessibilityTitle = formatAdaptiveDurationTitle(higherCandidate),
             subtitle = null,
@@ -6929,28 +6957,30 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
         TrailerSectionTitle("영상 클립 길이")
         Text("뮤직비디오 모드에서는 원본 영상 클립 길이를 원본 그대로 유지합니다.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-        // --- 전체 길이 ---
+        // --- 전체 길이 (시작·마지막 화면 포함; 넘지 않는 예산) ---
+        val cards = session.cardDuration
         val (minTotal, maxTotal) = if (project.autoPlan) {
-            minOf(1.0, totalTime) to 7200.0
+            minOf(1.0, totalTime) + cards to 7200.0 + cards
         } else {
-            calculateManualTotalBounds(project, session.sources)
+            budgetBodyBounds(project, session.sources).let { (lo, hi) -> min(lo, totalTime) + cards to max(hi, totalTime) + cards }
         }
         val hasTotalVariation = maxTotal > minTotal + 1e-4
 
-        var localTotalPreview by remember(totalTime) { mutableStateOf<Double?>(null) }
+        var localTotalPreview by remember(totalTime, cards) { mutableStateOf<Double?>(null) }
         val displayedTotal = if (hasTotalVariation) {
-            (localTotalPreview ?: totalTime).coerceIn(minTotal, maxTotal)
+            (localTotalPreview ?: (totalTime + cards)).coerceIn(minTotal, maxTotal)
         } else {
-            totalTime
+            totalTime + cards
         }
 
-        TrailerSectionTitle(if (!project.autoPlan) "본편 길이" else "전체 길이")
-        val fullTotal = session.totalDuration
-        val hasCards = session.cardDuration > 0.0
+        TrailerSectionTitle("전체 길이")
+        val hasCards = cards > 0.0
+        val reserved = project.budgetReserve.size
+        val sceneCount = if (reserved > 0) "장면 ${session.scenes.size}개 사용 · ${reserved}개 뺌" else "총 ${session.scenes.size}개 클립"
         val durationLabel = if (hasCards) {
-            "${formatAdaptiveDurationTitle(displayedTotal)} (시작·마지막 포함 ${formatAdaptiveDurationTitle(displayedTotal + session.cardDuration)}, 총 ${session.scenes.size}개 클립)"
+            "${formatAdaptiveDurationTitle(displayedTotal)} (본편 ${formatAdaptiveDurationTitle(displayedTotal - cards)} + 시작·마지막, $sceneCount)"
         } else {
-            "${formatAdaptiveDurationTitle(displayedTotal)} (총 ${session.scenes.size}개 클립)"
+            "${formatAdaptiveDurationTitle(displayedTotal)} ($sceneCount)"
         }
         Text(
             text = durationLabel,
@@ -6958,12 +6988,13 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
             fontWeight = FontWeight.Bold,
         )
 
-        val recommendedTotal = recDefaults.total.coerceIn(minTotal, maxTotal)
+        val recommendedTotal = (recDefaults.total + cards).coerceIn(minTotal, maxTotal)
         DurationControlRow(
             currentValue = displayedTotal,
             minValue = minTotal,
             maxValue = maxTotal,
             recommendedValue = recommendedTotal,
+            fixedChoices = listOf(180.0) to listOf(300.0),
             onValueSelected = { model.editorSetPlanTotal(it) },
         )
 
@@ -6984,9 +7015,9 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
                 .semantics { contentDescription = "전체 길이 슬라이더" },
         )
 
-        if (!project.autoPlan) {
+        if (!project.autoPlan || reserved > 0) {
             Text(
-                "모든 클립의 길이를 비율대로 늘리거나 줄여 전체 길이를 조절합니다. 범위를 벗어난 목표는 조절 가능 한계로 안전하게 맞춰집니다.",
+                "정한 전체 길이(시작·마지막 화면 포함)를 넘지 않게 장면 길이를 나눕니다. 동작은 자르지 않고, 다 안 들어가면 덜 중요한 장면을 통째로 빼며 길이를 늘리면 다시 넣습니다.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -7038,6 +7069,9 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
             minValue = minClip,
             maxValue = maxClip,
             recommendedValue = recommendedClip,
+            fixedChoices = listOf(1.0, 2.0) to listOf(4.0, 6.0),
+            recommendedActive = !project.clipChoiceExplicit,
+            onRecommendedSelected = { model.editorSetPlanClipLength(recommendedClip, recommended = true) },
             onValueSelected = { model.editorSetPlanClipLength(it) },
         )
 
@@ -7057,6 +7091,14 @@ private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel
                 .fillMaxWidth()
                 .semantics { contentDescription = "영상 클립 길이 슬라이더" },
         )
+    }
+
+    HorizontalDivider()
+    TrailerSectionTitle("순서")
+    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+        listOf("촬영순", "추가순", "랜덤").forEach { mode ->
+            TrailerChoice(mode, session.orderMode == mode, Modifier.weight(1f)) { model.editorApplyOrder(mode) }
+        }
     }
 }
 
@@ -7094,13 +7136,6 @@ private fun PlanOptionsSection(session: TrailerSession, model: NasFinderViewMode
             }
             if (session.musicTrack != null) TextButton(shape = EditorButtonShape, onClick = { model.editorSetMusic(null, TrailerMusicPolicy.LOOP_MUSIC, 1) }) { Text("제거") }
             Button(shape = EditorButtonShape, onClick = onOpenMusicPicker) { Text(if (session.musicTrack != null) "음악 변경" else "음악 선택") }
-        }
-    }
-    HorizontalDivider()
-    TrailerSectionTitle("순서")
-    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-        listOf("추가순", "시간순", "가나다순", "랜덤").forEach { mode ->
-            TrailerChoice(mode, session.orderMode == mode, Modifier.weight(1f)) { model.editorApplyOrder(mode) }
         }
     }
 

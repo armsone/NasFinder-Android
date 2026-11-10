@@ -139,7 +139,7 @@ internal fun VideoCollectionsScreen(
                             item = item,
                             compressing = state.compression?.let { it.itemId == item.id && it.running } == true,
                             onCompress = { compressItem = item },
-                            onPlay = { model.previewCollectionVideo(item) },
+                            onPlay = { model.previewCollectionVideo(item, collections) },
                             onTogglePin = { model.toggleCollectionPin(item.id) },
                             onSetPrivate = { model.setCollectionPrivate(item.id, it) },
                             onMove = { offset -> model.moveCollectionItem(item.id, offset) },

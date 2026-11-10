@@ -27,6 +27,9 @@ data class EditorScene(
     val sourceVolume: Float = 1f,
     // Optional manual caption for this scene's whole duration; null = no caption (old drafts).
     val caption: SceneCaption? = null,
+    // Source-time interval of the detected action the automatic plan protects; null = none (manual trim or legacy draft).
+    val actionStart: Double? = null,
+    val actionEnd: Double? = null,
 )
 
 /**
@@ -42,6 +45,16 @@ data class EditorProject(
     val nextKey: Long = (scenes.maxOfOrNull { it.key } ?: 0L) + 1L,
     val introCard: TrailerTitleCard = TrailerTitleCard(),
     val outroCard: TrailerTitleCard = TrailerTitleCard(),
+    // Whole scenes left out only so an explicit total/music length fits (every edit kept). The next budget change puts them
+    // back first; they are never rendered, counted or edited while reserved.
+    val budgetReserve: List<EditorScene> = emptyList(),
+    // Scene keys in their order when the budget was last fitted, so reserved scenes return to their own places.
+    val budgetOrder: List<Long> = emptyList(),
+    // Whole video length (title cards included) the user chose as a hard budget; null = none (music length fit has its own).
+    val budgetTarget: Double? = null,
+    // The clip row's last choice was a number (1, 2, 4, 6, −/+ or the slider), not 추천: video cuts keep exactly that length, so
+    // every budget (whole length or music length) only caps them and never stretches them back.
+    val clipChoiceExplicit: Boolean = false,
 ) {
     fun scene(key: Long): EditorScene? = scenes.firstOrNull { it.key == key }
 
@@ -64,6 +77,8 @@ data class EditorProject(
                 focusY = scene.focusY.coerceIn(-1f, 1f),
                 sourceVolume = if (source.isImage) 1f else scene.sourceVolume.coerceIn(0f, 2f),
                 caption = scene.caption?.normalizedOrNull(),
+                actionStart = scene.actionStart,
+                actionEnd = scene.actionEnd,
             )
         }
     }
@@ -89,6 +104,8 @@ data class EditorProject(
                     focusY = scene.focusY,
                     sourceVolume = scene.sourceVolume,
                     caption = scene.caption,
+                    actionStart = scene.actionStart,
+                    actionEnd = scene.actionEnd,
                 )
             }
             return EditorProject(scenes, autoPlan, musicVolume, firstKey + scenes.size, introCard, outroCard)
@@ -105,6 +122,24 @@ internal fun clampSceneWindow(source: TrailerSource, start: Double, length: Doub
     val minLength = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, duration)
     val safeStart = (if (start.isFinite()) start else 0.0).coerceIn(0.0, max(0.0, duration - minLength))
     return safeStart to safeLength.coerceIn(minLength, max(minLength, duration - safeStart))
+}
+
+/** Length of the protected action interval of a video scene, bounded by the source; 0 when nothing is protected. */
+internal fun EditorScene.protectedLength(sourceDuration: Double): Double {
+    val a = actionStart ?: return 0.0
+    val b = actionEnd ?: return 0.0
+    if (!a.isFinite() || !b.isFinite() || b <= a) return 0.0
+    return min(b - a, sourceDuration)
+}
+
+/** Moves [start] the least needed so a window of [length] still contains the scene's protected action interval. */
+internal fun EditorScene.startKeepingAction(start: Double, length: Double, sourceDuration: Double): Double {
+    if (protectedLength(sourceDuration) <= 0.0 || length + 1e-9 < protectedLength(sourceDuration)) return start
+    val a = actionStart!!
+    val b = min(actionEnd!!, sourceDuration)
+    val lo = max(0.0, b - length)
+    val hi = min(a, max(0.0, sourceDuration - length))
+    return if (lo <= hi + 1e-6) start.coerceIn(lo, max(lo, hi)) else start
 }
 
 internal data class SceneDurationBounds(
@@ -140,10 +175,12 @@ internal fun resolveSceneDurationBounds(scene: EditorScene, source: TrailerSourc
         )
     }
     val duration = source.duration
-    val minLen = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, duration)
-    val safeStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, max(0.0, duration - minLen))
+    val minLen = max(min(MIN_EDITOR_VIDEO_SCENE_SECONDS, duration), scene.protectedLength(duration))
+    val rawStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, max(0.0, duration - minLen))
+    val curWanted = if (scene.length.isFinite()) max(scene.length, minLen) else minLen
+    val safeStart = scene.startKeepingAction(rawStart, curWanted, duration).coerceIn(0.0, max(0.0, duration - minLen))
     val maxLen = max(minLen, duration - safeStart)
-    val curLen = (if (scene.length.isFinite()) scene.length else minLen).coerceIn(minLen, maxLen)
+    val curLen = curWanted.coerceIn(minLen, maxLen)
     return SceneDurationBounds(
         safeStart = safeStart,
         minLen = minLen,
@@ -151,6 +188,46 @@ internal fun resolveSceneDurationBounds(scene: EditorScene, source: TrailerSourc
         currentLen = curLen,
         isFixed = false,
     )
+}
+
+/** Puts the scenes reserved by an earlier budget fit back, each after the nearest scene that preceded it then. */
+internal fun EditorProject.withBudgetReserveRestored(): EditorProject {
+    if (budgetReserve.isEmpty()) return this
+    val result = scenes.toMutableList()
+    val position = budgetOrder.withIndex().associate { it.value to it.index }
+    for (reserved in budgetReserve.sortedBy { position[it.key] ?: Int.MAX_VALUE }) {
+        val at = position[reserved.key]
+        if (at == null) { result.add(reserved); continue }
+        val anchor = (at - 1 downTo 0).firstNotNullOfOrNull { i -> result.indexOfFirst { it.key == budgetOrder[i] }.takeIf { it >= 0 } } ?: -1
+        result.add(anchor + 1, reserved)
+    }
+    return copy(scenes = result, budgetReserve = emptyList(), budgetOrder = emptyList())
+}
+
+/** Reorders active and reserved scene pools preserving membership and fields, updating budgetOrder. */
+fun EditorProject.withReorderedScenes(orderedSources: List<TrailerSource>): EditorProject {
+    val rank = orderedSources.mapIndexed { index, source -> source.id to index }.toMap()
+    val sceneComparator = compareBy<EditorScene> { rank[it.sourceId] ?: Int.MAX_VALUE }
+        .thenBy { it.start }
+        .thenBy { it.key }
+    val newActiveScenes = scenes.sortedWith(sceneComparator)
+    val newBudgetReserve = budgetReserve.sortedWith(sceneComparator)
+    val allSorted = (scenes + budgetReserve).sortedWith(sceneComparator)
+    val newBudgetOrder = if (budgetReserve.isEmpty() && budgetOrder.isEmpty()) emptyList() else allSorted.map { it.key }
+    return copy(
+        scenes = newActiveScenes,
+        budgetReserve = newBudgetReserve,
+        budgetOrder = newBudgetOrder,
+    )
+}
+
+/** Range of the scene body an explicit total can ask for: the shortest single whole scene .. every scene at its longest. */
+internal fun budgetBodyBounds(project: EditorProject, sources: List<TrailerSource>): Pair<Double, Double> {
+    val byId = sources.associateBy { it.id }
+    val all = project.copy(budgetReserve = project.budgetReserve.filter { it.sourceId in byId }).withBudgetReserveRestored().scenes
+    if (all.isEmpty()) return 0.0 to 0.0
+    val bounds = all.map { resolveSceneDurationBounds(it, byId[it.sourceId]) }
+    return bounds.minOf { it.minLen } to bounds.sumOf { it.maxLen }
 }
 
 /** Computes achievable total duration range [minTotal, maxTotal] for manual editing. */
@@ -252,7 +329,8 @@ internal fun redistributeManualTotal(
         val b = sceneBounds[i]
         val source = sourcesById[scene.sourceId]
         val (safeStart, safeLen) = if (source != null && !b.isFixed) {
-            clampSceneWindow(source, b.safeStart, candidateLengths[i])
+            val (cs, cl) = clampSceneWindow(source, b.safeStart, candidateLengths[i])
+            if (source.isImage) cs to cl else scene.startKeepingAction(cs, cl, source.duration).let { ks -> clampSceneWindow(source, ks, cl) }
         } else {
             b.safeStart to candidateLengths[i]
         }
@@ -291,7 +369,8 @@ internal fun applyManualClipLength(
         } else {
             val minLen = min(MIN_EDITOR_VIDEO_SCENE_SECONDS, source.duration)
             val safeStart = (if (scene.start.isFinite()) scene.start else 0.0).coerceIn(0.0, max(0.0, source.duration - minLen))
-            val (start, length) = clampSceneWindow(source, safeStart, targetClipLength)
+            val wanted = max(targetClipLength, scene.protectedLength(source.duration))
+            val (start, length) = clampSceneWindow(source, scene.startKeepingAction(safeStart, wanted, source.duration), wanted)
             scene.copy(start = start, length = length)
         }
     }

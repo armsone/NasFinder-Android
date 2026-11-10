@@ -83,7 +83,54 @@ private const val AUTOMATIC_TOTAL_TOLERANCE = 0.0005
 private fun recommendedClipBounds(duration: Double): ClosedFloatingPointRange<Double> =
     min(duration, (duration / 20.0).coerceIn(2.0, 4.0))..min(duration, (duration / 8.0).coerceIn(4.0, 10.0))
 
-private class TrailerPeakEvidence(val time: Double, val score: Double)
+// onset: earliest isolated sharp hit shortly before the peak (the real impact when a louder sustained sound follows it), else the peak itself.
+// verified: the classifier confirmed this peak as a real hit (an independent action, unlike a merely loud sound).
+// sharp: an isolated sharp hit (a club/ball click that dies away at once) is this action or leads into it. Wind, carts, speech and
+// handling are sustained and never sharp, so sharp actions are kept however many a long source has.
+private class TrailerPeakEvidence(
+    val time: Double,
+    val score: Double,
+    val spanStart: Double = time,
+    val spanEnd: Double = time,
+    val onset: Double = time,
+    val verified: Boolean = false,
+    val sharp: Boolean = false,
+    val loud: Boolean = true,
+) {
+    // An independent hit: the classifier confirmed it, or an isolated sharp click (not a <0.3s split of the same hit) leads into it.
+    val independent: Boolean get() = verified || sharp || time - onset >= INDEPENDENT_TRANSIENT_LEAD_SECONDS
+
+    // Source-time interval to keep: lead-in before the (earliest) impact through the follow-through after the peak. Only a loud
+    // sharp click is the impact itself; any weaker sound may be a practice swing or set-up before a silent stroke, so it keeps longer.
+    fun protectedInterval(duration: Double): Pair<Double, Double> =
+        max(0.0, onset - ACTION_LEAD_SECONDS) to min(duration, time + if (sharp && loud) ACTION_FOLLOW_SECONDS else WEAK_ACTION_FOLLOW_SECONDS)
+}
+
+// Source-time interval a cut must keep. Real swing footage (setup -> back-swing -> impact -> finish) runs about
+// 1.8s before and 2.0s after the audio impact peak, so the cut's peak is kept with that lead-in/follow-through
+// (clipped to the source); a cut with no peak keeps the whole candidate window.
+internal const val ACTION_LEAD_SECONDS = 2.5
+internal const val ACTION_FOLLOW_SECONDS = 3.5
+
+// After a sound that is not a loud click: a silent stroke up to ~4s later (practice swing, quiet putt) plus its result (ball roll, camera follow).
+internal const val WEAK_ACTION_FOLLOW_SECONDS = 6.0
+
+// Transients closer than this belong to the same hit (a click split over neighbouring analysis frames).
+private const val TRANSIENT_MERGE_SECONDS = 0.6
+
+// A classifier-verified neighbour is merged into kept actions only while the result stays within three protected spans.
+private const val MAX_MERGED_ACTION_SECONDS = 3 * (ACTION_LEAD_SECONDS + ACTION_FOLLOW_SECONDS)
+
+// Largest gap between two kept actions of a source that a hit reaching into it closes.
+private const val MAX_BRIDGED_GAP_SECONDS = 2.0
+
+// An isolated click up to this long before a louder peak is that action's real impact (the louder sound is what followed it).
+private const val ONSET_SEARCH_SECONDS = 3.8
+
+private const val INDEPENDENT_TRANSIENT_LEAD_SECONDS = 0.3
+
+// Lead-in/out kept around the measured energetic span of a peak so a cut never lands on the first/last frame of the action.
+internal const val ACTION_SPAN_PAD_SECONDS = 0.25
 
 // clipLength: median continuous energetic span around the meaningful peaks (rounded to .5s, clamped to the
 // source bounds), or the bounded 4s default when there is no valid evidence. peaks: meaningful peaks,
@@ -103,54 +150,328 @@ private fun TrailerSource.recommendationEvidence(): TrailerSourceEvidence {
     val baseline = finite.average()
     if (!(top > 0.0) || top - baseline < top * 0.15) return unknown
     val strongCut = max(baseline, top * 0.55)
+    val verifiedTimes = analysis.verifiedPeakTimesSeconds
+    // A classifier-verified hit is kept even when quieter than the strongCut loudness; unverified peaks still need the loud cut.
     val indexed = analysis.peakTimesSeconds
         .filter { it.isFinite() && it >= 0.0 && it <= duration }
         .distinct()
         .mapNotNull { time ->
             val index = (time / duration * wave.size).toInt().coerceIn(0, wave.lastIndex)
             val score = wave[index]
-            if (score.isFinite() && score >= strongCut) Triple(time, index, score) else null
+            val verified = verifiedTimes.any { abs(it - time) < 1e-6 }
+            if (score.isFinite() && (score >= strongCut || verified)) Triple(time, index, score) to verified else null
         }
-        .sortedByDescending { it.third }
+        .sortedWith(compareByDescending<Pair<Triple<Double, Int, Double>, Boolean>> { it.second }.thenByDescending { it.first.third })
     if (indexed.isEmpty()) return unknown
-    val spans = indexed.map { (_, index, score) ->
-        val threshold = baseline + (score - baseline) * 0.4
+    val ranges = indexed.map { (peak, _) ->
+        val (_, index, score) = peak
+        val threshold = baseline + (max(score, baseline) - baseline) * 0.4
         var left = index
         var right = index
         while (left > 0 && wave[left - 1].let { it.isFinite() && it > threshold }) left--
         while (right + 1 < wave.size && wave[right + 1].let { it.isFinite() && it > threshold }) right++
-        (right - left + 1).toDouble() / wave.size * duration
-    }.sorted()
+        left.toDouble() / wave.size * duration to (right + 1).toDouble() / wave.size * duration
+    }
+    val spans = ranges.map { it.second - it.first }.sorted()
     val clip = (round(spans[spans.size / 2] * 2.0) / 2.0).coerceIn(bounds)
-    return TrailerSourceEvidence(clip, indexed.map { TrailerPeakEvidence(it.first, it.third) })
+    val transients = analysis.transientTimesSeconds.filter { it.isFinite() && it >= 0.0 && it <= duration }.sorted()
+        .fold(mutableListOf<Double>()) { kept, t -> if (kept.isEmpty() || t - kept.last() >= TRANSIENT_MERGE_SECONDS) kept += t; kept }
+    val leadWindow = ONSET_SEARCH_SECONDS
+    val peaks = indexed.mapIndexed { i, (p, verified) ->
+        val onset = transients.filter { it < p.first && p.first - it <= leadWindow }.minOrNull() ?: p.first
+        val sharp = transients.any { it <= p.first + TRANSIENT_MERGE_SECONDS && p.first - it <= leadWindow }
+        TrailerPeakEvidence(p.first, p.third, ranges[i].first, ranges[i].second, onset, verified, sharp, loud = p.third >= strongCut)
+    }
+    // A sharp hit the loudness/classifier ranking left out (a quiet putt, a first-person shot in wind) is its own action candidate.
+    val covered = { t: Double -> peaks.any { t >= it.onset - 1e-6 && t <= it.time + TRANSIENT_MERGE_SECONDS } }
+    val extraHits = transients.filterNot(covered).map { t ->
+        val score = wave[(t / duration * wave.size).toInt().coerceIn(0, wave.lastIndex)].takeIf { it.isFinite() } ?: 0.0
+        TrailerPeakEvidence(t, score, t, t, t, verified = false, sharp = true, loud = score >= strongCut)
+    }
+    // Sharp actions first (each is kept), then classifier-verified, then merely loud; strongest first within each.
+    val ranked = (peaks + extraHits).sortedWith(
+        compareByDescending<TrailerPeakEvidence> { it.sharp }.thenByDescending { it.verified }.thenByDescending { it.score }
+    )
+    return TrailerSourceEvidence(clip, ranked)
 }
 
-// Distinct, non-overlapping cut starts (chronological) a source contributes to the recommended plan.
+// Distinct, non-overlapping cuts (chronological) a source contributes to the recommended plan.
 // Evidence sources: strongest peaks whose clip windows do not overlap. Fallback sources: a limited,
-// duration-based even spread. Both are capped by the per-source maximum, real capacity and half the source.
-private fun recommendedSourceStarts(source: TrailerSource, evidence: TrailerSourceEvidence, clip: Double): List<Double> {
-    val duration = source.duration
-    val sceneLength = min(clip, duration)
+// duration-based even spread. Both are capped by the per-source maximum, real capacity and half the source,
+// except sharp hits: every one is kept (a long round can hold many shots), a hit next to a kept one widens that cut.
+private fun recommendedSourcePicks(source: TrailerSource, evidence: TrailerSourceEvidence, clip: Double): List<SourcePick> =
+    rankedSourcePicks(source, evidence, clip).let { if (evidence.hasEvidence) it.sortedBy { pick -> pick.start } else it }
+
+private fun sourceSceneLimit(duration: Double, sceneLength: Double): Int {
     val capacity = floor(duration / sceneLength + 1e-6).toInt().coerceAtLeast(1)
     val halfBudget = floor(duration / 2.0 / sceneLength + 1e-6).toInt().coerceAtLeast(1)
-    val limit = minOf(capacity, halfBudget, MAX_RECOMMENDED_SCENES_PER_SOURCE)
+    return minOf(capacity, halfBudget, MAX_RECOMMENDED_SCENES_PER_SOURCE)
+}
+
+// A cut start with the peak it was cut for (null for the evidence-free even spread) and the action interval it must keep
+// (null = the whole window; wider than the peak's own interval when neighbouring sharp hits were merged into it).
+private data class SourcePick(val start: Double, val peak: TrailerPeakEvidence?, val actionStart: Double? = null, val actionEnd: Double? = null)
+
+// Strongest first (evidence sources).
+private fun rankedSourcePicks(source: TrailerSource, evidence: TrailerSourceEvidence, clip: Double): List<SourcePick> {
+    val duration = source.duration
+    val sceneLength = min(clip, duration)
+    val limit = sourceSceneLimit(duration, sceneLength)
     val maxStart = max(0.0, duration - sceneLength)
     if (evidence.hasEvidence) {
-        val starts = mutableListOf<Double>()
-        for (peak in evidence.peaks) {
-            if (starts.size >= limit) break
+        val picks = mutableListOf<SourcePick>()
+        fun overlaps(a: Double, b: Double, pick: SourcePick) = a < pick.actionEnd!! - 1e-6 && pick.actionStart!! < b - 1e-6
+        // A verified hit first met with the source already full is retried once all cuts are known: it may still join one.
+        val deferred = mutableListOf<TrailerPeakEvidence>()
+        fun consider(peak: TrailerPeakEvidence, retry: Boolean) {
+            val (a, b) = peak.protectedInterval(duration)
             val start = (peak.time - sceneLength / 2).coerceIn(0.0, maxStart)
-            if (starts.none { abs(it - start) < sceneLength - 1e-6 }) starts += start
+            val clash = picks.indexOfFirst { abs(it.start - start) < sceneLength - 1e-6 || overlaps(a, b, it) }
+            if (clash < 0) {
+                if (!peak.sharp && picks.size >= limit) {
+                    if (!retry && peak.verified) deferred += peak
+                    return
+                }
+                picks += SourcePick(start, peak, a, b)
+                return
+            }
+            // A separate hit next to kept actions is not dropped: they become one action holding all of them. A sharp hit always
+            // merges; a classifier-verified one only while the merged action stays short, so runs of noise cannot swallow a source.
+            val members = sortedSetOf(clash)
+            var action = min(a, picks[clash].actionStart!!) to max(b, picks[clash].actionEnd!!)
+            var changed = true
+            while (changed) {
+                changed = false
+                picks.forEachIndexed { i, other ->
+                    if (i !in members && overlaps(action.first, action.second, other)) {
+                        members += i
+                        action = min(action.first, other.actionStart!!) to max(action.second, other.actionEnd!!)
+                        changed = true
+                    }
+                }
+            }
+            val grows = members.any { action.first < picks[it].actionStart!! - 1e-6 || action.second > picks[it].actionEnd!! + 1e-6 }
+            if (!grows) return
+            if (!(peak.sharp || (peak.verified && action.second - action.first <= MAX_MERGED_ACTION_SECONDS))) {
+                // Too long to merge: a verified hit still outside every kept action gets the free gap between them, if the hit
+                // itself (with a second either side) fits there. It only fills space next to kept actions, so the source limit does not apply.
+                val lo = max(a, picks.filter { it.actionEnd!! <= peak.time + 1e-6 }.maxOfOrNull { it.actionEnd!! } ?: a)
+                val hi = min(b, picks.filter { it.actionStart!! >= peak.time - 1e-6 }.minOfOrNull { it.actionStart!! } ?: b)
+                if (peak.independent && peak.time - lo >= 1.0 - 1e-6 && hi - peak.time >= 1.0 - 1e-6 &&
+                    picks.none { overlaps(lo, hi, it) }
+                ) picks += SourcePick(start, peak, lo, hi)
+                return
+            }
+            // The strongest of the merged picks keeps its place in the ranking.
+            val strongest = picks[members.first()].copy(actionStart = action.first, actionEnd = action.second)
+            members.descendingSet().forEach { picks.removeAt(it) }
+            picks.add(members.first(), strongest)
         }
-        return starts.sorted()
+        evidence.peaks.forEach { consider(it, retry = false) }
+        deferred.toList().forEach { consider(it, retry = true) }
+        // Two kept actions less than MAX_BRIDGED_GAP_SECONDS apart whose gap an independent hit's context reaches into are joined, so
+        // that hit is not cut between them.
+        val order = picks.indices.sortedBy { picks[it].actionStart!! }
+        for (k in 0 until order.size - 1) {
+            val cur = picks[order[k]]
+            val next = picks[order[k + 1]]
+            val gap = next.actionStart!! - cur.actionEnd!!
+            if (gap <= 1e-6 || gap > MAX_BRIDGED_GAP_SECONDS) continue
+            val reaches = evidence.peaks.any { p -> p.independent && p.protectedInterval(duration).let { (a, b) -> a < next.actionStart - 1e-6 && b > cur.actionEnd + 1e-6 } }
+            if (reaches) picks[order[k]] = cur.copy(actionEnd = next.actionStart)
+        }
+        return picks
     }
     val count = when {
         duration >= 60.0 -> 3
         duration >= 20.0 -> 2
         else -> 1
     }.coerceAtMost(limit)
-    return (0 until count).map { index -> ((index + 0.5) * duration / count - sceneLength / 2).coerceIn(0.0, maxStart) }
+    return (0 until count).map { index -> SourcePick(((index + 0.5) * duration / count - sceneLength / 2).coerceIn(0.0, maxStart), null) }
 }
+
+
+// The cut grows (centred on the interval) when the protected action is longer than the requested clip, so the window always holds it.
+private fun actionScene(source: TrailerSource, pick: SourcePick, length: Double): TrailerScene {
+    val a = pick.actionStart ?: return TrailerScene(source, pick.start, length, actionStart = pick.start, actionEnd = pick.start + length)
+    val b = pick.actionEnd ?: (pick.start + length)
+    if (b - a > length + 1e-9) return TrailerScene(source, a, b - a, actionStart = a, actionEnd = b)
+    // Action span equal to the clip within float noise (b - length a hair above a) must not invert the range; start at a then.
+    val start = pick.start.coerceIn(min(a, max(0.0, b - length)), a)
+    return TrailerScene(source, start, length, actionStart = a, actionEnd = b)
+}
+
+// A source cut into fewer scenes than it has independent actions (e.g. one clip around the first of two putts) must not drop the
+// rest: every further independent hit (sharp, classifier-verified, or led by an isolated click) gets its own scene. The picks are
+// already separate actions within the per-source limit (sharp hits beyond it); plain loud sounds never qualify, so wind/noise
+// cannot flood the montage.
+private fun additionalActionScenes(source: TrailerSource, rest: List<SourcePick>, length: Double): List<TrailerScene> =
+    rest.filter { it.peak?.independent == true }.map { actionScene(source, it, length) }.sortedBy { it.actionStart ?: it.start }
+
+// Explicit "추천으로 다시 맞추기" for a project whose cuts were stored without verified anchors (e.g. saved before analysis
+// was persisted): each source's scenes, in project order, take that source's freshly recommended windows. Order, captions,
+// framing and volume stay; a source without verified evidence, or scenes beyond its recommended window count, are untouched.
+// Independent verified actions beyond the source's scene count are added as new scenes (chronological, next to that source's
+// own scenes; they inherit the neighbouring scene's framing/volume, no caption), so no known action is left out.
+internal fun EditorProject.rebuiltFromRecommendation(sources: List<TrailerSource>): EditorProject {
+    val byId = sources.associateBy { it.id }
+    val usable = HashMap<Int, TrailerSource?>()
+    fun usableSource(id: Int) = usable.getOrPut(id) {
+        byId[id]?.takeIf { !it.isImage && it.hasValidDuration && it.analysis.highlightSource != ClipHighlightSource.Fallback && it.analysis.waveform.isNotEmpty() }
+    }
+    // A source with m scenes keeps its m strongest recommended windows (not the m earliest), handed out chronologically in project order.
+    val windows = HashMap<Int, List<TrailerScene>>()
+    val extraWindows = HashMap<Int, List<TrailerScene>>()
+    for ((id, count) in scenes.groupingBy { it.sourceId }.eachCount()) {
+        val source = usableSource(id) ?: continue
+        val evidence = source.recommendationEvidence()
+        val clip = commonClipLength(listOf(evidence))
+        val length = min(clip, source.duration)
+        val picks = rankedSourcePicks(source, evidence, clip)
+        val core = picks.take(count).sortedBy { it.start }.map { actionScene(source, it, length) }
+        windows[id] = core
+        extraWindows[id] = additionalActionScenes(source, picks.drop(count), length)
+    }
+    val used = HashMap<Int, Int>()
+    var nextKey = this.nextKey
+    fun actionOf(scene: TrailerScene) = scene.actionStart ?: scene.start
+    val rebuilt = scenes.flatMap { scene ->
+        val source = usableSource(scene.sourceId) ?: return@flatMap listOf(scene)
+        val index = used.getOrDefault(source.id, 0)
+        val core = windows[source.id].orEmpty()
+        val rec = core.getOrNull(index) ?: return@flatMap listOf(scene)
+        used[source.id] = index + 1
+        // The cut grows to hold the whole protected action and is centred on it, so the window always contains the interval.
+        fun place(window: TrailerScene, base: EditorScene, length0: Double): EditorScene {
+            val actionStart = window.actionStart ?: window.start
+            val actionEnd = window.actionEnd ?: (window.start + window.length)
+            val span = actionEnd - actionStart
+            val length = min(max(length0, max(window.length, span)), source.duration)
+            val start = (actionStart - (length - span) / 2).coerceIn(0.0, max(0.0, source.duration - length))
+            return base.copy(start = start, length = length, actionStart = actionStart, actionEnd = actionEnd)
+        }
+        val extras = extraWindows[source.id].orEmpty()
+        // Extras sit between the core scenes by source time: before the first, or after the core scene they follow.
+        val before = if (index == 0) extras.filter { actionOf(it) < actionOf(rec) } else emptyList()
+        val next = core.getOrNull(index + 1)
+        val after = extras.filter { actionOf(it) > actionOf(rec) && (next == null || actionOf(it) < actionOf(next)) }
+        fun extra(window: TrailerScene) = place(window, scene.copy(key = nextKey++, caption = null), scene.length)
+        before.map(::extra) + place(rec, scene, scene.length) + after.map(::extra)
+    }
+    return copy(scenes = rebuilt, autoPlan = false, nextKey = nextKey)
+}
+
+// How much a whole scene matters when an explicit total cannot hold every protected scene: an important photo 2, another photo its
+// quality ratio; a video cut holding an action 1 + sharp 1 + verified .5, a cut with evidence but no action .5, a video without
+// evidence 1. (Loudness is relative to each source, so it does not rank scenes of different sources.)
+private fun sceneImportance(scene: EditorScene, source: TrailerSource?, evidence: (TrailerSource) -> TrailerSourceEvidence): Double {
+    if (source == null) return 0.0
+    if (source.isImage) return if (source.isImportant) 2.0 else source.effectivePhotoDurationRatio().coerceAtMost(0.95)
+    if (!source.hasValidDuration) return 0.0
+    val peaks = evidence(source).peaks
+    if (peaks.isEmpty()) return 1.0
+    val a = scene.actionStart ?: scene.start
+    val b = scene.actionEnd ?: (scene.start + scene.length)
+    return peaks.filter { it.time >= a - 1e-6 && it.time <= b + 1e-6 }
+        .maxOfOrNull { 1.0 + (if (it.sharp) 1.0 else 0.0) + (if (it.verified) 0.5 else 0.0) } ?: 0.5
+}
+
+internal class BudgetFit(val project: EditorProject, val total: Double, val included: Int, val excluded: Int)
+
+// Share of an explicit budget left free when whole scenes have to leave, so beat fitting can still move cuts.
+internal const val BUDGET_SLACK = 0.1
+
+/**
+ * Fits the scene body to an explicit [bodyTarget] (the total minus title cards) that is a hard budget. Scenes reserved by an earlier
+ * fit come back first. When the protected minimum lengths do not fit, whole scenes are chosen most important first (each source's
+ * strongest scene before any source's extra scenes; earlier first on a tie), each one that still fits whole; the rest are reserved.
+ * Kept scenes keep their protected action and share the budget. null when not even one whole scene fits.
+ */
+internal fun fitEditorToBudget(project: EditorProject, sources: List<TrailerSource>, bodyTarget: Double, capOnly: Boolean = false): BudgetFit? {
+    val byId = sources.associateBy { it.id }
+    // A reserved scene whose source was removed meanwhile is gone with it.
+    val all = project.copy(budgetReserve = project.budgetReserve.filter { it.sourceId in byId }).withBudgetReserveRestored()
+    if (all.scenes.isEmpty() || !bodyTarget.isFinite() || bodyTarget <= 0.0) return null
+    val minLen = all.scenes.map { resolveSceneDurationBounds(it, byId[it.sourceId]).minLen }
+    val keep = BooleanArray(all.scenes.size) { true }
+    var minSum = minLen.sum()
+    if (minSum > bodyTarget + 1e-6) {
+        val evidence = HashMap<Int, TrailerSourceEvidence>()
+        val importance = all.scenes.map { scene ->
+            sceneImportance(scene, byId[scene.sourceId]) { source -> evidence.getOrPut(source.id) { source.recommendationEvidence() } }
+        }
+        val representative = all.scenes.indices.groupBy { all.scenes[it].sourceId }.values
+            .map { group -> group.maxWith(compareBy<Int> { importance[it] }.thenByDescending { minLen[it] }.thenByDescending { it }) }.toSet()
+        // Least wanted first: extra scenes before each source's strongest, then less important, then (equally important) the longer
+        // protected minimum, so the most whole shots fit; then later.
+        val order = all.scenes.indices.sortedWith(
+            compareBy<Int> { it in representative }.thenBy { importance[it] }.thenByDescending { minLen[it] }.thenByDescending { it }
+        )
+        // When scenes must leave, the kept minimum leaves BUDGET_SLACK of the budget free so cuts can still move onto beats (and get
+        // context); a budget that holds a whole scene only without that room uses all of it.
+        // Most important first (each source's strongest scene before any extra one; shorter first on equal importance), every whole
+        // scene that still fits goes in.
+        fun choose(limit: Double) {
+            keep.fill(false)
+            minSum = 0.0
+            for (i in order.asReversed()) if (minSum + minLen[i] <= limit + 1e-6) { keep[i] = true; minSum += minLen[i] }
+        }
+        choose(bodyTarget * (1 - BUDGET_SLACK))
+        if (keep.none { it }) choose(bodyTarget)
+        if (keep.none { it }) return null
+    }
+    val kept = all.scenes.filterIndexed { i, _ -> keep[i] }
+    val reserve = all.scenes.filterIndexed { i, _ -> !keep[i] }
+    // capOnly (a clip length change under a chosen total) or a chosen number clip: the budget only caps, kept scenes are not stretched.
+    val target = if (capOnly || project.clipChoiceExplicit) min(bodyTarget, kept.sumOf { it.length }) else bodyTarget
+    val (fitted, total) = redistributeManualTotal(all.copy(scenes = kept), sources, target)
+    val order = if (reserve.isEmpty()) emptyList() else all.scenes.map { it.key }
+    return BudgetFit(all.copy(scenes = fitted, budgetReserve = reserve, budgetOrder = order), total, kept.size, reserve.size)
+}
+
+/**
+ * The clip row (−, 1, 2, 추천, 4, 6, +). 추천 (the recommended clip, [recommended]) is protection-aware: each video cut protects its whole
+ * detected action again (the source evidence inside the cut) and is never shorter than it. Any other length is the user's own choice:
+ * each video cut becomes exactly that long (within its source) around its impact where known, and that window is what it protects
+ * from then on (a 1s cut does not claim to hold the whole swing). Photos and scenes without a valid video source are left as they are.
+ */
+internal fun clipLengthScenes(scenes: List<EditorScene>, sources: List<TrailerSource>, length: Double, recommended: Boolean): List<EditorScene> {
+    if (!length.isFinite() || length <= 0.0) return scenes
+    val byId = sources.associateBy { it.id }
+    val evidence = HashMap<Int, TrailerSourceEvidence>()
+    return scenes.map { scene ->
+        val source = byId[scene.sourceId]?.takeIf { !it.isImage && it.hasValidDuration } ?: return@map scene
+        val duration = source.duration
+        val a = (scene.actionStart ?: scene.start).coerceIn(0.0, duration)
+        val b = min(scene.actionEnd ?: (scene.start + scene.length), duration).coerceAtLeast(a)
+        val peak = evidence.getOrPut(source.id) { source.recommendationEvidence() }.peaks.firstOrNull { it.time >= a - 1e-6 && it.time <= b + 1e-6 }
+        if (recommended) {
+            val (pa, pb) = peak?.protectedInterval(duration) ?: return@map scene
+            return@map scene.copy(actionStart = min(a, pa), actionEnd = max(b, pb))
+        }
+        val len = min(length, duration)
+        val anchor = peak?.onset ?: ((a + b) / 2)
+        val wanted = anchor - 0.4 * len
+        val start = (if (len <= b - a) wanted.coerceIn(a, max(a, b - len)) else wanted.coerceIn(max(0.0, b - len), max(max(0.0, b - len), a)))
+            .coerceIn(0.0, max(0.0, duration - len))
+        val shorter = len < b - a - 1e-9
+        scene.copy(
+            start = start,
+            length = len,
+            actionStart = if (shorter && scene.actionStart != null) start else scene.actionStart,
+            actionEnd = if (shorter && scene.actionEnd != null) start + len else scene.actionEnd,
+        )
+    }
+}
+
+/** What a budget fit traded off, for the status line; null when every scene fits. */
+internal fun budgetFitStatus(fit: BudgetFit, cards: Double): String? =
+    if (fit.excluded == 0) null
+    else "전체 ${trailerTime(fit.total + cards)}에 맞추려고 장면 ${fit.included}개를 넣고 덜 중요한 ${fit.excluded}개는 통째로 뺐어요. 길이를 늘리면 다시 들어갑니다."
+
+/** Refusal when even the shortest whole scene (plus title cards) is longer than the requested total. */
+internal fun budgetTooShortMessage(project: EditorProject, sources: List<TrailerSource>, cards: Double): String =
+    "가장 짧은 장면도 동작이 잘리지 않으려면 전체 ${trailerTime(budgetBodyBounds(project, sources).first + cards)} 이상이 필요해요. 이전 설정을 그대로 둡니다."
 
 internal class TrailerRecommendation(val clipLength: Double, val scenes: List<TrailerScene>) {
     val total: Double get() = scenes.sumOf { it.length }
@@ -187,7 +508,7 @@ internal fun recommendTrailerPlan(sources: List<TrailerSource>, explicitClip: Do
             evidence == null -> emptyList()
             else -> {
                 val sceneLength = min(clip, source.duration)
-                recommendedSourceStarts(source, evidence, clip).map { TrailerScene(source, it, sceneLength) }
+                recommendedSourcePicks(source, evidence, clip).map { actionScene(source, it, sceneLength) }
             }
         }
     }
@@ -269,6 +590,20 @@ object NaturalOrderComparator : Comparator<String> {
     }
 }
 
+fun sortTrailerSources(
+    sources: List<TrailerSource>,
+    mode: String?,
+    random: java.util.Random? = null,
+): List<TrailerSource> = when (mode) {
+    "촬영순", "시간순" -> sources.sortedWith(compareBy<TrailerSource> {
+        if (it.captureTimeMillis > 0L) it.captureTimeMillis else it.file.lastModified().takeIf { t -> t > 0L } ?: Long.MAX_VALUE
+    }.thenBy { it.id })
+    "추가순" -> sources.sortedBy { it.id }
+    "가나다순" -> sources.sortedWith(compareBy<TrailerSource, String>(NaturalOrderComparator) { it.name }.thenBy { it.id })
+    "랜덤" -> if (random != null) sources.shuffled(random) else sources.shuffled()
+    else -> sources
+}
+
 /** How a scene fills the output frame: FILL crops to cover (focus picks the visible part), FIT letterboxes. */
 enum class SceneFit(val title: String) { FILL("채우기"), FIT("맞추기") }
 
@@ -284,6 +619,9 @@ data class TrailerScene(
     val sourceVolume: Float = 1f,
     // Manual caption burned in after framing/photo motion, fixed to the output frame; null = none.
     val caption: SceneCaption? = null,
+    // Source-time interval of the detected action this scene must keep (null = nothing to protect).
+    val actionStart: Double? = null,
+    val actionEnd: Double? = null,
 )
 enum class TrailerFormat(val title: String, val width: Int, val height: Int) {
     ORIGINAL("원본", 0, 0),
@@ -353,7 +691,7 @@ data class TrailerSession(
     val draftId: String? = null,
     // False while sources only carry the placeholder analysis of music mode (no highlight/photo ratio data).
     val highlightAnalyzed: Boolean = true,
-    val orderMode: String? = "추가순",
+    val orderMode: String? = "촬영순",
     // Explicit, editable scene list of the CURRENT project (null only while staging). Export and autosave use it.
     val editor: EditorProject? = null,
     // Incremented on every editor change; export snapshots and autosave compare against it.
@@ -691,6 +1029,22 @@ fun syncPhotoScenesToBeatOnsets(
     val minLen = DoubleArray(n) { bounds[it].minLen }
     val maxLen = DoubleArray(n) { bounds[it].maxLen }
     val origLen = DoubleArray(n) { bounds[it].currentLen }
+    // 보호된 영상이 줄지 못하면 남는 박자 흡수를 사진이 떠맡아 0.2초 깜빡임이나 7초 정지가 생긴다. 사진은 원래 길이의 절반~2배 안에서만 움직인다.
+    // 이 범위로 음악 길이를 못 채우게 되면(예산 불가능) 원래의 넓은 범위로 되돌린다.
+    run {
+        val narrowMin = minLen.copyOf()
+        val narrowMax = maxLen.copyOf()
+        for (i in 0 until n) {
+            val src = byId[scenes[i].sourceId]
+            if (src == null || !src.isImage || bounds[i].isFixed) continue
+            narrowMin[i] = max(minLen[i], min(maxLen[i], origLen[i] * 0.5))
+            narrowMax[i] = min(maxLen[i], max(narrowMin[i], origLen[i] * 2.0))
+        }
+        val begin = max(0.0, introOffset)
+        val feasible = maxBudget == null ||
+            (begin + narrowMin.sum() <= maxBudget + eps && begin + narrowMax.sum() >= maxBudget - eps)
+        if (feasible) { narrowMin.copyInto(minLen); narrowMax.copyInto(maxLen) }
+    }
     // i번째 이후 장면들이 낼 수 있는 최소/최대 길이 합. softMin은 "여유 있게" 남겨 둘 시간(원래 길이의 절반 이상)이다.
     val tailMin = DoubleArray(n + 1)
     val tailMax = DoubleArray(n + 1)
@@ -701,10 +1055,9 @@ fun syncPhotoScenesToBeatOnsets(
         tailSoft[i] = tailSoft[i + 1] + if (bounds[i].isFixed) minLen[i] else min(maxLen[i], max(minLen[i], origLen[i] * 0.5))
     }
     val start = max(0.0, introOffset)
-    // 음악 끝을 맞춰야 하고 길이 범위상 가능할 때만 예산 제약을 쓴다. 불가능하면 비트만 맞추고 차이는 fitResidual로 알린다.
+    // 예산(음악 길이 맞춤의 음악 끝, 그 밖에는 지금 총길이)이 길이 범위상 가능할 때만 끝을 거기에 맞춘다. 불가능하면 비트만 맞추고 차이는 fitResidual로 알린다.
     val budget = maxBudget?.takeIf {
-        musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && it.isFinite() &&
-            start + tailMin[0] <= it + eps && start + tailMax[0] >= it - eps
+        it.isFinite() && start + tailMin[0] <= it + eps && start + tailMax[0] >= it - eps
     }
     val lastAdjustable = bounds.indexOfLast { !it.isFixed }
 
@@ -774,7 +1127,7 @@ fun syncPhotoScenesToBeatOnsets(
             end = currentEnd
         } else if (budget != null && i == lastAdjustable) {
             // 마지막 장면은 비트가 아니라 음악 끝에 맞추는 장면: 남은 시간을 그대로 받는다.
-            end = currentEnd.coerceIn(lo, hi)
+            end = currentEnd.coerceIn(lo, max(lo, hi))
         } else {
             // 원래 컷 시각에 가까운 비트부터. 남은 장면이 너무 짧아지지 않고(소프트) 다음 장면이 닿을 수 있는 후보를 먼저 쓴다.
             val ordered = beatsIn(lo - eps, hi + eps).sortedBy { abs(it - origEnd) }
@@ -782,13 +1135,17 @@ fun syncPhotoScenesToBeatOnsets(
                 ?: ordered.firstOrNull { nextCanReachBeat(i, it) }
                 ?: ordered.firstOrNull()
             if (pick == null) unalignedCount++
-            end = pick ?: currentEnd.coerceIn(lo, hi)
+            end = pick ?: currentEnd.coerceIn(lo, max(lo, hi))
         }
 
         var newLen = (end - cursor).coerceIn(minLen[i], maxLen[i])
         // 이미 비트에서 20ms 이내이고 예산 범위 안이면 길이를 건드리지 않는다.
         if (pick != null && abs(newLen - origLen[i]) <= 0.02 && currentEnd >= lo - eps && currentEnd <= hi + eps) newLen = origLen[i]
-        if (abs(newLen - scene.length) > 1e-9) resultScenes[i] = scene.copy(length = newLen)
+        if (abs(newLen - scene.length) > 1e-9) {
+            val src = byId[scene.sourceId]
+            val keptStart = if (src != null && !src.isImage) scene.startKeepingAction(scene.start, newLen, src.duration) else scene.start
+            resultScenes[i] = scene.copy(start = keptStart, length = newLen)
+        }
         if (pick != null && abs(newLen - origLen[i]) > 0.02) {
             adjustedCount++
             totalShift += abs(newLen - origLen[i])
@@ -796,7 +1153,161 @@ fun syncPhotoScenesToBeatOnsets(
         cursor += newLen
     }
 
-    val fitResidual = if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && maxBudget != null) maxBudget - cursor else 0.0
+    val fitResidual = if (maxBudget != null) maxBudget - cursor else 0.0
     val avgShift = if (adjustedCount > 0) totalShift / adjustedCount.toDouble() else 0.0
     return resultScenes to BeatSyncResult(adjustedCount, avgShift, unalignedCount, if (abs(fitResidual) <= 0.01) 0.0 else fitResidual)
 }
+
+internal class BeatFitResult(val scenes: List<EditorScene>, val sync: BeatSyncResult, val repeatCount: Int)
+
+/**
+ * 비트 맞춤. 음악 반복 횟수는 사용자가 고른 그대로이며(자동으로 늘리지 않는다) 예산을 넘기지 않는다: 음악 길이 맞춤은 음악 끝,
+ * 다른 정책은 지금 총길이가 끝이다. 닿지 못한 컷은 unalignedCount로 알린다.
+ */
+internal fun syncToBeatsWithMinimumRepeats(
+    project: EditorProject,
+    sources: List<TrailerSource>,
+    beats: List<Double>,
+    musicDuration: Double,
+    musicPolicy: TrailerMusicPolicy,
+    fitCount: Int,
+): BeatFitResult {
+    val introOffset = if (project.introCard.enabled) project.introCard.clampedDuration() else 0.0
+    val outroDuration = if (project.outroCard.enabled) project.outroCard.clampedDuration() else 0.0
+    val fit = musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicDuration.isFinite() && musicDuration > 0.0
+    val maxBudget = if (fit) musicDuration * fitCount - outroDuration else introOffset + project.scenes.sumOf { it.length }
+    val (synced, sync) = syncPhotoScenesToBeatOnsets(project.scenes, sources, beats, musicDuration, introOffset, musicPolicy, maxBudget)
+    return BeatFitResult(synced, sync, fitCount)
+}
+
+/** Regenerates the scenes from the recommended plan; only valid while the project is still automatic. */
+internal fun TrailerSession.withRegeneratedPlan(): TrailerSession = regeneratedPlanOrNull() ?: this
+
+/** [withRegeneratedPlan], or null when the explicit total/music length cannot hold even one whole scene (nothing changes then). */
+internal fun TrailerSession.regeneratedPlanOrNull(): TrailerSession? {
+    val project = editor ?: return this
+    val music = plannedMusic
+    if (!isMusicOverlayMode && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && music != null &&
+        music.durationSeconds.isFinite() && music.durationSeconds > 0.0
+    ) {
+        // 음악 예산으로 장면을 새로 고르면 뒤쪽(마지막 샷)이 잘린다. 앵커가 있는 전체 추천을 먼저 옮기고,
+        // 보호 구간을 지키며 고른 반복 횟수의 길이에 맞춘다(안 들어가는 덜 중요한 장면은 통째로 뺀다).
+        val full = recommendTrailerPlan(sources, explicitClip = clipLength)?.scenes
+        if (!full.isNullOrEmpty()) {
+            val plan = EditorProject.fromPlan(
+                full,
+                autoPlan = true,
+                musicVolume = project.musicVolume,
+                firstKey = project.nextKey,
+                introCard = project.introCard,
+                outroCard = project.outroCard,
+            )
+            val seeded = copy(editor = plan.copy(
+                scenes = clipLengthScenes(plan.scenes, sources, clipLength, !project.clipChoiceExplicit),
+                clipChoiceExplicit = project.clipChoiceExplicit,
+            ))
+            return seeded.withBudgetMusicFit()
+        }
+    }
+    if (!isMusicOverlayMode) {
+        // 정해 둔 길이로 장면을 새로 고르면 그 길이에 안 들어가는 샷이 조용히 빠진다. 전체 추천(모든 동작)에서 시작해 요청 길이에
+        // 맞추되 보호된 동작은 자르지 않고, 다 안 들어가면 덜 중요한 장면을 통째로 빼고 그렇게 알린다.
+        val full = recommendTrailerPlan(sources, explicitClip = clipLength)?.scenes
+        if (!full.isNullOrEmpty()) {
+            val plan = EditorProject.fromPlan(
+                full,
+                autoPlan = true,
+                musicVolume = project.musicVolume,
+                firstKey = project.nextKey,
+                introCard = project.introCard,
+                outroCard = project.outroCard,
+            )
+            val seeded = plan.copy(
+                scenes = clipLengthScenes(plan.scenes, sources, clipLength, !project.clipChoiceExplicit),
+                budgetTarget = project.budgetTarget,
+                clipChoiceExplicit = project.clipChoiceExplicit,
+            )
+            // Only a whole length the user chose (cards included) is a budget, kept through every regeneration (order, photos, cards,
+            // added sources). Without one the recommendation keeps every shot (an older automatic total is not a budget).
+            val requested = project.budgetTarget?.let { it - cardDuration }
+                ?: return copy(total = seeded.scenes.sumOf { it.length }, editor = seeded)
+            val fit = fitEditorToBudget(seeded, sources, requested) ?: return null
+            return copy(
+                total = fit.total,
+                editor = fit.project,
+                status = budgetFitStatus(fit, cardDuration) ?: status,
+            )
+        }
+    }
+    val genScenes = autoPlanScenes()
+    val actualSum = genScenes.sumOf { it.length }
+    return copy(
+        total = if (actualSum > 0.0) actualSum else total,
+        editor = EditorProject.fromPlan(
+            genScenes,
+            autoPlan = true,
+            musicVolume = project.musicVolume,
+            firstKey = project.nextKey,
+            introCard = project.introCard,
+            outroCard = project.outroCard,
+        ),
+    )
+}
+
+/**
+ * 직접 편집한 프로젝트에서 음악 길이 맞춤: 컷·순서·자막은 그대로 두고 장면 길이만 (음악 길이 × 반복 − 시작/마지막 카드)에
+ * 맞춰 다시 나눈다. 장면 길이 한계로 못 맞추면 가능한 만큼만 바뀌고, 내보낼 때 음악이 영상 끝까지 이어진다.
+ */
+internal fun TrailerSession.withManualMusicFit(): TrailerSession {
+    val project = editor ?: return this
+    if (project.autoPlan) return this
+    return withBudgetMusicFit() ?: copy(status = budgetTooShortMessage(project, sources, cardDuration))
+}
+
+/**
+ * 자동/수동 공통 음악 길이 맞춤: 고른 반복 횟수 그대로(자동으로 늘리지 않는다) 음악 길이 × 횟수(카드 포함)가 예산이다.
+ * 보호된 동작은 자르지 않고, 다 안 들어가면 덜 중요한 장면을 통째로 뺀다. 숫자로 고른 클립이면 음악 길이는 상한일 뿐 컷을 다시 늘리지
+ * 않아 영상이 음악보다 짧을 수 있다(화면이 실제 길이를 보여 준다). 한 장면도 안 들어가면 null.
+ */
+internal fun TrailerSession.withBudgetMusicFit(): TrailerSession? {
+    val project = editor ?: return this
+    val music = plannedMusic ?: return this
+    val musicLength = music.durationSeconds
+    if (musicPolicy != TrailerMusicPolicy.FIT_MUSIC_LENGTH || !musicLength.isFinite() || musicLength <= 0.0 || project.scenes.isEmpty()) return this
+    val cards = cardDuration.takeIf { it.isFinite() }?.coerceAtLeast(0.0) ?: 0.0
+    val count = musicFitCount.coerceIn(1, 600)
+    val fit = fitEditorToBudget(project, sources, (musicLength * count - cards).coerceAtLeast(0.1)) ?: return null
+    return copy(
+        total = fit.total,
+        musicFitCount = count,
+        editor = fit.project,
+        status = budgetFitStatus(fit, cards) ?: status,
+    )
+}
+
+/** A chosen whole length (not the music length fit) refits after title cards or clip lengths changed; [capOnly] for clip changes. */
+internal fun TrailerSession.withBudgetTargetRefit(capOnly: Boolean = false): TrailerSession {
+    val project = editor ?: return this
+    val target = project.budgetTarget ?: return this
+    if (musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && plannedMusic != null) return this
+    val fit = fitEditorToBudget(project, sources, target - cardDuration, capOnly) ?: return copy(status = budgetTooShortMessage(project, sources, cardDuration))
+    return copy(total = fit.total, editor = fit.project.copy(autoPlan = project.autoPlan), status = budgetFitStatus(fit, cardDuration) ?: status)
+}
+
+// editorSetMusic의 상태 변환(음악·정책·반복 횟수 선택 → 장면 재계획/길이 맞춤). 화면과 계측 테스트가 같은 모델을 쓴다.
+internal fun TrailerSession.withMusicSelection(track: TrailerMusicTrack?, policy: TrailerMusicPolicy, count: Int): TrailerSession {
+    var next = copy(
+        musicTrack = track,
+        unavailableMusic = null,
+        musicExportPrompt = false,
+        musicPolicy = policy,
+        musicFitCount = count,
+    )
+    if (track != null && policy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && track.durationSeconds > 0.0) {
+        // The music length × count is the budget now; a whole length chosen earlier no longer applies.
+        next = next.copy(total = (track.durationSeconds * count - cardDuration).coerceAtLeast(0.1), editor = editor?.copy(budgetTarget = null))
+    }
+    // 고른 반복 횟수의 길이에 한 장면도 통째로 안 들어가면 이전 상태 그대로(호출자가 최소 길이를 알린다).
+    return if (editor?.autoPlan == true) next.regeneratedPlanOrNull() ?: this else next.withBudgetMusicFit() ?: this
+}
+

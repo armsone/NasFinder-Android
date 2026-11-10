@@ -191,6 +191,11 @@ internal fun VideoDraftsScreen(
                                     Spacer(Modifier.width(4.dp))
                                     Text("복제", maxLines = 1, softWrap = false)
                                 }
+                                TextButton(onClick = { model.duplicateTrailerDraftRebuiltFromRecommendation(draft) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
+                                    Icon(Icons.Default.ContentCopy, null, Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("추천으로 다시 맞춘 사본", maxLines = 1, softWrap = false)
+                                }
                                 TextButton(onClick = {
                                     draftToRename = draft
                                     renameTitle = draft.displayTitle

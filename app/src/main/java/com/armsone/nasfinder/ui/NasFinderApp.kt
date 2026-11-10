@@ -663,7 +663,8 @@ private tailrec fun Context.findHostActivity(): Activity? = when (this) {
 @Composable
 private fun PreviewCircleActionButton(
     onClick: () -> Unit,
-    icon: ImageVector,
+    icon: ImageVector? = null,
+    text: String? = null,
     contentDescription: String?,
     enabled: Boolean = true,
     modifier: Modifier = Modifier,
@@ -697,12 +698,22 @@ private fun PreviewCircleActionButton(
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = contentDescription,
-                tint = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
-                modifier = Modifier.size(20.dp),
-            )
+            if (icon != null) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = contentDescription,
+                    tint = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
+                    modifier = Modifier.size(20.dp),
+                )
+            } else if (text != null) {
+                Text(
+                    text = text,
+                    color = if (enabled) Color.White else Color.White.copy(alpha = 0.38f),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                )
+            }
         }
     }
 }
@@ -1112,10 +1123,14 @@ internal fun BuiltInPreviewScreen(
                         },
                         onNextMedia = if (preview.images.size > 1) {
                             {
-                                slideshowPlaying = true
                                 val nextIndex = MediaSlideshowPolicy.nextIndex(preview.index, preview.images.size, playbackMode)
-                                implicitAdvanceIndex = nextIndex
-                                onSelectIndex(nextIndex)
+                                if (nextIndex in preview.images.indices) {
+                                    slideshowPlaying = true
+                                    implicitAdvanceIndex = nextIndex
+                                    onSelectIndex(nextIndex)
+                                } else {
+                                    slideshowPlaying = false
+                                }
                             }
                         } else null,
                     )
@@ -1246,7 +1261,7 @@ internal fun BuiltInPreviewScreen(
                                 MediaViewerPreferences.setSlideshowInterval(context, nextSec)
                                 revealControls()
                             },
-                            icon = Icons.Default.Timer,
+                            text = "${slideshowInterval}초",
                             contentDescription = "재생 간격: ${slideshowInterval}초",
                             enabled = true,
                         )
@@ -1639,6 +1654,9 @@ private fun MediaPreviewContent(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var gestureMessage by remember { mutableStateOf<String?>(null) }
     var fineVolumeFraction by remember(mediaSourceKey) { mutableStateOf<Float?>(null) }
+    val currentPlaybackMode by rememberUpdatedState(playbackMode)
+    val currentOnNextMedia by rememberUpdatedState(onNextMedia)
+    val currentVideoRepeat by rememberUpdatedState(videoRepeat)
 
     LaunchedEffect(playing, isBuffering, playbackError) {
         onPlayStateChanged?.invoke(playing, isBuffering, playbackError != null)
@@ -1704,8 +1722,13 @@ private fun MediaPreviewContent(
         }
     }
 
-    LaunchedEffect(player, videoRepeat) {
-        player?.repeatMode = if (videoRepeat) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+    val hasPlaylist = onNextMedia != null && preview.images.size > 1
+    LaunchedEffect(player, hasPlaylist, playbackMode, videoRepeat) {
+        player?.repeatMode = MediaPlaybackPolicy.exoPlayerRepeatMode(
+            hasPlaylist = hasPlaylist,
+            mode = playbackMode,
+            singleItemRepeat = videoRepeat,
+        )
     }
 
     LaunchedEffect(gestureMessage) {
@@ -1949,23 +1972,26 @@ private fun MediaPreviewContent(
                                 isBuffering = false
                                 playbackError = null
                             } else if (playbackState == Player.STATE_ENDED) {
-                                if (preview.kind == BuiltInPreviewKind.VIDEO) {
-                                    if (videoRepeat) {
+                                val hasPlaylist = currentOnNextMedia != null && preview.images.size > 1
+                                val action = MediaPlaybackPolicy.videoEOSAction(
+                                    hasPlaylist = hasPlaylist,
+                                    mode = currentPlaybackMode,
+                                    singleItemRepeat = currentVideoRepeat,
+                                )
+                                when (action) {
+                                    VideoEOSAction.REPEAT -> {
                                         seekTo(0)
                                         play()
-                                    } else {
+                                    }
+                                    VideoEOSAction.ADVANCE -> {
+                                        playing = false
+                                        position = duration
+                                        currentOnNextMedia?.invoke()
+                                    }
+                                    VideoEOSAction.STOP -> {
                                         pause()
                                         playing = false
                                         position = duration
-                                    }
-                                } else {
-                                    if (playbackMode == MediaPlaybackMode.ONE_REPEAT) {
-                                        seekTo(0)
-                                        play()
-                                    } else {
-                                        playing = false
-                                        position = duration
-                                        onNextMedia?.invoke()
                                     }
                                 }
                             }
@@ -2243,19 +2269,39 @@ private fun MediaPreviewContent(
                                     tint = Color.White,
                                 )
                             }
-                            IconButton(
-                                onClick = {
-                                    onInteraction()
-                                    val nextRepeat = !videoRepeat
-                                    videoRepeat = nextRepeat
-                                    MediaViewerPreferences.setVideoRepeat(context, nextRepeat)
-                                },
-                            ) {
-                                Icon(
-                                    imageVector = if (videoRepeat) Icons.Default.RepeatOne else Icons.Default.Repeat,
-                                    contentDescription = if (videoRepeat) "반복 재생: 켜짐" else "반복 재생: 꺼짐",
-                                    tint = if (videoRepeat) Color.White else Color.White.copy(alpha = 0.5f),
-                                )
+                            if (onNextMedia != null && preview.images.size > 1) {
+                                IconButton(
+                                    onClick = {
+                                        onInteraction()
+                                        onPlaybackModeChange(playbackMode.next())
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = when (playbackMode) {
+                                            MediaPlaybackMode.ALL_REPEAT -> Icons.Default.Repeat
+                                            MediaPlaybackMode.SHUFFLE -> Icons.Default.Shuffle
+                                            MediaPlaybackMode.ONE_REPEAT -> Icons.Default.RepeatOne
+                                            MediaPlaybackMode.ONCE -> Icons.Default.LooksOne
+                                        },
+                                        contentDescription = "재생 모드: ${playbackMode.title}",
+                                        tint = Color.White,
+                                    )
+                                }
+                            } else {
+                                IconButton(
+                                    onClick = {
+                                        onInteraction()
+                                        val nextRepeat = !videoRepeat
+                                        videoRepeat = nextRepeat
+                                        MediaViewerPreferences.setVideoRepeat(context, nextRepeat)
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = if (videoRepeat) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                                        contentDescription = if (videoRepeat) "반복 재생: 켜짐" else "반복 재생: 꺼짐",
+                                        tint = if (videoRepeat) Color.White else Color.White.copy(alpha = 0.5f),
+                                    )
+                                }
                             }
                         }
                     } else {
