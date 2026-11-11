@@ -1,12 +1,15 @@
 package com.armsone.nasfinder.ui
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -49,15 +52,36 @@ internal fun SceneAdvancedSection(
     source: TrailerSource,
     model: NasFinderViewModel,
     clipPlayback: ClipPlaybackState?,
+    showsTitle: Boolean = true,
+    asMenu: Boolean = false,
 ) {
     var tool by rememberSaveable(scene.key) { mutableStateOf<String?>(null) }
     val adjust = scene.adjustments ?: TrailerClipAdjustments()
     val tools = if (source.isImage) AdvancedTool.entries - AdvancedTool.RATE else AdvancedTool.entries
-    TrailerSectionTitle("세부 편집")
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        tools.forEach { entry ->
-            val active = adjustedLabel(entry, adjust)
-            TrailerChoice(active ?: entry.title, tool == entry.name, compact = true) { tool = if (tool == entry.name) null else entry.name }
+    if (showsTitle) TrailerSectionTitle("세부 편집")
+    if (asMenu) {
+        // Phone: the five tools live in one dropdown so only the chosen detail control is on screen.
+        var open by remember { mutableStateOf(false) }
+        val current = tools.firstOrNull { it.name == tool }
+        Box {
+            OutlinedButton(shape = EditorButtonShape, onClick = { open = true }) {
+                Text(current?.let { adjustedLabel(it, adjust) ?: it.title } ?: "세부 조절 선택 ▾", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                tools.forEach { entry ->
+                    DropdownMenuItem(
+                        text = { Text(adjustedLabel(entry, adjust) ?: entry.title) },
+                        onClick = { tool = if (tool == entry.name) null else entry.name; open = false },
+                    )
+                }
+            }
+        }
+    } else {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            tools.forEach { entry ->
+                val active = adjustedLabel(entry, adjust)
+                TrailerChoice(active ?: entry.title, tool == entry.name, compact = true) { tool = if (tool == entry.name) null else entry.name }
+            }
         }
     }
     val shown = tools.firstOrNull { it.name == tool } ?: return

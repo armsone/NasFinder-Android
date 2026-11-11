@@ -148,6 +148,16 @@ private enum class EditorPhase { EDIT, EXPORT }
 /** Portrait tablet / TriFold: the one switch under the fixed preview (클립 board or 설정 tabs). UI-only, survives rotation. */
 private enum class PhoneRole(val title: String) { CLIPS("클립"), PREVIEW("미리보기"), SETTINGS("설정") }
 
+/** Folded phone (Fold6): one clear tool choice under the timeline, no duplicate tab stacks. UI-only. */
+private enum class PhoneTool(val title: String) {
+    TRIM("편집"),
+    BOARD("목록"),
+    CAPTION("자막·구간"),
+    SOUND("음악"),
+    SCREEN("화면"),
+    EFFECT("효과"),
+}
+
 private enum class PortraitPane(val title: String) { CLIPS("클립"), SETTINGS("설정") }
 
 /** Tablet / board display mode: 자세히 (detail), 썸네일 (thumbnail), 포스터 (poster). UI-only, survives rotation. */
@@ -211,6 +221,7 @@ internal fun AdaptiveEditorWorkspace(
     var portraitPane by rememberSaveable(directoryKey) { mutableStateOf(PortraitPane.CLIPS) }
     // Phone only: 클립 (board) / 미리보기 (picture + selected clip tools) share inspectorTab == SCENE; 설정 is any other tab.
     var phonePreviewOnly by rememberSaveable(directoryKey) { mutableStateOf(false) }
+    var phoneTool by rememberSaveable(directoryKey) { mutableStateOf(PhoneTool.TRIM) }
     val portraitSettingsScroll = rememberScrollState()
     var landscapePlacement by rememberSaveable(directoryKey) { mutableStateOf(LandscapePlacement.CLIPS_LEFT) }
     var boardDisplayMode by rememberSaveable(directoryKey) { mutableStateOf(BoardDisplayMode.DETAIL) }
@@ -774,6 +785,7 @@ internal fun AdaptiveEditorWorkspace(
         fun showPendingCaption() {
             phase = EditorPhase.EDIT
             inspectorTab = InspectorTab.CAPTION
+            if (isPhone) phoneTool = PhoneTool.CAPTION
             val ownerKey = captionDraft?.sceneKey?.takeIf { project.scene(it) != null }
             if (ownerKey != null && ownerKey != selectedSceneKey) {
                 selectedSceneKey = ownerKey
@@ -884,6 +896,7 @@ internal fun AdaptiveEditorWorkspace(
                         selectedSceneKey = key
                         selectedSceneKeys = setOf(key)
                         inspectorTab = InspectorTab.CAPTION
+                        phoneTool = PhoneTool.CAPTION
                     }
                 } else null,
                 page = page,
@@ -959,15 +972,24 @@ internal fun AdaptiveEditorWorkspace(
                         ProjectTimeline(
                             sizeRatio = if (fitPane) 0.5f else sizeRatio,
                             compactPhone = isPhone,
-                            showClock = fitPane,
+                            showClock = fitPane || isPhone,
                             session = session,
                             segments = timelineSegs,
                             selectedKey = selectedSceneKey,
                             clipPlayback = clipPlayback,
-                            onSelectScene = ::selectOnly,
+                            onSelectScene = { key ->
+                                selectOnly(key)
+                                if (isPhone && phoneTool == PhoneTool.BOARD) {
+                                    phoneTool = PhoneTool.TRIM
+                                }
+                            },
                             onTogglePlay = ::toggleProjectPlay,
                             onToggleFullscreen = { editingFullscreen = true },
                             fullscreenEnabled = editingFullscreenAllowed,
+                            onUndo = model::editorUndo,
+                            canUndo = session.canUndo && !session.busy,
+                            onRedo = model::editorRedo,
+                            canRedo = session.canRedo && !session.busy,
                         )
                     },
                     modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
@@ -1143,6 +1165,26 @@ internal fun AdaptiveEditorWorkspace(
             }
             // One header across every width (edit-only controls hidden on the made video); below it only the current screen.
             Column(Modifier.weight(1f).fillMaxHeight()) {
+                val export = session.export
+                val exportLabel = when {
+                    rendering && export?.status == EDITOR_EXPORT_SAVING_STATUS -> "저장 중…"
+                    rendering -> {
+                        val percent = export?.progress?.let { " ${(it * 100).roundToInt().coerceIn(0, 100)}%" } ?: ""
+                        "만드는 중$percent"
+                    }
+                    outputCurrent && !captionPending -> "내보내기"
+                    else -> "내보내기"
+                }
+                val exportAction = when {
+                    rendering -> ::openResult
+                    outputCurrent && !captionPending -> ::openResult
+                    else -> ::startVideo
+                }
+                val exportEnabled = when {
+                    rendering -> true
+                    outputCurrent && !captionPending -> true
+                    else -> !session.busy && project.scenes.isNotEmpty()
+                }
                 EditorHeader(
                     session = session,
                     editing = phase == EditorPhase.EDIT,
@@ -1153,26 +1195,11 @@ internal fun AdaptiveEditorWorkspace(
                     // Both orientations: the header itself shows the three roles once its width (= the pane area's) fits two panes.
                     landscapePlacement = if (!isPhone) landscapePlacement else null,
                     onLandscapePlacementChange = { landscapePlacement = it },
+                    isPhone = isPhone,
+                    onExport = exportAction,
+                    exportButtonLabel = exportLabel,
+                    exportEnabled = exportEnabled,
                 )
-                if (isPhone && phase == EditorPhase.EDIT) {
-                    val phoneRole = when {
-                        inspectorTab != InspectorTab.SCENE && inspectorTab != InspectorTab.PLAN -> PhoneRole.SETTINGS
-                        phonePreviewOnly -> PhoneRole.PREVIEW
-                        else -> PhoneRole.CLIPS
-                    }
-                    MacSegmentedControl(
-                        options = PhoneRole.entries.map { it to it.title },
-                        selected = phoneRole,
-                        onSelect = { role ->
-                            when (role) {
-                                PhoneRole.CLIPS -> { phonePreviewOnly = false; inspectorTab = InspectorTab.SCENE }
-                                PhoneRole.PREVIEW -> { phonePreviewOnly = true; inspectorTab = InspectorTab.SCENE }
-                                PhoneRole.SETTINGS -> if (phoneRole != PhoneRole.SETTINGS) inspectorTab = InspectorTab.CAPTION
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
-                    )
-                }
                 SessionStatusLine(session)
                 when (phase) {
                     EditorPhase.EXPORT -> ResultPhase(Modifier.weight(1f).fillMaxWidth())
@@ -1215,7 +1242,7 @@ internal fun AdaptiveEditorWorkspace(
                             @Composable
                             fun PreviewAndTabs(tabsBelowPicture: Boolean = true, stageHeight: Dp = paneHeight) {
                                 when {
-                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.15f, baseMax = 96.dp, maxShare = if (imeVisible) 0.18f else 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = false, reservedBelow = if (phoneLowLandscape) 1.dp else 0.dp, fitPane = phoneLowLandscape)
+                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.38f, baseMax = 320.dp, maxShare = if (imeVisible) 0.18f else 0.50f, horizontalPadding = 4.dp, tabsBelowPicture = false, reservedBelow = if (phoneLowLandscape) 1.dp else 0.dp, fitPane = phoneLowLandscape)
                                     // Two-pane portrait (TriFold) sizes the picture like landscape, not with the 140dp phone-ish cap.
                                     isLandscape || twoColumns -> Stage(paneHeight = stageHeight, baseShare = 0.55f, baseMax = 420.dp, maxShare = if (imeVisible) 0.42f else 0.75f, horizontalPadding = 0.dp, tabsBelowPicture = tabsBelowPicture)
                                     else -> Stage(paneHeight = paneHeight, baseShare = 0.165f, baseMax = 140.dp, maxShare = 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = tabsBelowPicture)
@@ -1461,6 +1488,178 @@ internal fun AdaptiveEditorWorkspace(
                                         }
                                     }
                                 }
+                            } else if (isPhone) {
+                                @Composable
+                                fun PhoneToolContent() {
+                                    when (phoneTool) {
+                                        PhoneTool.BOARD -> {
+                                            Board(
+                                                fixedColumns = columns,
+                                                maxColumns = maxColumns,
+                                                onColumnsChange = { phoneColumns = it },
+                                                thumbnailAspect = thumbAspect,
+                                                compactCells = compactCells,
+                                                modifier = Modifier.fillMaxSize(),
+                                                page = null,
+                                                forceClips = true,
+                                            )
+                                        }
+                                        PhoneTool.TRIM -> {
+                                            Column(
+                                                Modifier
+                                                    .fillMaxSize()
+                                                    .verticalScroll(rememberScrollState())
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                SceneSection(session, selectedScene, selectedSource, model, ::selectOnly, clipPlayback, phoneCompact = true)
+                                                Spacer(Modifier.height(32.dp))
+                                            }
+                                        }
+                                        PhoneTool.EFFECT -> {
+                                            Column(
+                                                Modifier
+                                                    .fillMaxSize()
+                                                    .verticalScroll(rememberScrollState())
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                val effectScene = selectedScene
+                                                val effectSource = selectedSource
+                                                if (effectScene != null && effectSource != null) {
+                                                    val effectNumber = project.scenes.indexOfFirst { it.key == effectScene.key } + 1
+                                                    Text(
+                                                        "${effectNumber}번 클립 · ${effectSource.name}",
+                                                        style = MaterialTheme.typography.labelLarge,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                    )
+                                                    SceneAdvancedSection(effectScene, effectSource, model, clipPlayback, showsTitle = false, asMenu = true)
+                                                } else {
+                                                    Text("효과를 적용할 클립을 먼저 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                }
+                                                Spacer(Modifier.height(32.dp))
+                                            }
+                                        }
+                                        PhoneTool.CAPTION -> {
+                                            Column(
+                                                Modifier
+                                                    .fillMaxSize()
+                                                    .verticalScroll(rememberScrollState())
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                InspectorBody(Modifier.fillMaxWidth()) {
+                                                    val single = body.single
+                                                    if (single != null) {
+                                                        single()
+                                                    } else {
+                                                        body.left()
+                                                        body.right?.let { right ->
+                                                            if (body.dividerBetween) HorizontalDivider()
+                                                            right()
+                                                        }
+                                                    }
+                                                }
+                                                Spacer(Modifier.height(32.dp))
+                                            }
+                                        }
+                                        PhoneTool.SOUND -> {
+                                            Column(
+                                                Modifier
+                                                    .fillMaxSize()
+                                                    .verticalScroll(rememberScrollState())
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                InspectorBody(Modifier.fillMaxWidth()) {
+                                                    body.left()
+                                                    body.right?.let { right ->
+                                                        if (body.dividerBetween) HorizontalDivider()
+                                                        right()
+                                                    }
+                                                }
+                                                Spacer(Modifier.height(32.dp))
+                                            }
+                                        }
+                                        PhoneTool.SCREEN -> {
+                                            Column(
+                                                Modifier
+                                                    .fillMaxSize()
+                                                    .verticalScroll(rememberScrollState())
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                InspectorBody(Modifier.fillMaxWidth()) {
+                                                    val single = body.single
+                                                    if (single != null) {
+                                                        single()
+                                                    } else {
+                                                        body.left()
+                                                        body.right?.let { right ->
+                                                            if (body.dividerBetween) HorizontalDivider()
+                                                            right()
+                                                        }
+                                                    }
+                                                }
+                                                Spacer(Modifier.height(32.dp))
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (phoneLowLandscape) {
+                                    Row(Modifier.fillMaxSize()) {
+                                        Column(Modifier.weight(0.5f).fillMaxHeight()) {
+                                            PreviewAndTabs()
+                                        }
+                                        VerticalHairline()
+                                        Column(Modifier.weight(0.5f).fillMaxHeight()) {
+                                            MacSegmentedControl(
+                                                options = PhoneTool.entries.map { it to it.title },
+                                                selected = phoneTool,
+                                                onSelect = { tool ->
+                                                    phoneTool = tool
+                                                    when (tool) {
+                                                        PhoneTool.TRIM, PhoneTool.BOARD, PhoneTool.EFFECT -> inspectorTab = InspectorTab.SCENE
+                                                        PhoneTool.CAPTION -> inspectorTab = InspectorTab.CAPTION
+                                                        PhoneTool.SOUND -> inspectorTab = InspectorTab.SOUND
+                                                        PhoneTool.SCREEN -> inspectorTab = InspectorTab.SCREEN
+                                                    }
+                                                },
+                                                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
+                                            )
+                                            Box(Modifier.weight(1f).fillMaxWidth()) {
+                                                PhoneToolContent()
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Column(Modifier.fillMaxSize()) {
+                                        // 1. Aspect-correct preview + compact transport (play/time/undo-redo) + timeline
+                                        PreviewAndTabs()
+                                        // 2. One clear tool choice bar (no duplicate tab stacks)
+                                        MacSegmentedControl(
+                                            options = PhoneTool.entries.map { it to it.title },
+                                            selected = phoneTool,
+                                            onSelect = { tool ->
+                                                phoneTool = tool
+                                                when (tool) {
+                                                    PhoneTool.TRIM, PhoneTool.BOARD, PhoneTool.EFFECT -> inspectorTab = InspectorTab.SCENE
+                                                    PhoneTool.CAPTION -> inspectorTab = InspectorTab.CAPTION
+                                                    PhoneTool.SOUND -> inspectorTab = InspectorTab.SOUND
+                                                    PhoneTool.SCREEN -> inspectorTab = InspectorTab.SCREEN
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                                        )
+                                        // 3. Tool details open contextually below, fully scrollable, sliders reachable
+                                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                                            PhoneToolContent()
+                                        }
+                                    }
+                                }
                             } else {
                                 if ((inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) && !(isPhone && phonePreviewOnly)) {
                                     // Phone: the picture + timeline (the one shared player) stay fixed on top at their compact height,
@@ -1534,7 +1733,7 @@ internal fun AdaptiveEditorWorkspace(
                             }
                         }
                         // The footer sits outside the page scroll; it yields to the keyboard while typing.
-                        if (!imeVisible) EditFooter()
+                        if (!imeVisible && !isPhone) EditFooter()
                     }
                 }
             }
@@ -1881,6 +2080,10 @@ private fun EditorHeader(
     onRedo: () -> Unit,
     landscapePlacement: LandscapePlacement? = null,
     onLandscapePlacementChange: ((LandscapePlacement) -> Unit)? = null,
+    isPhone: Boolean = false,
+    onExport: (() -> Unit)? = null,
+    exportButtonLabel: String = "내보내기",
+    exportEnabled: Boolean = true,
 ) {
     val palette = themePalette()
     val project = session.editor
@@ -1892,7 +2095,7 @@ private fun EditorHeader(
     val metadataText = listOf(counts, saveLabel, if (project?.autoPlan == false) "직접 편집" else "자동 추천").filter { it.isNotBlank() }.joinToString(" · ")
 
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val isCompactHeader = maxWidth < 480.dp
+        val isCompactHeader = isPhone || maxWidth < 480.dp
         if (isCompactHeader && editing) {
             Column(
                 Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
@@ -1913,11 +2116,44 @@ private fun EditorHeader(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f).clickable(onClickLabel = "프로젝트 이름 바꾸기", onClick = onRename).padding(horizontal = 4.dp),
                     )
-                    IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
-                        Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon))
-                    }
-                    IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
-                        Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon))
+                    if (isPhone && onExport != null) {
+                        val (w, h) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
+                        val resTag = when {
+                            maxOf(w, h) >= 3840 -> "4K"
+                            maxOf(w, h) >= 2560 -> "2K"
+                            maxOf(w, h) >= 1920 -> "FHD"
+                            maxOf(w, h) >= 1280 -> "HD"
+                            else -> "SD"
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier.padding(end = 6.dp),
+                        ) {
+                            Text(
+                                resTag,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontSize = 11.sp),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Button(
+                            shape = EditorButtonShape,
+                            onClick = onExport,
+                            enabled = exportEnabled,
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            modifier = Modifier.heightIn(min = 34.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = palette.solidAction, contentColor = palette.onAccent),
+                        ) {
+                            Text(exportButtonLabel, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), maxLines = 1)
+                        }
+                    } else {
+                        IconButton(onClick = onUndo, enabled = session.canUndo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                            Icon(Icons.AutoMirrored.Filled.Undo, "실행 취소", Modifier.size(ToolbarActionIcon))
+                        }
+                        IconButton(onClick = onRedo, enabled = session.canRedo && !session.busy, modifier = Modifier.size(IconHitTarget)) {
+                            Icon(Icons.AutoMirrored.Filled.Redo, "다시 실행", Modifier.size(ToolbarActionIcon))
+                        }
                     }
                 }
                 Text(
@@ -2699,6 +2935,8 @@ private fun EditorStage(
                                 detectTapGestures { handleToggle() }
                             }
                     )
+                    // 타임라인이 있으면 재생 단추는 그 줄 하나뿐이다(그림 탭은 같은 재생 전환). 타임라인이 없을 때만 그림 위 단추를 둔다.
+                    if (timeline == null) {
                     val isPlaying = clipPlayback.playing
                     IconButton(
                         onClick = handleToggle,
@@ -2715,6 +2953,7 @@ private fun EditorStage(
                             tint = Color.White,
                             modifier = Modifier.size(20.dp),
                         )
+                    }
                     }
                 }
             }
@@ -3170,6 +3409,10 @@ private fun ProjectTimeline(
     isFullscreen: Boolean = false,
     // Keeps the clock visible at compact size (low phone landscape).
     showClock: Boolean = false,
+    onUndo: (() -> Unit)? = null,
+    canUndo: Boolean = false,
+    onRedo: (() -> Unit)? = null,
+    canRedo: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     if (segments.isEmpty()) return
@@ -3220,8 +3463,34 @@ private fun ProjectTimeline(
                     maxLines = 1,
                 )
             }
+            Spacer(Modifier.weight(1f))
+            if (compactPhone && onUndo != null && onRedo != null) {
+                IconButton(
+                    onClick = onUndo,
+                    enabled = canUndo,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Undo,
+                        contentDescription = "실행 취소",
+                        modifier = Modifier.size(18.dp),
+                        tint = if (canUndo) Color.White else Color.White.copy(alpha = 0.38f),
+                    )
+                }
+                IconButton(
+                    onClick = onRedo,
+                    enabled = canRedo,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Redo,
+                        contentDescription = "다시 실행",
+                        modifier = Modifier.size(18.dp),
+                        tint = if (canRedo) Color.White else Color.White.copy(alpha = 0.38f),
+                    )
+                }
+            }
             if (onToggleFullscreen != null) {
-                Spacer(Modifier.weight(1f))
                 IconButton(
                     onClick = onToggleFullscreen,
                     enabled = fullscreenEnabled,
@@ -6358,7 +6627,7 @@ private fun <T> MacSegmentedControl(
 }
 
 @Composable
-private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit, clipPlayback: ClipPlaybackState? = null) {
+private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit, clipPlayback: ClipPlaybackState? = null, phoneCompact: Boolean = false) {
     if (scene == null || source == null) {
         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("선택한 클립이 없습니다. 클립 목록에서 길이나 구간을 조절할 클립을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -6373,8 +6642,19 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
     val index = project.scenes.indexOfFirst { it.key == scene.key }
     val outputLength = remember(project) { project.canonicalClipMappings().firstOrNull { it.sceneKey == scene.key }?.outputDuration } ?: scene.length
     // 번호는 목록 순서(index + 1)이며 내부 key가 아니다. 원본 구간 길이와 영상에서 차지하는 길이를 구분한다.
+    if (phoneCompact) {
+        // 폰: 선택 맥락은 한 줄. 세부 효과는 '효과' 도구에서, 정밀 조절은 아래에서 열고 닫는다.
+        Text(
+            "${index + 1}번 클립 · ${source.name} · ${if (source.isImage) "사진" else "영상"} ${seconds1(outputLength)}",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    } else {
     TrailerSectionTitle("${index + 1}번 클립 / 전체 ${project.scenes.size}개 · ${if (source.isImage) "사진" else "영상"} ${seconds1(outputLength)}" + if (!source.isImage && kotlin.math.abs(outputLength - scene.length) > 0.05) " (원본 ${seconds1(scene.length)})" else "")
     Text(source.name, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
     SceneActionRow(session, scene, model, clipPlayback, onSelectScene)
     if (source.isImage) {
         var length by remember(scene.key, scene.length) { mutableFloatStateOf(scene.length.toFloat()) }
@@ -6399,7 +6679,11 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
             valueRange = 0f..duration,
             modifier = Modifier.semantics { contentDescription = "영상 클립 시작과 끝" },
         )
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
+        var nudgeOpen by rememberSaveable(scene.key) { mutableStateOf(!phoneCompact) }
+        if (phoneCompact) {
+            TextButton(shape = EditorButtonShape, onClick = { nudgeOpen = !nudgeOpen }) { Text(if (nudgeOpen) "정밀 조절 닫기" else "정밀 조절 (±0.5초)") }
+        }
+        if (nudgeOpen) BoxWithConstraints(Modifier.fillMaxWidth()) {
             val configuration = LocalConfiguration.current
             val isTablet = configuration.smallestScreenWidthDp >= 600
             // 폭이 좁은 인스펙터(300dp)에서는 2x2, 접힌 폭(~387dp) 등에서는 기존처럼 한 줄 4개.
@@ -6421,7 +6705,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
             }
         }
     }
-    SceneAdvancedSection(scene, source, model, clipPlayback)
+    if (!phoneCompact) SceneAdvancedSection(scene, source, model, clipPlayback)
     // 위치 이동·복제·삭제 live on the scene board (selection actions and each thumbnail's menu), not repeated here.
 }
 
