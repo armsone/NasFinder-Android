@@ -48,17 +48,21 @@ import kotlin.math.sqrt
 class PhoneSmokeInstrumentation : Instrumentation() {
     companion object { var purgeBatchIds: List<String> = emptyList() }
 
+    private var editsArgs: Bundle? = null
+
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
-        purgeBatchIds = arguments?.getString("purge")?.split(',')?.filter { it.isNotBlank() }.orEmpty()
+        // mode=edits-proof: own-UUID Edits UI proof only. The default smoke (execute/purge) is never reachable from this branch.
+        editsArgs = arguments?.takeIf { it.getString("mode") == "edits-proof" }
+        if (editsArgs == null) purgeBatchIds = arguments?.getString("purge")?.split(',')?.filter { it.isNotBlank() }.orEmpty()
         start()
     }
 
     override fun onStart() {
         super.onStart()
-        val runner = SmokeRun(this)
+        val runner = SmokeRun(this, editsArgs)
         val summary = try {
-            runner.execute()
+            if (editsArgs != null) runner.executeEdits() else runner.execute()
         } catch (error: Throwable) {
             runner.crash(error)
         }
@@ -73,15 +77,20 @@ class PhoneSmokeInstrumentation : Instrumentation() {
     }
 }
 
-private class SmokeRun(private val inst: Instrumentation) {
+private class SmokeRun(private val inst: Instrumentation, private val edits: Bundle? = null) {
     private val target = inst.targetContext
     private val pkg = target.packageName
     private val app = target.applicationContext as Application
-    private val ua: UiAutomation = inst.uiAutomation
+    // edits-proof: no UiAutomation connection and no directory is created before the ownership guard passes
+    private val ua: UiAutomation by lazy { inst.uiAutomation }
     private val runId = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
-    val outDir: File = File(target.getExternalFilesDir(null) ?: target.filesDir, "phone-smoke-$runId").apply { mkdirs() }
-    private val screens = File(outDir, "screens").apply { mkdirs() }
-    private val fixtureDir = File(outDir, "fixtures").apply { mkdirs() }
+    private val editsUuid: String? = edits?.getString("ownUuid")
+    private val editsBase: File? = editsUuid?.let { File(target.getExternalFilesDir(null) ?: target.filesDir, "nfa-proof-$it") }
+    private val editsTag: String? = edits?.let { "${it.getString("profile")}-${it.getString("orientation")}" }
+    private var editsGuardOk = false
+    val outDir: File = if (edits != null) File(editsBase!!, "ui/$editsTag") else File(target.getExternalFilesDir(null) ?: target.filesDir, "phone-smoke-$runId").apply { mkdirs() }
+    private val screens by lazy { File(outDir, "screens").apply { mkdirs() } }
+    private val fixtureDir by lazy { File(outDir, "fixtures").apply { mkdirs() } }
     private val checks = JSONArray()
     private val ui = JSONObject()
     private val analysisJson = JSONObject()
@@ -91,6 +100,8 @@ private class SmokeRun(private val inst: Instrumentation) {
     private var crashText: String? = null
     private var originalRotation = 0
     private var originalAutoRotation = 0
+    private var rotationTouched = false
+    private val actions = JSONArray()
     private val ownBatchIds = linkedSetOf<String>()
     private fun protectedSnapshot(): JSONObject {
         val result = JSONObject()
@@ -135,11 +146,15 @@ private class SmokeRun(private val inst: Instrumentation) {
         for (i in 0 until checks.length()) when (checks.getJSONObject(i).getString("status")) { "PASS" -> pass++; "FAIL" -> fail++; else -> unverified++ }
         val summary = JSONObject().put("runId", runId).put("pass", pass).put("fail", fail).put("unverified", unverified)
         crashText?.let { summary.put("crash", it) }
+        if (edits != null && !editsGuardOk) return summary // nothing is written until the own-UUID guard has passed
         writeJson("checks.json", JSONObject().put("summary", summary).put("checks", checks))
         writeJson("ui-record.json", ui)
-        writeJson("analysis.json", analysisJson)
-        writeJson("fixture-manifest.json", fixtureManifest)
         writeJson("cleanup.json", cleanup)
+        if (edits != null) writeJson("actions.json", actions)
+        if (edits == null) {
+            writeJson("analysis.json", analysisJson)
+            writeJson("fixture-manifest.json", fixtureManifest)
+        }
         return summary
     }
 
@@ -148,8 +163,10 @@ private class SmokeRun(private val inst: Instrumentation) {
     private fun idle() { try { ua.waitForIdle(500, 5000) } catch (_: TimeoutException) {}; Thread.sleep(800) }
 
     private fun root(): AccessibilityNodeInfo? {
+        if (edits != null) return editsRoot()
         repeat(12) {
-            ua.clearCache()
+            // UiAutomation.clearCache() was added in API 34
+            if (Build.VERSION.SDK_INT >= 34) ua.clearCache()
             val r = ua.rootInActiveWindow
             if (r != null && r.packageName?.toString() == pkg) return r
             Thread.sleep(250)
@@ -157,9 +174,35 @@ private class SmokeRun(private val inst: Instrumentation) {
         return null
     }
 
+    /** edits-proof root: fails within ~10s (no blind retry) when there is no own root or the own MainActivity is not RESUMED. */
+    private fun editsRoot(): AccessibilityNodeInfo? {
+        val end = android.os.SystemClock.elapsedRealtime() + 10_000
+        while (true) {
+            if (Build.VERSION.SDK_INT >= 34) ua.clearCache()
+            val resumed = resumedActivity
+            if (resumed != null) {
+                val r = ua.rootInActiveWindow?.takeIf { it.packageName?.toString() == pkg }
+                    ?: runCatching { ua.windows.firstNotNullOfOrNull { w -> w.root?.takeIf { it.packageName?.toString() == pkg } } }.getOrNull()
+                if (r != null) return r
+            } else if (android.os.SystemClock.elapsedRealtime() > end - 8_000) {
+                // not resumed for ~2s: the activity is gone or backgrounded; waiting longer cannot help
+                throw IllegalStateException(rootFailure("own MainActivity is not RESUMED"))
+            }
+            if (android.os.SystemClock.elapsedRealtime() >= end) throw IllegalStateException(rootFailure("no own root within 10s"))
+            Thread.sleep(250)
+        }
+    }
+
+    private fun rootFailure(why: String): String {
+        val a = activity
+        return "$why: activity=${a?.javaClass?.simpleName} isFinishing=${a?.isFinishing} isDestroyed=${a?.isDestroyed} resumed=${resumedActivity != null} lifecycleEvents=${lifecycleLog.length()}"
+    }
+
     private fun nodes(): List<AccessibilityNodeInfo> {
         val out = ArrayList<AccessibilityNodeInfo>()
-        fun walk(n: AccessibilityNodeInfo) { out += n; for (i in 0 until n.childCount) n.getChild(i)?.let(::walk) }
+        // edits-proof (API 29 clearCache is unavailable): refresh each node before its properties/children are read so a
+        // stale cached hierarchy never reports old labels/state (e.g. a trim range already changed on screen).
+        fun walk(n: AccessibilityNodeInfo) { if (edits != null) n.refresh(); out += n; for (i in 0 until n.childCount) n.getChild(i)?.let(::walk) }
         root()?.let(::walk)
         return out
     }
@@ -179,7 +222,57 @@ private class SmokeRun(private val inst: Instrumentation) {
 
     private fun click(n: AccessibilityNodeInfo): Boolean {
         n.refresh()
+        if (edits != null) bringIntoView(n)
         return clickableAncestor(n)?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+    }
+
+    /** The own app window's viewport (falls back to the display when the window root is unavailable). */
+    private fun windowViewport(): Rect = root()?.let(::bounds)?.takeIf { it.width() > 0 && it.height() > 0 }
+        ?: target.resources.displayMetrics.let { Rect(0, 0, it.widthPixels, it.heightPixels) }
+
+    /** Node bounds clipped to the window viewport and to its scroll ancestor's viewport (empty when it is scrolled out). */
+    private fun clippedBounds(n: AccessibilityNodeInfo): Rect {
+        n.refresh()
+        val clipped = Rect(bounds(n))
+        if (!clipped.intersect(windowViewport())) return Rect()
+        val pane = scrollableAncestor(n)
+        if (pane != null && !clipped.intersect(bounds(pane))) return Rect()
+        return clipped
+    }
+
+    /** Visible to the user AND at least half of the node lies inside the window viewport and its scroll ancestor's viewport. */
+    private fun fullyShown(n: AccessibilityNodeInfo): Boolean {
+        n.refresh()
+        val b = bounds(n)
+        if (!n.isVisibleToUser || b.width() <= 0 || b.height() <= 0) return false
+        val c = clippedBounds(n)
+        return c.width() * 2 >= b.width() && c.height() * 2 >= b.height()
+    }
+
+    /** Only when the node is off screen: SHOW_ON_SCREEN first, then scroll its own scroll ancestor (the pane that owns it) until it is shown. */
+    private fun bringIntoView(n: AccessibilityNodeInfo): Boolean {
+        if (fullyShown(n)) return true
+        n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id); idle()
+        if (fullyShown(n)) return true
+        val pane = scrollableAncestor(n) ?: return false
+        for (action in listOf(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD, AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+            for (i in 0 until 8) {
+                pane.refresh()
+                if (!pane.performAction(action)) break
+                idle()
+                if (fullyShown(n)) return true
+            }
+        }
+        return fullyShown(n)
+    }
+
+    private fun scrollPaneTop(pane: AccessibilityNodeInfo?) {
+        if (pane == null) return
+        for (i in 0 until 10) {
+            pane.refresh()
+            if (!pane.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) return
+            idle()
+        }
     }
 
     private fun waitFor(timeoutMs: Long, predicate: () -> Boolean): Boolean {
@@ -191,8 +284,10 @@ private class SmokeRun(private val inst: Instrumentation) {
     /** Looks for [text] on screen; scrolls the first scrollable container forward (then back to top) when it is off screen. */
     private fun findScrolling(text: String, exact: Boolean = true): AccessibilityNodeInfo? {
         val dm = target.resources.displayMetrics
-        fun visible(n: AccessibilityNodeInfo): Boolean = bounds(n).let { it.height() > 0 && it.top >= 0 && it.bottom <= dm.heightPixels }
+        fun visible(n: AccessibilityNodeInfo): Boolean = if (edits != null) fullyShown(n) else bounds(n).let { it.height() > 0 && it.top >= 0 && it.bottom <= dm.heightPixels }
         findAll(text, exact).firstOrNull(::visible)?.let { return it }
+        // edits-proof: a node that exists but is off screen is brought in through its own scroll ancestor, not by scrolling an arbitrary container
+        if (edits != null) findAll(text, exact).firstOrNull { bringIntoView(it) }?.let { return it }
         repeat(2) { direction ->
             val action = if (direction == 0) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
             repeat(10) {
@@ -217,7 +312,15 @@ private class SmokeRun(private val inst: Instrumentation) {
         return ok
     }
 
-    private fun back() { ua.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK); idle() }
+    private fun back() {
+        if (edits != null) {
+            // global BACK only while the own app window is foreground/resumed right now AND the own project is the open context
+            val a = activity
+            check(resumedActivity != null && a != null && a === resumedActivity && !a.isFinishing && !a.isDestroyed) { rootFailure("global BACK refused: own app window is not foreground/resumed") }
+            check(ua.rootInActiveWindow?.packageName?.toString() == pkg) { rootFailure("global BACK refused: active window root is not the own package") }
+            requireOwn("global-back")
+        }
+        ua.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK); idle() }
 
     private val tabLabels = listOf("도구", "파인더", "홈", "만들기", "설정")
 
@@ -232,12 +335,29 @@ private class SmokeRun(private val inst: Instrumentation) {
         return tabLabels.all { tabNode(it) != null }
     }
 
-    private fun launch() {
+    private fun launch(rotation: Int = UiAutomation.ROTATION_FREEZE_0) {
         // phone smoke is a portrait-phone check: record the starting rotation, then freeze portrait via UiAutomation (same locked state the device already had)
-        originalRotation = Settings.System.getInt(target.contentResolver, Settings.System.USER_ROTATION, 0)
-        originalAutoRotation = Settings.System.getInt(target.contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
-        ui.put("rotationBefore", originalRotation).put("accelerometerBefore", originalAutoRotation)
-        ua.setRotation(UiAutomation.ROTATION_FREEZE_0)
+        if (!rotationTouched) {
+            originalRotation = Settings.System.getInt(target.contentResolver, Settings.System.USER_ROTATION, 0)
+            originalAutoRotation = Settings.System.getInt(target.contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
+            // the tablet's observed original is user_rotation=1/auto=1; an earlier run's incomplete restore left 0, so reinstate the observed original
+            if (edits != null && edits.getString("profile") == "tablet" && originalAutoRotation == 1 && originalRotation == 0) {
+                originalRotation = 1; ui.put("rotationBeforeReadAs0", true)
+            }
+            ui.put("rotationBefore", originalRotation).put("accelerometerBefore", originalAutoRotation)
+            rotationTouched = true
+        }
+        ua.setRotation(rotation)
+        // a sleeping screen stops the activity within seconds; wake it with a plain key event (no keyguard/security change)
+        val power = target.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        ui.put("interactiveBeforeLaunch", power.isInteractive)
+        if (!power.isInteractive) {
+            val t0 = android.os.SystemClock.uptimeMillis()
+            ua.injectInputEvent(android.view.KeyEvent(t0, t0, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_WAKEUP, 0), true)
+            ua.injectInputEvent(android.view.KeyEvent(t0, t0, android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_WAKEUP, 0), true)
+            waitFor(3000) { power.isInteractive }
+            ui.put("interactiveAfterWake", power.isInteractive)
+        }
         val intent = Intent().setClassName(pkg, "com.armsone.nasfinder.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         activity = inst.startActivitySync(intent)
         idle()
@@ -277,7 +397,13 @@ private class SmokeRun(private val inst: Instrumentation) {
     /** Takes the screenshot, saves the PNG and records size/hash/insets/control bounds/edge-pixel evidence for this state. */
     private fun capture(name: String, controls: List<String> = emptyList()): JSONObject {
         idle()
-        val bmp = ua.takeScreenshot() ?: throw IllegalStateException("takeScreenshot returned null for $name")
+        if (edits != null) requireOwn("capture $name")
+        // edits-proof: the foldable default display screenshot may be black for other surfaces, so use the public per-window overload (API 34+)
+        // Dialog/popup windows are only in the display capture, so that wins whenever it is not blank.
+        val displayShot = ua.takeScreenshot()
+        fun blank(b: Bitmap?) = b == null || HashSet<Int>().also { s -> for (y in 0 until b.height step 48) for (x in 0 until b.width step 48) s += b.getPixel(x, y) }.size < 8
+        val windowShot = if (edits != null && blank(displayShot) && Build.VERSION.SDK_INT >= 34) activity?.window?.let { runCatching { ua.takeScreenshot(it) }.getOrNull() } else null
+        val bmp = windowShot ?: displayShot ?: throw IllegalStateException("takeScreenshot returned null for $name")
         val file = File(screens, "$name.png")
         FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
         val inset = insets()
@@ -343,6 +469,894 @@ private class SmokeRun(private val inst: Instrumentation) {
                 rotationOk && afterRotation == originalRotation && afterAuto == originalAutoRotation, cleanup.getJSONObject("rotation").toString())
         }
         return writeAll()
+    }
+
+    // ---------------------------------------------------------------- edits-proof (own UUID project only)
+
+    private val ownPrefix get() = "QA Edits ${editsUuid!!.take(8)}"
+    private var ownDraftId = ""
+    private var ownDir: File? = null
+    private var editsOrientation = "portrait"
+    private val lifecycleLog = JSONArray()
+    @Volatile private var resumedActivity: Activity? = null
+    private val lifecycle = object : Application.ActivityLifecycleCallbacks {
+        private fun rec(event: String, a: Activity) { lifecycleLog.put(JSONObject().put("e", event).put("c", a.javaClass.simpleName).put("h", System.identityHashCode(a)).put("t", android.os.SystemClock.elapsedRealtime())) }
+        override fun onActivityCreated(a: Activity, s: Bundle?) { rec("created", a) }
+        override fun onActivityStarted(a: Activity) { rec("started", a) }
+        override fun onActivityResumed(a: Activity) { rec("resumed", a); activity = a; resumedActivity = a }
+        override fun onActivityPaused(a: Activity) { rec("paused", a); if (resumedActivity === a) resumedActivity = null }
+        override fun onActivityStopped(a: Activity) { rec("stopped", a) }
+        override fun onActivitySaveInstanceState(a: Activity, s: Bundle) {}
+        override fun onActivityDestroyed(a: Activity) { rec("destroyed", a) }
+    }
+
+    /** Ownership guard: runs before any write or UI action. Nothing but the own-UUID namespace/seed/project can pass. */
+    private fun editsGuard() {
+        val a = edits!!
+        val uuid = a.getString("ownUuid") ?: error("ownUuid required")
+        val nonce = a.getString("nonce") ?: error("nonce required")
+        check(uuid == "3d17271c-72d6-41df-8e1f-41036394716d" && java.util.UUID.fromString(uuid).toString() == uuid) { "ownUuid is not the approved canonical uuid" }
+        val profile = a.getString("profile"); editsOrientation = a.getString("orientation") ?: ""
+        check(profile == "phone" || profile == "tablet") { "profile" }
+        check(editsOrientation == "portrait" || editsOrientation == "landscape") { "orientation" }
+        val base = editsBase!!
+        check(File(base, ".owner").let { it.isFile && it.readText() == "$uuid:$nonce" }) { "owner mismatch" }
+        val seed = JSONObject(File(base, "seed.json").readText())
+        ownDraftId = seed.getString("draftId")
+        val dir = File(seed.getString("dir")).canonicalFile
+        check(dir.parentFile == File(target.filesDir, "trailer_projects").canonicalFile && dir.isDirectory) { "seed dir is not a canonical project dir" }
+        check(dir.listFiles().orEmpty().any { it.isFile && it.length() > 0 && it.name.startsWith("own-$uuid-") }) { "synthetic own media missing" }
+        val arr = JSONArray(File(target.filesDir, "trailer_drafts/drafts_meta.json").readText())
+        val mine = (0 until arr.length()).mapNotNull { arr.opt(it) as? JSONObject }.filter { it.opt("id") == ownDraftId }
+        check(mine.size == 1) { "own draft record count ${mine.size}" }
+        check(mine[0].optString("customTitle").startsWith(ownPrefix)) { "own draft title guard" }
+        check(mine[0].toString().contains(dir.name) && mine[0].toString().contains("own-$uuid-")) { "own draft dir/media guard" }
+        ownDir = dir
+        editsGuardOk = true
+        outDir.mkdirs()
+    }
+
+    private fun act(name: String, ok: Boolean, startMs: Long, detail: String = "") {
+        val ms = android.os.SystemClock.elapsedRealtime() - startMs
+        actions.put(JSONObject().put("name", name).put("ok", ok).put("ms", ms).put("detail", detail.take(300)))
+        check("act.$name", name, if (ok) "PASS" else "FAIL", "ms=$ms $detail")
+    }
+
+    /** Short digit-free labels only: enough to see which app chrome is on a list screen without echoing user titles. */
+    private fun chromeLabels() = labels().distinct().filter { it.length <= 10 && it.none(Char::isDigit) }
+
+    private fun editorOpen() = "편집 닫기 (편집본 자동 저장)" in labels()
+
+    // ---- ownership identity (fail-closed): the open editor must be the own seed project in the real ViewModel, not just a matching header.
+
+    /** Canonical dir of the editor session currently held by the ViewModel, only when the stored own draft record points at the same dir. */
+    private fun ownSessionOpen(): Boolean = runCatching {
+        val own = ownDir ?: return false
+        val session = viewModel().state.value.trailer ?: return false
+        if (session.draftId != null && session.draftId != ownDraftId) return false
+        val open = session.directory.canonicalFile
+        val stored = com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().firstOrNull { it.id == ownDraftId }?.directory?.canonicalFile
+        open == own && stored == own
+    }.getOrDefault(false)
+
+    private fun headerOwned(): Boolean {
+        val screenH = target.resources.displayMetrics.heightPixels
+        return nodes().any { label(it).startsWith(ownPrefix) && bounds(it).top < screenH * 0.25 }
+    }
+
+    /** True for the own project's session whether the editor, one of its dialogs or its export view is on screen; false for anything else. */
+    private fun ownContext(): Boolean = ownSessionOpen() && (!editorOpen() || headerOwned())
+
+    /** The editor is open AND is the own project (header prefix + ViewModel session dir + stored own draft dir). */
+    private fun ownedEditor(): Boolean = editorOpen() && ownContext()
+
+    private fun requireOwn(what: String) { check(ownContext()) { "ownership guard refused '$what': open editor/session is not the own project" } }
+
+    private fun ownClick(text: String, exact: Boolean = true): Boolean = ownContext() && clickLabel(text, exact)
+
+    /** stage=remaining29: only the still-failed tool / low-landscape / rotation / native checks run (already-passed full proofs are not repeated). */
+    private val remaining29 get() = edits?.getString("stage").let { it == "remaining29" || it == "toolsOnly" }
+
+    /** stage=toolsOnly (same own mode/guard/entry/finally): only openTrimPanel + detailPanels + read-only protected state; no OS request, no rename/trim/split/rotate/export. */
+    private val toolsOnly get() = edits?.getString("stage") == "toolsOnly"
+
+    /** Set when the known OS permission dialog stayed pending (BACK did not dismiss it): own-root checks must not run behind it. */
+    private var osPromptPending = false
+
+    /** remaining29: a missing selector returns within [totalMs] overall (no clickLabel 5x findScrolling loops); the shown node comes from its own pane. */
+    private fun ownClickFast(text: String, totalMs: Long = 10_000): Boolean {
+        val end = android.os.SystemClock.elapsedRealtime() + totalMs
+        // toolsOnly tablet: a pruned (off-screen) chip does not exist yet, so the SAME captured inspector is moved forward (bounded) until it appears
+        var inspectorSteps = 0
+        while (android.os.SystemClock.elapsedRealtime() < end) {
+            if (!ownContext()) return false
+            val node = findAll(text).firstOrNull { clickableAncestor(it) != null && (fullyShown(it) || (android.os.SystemClock.elapsedRealtime() < end && bringIntoView(it))) }
+            if (node != null && click(node)) { idle(); return true }
+            if (toolsOnly && inspectorRect != null) {
+                if (inspectorSteps < 10 && inspectorScroll(true)) { inspectorSteps++; continue }
+                if (inspectorSteps >= 10) return false
+            }
+            Thread.sleep(300)
+        }
+        return false
+    }
+
+    /** The actual '만들기' destination of the own MainActivity: bottom tab (phone) or side rail (tablet); no 70%-height condition, no back navigation. */
+    private fun makeNode(): AccessibilityNodeInfo? {
+        val screenH = target.resources.displayMetrics.heightPixels
+        val candidates = findAll("만들기").filter { clickableAncestor(it) != null }
+        return candidates.filter { bounds(it).top > screenH * 0.7 }.maxByOrNull { bounds(it).top } ?: candidates.minByOrNull { bounds(it).left }
+    }
+
+    /** Never touches a non-owned open editor: it throws instead of closing, saving or capturing it. */
+    private fun openOwnProject(): Boolean {
+        repeat(3) {
+            if (editorOpen()) {
+                check(waitFor(3000) { ownedEditor() }) { "ownership guard: an editor that is not the own project is open; refusing to touch it" }
+                return true
+            }
+            makeNode()?.let { click(it) }; idle()
+            val n = findScrolling(storedTitle()?.takeIf { it.startsWith(ownPrefix) } ?: ownPrefix, exact = false)
+            if (n != null && click(n) && waitFor(8000) { editorOpen() }) {
+                check(waitFor(3000) { ownedEditor() }) { "ownership guard: opened editor is not the own project; refusing to touch it" }
+                return true
+            }
+        }
+        if (editorOpen()) check(ownedEditor()) { "ownership guard: an editor that is not the own project is open; refusing to touch it" }
+        return ownedEditor()
+    }
+
+    private fun closeEditor(): Boolean {
+        requireOwn("close-editor")
+        check(ownedEditor()) { "ownership guard refused 'close-editor': editor is not open for the own project" }
+        val ok = clickLabel("편집 닫기 (편집본 자동 저장)")
+        return ok && waitFor(8000) { !editorOpen() }
+    }
+
+    private fun setField(text: String): Boolean {
+        val field = nodes().firstOrNull { it.isEditable } ?: return false
+        field.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val ok = field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) })
+        idle(); return ok
+    }
+
+    private fun storedTitle(): String? = com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().firstOrNull { it.id == ownDraftId }?.customTitle
+
+    /** The title row in the editor header (clickable, onClickLabel 프로젝트 이름 바꾸기); located by its own text. */
+    private fun renameViaUi(newName: String): Boolean {
+        val screenH = target.resources.displayMetrics.heightPixels
+        requireOwn("rename-ui")
+        val header = nodes().filter { label(it).startsWith(ownPrefix) && bounds(it).top < screenH * 0.25 }.minByOrNull { bounds(it).top } ?: return false
+        if (!click(header)) return false
+        if (!waitFor(5000) { "프로젝트 이름" in labels() }) return false
+        capture("e02-rename-dialog", listOf("확인", "취소"))
+        requireOwn("rename-field")
+        if (!setField(newName)) return false
+        if (!ownClick("확인")) return false
+        return waitFor(6000) { "프로젝트 이름" !in labels() && nodes().any { label(it).contains(newName) && bounds(it).top < screenH * 0.25 } }
+    }
+
+    private fun rotationFor(orientation: String) = if (orientation == "landscape") UiAutomation.ROTATION_FREEZE_90 else UiAutomation.ROTATION_FREEZE_0
+
+    private fun restoreRotation() {
+        // freeze the original user rotation first (the freeze rewrites USER_ROTATION), then un-freeze when auto-rotate was on
+        var rotationOk = ua.setRotation(originalRotation)
+        idle()
+        if (originalAutoRotation == 1) { rotationOk = ua.setRotation(UiAutomation.ROTATION_UNFREEZE) && rotationOk; idle() }
+        val afterRotation = Settings.System.getInt(target.contentResolver, Settings.System.USER_ROTATION, -1)
+        val afterAuto = Settings.System.getInt(target.contentResolver, Settings.System.ACCELEROMETER_ROTATION, -1)
+        cleanup.put("rotation", JSONObject().put("before", originalRotation).put("autoBefore", originalAutoRotation)
+            .put("after", afterRotation).put("autoAfter", afterAuto).put("apiResult", rotationOk))
+        pass("cleanup.rotation", "original rotation and accelerometer settings restored and reread",
+            rotationOk && afterRotation == originalRotation && afterAuto == originalAutoRotation, cleanup.getJSONObject("rotation").toString())
+    }
+
+    fun executeEdits(): JSONObject {
+        ui.put("screens", JSONArray())
+        editsGuard()
+        app.registerActivityLifecycleCallbacks(lifecycle)
+        try {
+            editsEnvironment()
+            launch(rotationFor(editsOrientation))
+            editsFlow()
+        } finally {
+            runCatching { app.unregisterActivityLifecycleCallbacks(lifecycle) }
+            ui.put("lifecycle", lifecycleLog)
+            if (rotationTouched) restoreRotation()
+        }
+        return writeAll()
+    }
+
+    private fun editsEnvironment() {
+        val info = target.packageManager.getPackageInfo(pkg, 0)
+        val dm = target.resources.displayMetrics
+        val env = JSONObject().put("pid", android.os.Process.myPid()).put("versionName", info.versionName).put("versionCode", info.longVersionCode)
+            .put("model", Build.MODEL).put("device", Build.DEVICE).put("sdkInt", Build.VERSION.SDK_INT).put("profile", edits!!.getString("profile")).put("orientation", editsOrientation)
+            .put("widthPx", dm.widthPixels).put("heightPx", dm.heightPixels).put("densityDpi", dm.densityDpi)
+            .put("storeDrafts", com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().size)
+            .put("metadataProblem", com.armsone.nasfinder.ui.TrailerDraftStore.metadataProblem() != null)
+            .put("installedApkSha256", sha256(File(info.applicationInfo!!.sourceDir))) // the one app binary file only
+        ui.put("environment", env)
+        pass("env.version", "installed app is 2.40.0 / 452079", info.versionName == "2.40.0" && info.longVersionCode == 452079L, env.toString())
+    }
+
+    private fun editsFlow() {
+        var t = android.os.SystemClock.elapsedRealtime()
+        val opened = openOwnProject()
+        val diag = if (opened) "" else "chrome=" + chromeLabels() + " activePkg=" + ua.rootInActiveWindow?.packageName +
+            " windows=" + runCatching { ua.windows.map { "${it.type}:${it.root?.packageName}" } }.getOrNull() +
+            " keyguardLocked=" + (target.getSystemService(android.content.Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
+        act("open-own", opened, t, diag)
+        if (!opened) return
+        val dm = activity!!.resources.displayMetrics
+        ui.put("orientationMetrics", JSONObject().put("w", dm.widthPixels).put("h", dm.heightPixels))
+        pass("orientation.applied", "frozen rotation matches requested $editsOrientation", (dm.heightPixels > dm.widthPixels) == (editsOrientation == "portrait"), "w=${dm.widthPixels} h=${dm.heightPixels}")
+        if (toolsOnly) {
+            requireOwn("tools-only")
+            visibilityRecord("toolsOnly-layout")
+            if (openTrimPanel()) visibilityRecord("toolsOnly-trim")
+            detailPanels()
+            protectedStateProof()
+            if (resumedActivity != null && ownedEditor()) closeEditor()
+            return
+        }
+        if (remaining29) {
+            remaining29Flow()
+            // a pending OS dialog (or any non-own foreground window) hides the app: the own root cannot be read, so the editor close is skipped
+            if (!osPromptPending && resumedActivity != null && ownedEditor()) closeEditor()
+            return
+        }
+        capture("e01-editor-open", listOf("편집 닫기 (편집본 자동 저장)", "실행 취소", "다시 실행"))
+        requireOwn("editor-scroll")
+        repeat(3) { i ->
+            nodes().firstOrNull { it.isScrollable && it.isVisibleToUser }?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD); idle()
+            capture("e03-scroll-$i")
+        }
+        repeat(6) { nodes().firstOrNull { it.isScrollable && it.isVisibleToUser }?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) }
+        idle()
+        // rename through the real header title row, close, reopen by the new name
+        val newName = "$ownPrefix ${edits!!.getString("profile")}-$editsOrientation"
+        t = android.os.SystemClock.elapsedRealtime()
+        val renamed = renameViaUi(newName)
+        act("rename-ui", renamed, t)
+        capture("e04-renamed", listOf("편집 닫기 (편집본 자동 저장)"))
+        t = android.os.SystemClock.elapsedRealtime()
+        val closed = closeEditor()
+        act("close-editor", closed, t)
+        t = android.os.SystemClock.elapsedRealtime()
+        val reopened = closed && openOwnProject()
+        val shown = reopened && nodes().any { label(it).contains(newName) }
+        act("reopen-renamed", shown, t)
+        pass("rename.persisted", "renamed title is shown after close+reopen and is the stored title", shown && storedTitle() == newName, "stored=${storedTitle() == newName}")
+        capture("e05-reopened", listOf("편집 닫기 (편집본 자동 저장)"))
+        editsPhases()
+        if (ownedEditor()) closeEditor()
+    }
+
+    // ---- touch + semantic helpers (own project only)
+
+    // injectInputEvent results of the last gesture (DOWN / MOVE count ok of total / UP), reported in the action detail.
+    private var injDown = false
+    private var injMoves = 0
+    private var injMovesOk = 0
+    private var injUp = false
+
+    private fun touch(action: Int, downTime: Long, x: Float, y: Float) {
+        if (action == android.view.MotionEvent.ACTION_DOWN) requireOwn("touch")
+        val ev = android.view.MotionEvent.obtain(downTime, android.os.SystemClock.uptimeMillis(), action, x, y, 0)
+        ev.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+        val ok = ua.injectInputEvent(ev, true); ev.recycle()
+        when (action) {
+            android.view.MotionEvent.ACTION_DOWN -> injDown = ok
+            android.view.MotionEvent.ACTION_MOVE -> { injMoves++; if (ok) injMovesOk++ }
+            android.view.MotionEvent.ACTION_UP -> injUp = ok
+        }
+    }
+
+    private fun gestureReset() { injDown = false; injMoves = 0; injMovesOk = 0; injUp = false }
+
+    /** Injection results of the last gesture plus the target's bounds and the window clip it had to land in. */
+    private fun gestureDetail(target: Rect?) =
+        "inject(down=$injDown move=$injMovesOk/$injMoves up=$injUp) target=${target?.toShortString()} window=${windowViewport().toShortString()}"
+
+    /** Real touch drag through UiAutomation.injectInputEvent: DOWN, interpolated MOVEs, UP. */
+    private fun drag(x0: Float, y0: Float, x1: Float, y1: Float, steps: Int = 14) {
+        gestureReset()
+        val down = android.os.SystemClock.uptimeMillis()
+        touch(android.view.MotionEvent.ACTION_DOWN, down, x0, y0)
+        for (i in 1..steps) { Thread.sleep(16); touch(android.view.MotionEvent.ACTION_MOVE, down, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps) }
+        touch(android.view.MotionEvent.ACTION_UP, down, x1, y1)
+        idle()
+    }
+
+    private fun tap(x: Float, y: Float) {
+        gestureReset()
+        val down = android.os.SystemClock.uptimeMillis()
+        touch(android.view.MotionEvent.ACTION_DOWN, down, x, y); Thread.sleep(40); touch(android.view.MotionEvent.ACTION_UP, down, x, y)
+        idle()
+    }
+
+    private fun center(n: AccessibilityNodeInfo) = bounds(n).let { it.exactCenterX() to it.exactCenterY() }
+
+    private fun rangeLabel(): Pair<Double, Double>? = labels().firstOrNull { it.startsWith("영상 구간:") }?.let {
+        Regex("([0-9.]+)초 ~ ([0-9.]+)초").find(it)?.let { m -> m.groupValues[1].toDouble() to m.groupValues[2].toDouble() }
+    }
+
+    private fun clipCount(): Int? = labels().firstNotNullOfOrNull { Regex("클립 (\\d+)개").find(it)?.groupValues?.get(1)?.toInt() }
+
+    private fun playheadSeconds(): Double? = labels().firstNotNullOfOrNull { Regex("타임라인 ([0-9.]+)초부터").find(it)?.groupValues?.get(1)?.toDouble() }
+
+    /** Order + inclusion + protection of every scene, and the full manual fields (timing, adjustments) of the protected ones. */
+    private fun manualState(): Pair<List<String>, List<String>> {
+        val scenes = viewModel().state.value.trailer?.editor?.scenes.orEmpty()
+        return scenes.map { "${it.key}|${it.excluded}|${it.automationProtected}" } to
+            scenes.filter { it.automationProtected }.map { "${it.key}|${it.start}|${it.length}|${it.adjustments}" }
+    }
+
+    private fun sceneSnapshot(): List<String> = com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().firstOrNull { it.id == ownDraftId }?.editor?.scenes.orEmpty().map { it.toString() }
+
+    /** Preview, timeline and the selected clip name/number must all be on screen together in the editor viewport. */
+    private fun visibilityRecord(tag: String) {
+        val dm = target.resources.displayMetrics
+        val nav = insets().optJSONObject("navigationBars")?.optInt("b") ?: 0
+        val all = nodes()
+        fun ok(pred: (String) -> Boolean) = all.firstOrNull { pred(label(it)) && bounds(it).let { b -> b.height() > 0 && b.top >= 0 && b.bottom <= dm.heightPixels - nav } && it.isVisibleToUser }
+        val preview = ok { it.endsWith("클립 화면") }
+        val timeline = ok { it.startsWith("프로젝트 타임라인") }
+        val clip = ok { Regex("^\\d+번 클립 [·/]").containsMatchIn(it) }
+        pass("visible.$tag", "preview + timeline + selected clip name/number are all visible together ($tag)", preview != null && timeline != null && clip != null,
+            "preview=${preview?.let(::bounds)} timeline=${timeline?.let(::bounds)} clip=${clip?.let { label(it).take(6) + bounds(it) }}")
+    }
+
+    // ---- own-metadata comparison: non-own records only, hashes/order/types/unknown keys (never values)
+
+    private fun canon(v: Any?, sb: StringBuilder) {
+        when (v) {
+            null, JSONObject.NULL -> sb.append("null")
+            is JSONObject -> { sb.append("{"); v.keys().asSequence().toList().sorted().forEachIndexed { i, k -> if (i > 0) sb.append(","); sb.append("s:").append(k.length).append(":").append(k).append("="); canon(v.get(k), sb) }; sb.append("}") }
+            is JSONArray -> { sb.append("["); for (i in 0 until v.length()) { if (i > 0) sb.append(","); canon(v.get(i), sb) }; sb.append("]") }
+            is String -> sb.append("s:").append(v.length).append(":").append(v)
+            is Boolean -> sb.append("b:").append(v)
+            is Number -> sb.append("nv:").append(runCatching { java.math.BigDecimal(v.toString()).stripTrailingZeros().let { if (it.signum() == 0) "0" else it.toPlainString() } }.getOrDefault(v.toString()))
+            else -> sb.append("?")
+        }
+    }
+
+    private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun nonOwnFingerprint(): JSONObject {
+        val arr = JSONArray(File(target.filesDir, "trailer_drafts/drafts_meta.json").readText())
+        val recs = JSONArray(); val digests = ArrayList<String>(); var own = 0
+        for (i in 0 until arr.length()) {
+            val v = arr.get(i)
+            if (v is JSONObject && v.opt("id") == ownDraftId) { own++; continue }
+            val sb = StringBuilder(); canon(v, sb)
+            val d = sha(sb.toString().toByteArray()); digests += d
+            val type = when (v) { is JSONObject -> "object"; is JSONArray -> "array"; is String -> "string"; is Boolean -> "boolean"; is Number -> "number"; else -> "null" }
+            val unknown = (v as? JSONObject)?.keys()?.asSequence()?.filter { it !in setOf("id", "isMusicOverlayMode", "directory", "total", "clipLength", "photoClipLength", "format", "musicPolicy", "musicFitCount", "autoDucking", "output", "showingSettings", "orderMode", "timestamp", "customTitle", "isPrivate", "revision", "outputRevision", "musicFile", "musicName", "musicDuration", "editor", "sources", "voiceovers", "batchCaption") }?.toList()?.sorted().orEmpty()
+            recs.put(JSONObject().put("i", i).put("type", type).put("digest", d).put("unknownKeysSha", sha(unknown.joinToString("\u0000").toByteArray())))
+        }
+        return JSONObject().put("total", arr.length()).put("own", own).put("nonOwn", digests.size).put("orderSha", sha(digests.joinToString(",").toByteArray())).put("records", recs)
+    }
+
+    private fun editsPhases() {
+        val profile = edits!!.getString("profile")
+        val metaBefore = nonOwnFingerprint()
+        writeJson("meta-before-$editsTag.json", metaBefore)
+        val scenesBefore = sceneSnapshot()
+        ui.put("scenesBefore", JSONArray(scenesBefore))
+        try {
+            trimSplitProtect()
+            detailPanels()
+            rotationContinuity()
+            exportOwn()
+        } finally {
+            val metaAfter = nonOwnFingerprint()
+            writeJson("meta-after-$editsTag.json", metaAfter)
+            val same = metaBefore.getInt("nonOwn") == metaAfter.getInt("nonOwn") && metaBefore.getString("orderSha") == metaAfter.getString("orderSha") &&
+                metaBefore.getJSONArray("records").toString() == metaAfter.getJSONArray("records").toString()
+            pass("meta.nonOwnUnchanged", "non-own metadata records unchanged (count/order/type/unknown keys/canonical digests) after the UI run", same && metaAfter.getInt("own") == 1,
+                "before=${metaBefore.getInt("nonOwn")} after=${metaAfter.getInt("nonOwn")} order=${metaBefore.getString("orderSha") == metaAfter.getString("orderSha")} own=${metaAfter.getInt("own")}")
+            ui.put("scenesAfter", JSONArray(sceneSnapshot()))
+            ui.put("metadataProblemAfter", com.armsone.nasfinder.ui.TrailerDraftStore.metadataProblem() != null)
+        }
+        ui.put("profile", profile)
+    }
+
+    private fun trimPanelShown() = labels().any { it.startsWith("영상 구간:") }
+
+    /**
+     * Phone: the editor's own 설정 tab. Tablet: the 설정 chooser is a placement role (not a tab) and the sidebar 설정 is global, so neither is
+     * clicked; the right inspector already shows its 자막·구간 tab (clicked only when another tab is active).
+     */
+    private fun openTrimPanel(): Boolean {
+        val tablet = edits!!.getString("profile") == "tablet"
+        if (!tablet && trimPanelShown()) return true
+        if (!ownContext()) return trimPanelShown()
+        if (tablet) {
+            // the visible 자막·구간 tab of the right-hand inspector (rightmost match: never the sidebar or the top role chooser)
+            fun inspectorTab() = findAll("자막·구간").filter { clickableAncestor(it) != null && fullyShown(it) }.maxByOrNull { bounds(it).left }
+            if (remaining29) return openTrimTabletPane()
+            if (!trimPanelShown()) inspectorTab()?.let { click(it) }
+            val shown = waitFor(4000) { trimPanelShown() }
+            // scroll the inspector pane that owns the tab (or the trim range) to its top, never another container
+            val pane = inspectorTab()?.let(::scrollableAncestor) ?: findAll("영상 구간:", exact = false).firstOrNull()?.let(::scrollableAncestor)
+            scrollPaneTop(pane)
+            return shown && trimPanelShown()
+        }
+        val screenH = target.resources.displayMetrics.heightPixels
+        findAll("설정").filter { bounds(it).top < screenH * 0.25 && clickableAncestor(it) != null && fullyShown(it) }.maxByOrNull { bounds(it).left }?.let { click(it) }
+        return waitFor(4000) { trimPanelShown() }
+    }
+
+    private fun scrollableAncestor(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var c: AccessibilityNodeInfo? = n.parent
+        while (c != null && !c.isScrollable) c = c.parent
+        return c
+    }
+
+    /** The scroll pane that owns [n]: the nearest scrollable ancestor that is a real pane (>= 25% of the window height), never a small chip-row scroller. */
+    private fun ownPane(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val minH = windowViewport().height() / 4
+        var nearest: AccessibilityNodeInfo? = null
+        var c: AccessibilityNodeInfo? = n.parent
+        while (c != null) {
+            if (c.isScrollable) {
+                if (nearest == null) nearest = c
+                if (bounds(c).height() >= minH) return c
+            }
+            c = c.parent
+        }
+        return nearest
+    }
+
+    private fun settle() { try { ua.waitForIdle(250, 1500) } catch (_: TimeoutException) {}; Thread.sleep(250) }
+
+    /**
+     * remaining29/toolsOnly tablet: one bounded (~12s) query. The inspector pane is captured ONCE (from the visible 자막·구간 tab, else from a visible own
+     * inspector node / the right-hand scroller) and every scroll reuses it: BACKWARD until the tab is visible, click the tab, FORWARD until the range appears.
+     * Never the global settings, the left clip board or any other container.
+     */
+    private fun openTrimTabletPane(): Boolean {
+        val end = android.os.SystemClock.elapsedRealtime() + 12_000
+        fun left() = end - android.os.SystemClock.elapsedRealtime()
+        fun finish(): Boolean { findAll("영상 구간:", exact = false).firstOrNull()?.let { bringIntoView(it) }; return trimPanelShown() }
+        // the visible tab label counts even when it is not clickable (the selected tab); the inspector viewport is captured once from it
+        inspectorTabLabel()?.let(::captureInspector)
+        if (inspectorRect == null) captureInspectorFallback()
+        if (trimPanelShown()) return finish()
+        var tabN = inspectorTabLabel()
+        var i = 0
+        while (tabN == null && i++ < 8 && left() > 0 && inspectorRect != null) {
+            // the tab was scrolled out: move the SAME captured inspector toward the top until it is visible again
+            if (!inspectorScroll(false)) break
+            tabN = inspectorTabLabel()
+        }
+        if (tabN == null) return finish()
+        captureInspector(tabN)
+        // a non-clickable tab label is the already-selected tab: nothing to click
+        val active = clickableAncestor(tabN) == null || generateSequence(tabN) { it.parent }.take(4).any { it.isSelected }
+        if (!active) { click(tabN); settle() }
+        var j = 0
+        while (!trimPanelShown() && j++ < 10 && left() > 0) {
+            if (!inspectorScroll(true)) break
+        }
+        return finish()
+    }
+
+    /** toolsOnly tablet: the own right inspector viewport, captured once (bounds from the exact own nodes, never the left board / global settings / full window). */
+    private var inspectorRect: Rect? = null
+    /** net forward steps of [inspectorScroll] since the pane was last at its top (reset walks back exactly this many). */
+    private var inspectorFwd = 0
+
+    private fun inspectorTabLabel(): AccessibilityNodeInfo? {
+        val vp = windowViewport()
+        return findAll("자막·구간").filter { fullyShown(it) && bounds(it).exactCenterX() > vp.exactCenterX() }.maxByOrNull { bounds(it).left }
+    }
+
+    /** Viewport from a node inside the inspector: the scrollable pane when the API reports one, else the nearest ancestor that is wide enough and lies in the right part of the window. */
+    private fun captureInspector(from: AccessibilityNodeInfo) {
+        if (inspectorRect != null) return
+        val vp = windowViewport()
+        fun rightPart(b: Rect) = b.width() > 0 && b.height() > 0 && b.left >= vp.left + vp.width() * 0.4
+        ownPane(from)?.let { p -> bounds(p).takeIf(::rightPart)?.let { inspectorRect = Rect(it).also { r -> r.intersect(vp) }; return } }
+        var c: AccessibilityNodeInfo? = from
+        while (c != null) {
+            val b = bounds(c)
+            if (rightPart(b) && b.width() >= vp.width() * 0.3) { inspectorRect = Rect(b).also { it.intersect(vp) }; return }
+            c = c.parent
+        }
+    }
+
+    /** The tab is scrolled away: capture from any other visible inspector node (clip info, chips, trim range). */
+    private fun captureInspectorFallback() {
+        val vp = windowViewport()
+        val names = setOf("추천 구간", "분할", "보호", "속도", "색상", "자막 타이밍", "움직임", "전환", "음악", "음성")
+        nodes().firstOrNull { n -> n.isVisibleToUser && bounds(n).exactCenterX() > vp.exactCenterX() && label(n).let { it in names || it.startsWith("영상 구간:") } }?.let(::captureInspector)
+    }
+
+    /** One step of the captured inspector: the scroll action when a scrollable own node supports it, else a short real touch drag (~70% of the pane height) wholly inside it. */
+    private fun inspectorScroll(forward: Boolean): Boolean {
+        val r = inspectorRect ?: return false
+        requireOwn("inspector-scroll")
+        val scroller = nodes().filter { n -> n.isScrollable && n.isVisibleToUser && bounds(n).let { b -> b.width() > 0 && b.left >= r.left - 8 && b.right <= r.right + 8 && r.contains(b.centerX(), b.centerY()) } }
+            .maxByOrNull { bounds(it).width() * bounds(it).height() }
+        var mode = "action"
+        var ok = scroller?.performAction(if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+        var detail = ""
+        if (ok) settle() else {
+            mode = "drag"
+            val v = Rect(r)
+            if (!v.intersect(windowViewport()) || v.height() < 40) return false
+            val x = v.left + v.width() * 0.05f
+            val hi = v.top + v.height() * 0.85f
+            val lo = v.top + v.height() * 0.15f
+            if (forward) drag(x, hi, x, lo) else drag(x, lo, x, hi)
+            ok = injDown && injUp
+            detail = gestureDetail(v)
+        }
+        if (ok) inspectorFwd = (inspectorFwd + if (forward) 1 else -1).coerceAtLeast(0)
+        val log = ui.optJSONArray("inspectorScrolls") ?: JSONArray().also { ui.put("inspectorScrolls", it) }
+        if (log.length() < 80) log.put(JSONObject().put("forward", forward).put("mode", mode).put("ok", ok).put("detail", detail))
+        return ok
+    }
+
+    /** Back toward the inspector top by exactly the net forward steps taken (plus one), through the same captured pane. */
+    private fun inspectorTop() {
+        repeat(inspectorFwd + 1) { if (!inspectorScroll(false)) return }
+        inspectorFwd = 0
+    }
+
+    private fun trimSplitProtect() {
+        var t = android.os.SystemClock.elapsedRealtime()
+        val settings = openTrimPanel()
+        act("open-settings-trim", settings, t)
+        if (!settings) { capture("t00-no-trim-panel"); return }
+        visibilityRecord("trim-panel")
+        capture("t01-trim-before", listOf("분할", "보호", "추천 구간", "영상에서 제외"))
+        val clipsBefore = clipCount()
+        val rangeBefore = rangeLabel()
+        // touch-drag the end handle (observed node bounds) forward by roughly two seconds of source time
+        var endHandle = findAll("범위 끝").firstOrNull()
+        var track = findAll("영상 클립 시작과 끝").firstOrNull()
+        // the handle and track must really be on screen (own pane, window viewport) before the physical drag; re-read after any scroll
+        val handlesShown = endHandle != null && track != null && bringIntoView(endHandle) && bringIntoView(track)
+        endHandle = findAll("범위 끝").firstOrNull(); track = findAll("영상 클립 시작과 끝").firstOrNull()
+        if (endHandle == null || track == null || rangeBefore == null || !handlesShown || !fullyShown(endHandle)) {
+            check("trim.handles", "trim handle nodes found and shown", "FAIL", "end=${endHandle != null} track=${track != null} shown=$handlesShown range=$rangeBefore"); return
+        }
+        val (hx, hy) = center(endHandle)
+        val tb = bounds(track)
+        val perSecond = (tb.width() - 36f) / 12.0f // source is 12.0s long in the own seed; the track keeps a small inset
+        t = android.os.SystemClock.elapsedRealtime()
+        drag(hx, hy, hx + perSecond * 2f, hy)
+        val dragDetail = gestureDetail(bounds(endHandle))
+        // fresh nodes only: poll until the range actually changed (or a short limit), never an old cached label
+        waitFor(2500) { (rangeLabel()?.second ?: 0.0) > rangeBefore.second + 0.4 }
+        val rangeAfter = rangeLabel()
+        act("trim-handle-drag", rangeAfter != null && rangeAfter.second > rangeBefore.second + 0.4, t, "before=$rangeBefore after=$rangeAfter dragPx=${perSecond * 2f} $dragDetail")
+        capture("t02-trim-after-drag", listOf("범위 시작", "범위 끝"))
+        // playhead: a real tap on the project timeline inside clip 1, then split at that playhead
+        val timeline = findAll("프로젝트 타임라인", exact = false).firstOrNull()?.also { bringIntoView(it) }?.let { findAll("프로젝트 타임라인", exact = false).firstOrNull() }
+        val phBefore = playheadSeconds()
+        if (timeline != null) {
+            val b = clippedBounds(timeline)
+            t = android.os.SystemClock.elapsedRealtime()
+            tap(b.left + b.width() * 0.08f, b.exactCenterY())
+            val tapDetail = gestureDetail(b)
+            waitFor(2000) { playheadSeconds().let { it != null && it != phBefore } }
+            val phAfter = playheadSeconds()
+            act("playhead-tap", phAfter != null && phAfter != phBefore, t, "before=$phBefore after=$phAfter $tapDetail")
+        } else check("playhead.timeline", "timeline node found", "FAIL", "missing")
+        val splitBefore = clipCount()
+        t = android.os.SystemClock.elapsedRealtime()
+        val split = ownClick("분할") && waitFor(4000) { clipCount() == (splitBefore ?: 0) + 1 }
+        act("split-at-playhead", split, t, "clips=$splitBefore->${clipCount()}")
+        capture("t03-after-split")
+        val scenesAfterSplit = sceneSnapshot()
+        t = android.os.SystemClock.elapsedRealtime()
+        val undone = ownClick("실행 취소") && waitFor(4000) { clipCount() == splitBefore }
+        act("undo", undone, t, "clips=${clipCount()}")
+        t = android.os.SystemClock.elapsedRealtime()
+        val redone = ownClick("다시 실행") && waitFor(4000) { clipCount() == (splitBefore ?: 0) + 1 }
+        act("redo", redone, t, "clips=${clipCount()}")
+        pass("redo.sameScenes", "redo restores exactly the post-split scene list", sceneSnapshot() == scenesAfterSplit, "scenes=${sceneSnapshot().size}")
+        // protection on the manually trimmed clip: the protect toggle, then the recommend action must not change the manual fields
+        val protectLabelsBefore = chromeLabels().filter { it.contains("보호") }
+        t = android.os.SystemClock.elapsedRealtime()
+        val protectClicked = ownClick("보호")
+        idle()
+        act("protect-toggle", protectClicked, t, "before=$protectLabelsBefore after=${chromeLabels().filter { it.contains("보호") }}")
+        capture("t04-protected", listOf("보호", "추천 구간"))
+        val manual = sceneSnapshot()
+        val manualBefore = manualState()
+        // the real 추천 구간 button: brought into view through its own pane, clicked only when it is actually enabled (a protected clip disables it)
+        requireOwn("recommend")
+        val recNode = findScrolling("추천 구간")
+        val recButton = recNode?.let { n -> generateSequence(n) { it.parent }.take(3).firstOrNull { it.isClickable } }
+        val recEnabled = recNode != null && recNode.isEnabled && recButton != null && recButton.isEnabled
+        val recClicked = recEnabled && ownContext() && click(recButton!!)
+        idle()
+        val afterRec = sceneSnapshot()
+        val manualAfter = manualState()
+        pass("recommend.keepsManual", "추천 구간 keeps the manual protected fields, order and inclusion (a click is claimed only when the real button was enabled; a disabled button is a recorded no-op)",
+            recNode != null && (!recEnabled || recClicked) && manualAfter == manualBefore,
+            "found=${recNode != null} enabled=$recEnabled clickExecuted=$recClicked scenes=${manualBefore.first.size}->${manualAfter.first.size} protected=${manualBefore.second.size} manualEqual=${manualAfter == manualBefore} fullSceneEqual=${afterRec == manual}")
+        capture("t05-after-recommend")
+        // save + reopen: close, reopen, settings tab, the same manual state is shown
+        val expectedClips = clipCount()
+        t = android.os.SystemClock.elapsedRealtime()
+        val closed = closeEditor()
+        val reopened = closed && openOwnProject() && openTrimPanel()
+        act("save-reopen", reopened && clipCount() == expectedClips, t, "clips=${clipCount()} expected=$expectedClips range=${rangeLabel()}")
+        capture("t06-reopened-settings")
+        pass("reopen.sameScenes", "reopened project keeps the exact scene list (order/timing) and manual-edit state", sceneSnapshot() == afterRec, "scenes=${sceneSnapshot().size}")
+    }
+
+    private fun detailPanels() {
+        if (!ownedEditor() && !openOwnProject()) return
+        openTrimPanel()
+        val tablet = edits!!.getString("profile") == "tablet"
+        for (chip in listOf("속도", "색상", "자막 타이밍", "움직임", "전환")) {
+            if (toolsOnly && inspectorRect != null) inspectorTop()
+            val t = android.os.SystemClock.elapsedRealtime()
+            val opened = if (remaining29) ownClickFast(chip) else ownClick(chip)
+            idle()
+            act("chip-$chip", opened, t)
+            // a click that lands is not proof of the tool: the clicked chip must be on screen and the controls of exactly that tool visible
+            // (EditorAdvancedControls: 속도 = 재생 속도 text, 색상 = 밝기/대비/채도 sliders, 움직임/자막 타이밍 = their add buttons, 전환 = dissolve text)
+            val required: List<(String) -> Boolean> = when (chip) {
+                "속도" -> listOf({ l -> l.startsWith("재생 속도") })
+                "색상" -> listOf({ l -> l == "밝기" }, { l -> l == "대비" }, { l -> l == "채도" })
+                "움직임" -> listOf({ l -> l == "현재 위치에 지점 추가" })
+                "자막 타이밍" -> listOf({ l -> l == "현재 위치에 자막 추가" })
+                else -> listOf({ l -> l.startsWith("다음 클립으로 넘어갈 때") })
+            }
+            val chipNode = findAll(chip).firstOrNull { fullyShown(it) }
+            val chipSelectedSemantics = chipNode != null && generateSequence(chipNode) { it.parent }.take(4).any { it.isSelected || it.isChecked }
+            // each expected control is brought into its own inspector viewport and recorded while it is shown (a later control may scroll an earlier one out)
+            val shownControls = HashSet<Int>()
+            // remaining29/toolsOnly: the inspector pane is captured ONCE from the visible clicked chip, before any scroll, and reused for chip scroll and control search
+            val chipPane = if (remaining29) chipNode?.let(::ownPane) else null
+            if (toolsOnly && chipNode != null) captureInspector(chipNode)
+            val useInspector = toolsOnly && inspectorRect != null
+            var forwardSteps = 0
+            var exhausted = false
+            waitFor(if (remaining29) 14_000 else 3000) {
+                required.forEachIndexed { i, p ->
+                    if (i !in shownControls && nodes().filter { p(label(it)) }.any { bringIntoView(it) && fullyShown(it) }) shownControls += i
+                }
+                if (shownControls.size == required.size) true
+                else {
+                    // Compose prunes off-screen controls, so nothing exists to bring into view: move THAT same pane forward and look again
+                    if (useInspector) { if (forwardSteps < 10 && inspectorScroll(true)) forwardSteps++ else exhausted = true }
+                    else if (chipPane != null && chipPane.refresh() && chipPane.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) settle()
+                    exhausted
+                }
+            }
+            val controlsShown = shownControls.size == required.size
+            pass("chip-$chip.panel", "chip '$chip' is the shown tool chip and its own controls are visible", opened && chipNode != null && controlsShown,
+                "chipShown=${chipNode != null} chipSelectedSemantics=$chipSelectedSemantics controlsShown=$controlsShown")
+            capture("d-$chip")
+            visibilityRecord("chip-$chip-top")
+            requireOwn("chip-scroll")
+            // tablet: scroll the pane that actually owns the chip (never the clip grid); phone: the single visible scroller
+            fun toolScroller() = if (remaining29) chipPane?.takeIf { it.refresh() }
+            else if (tablet) findAll(chip).firstOrNull { it.isVisibleToUser }?.let(::scrollableAncestor)
+            else nodes().filter { it.isScrollable && it.isVisibleToUser }.maxByOrNull { bounds(it).left }
+            if (useInspector) {
+                // same captured inspector: one more forward step for the scrolled capture, then back to its top for the next chip
+                if (inspectorScroll(true)) { capture("d-$chip-scrolled"); visibilityRecord("chip-$chip-scrolled") }
+                inspectorTop()
+                idle()
+            } else {
+            val scroller = toolScroller()
+            if (scroller?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true) {
+                idle(); capture("d-$chip-scrolled"); visibilityRecord("chip-$chip-scrolled")
+                if (remaining29) scrollPaneTop(scroller) else repeat(3) { scroller.refresh(); scroller.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) }
+                idle()
+            } else if (remaining29) scrollPaneTop(scroller)
+            }
+            if (!ownedEditor()) openOwnProject()
+        }
+    }
+
+    // The visible selected-clip header only ("N번 클립 · name" portrait / "N번 클립 / name" landscape), never the "N번 클립 메뉴" buttons.
+    private fun selectedClipNumber(): Int? = labels().firstNotNullOfOrNull { Regex("^(\\d+)번 클립 [·/]").find(it)?.groupValues?.get(1)?.toInt() }
+
+    /** One editor process: pick a non-first clip with a non-zero playhead via the real timeline, rotate both ways, compare the same clip/playhead. */
+    private fun rotationContinuity() {
+        if (!ownedEditor() && !openOwnProject()) return
+        val timeline = findAll("프로젝트 타임라인", exact = false).firstOrNull()?.also { bringIntoView(it) } ?: run { check("rotation.timeline", "timeline node found", "FAIL", "missing"); return }
+        // real timeline taps (canonical output position) until a non-first clip is selected at a non-zero playhead; fresh bounds, clipped to the window/pane
+        for (fraction in listOf(0.62f, 0.8f, 0.45f, 0.92f)) {
+            val b = clippedBounds(timeline)
+            tap(b.left + b.width() * fraction, b.exactCenterY())
+            if (waitFor(1500) { (selectedClipNumber() ?: 0) >= 2 && (playheadSeconds() ?: 0.0) > 0.0 }) break
+        }
+        val clipBefore = selectedClipNumber(); val headBefore = playheadSeconds()
+        val clipLineBefore = labels().firstOrNull { Regex("^\\d+번 클립 [·/]").containsMatchIn(it) }
+        // actual scene key of the selected UI index (existing public editor data), plus the project identity, read before rotating
+        fun selectedKey(index: Int?): Any? = index?.let { viewModel().state.value.trailer?.editor?.scenes?.getOrNull(it - 1)?.key }
+        fun projectDir() = viewModel().state.value.trailer?.directory?.canonicalFile
+        val keyBefore = selectedKey(clipBefore); val dirBefore = projectDir()
+        pass("rotation.pre", "a non-first clip is selected with a non-zero playhead and a known scene key before rotating", (clipBefore ?: 0) >= 2 && (headBefore ?: 0.0) > 0.0 && keyBefore != null,
+            "clip=$clipBefore playhead=$headBefore key=$keyBefore")
+        if ((clipBefore ?: 0) < 2 || (headBefore ?: 0.0) <= 0.0 || keyBefore == null) return // a fresh first-clip/0s start proves nothing
+        val other = if (editsOrientation == "portrait") "landscape" else "portrait"
+        val pidBefore = android.os.Process.myPid()
+        for ((step, orientation) in listOf("rotated" to other, "restored" to editsOrientation)) {
+            val t = android.os.SystemClock.elapsedRealtime()
+            ua.setRotation(rotationFor(orientation)); idle()
+            val dm = activity!!.resources.displayMetrics
+            // ready = recreated activity in the new orientation, own editor open, selected clip + playhead labels back on screen
+            val applied = waitFor(6000) { activity!!.resources.displayMetrics.let { (it.heightPixels > it.widthPixels) == (orientation == "portrait") } } && ownContext() && editorOpen() &&
+                waitFor(6000) { selectedClipNumber() != null && playheadSeconds() != null }
+            val clip = selectedClipNumber(); val head = playheadSeconds()
+            val clipLine = labels().firstOrNull { Regex("^\\d+번 클립 [·/]").containsMatchIn(it) }
+            // same selected clip (number + source name) and the same output position within the label's 0.1s rounding
+            val keyAfter = selectedKey(clip)
+            val sameKey = keyAfter != null && keyAfter == keyBefore
+            val sameProject = dirBefore != null && projectDir() == dirBefore
+            // identity = index + scene key + project + canonical head; the display line differs by design ('·' portrait, '/' landscape)
+            val same = clip == clipBefore && sameKey && sameProject && head != null && abs(head - headBefore!!) <= 0.11
+            act("rotate-$step", applied && same, t, "orientation=$orientation w=${dm.widthPixels} h=${dm.heightPixels} clip=$clip/$clipBefore playhead=$head/$headBefore sameLine=${clipLine == clipLineBefore} key=$keyAfter/$keyBefore sameProject=$sameProject")
+            capture("r-$step-$orientation")
+        }
+        pass("rotation.sameProcess", "rotation continuity ran inside one app process", android.os.Process.myPid() == pidBefore, "pid=$pidBefore")
+    }
+
+    /** stage=remaining29 (own project, same guard/entry/finally): only the previously failed checks. Final source hash is env.installedApkSha256. */
+    private fun remaining29Flow() {
+        requireOwn("remaining29")
+        var t = android.os.SystemClock.elapsedRealtime()
+        val settings = openTrimPanel()
+        act("open-settings-panel", settings, t)
+        if (settings) {
+            visibilityRecord("remaining29-layout")
+            footerClearance("remaining29-layout")
+            capture("m01-layout", listOf("내보내기"))
+        }
+        detailPanels()
+        protectedStateProof()
+        rotationContinuity()
+        footerClearance("remaining29-after-rotation")
+        nativeAvailabilityProof()
+    }
+
+    /** Fixed picture/timeline/selected-clip line must end above the fixed footer's primary (no content behind the footer). */
+    private fun footerClearance(tag: String) {
+        val all = nodes()
+        val footer = all.firstOrNull { label(it) == "내보내기" && clickableAncestor(it) != null && it.isVisibleToUser }?.let(::bounds)
+        val timeline = all.firstOrNull { label(it).startsWith("프로젝트 타임라인") && it.isVisibleToUser }?.let(::bounds)
+        val clip = all.firstOrNull { Regex("^\\d+번 클립 [·/]").containsMatchIn(label(it)) && it.isVisibleToUser }?.let(::bounds)
+        val ok = footer != null && timeline != null && clip != null && timeline.bottom <= footer.top + 1 && clip.bottom <= footer.top + 1
+        pass("footer.clear.$tag", "timeline and selected-clip line end above the fixed footer ($tag)", ok, "footer=$footer timeline=$timeline clip=$clip")
+    }
+
+    /** Reads the already-protected own clip's manual mask/fields; never toggles protection and never clicks the (disabled) 추천 구간. */
+    private fun protectedStateProof() {
+        val (mask, fields) = manualState()
+        val rec = findAll("추천 구간").firstOrNull()
+        val recEnabled = rec != null && rec.isEnabled && generateSequence(rec) { it.parent }.take(3).firstOrNull { it.isClickable }?.isEnabled == true
+        val status = if (fields.isNotEmpty()) "PASS" else "UNVERIFIED"
+        check("protected.state", "own clip is protected with its manual fields intact; 추천 구간 disabled and not executed", status,
+            "scenes=${mask.size} protected=${fields.size} recommendEnabled=$recEnabled recommendExecuted=false fields=${sha(fields.joinToString("\n").toByteArray()).take(12)}")
+    }
+
+    /** Reads the current RECORD_AUDIO permission and the on-device speech availability through the normal API; never grants, requests, downloads or records. */
+    private fun nativeAvailabilityProof() {
+        val granted = target.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val availability = runCatching {
+            runBlocking { kotlinx.coroutines.withTimeoutOrNull(10_000) { com.armsone.nasfinder.ui.OnDeviceSpeech.availability(target) } }
+        }
+        val value = availability.getOrNull()
+        ui.put("native", JSONObject().put("recordAudioGranted", granted).put("speechState", value?.state?.name ?: JSONObject.NULL).put("speechTag", value?.languageTag ?: JSONObject.NULL))
+        pass("native.availability", "RECORD_AUDIO state and on-device speech availability read through the normal API (no grant/download)", value != null,
+            "granted=$granted state=${value?.state} error=${availability.exceptionOrNull()?.javaClass?.simpleName}")
+        nativeRecordPrompt(granted)
+    }
+
+    /**
+     * Own 음악 inspector -> the visible '녹음' button, clicked once and only while RECORD_AUDIO is denied, to observe the OS prompt.
+     * Never Allow/Deny, never grants, never records. The human/OS grant stays PENDING. Only the recognised own permission prompt is dismissed (BACK); an unknown window is left alone.
+     */
+    private fun nativeRecordPrompt(grantedBefore: Boolean) {
+        fun recordGranted() = target.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (grantedBefore) {
+            check("native.recordPrompt", "OS record prompt via the audio inspector's record button", "UNVERIFIED",
+                "RECORD_AUDIO already granted: no prompt to observe; ambient recording not run; a real record test stays pending")
+            return
+        }
+        val tabOpened = ownClickFast("음악")
+        val shownBefore = tabOpened && findAll("녹음").any { clickableAncestor(it) != null }
+        val clicked = shownBefore && ownClickFast("녹음")
+        val permissionPackages = setOf("com.google.android.permissioncontroller", "com.android.permissioncontroller")
+        val appLabel = target.applicationInfo.loadLabel(target.packageManager).toString()
+        // Owned-OS-dialog exception: the permission controller is not the own package, so the own-filtered root()/labels() cannot see it.
+        // Read the active window root directly (public UiAutomation API), only its package name, and only read-only labels when that package is exactly the permission controller.
+        fun activePackage(): String? = runCatching {
+            if (Build.VERSION.SDK_INT >= 34) ua.clearCache()
+            ua.rootInActiveWindow?.packageName?.toString()
+        }.getOrNull()
+        fun permissionRoot(): AccessibilityNodeInfo? = runCatching {
+            if (Build.VERSION.SDK_INT >= 34) ua.clearCache()
+            ua.rootInActiveWindow?.takeIf { it.packageName?.toString() in permissionPackages }
+        }.getOrNull()
+        fun readLabels(n: AccessibilityNodeInfo, out: MutableList<String>, depth: Int) {
+            if (depth > 30 || out.size >= 60) return
+            (n.text?.toString()?.takeIf { it.isNotEmpty() } ?: n.contentDescription?.toString())?.takeIf { it.isNotEmpty() }?.let { out += it }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { readLabels(it, out, depth + 1) }
+        }
+        val promptShown = clicked && waitFor(6000) { activePackage() in permissionPackages }
+        val promptLabels = if (promptShown) {
+            val collected = ArrayList<String>()
+            permissionRoot()?.let { readLabels(it, collected, 0) }
+            collected.distinct().filter { it.length <= 80 }.take(12)
+        } else emptyList()
+        val ownPrompt = promptShown && promptLabels.any { it.contains(appLabel) || it.contains(pkg) }
+        var dismissed = false
+        if (ownPrompt && activePackage() in permissionPackages) {
+            ua.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            dismissed = waitFor(5000) { activePackage() == pkg && resumedActivity != null }
+            if (dismissed) requireOwn("native-record-prompt-dismissed")
+        }
+        // BACK was sent once and never repeated: a known OS dialog that stays (API 29 BACK=false) is a real system condition, reported PENDING
+        osPromptPending = ownPrompt && !dismissed && activePackage() in permissionPackages
+        val grantedAfter = recordGranted()
+        ui.put("nativeRecordPrompt", JSONObject().put("tabOpened", tabOpened).put("recordButtonShown", shownBefore).put("clickedOnce", clicked)
+            .put("promptShown", promptShown).put("ownPrompt", ownPrompt).put("dismissedByBack", dismissed).put("grantedAfter", grantedAfter).put("promptLabels", JSONArray(promptLabels)))
+        val status = when {
+            grantedAfter -> "UNVERIFIED" // surprisingly granted: reported, ambient recording not run
+            ownPrompt && dismissed -> "PASS"
+            else -> "UNVERIFIED"
+        }
+        check("native.recordPrompt", "OS record prompt appears after the app's own request from the 음악 inspector's 녹음 button (no Allow/Deny)", status,
+            "tab=$tabOpened button=$shownBefore clickedOnce=$clicked prompt=$promptShown own=$ownPrompt dismissed=$dismissed grantedAfter=$grantedAfter osDialogPending=$osPromptPending${if (osPromptPending) " PENDING: OS dialog observed, BACK did not dismiss it (system condition, not an app failure); not repeated, own-root/close checks skipped" else ""}; grant/record stay pending human approval")
+    }
+
+    private fun exportOwn() {
+        if (!ownedEditor() && !openOwnProject()) return
+        val seed = JSONObject(File(editsBase!!, "seed.json").readText())
+        val ledger = File(outDir, "export-ledger.json")
+        ledger.writeText(JSONObject().put("projectId", ownDraftId).put("dir", seed.getString("dir")).put("status", "before-export").toString(2))
+        // the committed output of the own draft, only when it is a non-empty file inside the own project dir (the owned-artifact guard)
+        fun ownOutput(): File? = runCatching {
+            com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().firstOrNull { it.id == ownDraftId }?.output
+                ?.takeIf { it.isFile && it.length() > 0 && it.canonicalFile.parentFile == ownDir }
+        }.getOrNull()
+        // the result view that already exists in the app: 편집으로 돌아가기 plus 재생 or 저장·공유 (a missing expected word is a host-selector issue)
+        fun previewReady() = labels().let { l -> "편집으로 돌아가기" in l && ("저장·공유" in l || "재생" in l) }
+        fun storeDraft() = com.armsone.nasfinder.ui.TrailerDraftStore.getEveryDraft().firstOrNull { it.id == ownDraftId }
+        // the committed output belongs to the current revision (or the store has no revision numbers, then nothing newer can exist)
+        fun committedCurrent() = storeDraft().let { d -> d != null && (d.revision == null || d.outputRevision == d.revision) }
+        fun proof(f: File?) = JSONObject().put("revision", storeDraft()?.revision ?: JSONObject.NULL).put("outputRevision", storeDraft()?.outputRevision ?: JSONObject.NULL)
+            .put("file", f?.absolutePath ?: JSONObject.NULL).put("bytes", f?.length() ?: 0).put("lastModified", f?.lastModified() ?: 0L)
+            .put("sha256", if (f != null) sha256(f) else JSONObject.NULL)
+        val outputBefore = ownOutput()
+        val reusedBefore = outputBefore
+        val proofBefore = proof(outputBefore)
+        var t = android.os.SystemClock.elapsedRealtime()
+        val clicked = ownClick("내보내기")
+        act("export-click", clicked, t)
+        // ready = own output file exists, committed for the current revision, and the result view is on screen
+        val done = waitFor(240_000) { ownOutput() != null && committedCurrent() && previewReady() }
+        act("export-ready", done, t, "output=${ownOutput()?.length()} reusedExisting=${reusedBefore != null} chrome=" + chromeLabels().take(30))
+        capture("x01-export-result")
+        val out = ownOutput()
+        val proofAfter = proof(out)
+        val newOutput = proofBefore.toString() != proofAfter.toString()
+        ledger.writeText(JSONObject().put("projectId", ownDraftId).put("dir", seed.getString("dir")).put("status", if (out != null) "exported" else "no-output")
+            .put("reusedExisting", reusedBefore != null).put("outputChanged", newOutput).put("committedCurrent", committedCurrent()).put("uiReady", previewReady())
+            .put("before", proofBefore).put("after", proofAfter)
+            .put("file", out?.absolutePath ?: JSONObject.NULL).put("uri", out?.let { Uri.fromFile(it).toString() } ?: JSONObject.NULL)
+            .put("bytes", out?.length() ?: 0).put("sha256", if (out != null) sha256(out) else JSONObject.NULL).toString(2))
+        pass("export.file", "own UI export produced a real output file inside the own project", out != null && out.isFile && out.length() > 0, "bytes=${out?.length()} outputChanged=$newOutput reusedExisting=${reusedBefore != null} committedCurrent=${committedCurrent()}")
+        if (!ownedEditor()) {
+            requireOwn("export-return")
+            if ("편집으로 돌아가기" in labels()) ownClick("편집으로 돌아가기")
+            if (!ownedEditor()) { requireOwn("export-back"); back(); if (!ownedEditor()) openOwnProject() }
+        }
     }
 
     private fun environment() {

@@ -415,11 +415,11 @@ class PhotoMotionGeometryTest {
                 EditorScene(2, 2, 2.0, 6.0, actionStart = 2.0, actionEnd = 8.0),
             ),
         )
-        // 음악 예산 5초보다 보호 구간(12초)이 길어도 마지막 샷까지 잘리지 않고 최소(보호) 길이로 남는다.
+        // 고정 출력 예산 5초가 보호 구간(12초)보다 짧으면 두 샷 모두 남기고 동작 중심으로 좁혀 예산을 지킨다.
         val (scenes, total) = redistributeManualTotal(project, listOf(video, last), 5.0)
         assertEquals(listOf(1, 2), scenes.map { it.sourceId })
-        assertTrue(scenes.all { it.length >= 6.0 - 1e-6 })
-        assertEquals(12.0, total, 1e-6)
+        assertEquals(5.0, total, 1.0 / 30.0)
+        assertTrue(scenes.all { it.start <= (it.actionStart!! + it.actionEnd!!) / 2 && it.start + it.length >= (it.actionStart!! + it.actionEnd!!) / 2 })
         // 앵커 없는 수동 트림은 기존대로 줄어든다.
         val manual = redistributeManualTotal(EditorProject(project.scenes.map { it.copy(actionStart = null, actionEnd = null) }), listOf(video, last), 5.0)
         assertTrue(manual.second < 12.0)
@@ -483,10 +483,10 @@ class PhotoMotionGeometryTest {
             assertTrue(scene.start <= scene.actionStart!! + 1e-6 && scene.start + scene.length >= scene.actionEnd!! - 1e-6)
         }
         assertTrue(first.start + first.length <= second.start + 1e-6)
-        // Redistributing the length (music fit shorter than the protected total) never cuts either action.
+        // A fixed budget shorter than the protected total narrows around each action's centre instead of overrunning it.
         val (fitted, total) = redistributeManualTotal(rebuilt, listOf(putts, other), 5.0)
-        assertTrue(fitted.take(2).all { it.length >= (it.actionEnd!! - it.actionStart!!) - 1e-6 })
-        assertTrue(total >= (first.actionEnd!! - first.actionStart!!) + (second.actionEnd!! - second.actionStart!!) - 1e-6)
+        assertTrue(fitted.take(2).all { val mid = (it.actionStart!! + it.actionEnd!!) / 2; it.start <= mid && it.start + it.length >= mid })
+        assertTrue(total <= 5.0 + 1.0 / 30.0 + rebuilt.scenes.drop(2).sumOf { it.length })
         // A project that already has a scene per action gets no extra scene (counts only grow for omitted actions).
         val both = EditorProject(listOf(EditorScene(1, 1, 3.0, 4.0), EditorScene(2, 1, 15.0, 4.0)))
         assertEquals(2, both.rebuiltFromRecommendation(listOf(putts)).scenes.size)
@@ -563,10 +563,12 @@ class PhotoMotionGeometryTest {
         }
         val full = EditorProject(scenes, autoPlan = false)
         val short = fitEditorToBudget(full, listOf(video), 12.0)!!
-        assertEquals(2, short.included)
-        assertEquals(4, short.excluded)
+        // Two whole 5s actions fit; the next most important scene is narrowed into the remaining ~2s (>= its physical floor) instead of left out.
+        assertEquals(3, short.included)
+        assertEquals(3, short.excluded)
         assertTrue(short.total <= 12.0 + 1e-6)
-        assertTrue(short.project.scenes.all { it.length >= 5.0 - 1e-6 })
+        assertEquals(2, short.project.scenes.count { it.length >= 5.0 - 1e-6 })
+        assertTrue(short.project.scenes.all { it.length >= 1.0 / 30.0 - 1e-6 })
         // Longer again: every reserved scene comes back in its own place with its caption/volume.
         val long = fitEditorToBudget(short.project, listOf(video), 40.0)!!
         assertEquals(0, long.excluded)
@@ -577,9 +579,12 @@ class PhotoMotionGeometryTest {
         // Short again: the same choice.
         val again = fitEditorToBudget(long.project, listOf(video), 12.0)!!
         assertEquals(short.project.scenes.map { it.key }, again.project.scenes.map { it.key })
-        // Not even one whole action fits: refused.
-        assertNull(fitEditorToBudget(full, listOf(video), 4.0))
-        assertEquals(5.0, budgetBodyBounds(short.project, listOf(video)).first, 1e-6)
+        // Not even one whole action fits: the best scene is narrowed around its action instead of refusing.
+        val narrowed = fitEditorToBudget(full, listOf(video), 4.0)!!
+        assertEquals(1, narrowed.included)
+        assertEquals(4.0, narrowed.total, 1.0 / 30.0)
+        // The shortest achievable body is now the hard one-output-frame floor (context and action are narrowed, not refused).
+        assertEquals(1.0 / 30.0, budgetBodyBounds(short.project, listOf(video)).first, 1e-6)
     }
 
     @Test

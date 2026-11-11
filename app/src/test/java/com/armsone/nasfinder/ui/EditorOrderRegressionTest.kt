@@ -163,4 +163,85 @@ class EditorOrderRegressionTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun testGeneratedCuesNeverOverrideManualOrTombstones() {
+        val manual = TrailerTimedCaptionCue(sourceId = 1, sourceStart = 1.0, sourceEnd = 2.0, text = "직접", origin = CueOrigin.MANUAL, manuallyEdited = true)
+        val overlapping = TrailerTimedCaptionCue(sourceId = 1, sourceStart = 1.05, sourceEnd = 2.0, text = "자동", origin = CueOrigin.GENERATED)
+        val deleted = TrailerTimedCaptionCue(sourceId = 1, sourceStart = 5.0, sourceEnd = 6.0, text = "삭제된", origin = CueOrigin.GENERATED)
+        val fresh = TrailerTimedCaptionCue(sourceId = 1, sourceStart = 8.0, sourceEnd = 9.0, text = "새", origin = CueOrigin.GENERATED)
+        val merged = TrailerTimedCaptionCue.merge(listOf(manual), listOf(overlapping, deleted, fresh), listOf(TrailerCueSuppression(1, 5.0, 6.0)))
+        assertEquals(listOf("직접", "새"), merged.map { it.text })
+        assertEquals(CueOrigin.GENERATED, merged.last().origin)
+        assertTrue(!merged.last().manuallyEdited)
+    }
+
+    @Test
+    fun testCueAndVoiceTakeJsonRoundTrip() {
+        val cue = TrailerTimedCaptionCue(sourceId = 3, sourceStart = 1.5, sourceEnd = 2.5, text = "문장", origin = CueOrigin.MANUAL, manuallyEdited = true)
+        val back = TrailerTimedCaptionCue.fromJson(cue.toJson())
+        assertEquals(cue.copy(style = back!!.style), back)
+        val take = TrailerVoiceoverTake(relativeFile = "voice/a.m4a", outputStart = 2.0, sourceIn = 0.0, sourceOut = 3.5, volume = 1.2)
+        val takeBack = TrailerVoiceoverTake.fromJson(take.toJson())
+        assertEquals(take, takeBack)
+        assertEquals(5.5, take.requiredOutputEnd()!!, 1e-9)
+        assertEquals(null, TrailerVoiceoverTake(relativeFile = "../x.m4a", sourceOut = 1.0).hardOutputRange())
+    }
+
+    @Test
+    fun testCueDeleteAndEditLeaveTombstonesSoGeneratedCuesStayGone() {
+        val generated = TrailerTimedCaptionCue(sourceId = 1, sourceStart = 2.0, sourceEnd = 3.0, text = "자동", origin = CueOrigin.GENERATED)
+        val base = TrailerClipAdjustments(cues = listOf(generated))
+        val deleted = deleteCueWithTombstone(base, generated.stableId)
+        assertTrue(deleted.cues.isEmpty())
+        val regenerated = TrailerTimedCaptionCue.merge(deleted.cues, listOf(generated.copy(stableId = java.util.UUID.randomUUID())), deleted.suppressions)
+        assertTrue(regenerated.isEmpty())
+        val edited = editCueWithTombstone(base, generated.stableId, "고침", 2.5, 3.5)
+        assertEquals(CueOrigin.MANUAL, edited.cues.single().origin)
+        assertTrue(edited.cues.single().manuallyEdited)
+        assertEquals(1, edited.suppressions.size)
+        assertTrue(TrailerTimedCaptionCue.merge(edited.cues, listOf(generated), edited.suppressions).single().text == "고침")
+    }
+
+    @Test
+    fun testBudgetNarrowsAroundActionPeakNotSourceStart() {
+        // Real peak evidence: a verified, sharp spike at 9.0s of a 10s source (waveform index 90 of 100).
+        val base = makeSource(0, "a.mp4", 0L, 0L)
+        val src = base.copy(analysis = base.analysis.copy(
+            waveform = List(100) { if (it == 90) 0.9 else 0.05 },
+            peakTimeSeconds = 9.0, peakTimesSeconds = listOf(9.0), verifiedPeakTimesSeconds = listOf(9.0), transientTimesSeconds = listOf(9.0),
+        ))
+        val scene = EditorScene(key = 1, sourceId = 0, start = 0.0, length = 10.0, actionStart = 8.0, actionEnd = 10.0)
+        val fit = fitEditorToBudget(EditorProject(scenes = listOf(scene)), listOf(src), 1.0)!!
+        val out = fit.project.scenes.single()
+        assertTrue("window ${out.start}+${out.length} must hold the action peak 9.0", out.start <= 9.0 && out.start + out.length >= 9.0)
+        assertTrue("action [8,10] narrowed to 1s must not restart at 0 (start ${out.start})", out.start >= 8.0 - 1e-6)
+        assertEquals(1.0, out.length, 0.05)
+        // A wide action [0,10] still holds the real peak, not the span start.
+        val wide = scene.copy(actionStart = 0.0, actionEnd = 10.0)
+        val wideOut = fitEditorToBudget(EditorProject(scenes = listOf(wide)), listOf(src), 1.0)!!.project.scenes.single()
+        assertTrue("window ${wideOut.start}+${wideOut.length} must hold 9.0", wideOut.start <= 9.0 && wideOut.start + wideOut.length >= 9.0)
+        assertTrue(wideOut.start > 0.0)
+        // A one-output-frame budget at 2x stays a one-frame (2/30 source) window around the peak, never re-expanded to 0.2s.
+        val fast = scene.copy(adjustments = TrailerClipAdjustments(rate = 2.0))
+        val tiny = fitEditorToBudget(EditorProject(scenes = listOf(fast)), listOf(src), 1.0 / 30.0)!!.project.scenes.single()
+        assertEquals(2.0 / 30.0, tiny.length, 1e-6)
+        assertTrue(tiny.start <= 9.0 && tiny.start + tiny.length >= 9.0)
+    }
+
+    @Test
+    fun adjacentOverlapIsClampedToHalfOfEachOutputDuration() {
+        fun m(vararg lens: Double, req: Double) = TrailerClipTimeMappingFactory.buildTimelineMappings(
+            lens.mapIndexed { i, l -> TrailerClipInput(i + 1L, 0, 0.0, l, requestedOutgoingOverlap = if (i < lens.size - 1) req else 0.0) })
+        val c2 = m(0.5, 0.5, req = 1.0)
+        assertEquals(0.25, c2[0].outgoingOverlap, 1e-9)
+        assertEquals(0.75, c2[1].outputStart + c2[1].outputDuration, 1e-9)
+        val c3 = m(1.0, 1.0, req = 2.0)
+        assertEquals(0.5, c3[0].outgoingOverlap, 1e-9)
+        assertEquals(1.5, c3[1].outputStart + c3[1].outputDuration, 1e-9)
+        val three = m(1.0, 1.0, 1.0, req = 5.0)
+        three.forEach { assertTrue(it.incomingOverlap + it.outgoingOverlap <= it.outputDuration + 1e-9) }
+        assertEquals(0.5, three[1].incomingOverlap, 1e-9)
+        assertEquals(0.5, three[1].outgoingOverlap, 1e-9)
+    }
 }

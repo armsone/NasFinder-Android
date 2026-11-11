@@ -146,6 +146,8 @@ private enum class InspectorTab(val title: String) { SCENE("클립"), CAPTION("�
 private enum class EditorPhase { EDIT, EXPORT }
 
 /** Portrait tablet / TriFold: the one switch under the fixed preview (클립 board or 설정 tabs). UI-only, survives rotation. */
+private enum class PhoneRole(val title: String) { CLIPS("클립"), PREVIEW("미리보기"), SETTINGS("설정") }
+
 private enum class PortraitPane(val title: String) { CLIPS("클립"), SETTINGS("설정") }
 
 /** Tablet / board display mode: 자세히 (detail), 썸네일 (thumbnail), 포스터 (poster). UI-only, survives rotation. */
@@ -207,6 +209,8 @@ internal fun AdaptiveEditorWorkspace(
     var finderOpen by rememberSaveable(directoryKey) { mutableStateOf(false) }
     var inspectorTab by rememberSaveable(directoryKey) { mutableStateOf(InspectorTab.SCENE) }
     var portraitPane by rememberSaveable(directoryKey) { mutableStateOf(PortraitPane.CLIPS) }
+    // Phone only: 클립 (board) / 미리보기 (picture + selected clip tools) share inspectorTab == SCENE; 설정 is any other tab.
+    var phonePreviewOnly by rememberSaveable(directoryKey) { mutableStateOf(false) }
     val portraitSettingsScroll = rememberScrollState()
     var landscapePlacement by rememberSaveable(directoryKey) { mutableStateOf(LandscapePlacement.CLIPS_LEFT) }
     var boardDisplayMode by rememberSaveable(directoryKey) { mutableStateOf(BoardDisplayMode.DETAIL) }
@@ -300,9 +304,7 @@ internal fun AdaptiveEditorWorkspace(
         selectedSceneKey = key
         selectedSceneKeys = setOf(key)
     }
-    val timelineSegs = remember(project.scenes, project.introCard, project.outroCard) {
-        timelineSegments(project.scenes, project.introCard, project.outroCard)
-    }
+    val timelineSegs = remember(project) { timelineSegments(project) }
 
     val (outputWidth, outputHeight) = session.format.resolveDimensions(session.scenes.map { it.source }.ifEmpty { session.sources })
     val scenesPrepSignature = remember(
@@ -682,73 +684,23 @@ internal fun AdaptiveEditorWorkspace(
             return
         }
         val current = scenes.firstOrNull { it.key == selectedSceneKey } ?: scenes.first()
-        val total = timelineSegs.last().let { it.startSec + it.lengthSec }
+        val total = timelineTotal(timelineSegs)
         var at = timelineSecondsAt(timelineSegs, current.key, clipPlayback)
         if (at >= total - 0.05) at = 0.0
         seekTimeline(timelineSegs, at, clipPlayback, ::selectOnly, selectedSceneKey)
         clipPlayback.continuous = true
         clipPlayback.playing = true
     }
-    val timelineSignature = timelineSegs.map { Triple(it.slot, it.scene?.key, it.lengthSec) }
-    LaunchedEffect(clipPlayback.playing, clipPlayback.continuous, clipPlayback.epoch, timelineSignature) {
-        if (!clipPlayback.playing || !clipPlayback.continuous) return@LaunchedEffect
-        val scenes = project.scenes
-        val key = clipPlayback.sceneKey
-        val index = scenes.indexOfFirst { it.key == key }
-        if (key == null || index < 0 || selectedSceneKey != key) {
-            clipPlayback.playing = false
-            clipPlayback.continuous = false
-            clipPlayback.card = null
-            return@LaunchedEffect
-        }
-        val slot = clipPlayback.card
-        val lengthMs = when (slot) {
-            TitleSlot.INTRO -> (project.introCard.clampedDuration() * 1000).toLong()
-            TitleSlot.OUTRO -> (project.outroCard.clampedDuration() * 1000).toLong()
-            null -> (scenes[index].length * 1000).toLong()
-        }
-        val startMs = (if (slot != null) clipPlayback.cardPositionMs else clipPlayback.positionFor(key)) ?: 0L
-        val startedAt = android.os.SystemClock.uptimeMillis()
-        while (isActive) {
-            delay(30)
-            // The user picked another clip on the board (or the preview moved on): timeline play ends there.
-            if (selectedSceneKey != key) {
-                clipPlayback.playing = false
-                clipPlayback.continuous = false
-                clipPlayback.card = null
-                return@LaunchedEffect
-            }
-            val elapsed = startMs + (android.os.SystemClock.uptimeMillis() - startedAt)
-            // A card has no player: this clock is its position.
-            if (slot != null) clipPlayback.cardPositionMs = elapsed.coerceAtMost(lengthMs)
-            if (elapsed >= lengthMs) break
-        }
-        when (slot) {
-            TitleSlot.INTRO -> {
-                // The start card holds the first scene; its own clip starts from 0.
-                selectOnly(scenes.first().key)
-                clipPlayback.seekWithin(scenes.first().key, 0L)
-            }
-            TitleSlot.OUTRO -> {
-                clipPlayback.playing = false
-                clipPlayback.continuous = false
-            }
-            null -> {
-                val next = scenes.getOrNull(index + 1)
-                if (next != null) {
-                    selectOnly(next.key)
-                    clipPlayback.seekWithin(next.key, 0L)
-                } else if (project.outroCard.enabled) {
-                    clipPlayback.positionMs = lengthMs
-                    clipPlayback.seekCard(TitleSlot.OUTRO, key, 0L, lengthMs)
-                } else {
-                    clipPlayback.positionMs = lengthMs
-                    clipPlayback.playing = false
-                    clipPlayback.continuous = false
-                }
-            }
-        }
-    }
+    ProjectPreviewEngine(
+        host = clipPlayback.previewHost,
+        session = session,
+        clipPlayback = clipPlayback,
+        playbackAllowed = !fullscreenPlayback && !editingFullscreen,
+        selectedKey = { selectedSceneKey },
+        onSelect = ::selectOnly,
+        heldKeyFor = { slot -> heldSceneKey(timelineSegs, slot) },
+        prepState = previewPrepState,
+    )
     // A card view never outlives its owner: another clip selected, or the card switched off, returns to the scene view.
     LaunchedEffect(selectedSceneKey, project.introCard.enabled, project.outroCard.enabled) {
         val slot = clipPlayback.card ?: return@LaunchedEffect
@@ -762,16 +714,6 @@ internal fun AdaptiveEditorWorkspace(
             clipPlayback.continuous = false
         }
     }
-    TimelineMusic(
-        active = clipPlayback.playing && clipPlayback.continuous,
-        track = session.musicTrack,
-        policy = session.musicPolicy,
-        volume = project.musicVolume,
-        autoDucking = session.autoDucking,
-        sources = session.sources,
-        segments = timelineSegs,
-        clipPlayback = clipPlayback,
-    )
 
     fun shareOutput() {
         // A render of an older edit is never shared as if it were the current project.
@@ -936,8 +878,8 @@ internal fun AdaptiveEditorWorkspace(
                 // Every clip board keeps its own selection/move/clone/remove/columns toolbar (as on Mac); on the phone it
                 // follows the preview page inside the same lazy scroll.
                 showToolbar = forceClips,
-                // Phone only (page given): the clip menu opens 자막·구간 for that clip without scrolling.
-                onOpenCaption = if (isPhone && page != null) {
+                // Phone only: the clip menu opens 자막·구간 for that clip without scrolling.
+                onOpenCaption = if (isPhone) {
                     { key: Long ->
                         selectedSceneKey = key
                         selectedSceneKeys = setOf(key)
@@ -960,7 +902,7 @@ internal fun AdaptiveEditorWorkspace(
         fun widthSafeColumns(boardWidth: Dp, cap: Int): Int = (((boardWidth - 8.dp) / 56.dp).toInt()).coerceIn(2, cap)
 
         @Composable
-        fun Stage(paneHeight: Dp, baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp, portraitSwitch: Boolean = false, tabsBelowPicture: Boolean = true, reservedBelow: Dp = 0.dp) {
+        fun Stage(paneHeight: Dp, baseShare: Float, baseMax: Dp, maxShare: Float, horizontalPadding: Dp, portraitSwitch: Boolean = false, tabsBelowPicture: Boolean = true, reservedBelow: Dp = 0.dp, fitPane: Boolean = false) {
             // paneHeight is the editing area left above the keyboard (IME insets are in the Row's padding).
             BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val paneWidth = (maxWidth - horizontalPadding * 2).coerceAtLeast(1.dp)
@@ -968,12 +910,20 @@ internal fun AdaptiveEditorWorkspace(
                 // Tablet/landscape/portrait panes are bounded: the controls under the picture (6dp gaps, 4dp stage padding, tab row,
                 // transport + film timeline = 110dp, 24dp handle) are reserved first, so the picture takes only what is left and
                 // the stage never overflows its pane. The phone page scrolls and keeps its unbounded sizing.
-                val controlsHeight = if (isPhone) 0.dp else {
+                // Low phone landscape (fitPane) is bounded too: its fixed left area must hold picture + timeline + selected line in the real pane height.
+                // Low phone landscape uses one budget: 8dp stage padding + 6dp gap + the compact timeline (3+32+3+24+3 = 65dp),
+                // no resize handle and no tab row under the picture; the picture takes exactly what is left of the real pane height.
+                val controlsHeight = if (isPhone && !fitPane) 0.dp else if (fitPane) {
+                    8.dp + (if (imeVisible) 0.dp else 6.dp + 65.dp)
+                } else {
                     8.dp + (if (tabsBelowPicture) 58.dp else 0.dp) +
                         (if (imeVisible) 0.dp else 6.dp + 110.dp + 6.dp + 24.dp)
                 }
-                val pictureRoom = if (isPhone) safePaneHeight else (paneHeight - controlsHeight - reservedBelow).coerceAtLeast(48.dp)
-                val cap = minOf((safePaneHeight * baseShare).coerceIn(72.dp, baseMax), pictureRoom)
+                val pictureRoom = if (isPhone && !fitPane) safePaneHeight
+                else if (fitPane) (paneHeight - controlsHeight - reservedBelow).coerceAtLeast(0.dp)
+                else (paneHeight - controlsHeight - reservedBelow).coerceAtLeast(48.dp)
+                val cap = if (fitPane) pictureRoom else minOf((safePaneHeight * baseShare).coerceIn(72.dp, baseMax), pictureRoom)
+                val fitBaseHeight = if (fitPane) stageVisualHeight(session, paneWidth, cap) else 0.dp
                 val tabsContent: @Composable (Modifier, List<CustomAccessibilityAction>) -> Unit = { dragModifier, resizeActions ->
                     if (portraitSwitch) {
                         PortraitPaneSwitch(portraitPane, onPane = { portraitPane = it }, resizeActions = resizeActions, modifier = dragModifier)
@@ -992,9 +942,9 @@ internal fun AdaptiveEditorWorkspace(
                     source = selectedSource,
                     caption = previewCaption,
                     // The persisted previewScale is clamped here: a scale saved in a roomier layout never exceeds pictureRoom.
-                    visualHeight = scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), previewScale, imeVisible),
-                    baseVisualHeight = stageVisualHeight(session, paneWidth, cap),
-                    maxVisualHeight = scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), 2f, imeVisible),
+                    visualHeight = if (fitPane) fitBaseHeight else scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), previewScale, imeVisible),
+                    baseVisualHeight = if (fitPane) fitBaseHeight else stageVisualHeight(session, paneWidth, cap),
+                    maxVisualHeight = if (fitPane) fitBaseHeight else scaledStageHeight(session, paneWidth, cap, minOf(safePaneHeight * maxShare, pictureRoom), 2f, imeVisible),
                     previewScale = previewScale,
                     onPreviewScaleChange = { previewScale = it },
                     showControls = !imeVisible,
@@ -1007,8 +957,9 @@ internal fun AdaptiveEditorWorkspace(
                     onTogglePlay = ::toggleProjectPlay,
                     timeline = { sizeRatio ->
                         ProjectTimeline(
-                            sizeRatio = sizeRatio,
+                            sizeRatio = if (fitPane) 0.5f else sizeRatio,
                             compactPhone = isPhone,
+                            showClock = fitPane,
                             session = session,
                             segments = timelineSegs,
                             selectedKey = selectedSceneKey,
@@ -1022,6 +973,7 @@ internal fun AdaptiveEditorWorkspace(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding, vertical = 4.dp),
                     // 설정 좌측 places the tabs above the settings instead, so the preview alone stays on the right.
                     belowPicture = tabsRow,
+                    showResizeHandle = !fitPane,
                     preparationState = previewPrepState,
                 )
             }
@@ -1045,6 +997,7 @@ internal fun AdaptiveEditorWorkspace(
                 onOpenMusicPicker = { showMusicPicker = true },
                 rankedBackgroundChoices = rankedBackgroundChoices,
                 isRankingBackgroundChoices = isRankingBackgroundChoices,
+                clipPlayback = clipPlayback,
             )
 
         // The made video of the current revision: while rendering, the snapshot scene the progress has reached (still
@@ -1130,6 +1083,15 @@ internal fun AdaptiveEditorWorkspace(
                                 Text(saveButtonLabel, style = MaterialTheme.typography.labelLarge, color = palette.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
+                        if (!rendering) {
+                            OutlinedButton(
+                                shape = EditorButtonShape,
+                                onClick = { finderOpen = true },
+                                enabled = !session.busy,
+                                modifier = buttonModifier.heightIn(min = 48.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                            ) { Text("클립 추가", style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                        }
                         when {
                             rendering && export?.status == EDITOR_EXPORT_SAVING_STATUS ->
                                 PhasePrimaryButton("편집본 저장 중…", enabled = false, modifier = buttonModifier, onClick = {})
@@ -1192,6 +1154,25 @@ internal fun AdaptiveEditorWorkspace(
                     landscapePlacement = if (!isPhone) landscapePlacement else null,
                     onLandscapePlacementChange = { landscapePlacement = it },
                 )
+                if (isPhone && phase == EditorPhase.EDIT) {
+                    val phoneRole = when {
+                        inspectorTab != InspectorTab.SCENE && inspectorTab != InspectorTab.PLAN -> PhoneRole.SETTINGS
+                        phonePreviewOnly -> PhoneRole.PREVIEW
+                        else -> PhoneRole.CLIPS
+                    }
+                    MacSegmentedControl(
+                        options = PhoneRole.entries.map { it to it.title },
+                        selected = phoneRole,
+                        onSelect = { role ->
+                            when (role) {
+                                PhoneRole.CLIPS -> { phonePreviewOnly = false; inspectorTab = InspectorTab.SCENE }
+                                PhoneRole.PREVIEW -> { phonePreviewOnly = true; inspectorTab = InspectorTab.SCENE }
+                                PhoneRole.SETTINGS -> if (phoneRole != PhoneRole.SETTINGS) inspectorTab = InspectorTab.CAPTION
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                    )
+                }
                 SessionStatusLine(session)
                 when (phase) {
                     EditorPhase.EXPORT -> ResultPhase(Modifier.weight(1f).fillMaxWidth())
@@ -1228,15 +1209,34 @@ internal fun AdaptiveEditorWorkspace(
                             val settingsPaneLayout = portraitSplit || twoColumns
                             val bodyTab = if (settingsPaneLayout && (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN)) InspectorTab.CAPTION else inspectorTab
                             val body = inspectorColumns(bodyTab)
+                            // Low phone landscape: fixed picture/timeline/selected-clip area beside the tools (same condition as the Row below).
+                            val phoneLowLandscape = isPhone && maxWidth > maxHeight &&
+                                ((inspectorTab != InspectorTab.SCENE && inspectorTab != InspectorTab.PLAN) || phonePreviewOnly)
                             @Composable
                             fun PreviewAndTabs(tabsBelowPicture: Boolean = true, stageHeight: Dp = paneHeight) {
                                 when {
-                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.15f, baseMax = 96.dp, maxShare = if (imeVisible) 0.18f else 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = tabsBelowPicture)
+                                    isPhone -> Stage(paneHeight = paneHeight, baseShare = 0.15f, baseMax = 96.dp, maxShare = if (imeVisible) 0.18f else 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = false, reservedBelow = if (phoneLowLandscape) 1.dp else 0.dp, fitPane = phoneLowLandscape)
                                     // Two-pane portrait (TriFold) sizes the picture like landscape, not with the 140dp phone-ish cap.
                                     isLandscape || twoColumns -> Stage(paneHeight = stageHeight, baseShare = 0.55f, baseMax = 420.dp, maxShare = if (imeVisible) 0.42f else 0.75f, horizontalPadding = 0.dp, tabsBelowPicture = tabsBelowPicture)
                                     else -> Stage(paneHeight = paneHeight, baseShare = 0.165f, baseMax = 140.dp, maxShare = 0.30f, horizontalPadding = 4.dp, tabsBelowPicture = tabsBelowPicture)
                                 }
                                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .6f))
+                            }
+                            // Phone: the selected clip's list number and source name, kept right under the fixed picture + timeline.
+                            @Composable
+                            fun SelectedClipLine() {
+                                // List order number (not the internal key) and the same source name the clip list shows.
+                                val clipNumber = project.scenes.indexOfFirst { it.key == selectedScene?.key } + 1
+                                val clipSource = selectedSource
+                                if (clipNumber > 0 && clipSource != null) {
+                                    Text(
+                                        "${clipNumber}번 클립 · ${clipSource.name}",
+                                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
                             }
                             if (portraitSplit) {
                                 Column(Modifier.fillMaxSize()) {
@@ -1379,7 +1379,10 @@ internal fun AdaptiveEditorWorkspace(
                                 when (landscapePlacement) {
                                     LandscapePlacement.PREVIEW_LEFT -> {
                                         Row(Modifier.fillMaxSize()) {
-                                            PreviewPane(Modifier.weight(splitRatio).fillMaxHeight(), paneHeight)
+                                            Column(Modifier.weight(splitRatio).fillMaxHeight()) {
+                                                PreviewPane(Modifier.weight(1f).fillMaxWidth(), paneHeight)
+                                                SelectedClipLine()
+                                            }
                                             SplitDivider()
                                             Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
                                                 // The settings sit after every clip in the ONE grid, so a compact heading outside the grid
@@ -1433,9 +1436,13 @@ internal fun AdaptiveEditorWorkspace(
                                         Row(Modifier.fillMaxSize()) {
                                             BoardPane(Modifier.weight(splitRatio).fillMaxHeight())
                                             SplitDivider()
-                                            Column(Modifier.weight(1f - splitRatio).fillMaxHeight().verticalScroll(landscapeRightScroll)) {
-                                                PreviewHeader()
-                                                InspectorContent()
+                                            // Picture + timeline stay fixed, the selected clip is named under them, only the tools scroll.
+                                            Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
+                                                Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                                    PreviewAndTabs(tabsBelowPicture = false, stageHeight = paneHeight * 0.8f - 13.dp)
+                                                }
+                                                SelectedClipLine()
+                                                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(landscapeRightScroll)) { InspectorContent() }
                                             }
                                         }
                                     }
@@ -1443,41 +1450,84 @@ internal fun AdaptiveEditorWorkspace(
                                         Row(Modifier.fillMaxSize()) {
                                             InspectorPane(Modifier.weight(splitRatio).fillMaxHeight())
                                             SplitDivider()
-                                            BoardPane(Modifier.weight(1f - splitRatio).fillMaxHeight(), page = { PreviewHeader() })
+                                            // Picture + timeline stay fixed (same bounded size as 클립 좌측), only the clip board scrolls.
+                                            Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
+                                                Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                                    PreviewAndTabs(tabsBelowPicture = false, stageHeight = paneHeight * 0.8f - 13.dp)
+                                                }
+                                                SelectedClipLine()
+                                                BoardPane(Modifier.weight(1f).fillMaxWidth(), page = null)
+                                            }
                                         }
                                     }
                                 }
                             } else {
-                                if (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) {
-                                    // One lazy scroll: the preview/transport/tabs scroll off the top, the clips take the page.
-                                    Board(
-                                        fixedColumns = columns,
-                                        maxColumns = maxColumns,
-                                        onColumnsChange = { phoneColumns = it },
-                                        thumbnailAspect = thumbAspect,
-                                        compactCells = compactCells,
-                                        modifier = Modifier.fillMaxSize(),
-                                        page = { PreviewAndTabs() },
-                                        forceClips = true,
-                                    )
-                                } else {
-                                    Column(
-                                        Modifier
-                                            .fillMaxSize()
-                                            .verticalScroll(rememberScrollState()),
-                                    ) {
+                                if ((inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN) && !(isPhone && phonePreviewOnly)) {
+                                    // Phone: the picture + timeline (the one shared player) stay fixed on top at their compact height,
+                                    // the selected clip is named under them, and only the clip board below scrolls.
+                                    Column(Modifier.fillMaxSize()) {
                                         PreviewAndTabs()
-                                        InspectorBody(Modifier.fillMaxWidth()) {
-                                            val single = body.single
-                                            if (single != null) {
-                                                single()
-                                            } else {
-                                                body.left()
-                                                body.right?.let { right ->
-                                                    if (body.dividerBetween) HorizontalDivider()
-                                                    right()
+                                        SelectedClipLine()
+                                        Board(
+                                            fixedColumns = columns,
+                                            maxColumns = maxColumns,
+                                            onColumnsChange = { phoneColumns = it },
+                                            thumbnailAspect = thumbAspect,
+                                            compactCells = compactCells,
+                                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                                            page = null,
+                                            forceClips = true,
+                                        )
+                                    }
+                                } else {
+                                    // Phone settings: the picture + timeline (the one shared player) stay fixed on top so an effect can be
+                                    // judged while adjusting; only the selected tool's detail below scrolls. Other layouts keep one page scroll.
+                                    val phoneSettingsTabs = isPhone && inspectorTab != InspectorTab.SCENE && inspectorTab != InspectorTab.PLAN
+                                    // 미리보기 role (selected clip's tools) also keeps picture + timeline fixed, like the settings tools.
+                                    val phoneSettingsFixedTop = phoneSettingsTabs || (isPhone && phonePreviewOnly)
+                                    // Low phone landscape: header + picture + timeline + footer would take the whole height, so the
+                                    // same fixed picture/timeline/selected-clip area and the same tools scroll sit side by side.
+                                    @Composable
+                                    fun PhoneToolsScroll(scrollModifier: Modifier) {
+                                        Column(scrollModifier.verticalScroll(rememberScrollState())) {
+                                            if (!phoneSettingsFixedTop) PreviewAndTabs()
+                                            if (phoneSettingsTabs) Box(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                                                InspectorTabs(inspectorTab, onTab = { inspectorTab = it }, resizeActions = emptyList(), modifier = Modifier, settingsPane = true)
+                                            }
+                                            InspectorBody(Modifier.fillMaxWidth()) {
+                                                val single = body.single
+                                                if (single != null) {
+                                                    single()
+                                                } else {
+                                                    body.left()
+                                                    body.right?.let { right ->
+                                                        if (body.dividerBetween) HorizontalDivider()
+                                                        right()
+                                                    }
                                                 }
                                             }
+                                        }
+                                    }
+                                    if (phoneLowLandscape) {
+                                        Row(Modifier.fillMaxSize()) {
+                                            // Left: fixed, bounded picture + compact timeline (no page scroll). Right: fixed selected-clip line, then the tools scroll.
+                                            Column(Modifier.weight(0.5f).fillMaxHeight()) {
+                                                PreviewAndTabs()
+                                            }
+                                            VerticalHairline()
+                                            Column(Modifier.weight(0.5f).fillMaxHeight()) {
+                                                SelectedClipLine()
+                                                PhoneToolsScroll(Modifier.weight(1f).fillMaxWidth())
+                                            }
+                                        }
+                                    } else {
+                                        Column(Modifier.fillMaxSize()) {
+                                            if (phoneSettingsFixedTop) {
+                                                PreviewAndTabs()
+                                                // Named right under the fixed picture + timeline, outside the tools scroll.
+                                                SelectedClipLine()
+                                            }
+                                            PhoneToolsScroll(Modifier.weight(1f).fillMaxWidth())
                                         }
                                     }
                                 }
@@ -2557,6 +2607,17 @@ private fun EditingPreviewBox(
             Text("클립을 선택하거나 재료를 추가해 주세요.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
 
+        val engineHost = clipPlayback.previewHost
+        if (engineHost.preparing) {
+            PreviewProgressOverlay(loading = true, progress = engineHost.progress, statusText = engineHost.status, modifier = Modifier.align(Alignment.Center))
+        } else engineHost.error?.let { message ->
+            Text(
+                message,
+                Modifier.align(Alignment.BottomCenter).padding(8.dp).background(Color.Black.copy(alpha = .75f), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 4.dp),
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
         if (preparationState != null && preparationState.isPreparing) {
             val status = if (preparationState.failedCount > 0) {
                 "미리보기 준비 중 (${preparationState.completedCount}/${preparationState.totalCount}, 실패 ${preparationState.failedCount})"
@@ -2603,6 +2664,8 @@ private fun EditorStage(
     // TalkBack resize actions, both empty while typing.
     belowPicture: (@Composable (dragModifier: Modifier, resizeActions: List<CustomAccessibilityAction>) -> Unit)? = null,
     preparationState: TrailerPreviewPreparationState? = null,
+    // False only in the low phone landscape stage, which has no room for the 24dp handle under the picture.
+    showResizeHandle: Boolean = true,
 ) {
     // 편집 stage: the selected scene only (the whole video lives in 영상 만들기). The picture has its own bounded
     // height and the tab row under it doubles as its resize handle. While typing (showControls=false) only the
@@ -2659,7 +2722,9 @@ private fun EditorStage(
         // Ratio of the height actually shown (already clamped by the pane), not the persisted scale.
         if (timeline != null && showControls) timeline(if (baseVisualHeight > 0.dp) visualHeight / baseVisualHeight else 1f)
         if (belowPicture != null) {
-            if (onPreviewScaleChange != null && showControls) {
+            if (!showResizeHandle) {
+                belowPicture(Modifier, emptyList())
+            } else if (onPreviewScaleChange != null && showControls) {
                 // Preview size is a UI preference only: dragging the tab row under the picture changes this picture's
                 // height (down = larger), not framing or export. The drag starts only past touch slop, so a short tap
                 // still selects a tab and a drag never does. The scale is derived from the height actually shown so
@@ -2801,12 +2866,18 @@ internal class ClipPlaybackState {
     // its elapsed time, and [sceneKey] holds the first/last scene so the clip selection never changes.
     var card by mutableStateOf<TitleSlot?>(null)
     var cardPositionMs by mutableLongStateOf(0L)
+    // Output-timeline ms while the one player is at a time no clip/card covers (a gap, or the voiceover tail past the last
+    // visual); null otherwise. [sceneKey] keeps the last scene so the selection never changes. Same clock as the state above.
+    var unmappedOutputMs by mutableStateOf<Long?>(null)
+    // The one Composition player for this workspace's preview (see ProjectPreviewEngine); not parallel to the state above.
+    val previewHost = ProjectPreviewHost()
 
     fun isPlaying(key: Long) = playing && sceneKey == key && card == null
     fun positionFor(key: Long) = if (sceneKey == key) positionMs else 0L
     fun toggle(key: Long) {
         continuous = false
         card = null
+        unmappedOutputMs = null
         if (sceneKey != key) { sceneKey = key; positionMs = 0L; playing = true } else playing = !playing
     }
     fun seek(key: Long, posMs: Long) {
@@ -2819,6 +2890,7 @@ internal class ClipPlaybackState {
         sceneKey = key
         positionMs = scenePosMs
         seekRequestMs = null
+        unmappedOutputMs = null
         card = slot
         cardPositionMs = posMs
         epoch++
@@ -2832,9 +2904,21 @@ internal class ClipPlaybackState {
     /** Timeline seek/advance: moves to [posMs] of scene [key] without leaving continuous mode. */
     fun seekWithin(key: Long, posMs: Long, byUser: Boolean = false) {
         card = null
+        unmappedOutputMs = null
         sceneKey = key
         positionMs = posMs
         seekRequestMs = posMs
+        epoch++
+        if (byUser) userEpoch++
+    }
+
+    /** Timeline move onto an uncovered output time [outputMs] (gap / voiceover tail); [key] stays selected at [scenePosMs]. */
+    fun seekUnmapped(key: Long, outputMs: Long, scenePosMs: Long, byUser: Boolean = false) {
+        card = null
+        sceneKey = key
+        positionMs = scenePosMs
+        seekRequestMs = null
+        unmappedOutputMs = outputMs
         epoch++
         if (byUser) userEpoch++
     }
@@ -2847,43 +2931,65 @@ internal class ClipPlaybackState {
 /** Which title card a timeline segment / the card view stands for. */
 internal enum class TitleSlot { INTRO, OUTRO }
 
-/** One timed piece of the project timeline: an enabled start/end card ([slot]) or a scene, in export order. */
+/**
+ * One timed piece of the project timeline: an enabled start/end card ([slot]) or an active scene. [startSec]/[lengthSec] are
+ * the canonical OUTPUT start/duration (rate, dissolve overlap and card clamps applied, as in preview/export), so segments may
+ * overlap; [rate] converts output seconds to the scene's source seconds.
+ */
 private class TimelineSegment(
     val slot: TitleSlot?,
     val scene: EditorScene?,
     val startSec: Double,
     val lengthSec: Double,
     val card: TrailerTitleCard? = null,
+    val rate: Double = 1.0,
 )
 
-/** Enabled intro card, every scene, enabled outro card, back to back (the export's order and durations). */
-private fun timelineSegments(scenes: List<EditorScene>, intro: TrailerTitleCard, outro: TrailerTitleCard): List<TimelineSegment> {
-    if (scenes.isEmpty()) return emptyList()
-    val out = ArrayList<TimelineSegment>(scenes.size + 2)
-    var at = 0.0
-    if (intro.enabled) { val d = intro.clampedDuration(); out += TimelineSegment(TitleSlot.INTRO, null, at, d, intro); at += d }
-    for (scene in scenes) { out += TimelineSegment(null, scene, at, scene.length); at += scene.length }
-    if (outro.enabled) out += TimelineSegment(TitleSlot.OUTRO, null, at, outro.clampedDuration(), outro)
-    return out
+/** The segments plus the project's real total (visual end or voiceover floor, = [EditorProject.totalDuration]). */
+private class TimelineSegments(list: List<TimelineSegment>, val totalSec: Double) : List<TimelineSegment> by list
+
+/** Whole timeline seconds: the project's total including a voiceover tail past the last visual. */
+private fun timelineTotal(segments: List<TimelineSegment>): Double =
+    (segments as? TimelineSegments)?.totalSec ?: segments.maxOfOrNull { it.startSec + it.lengthSec } ?: 0.0
+
+/** Enabled cards and active (non-excluded) scenes at their canonical output start/duration (the export's timing). */
+private fun timelineSegments(project: EditorProject): List<TimelineSegment> {
+    val active = project.scenes.filter { !it.excluded }
+    if (active.isEmpty()) return emptyList()
+    val byKey = active.associateBy { it.key }
+    val out = ArrayList<TimelineSegment>(active.size + 2)
+    for (m in project.canonicalClipMappings(includeCards = true)) {
+        when (m.sceneKey) {
+            -999L -> out += TimelineSegment(TitleSlot.INTRO, null, m.outputStart, m.outputDuration, project.introCard)
+            -998L -> out += TimelineSegment(TitleSlot.OUTRO, null, m.outputStart, m.outputDuration, project.outroCard)
+            else -> byKey[m.sceneKey]?.let { out += TimelineSegment(null, it, m.outputStart, m.outputDuration, rate = m.rate) }
+        }
+    }
+    if (out.isEmpty()) return emptyList()
+    return TimelineSegments(out, project.totalDuration)
 }
 
 /** The clip a card segment holds for selection: the first scene for the start card, the last for the end card. */
 private fun heldSceneKey(segments: List<TimelineSegment>, slot: TitleSlot): Long? =
     (if (slot == TitleSlot.INTRO) segments.firstOrNull { it.scene != null } else segments.lastOrNull { it.scene != null })?.scene?.key
 
-/** Shown position (seconds from the video start) of the selected clip, or of the card while one is active. */
+/** Shown position (output seconds from the video start) of the selected clip, or of the card / uncovered time while active. */
 private fun timelineSecondsAt(segments: List<TimelineSegment>, selectedKey: Long?, clipPlayback: ClipPlaybackState): Double {
+    val total = timelineTotal(segments)
+    clipPlayback.unmappedOutputMs?.let { if (selectedKey != null && clipPlayback.sceneKey == selectedKey) return (it / 1000.0).coerceIn(0.0, total) }
     val slot = clipPlayback.card?.takeIf { clipPlayback.sceneKey == selectedKey }
     // A null selectedKey must not match card segments (their scene is null too), and a stale card/scene falls back to 0.
     val seg = if (slot != null) segments.firstOrNull { it.slot == slot }
     else if (selectedKey == null) null
     else segments.firstOrNull { it.scene?.key == selectedKey }
     seg ?: return 0.0
-    val posMs = if (slot != null) clipPlayback.cardPositionMs else clipPlayback.positionFor(seg.scene?.key ?: return 0.0)
-    return seg.startSec + (posMs / 1000.0).coerceIn(0.0, seg.lengthSec)
+    // A card position is already output time; a scene position is source time (positionMs), so it is divided by the rate.
+    val local = if (slot != null) clipPlayback.cardPositionMs / 1000.0
+    else clipPlayback.positionFor(seg.scene?.key ?: return 0.0) / 1000.0 / seg.rate
+    return seg.startSec + local.coerceIn(0.0, seg.lengthSec)
 }
 
-/** Moves the timeline to [targetSec]: selects the owning clip (the held one for a card) and seeks scene or card. */
+/** Moves the timeline to output time [targetSec]: selects the owning clip (the held one for a card) and seeks scene, card or tail. */
 private fun seekTimeline(
     segments: List<TimelineSegment>,
     targetSec: Double,
@@ -2892,15 +2998,31 @@ private fun seekTimeline(
     selectedKey: Long?,
 ) {
     if (segments.isEmpty()) return
-    val total = segments.last().let { it.startSec + it.lengthSec }
+    val total = timelineTotal(segments)
     val t = targetSec.coerceIn(0.0, total)
-    val seg = segments.lastOrNull { it.startSec <= t } ?: segments.first()
-    val offsetMs = ((t - seg.startSec).coerceIn(0.0, seg.lengthSec) * 1000).toLong()
+    // The segment actually on screen at t (the later one during a dissolve), as the preview engine maps it.
+    val seg = segments.lastOrNull { it.startSec <= t + 1e-6 && t < it.startSec + it.lengthSec - 1e-6 }
+    fun keyOf(s: TimelineSegment): Long? = (if (s.slot != null) heldSceneKey(segments, s.slot) else s.scene?.key)
+    fun sourceEndMs(key: Long): Long = ((segments.lastOrNull { it.scene?.key == key }?.scene?.length ?: 0.0) * 1000).toLong()
+    if (seg == null) {
+        // Nothing covers t (a gap, or the voiceover tail): stay on the previous clip/card and keep the real output position.
+        val prev = segments.lastOrNull { it.startSec <= t } ?: segments.first()
+        val key = keyOf(prev) ?: return
+        if (key != selectedKey) onSelectScene(key)
+        clipPlayback.seekUnmapped(key, (t * 1000).toLong(), sourceEndMs(key), byUser = true)
+        return
+    }
     val slot = seg.slot
-    val key = (if (slot != null) heldSceneKey(segments, slot) else seg.scene?.key) ?: return
+    val key = keyOf(seg) ?: return
     if (key != selectedKey) onSelectScene(key)
-    if (slot == null) clipPlayback.seekWithin(key, offsetMs, byUser = true)
-    else clipPlayback.seekCard(slot, key, offsetMs, if (slot == TitleSlot.INTRO) 0L else (segments.last { it.scene?.key == key }.lengthSec * 1000).toLong(), byUser = true)
+    val outputOffsetMs = ((t - seg.startSec).coerceIn(0.0, seg.lengthSec) * 1000).toLong()
+    if (slot == null) {
+        // Output offset -> source position inside the scene's own window (rate applied; the window start is never touched).
+        val sourceMs = (outputOffsetMs * seg.rate).toLong().coerceIn(0L, sourceEndMs(key))
+        clipPlayback.seekWithin(key, sourceMs, byUser = true)
+    } else {
+        clipPlayback.seekCard(slot, key, outputOffsetMs, if (slot == TitleSlot.INTRO) 0L else sourceEndMs(key), byUser = true)
+    }
 }
 
 /** Output size of the whole video (what the cards are rendered at), recomputed only when the session's inputs change. */
@@ -3046,6 +3168,8 @@ private fun ProjectTimeline(
     onToggleFullscreen: (() -> Unit)? = null,
     fullscreenEnabled: Boolean = true,
     isFullscreen: Boolean = false,
+    // Keeps the clock visible at compact size (low phone landscape).
+    showClock: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     if (segments.isEmpty()) return
@@ -3055,7 +3179,7 @@ private fun ProjectTimeline(
     val filmHeight = (if (compactPhone) 24f + 16f * filmRatio else 24f + 32f * filmRatio).dp
     val compact = sizeRatio <= 0.6f
     val scenes = remember(segments) { segments.mapNotNull { it.scene } }
-    val totalSeconds = segments.last().let { it.startSec + it.lengthSec }.coerceAtLeast(0.1)
+    val totalSeconds = timelineTotal(segments).coerceAtLeast(1e-6)
     val selectedIndex = scenes.indexOfFirst { it.key == selectedKey }.coerceAtLeast(0)
     val activeSlot = clipPlayback.card?.takeIf { clipPlayback.sceneKey == selectedKey }
     val activeSegmentIndex = if (activeSlot != null) segments.indexOfFirst { it.slot == activeSlot }
@@ -3069,7 +3193,7 @@ private fun ProjectTimeline(
 
     fun seekToFraction(fraction: Float) {
         val list = currentSegments
-        val total = list.last().let { it.startSec + it.lengthSec }
+        val total = timelineTotal(list)
         seekTimeline(list, fraction.coerceIn(0f, 1f) * total, clipPlayback, onSelectScene, currentSelected)
     }
     fun seekToScene(index: Int) {
@@ -3087,7 +3211,7 @@ private fun ProjectTimeline(
             IconButton(onClick = onTogglePlay, modifier = Modifier.size(if (compactPhone) 32.dp else if (compact) 30.dp else 36.dp)) {
                 PackIcon(if (playingAll) PackGlyph.PAUSE else PackGlyph.PLAY, if (playingAll) "전체 타임라인 재생 멈춤" else "타임라인 ${seconds1(if (shownSeconds >= totalSeconds - 0.05) 0.0 else shownSeconds)}부터 이어서 재생", Modifier.size(if (compact) 18.dp else 20.dp))
             }
-            if (!compact) {
+            if (!compact || showClock) {
                 Spacer(Modifier.width(6.dp))
                 Text(
                     "${timelineClock(shownSeconds)} / ${timelineClock(totalSeconds)}",
@@ -3187,7 +3311,7 @@ private fun TimelineFilmstrip(
     val videoTint = scheme.primaryContainer
     val cardTint = scheme.secondaryContainer
     val outline = scheme.primary
-    val total = segments.last().let { it.startSec + it.lengthSec }.coerceAtLeast(0.1)
+    val total = timelineTotal(segments).coerceAtLeast(1e-6)
     val dims = rememberOutputDims(session)
     val firstScene = segments.firstOrNull { it.scene != null }?.scene
     val lastScene = segments.lastOrNull { it.scene != null }?.scene
@@ -3231,7 +3355,7 @@ private fun TimelineFilmstrip(
                                 TitleSlot.INTRO -> TimelineBitmap(introThumb, alpha)
                                 TitleSlot.OUTRO -> TimelineBitmap(outroThumb, alpha)
                                 null -> seg.scene?.let { scene ->
-                                    FilmstripFrame(scene, sourcesById[scene.sourceId], (t - seg.startSec).coerceIn(0.0, seg.lengthSec), alpha)
+                                    FilmstripFrame(scene, sourcesById[scene.sourceId], (t - seg.startSec).coerceIn(0.0, seg.lengthSec) * seg.rate, alpha)
                                 }
                             }
                         }
@@ -3269,7 +3393,7 @@ private fun TimelineBitmap(bitmap: Bitmap?, alpha: Float) {
 @Composable
 private fun FilmstripFrame(scene: EditorScene, source: TrailerSource?, offsetSec: Double, alpha: Float) {
     if (source == null) return
-    // Photos use one frame; videos are sampled in 0.5s steps inside the clipped range.
+    // Photos use one frame; videos are sampled in 0.5s steps inside the clipped range ([offsetSec] is source time).
     val at = if (source.isImage) 0.0 else scene.start + kotlin.math.floor(offsetSec * 2) / 2.0
     val cacheKey = remember(source.file, source.isImage, at) { "${source.file.absolutePath}|${source.file.lastModified()}|${(at * 10).toLong()}" }
     val frame by produceState<Bitmap?>(TimelineFrameCache.get(cacheKey) ?: source.thumbnail, cacheKey) {
@@ -3304,127 +3428,6 @@ private object TimelineLoudnessCache {
             bins -= e.value.size
             it.remove()
         }
-    }
-}
-
-/**
- * Background music for the project timeline play: it starts where the timeline is (video-wide, cards included, as the
- * export mixes it), loops unless the music plays once, and stops with the timeline. Volume follows the project
- * music volume up to 100% (a player cannot go louder); with auto-ducking the gain follows the export's ducking
- * timeline; tempo shifts are not previewed.
- */
-@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-@Composable
-private fun TimelineMusic(
-    active: Boolean,
-    track: TrailerMusicTrack?,
-    policy: TrailerMusicPolicy,
-    volume: Float,
-    autoDucking: Boolean,
-    sources: List<TrailerSource>,
-    segments: List<TimelineSegment>,
-    clipPlayback: ClipPlaybackState,
-) {
-    val context = LocalContext.current
-    val currentSegments by rememberUpdatedState(segments)
-    val file = track?.file?.takeIf { it.isFile && it.length() > 0L }
-    val player = remember(file?.absolutePath) {
-        file?.let {
-            ExoPlayer.Builder(context).build().apply {
-                setMediaItem(MediaItem.fromUri(Uri.fromFile(it)))
-                playWhenReady = false
-                prepare()
-            }
-        }
-    }
-    DisposableEffect(player) { onDispose { player?.release() } }
-    LaunchedEffect(player, policy) { player?.repeatMode = if (policy == TrailerMusicPolicy.SINGLE) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ALL }
-    val duck = autoDucking && player != null
-    LaunchedEffect(player, volume, duck) { if (!duck) player?.volume = volume.coerceIn(0f, 1f) }
-    // Auto-ducking: the exporter's own loudness envelopes (0.05s bins) and AudioDuckingTimeline over the same
-    // card + scene layout, analysed lazily off the main thread (upcoming sources only) and cached per source file.
-    val sourcesById = remember(sources) { sources.associateBy { it.id } }
-    var envVersion by remember { mutableIntStateOf(0) }
-    val duckingTimeline by produceState<AudioDuckingTimeline?>(null, duck, segments, sourcesById, envVersion) {
-        if (!duck) { value = null; return@produceState }
-        value = withContext(Dispatchers.Default) {
-            var placeholderId = -1000
-            fun silent(length: Double) = TrailerScene(
-                source = TrailerSource(id = placeholderId--, name = "", file = File(""), duration = length, width = 0, height = 0, analysis = AudioAnalysisResult(emptyList(), 0.0), thumbnail = null, isImage = true),
-                start = 0.0, length = length,
-            )
-            val envelopes = HashMap<Int, FloatArray>()
-            val timelineScenes = segments.map { seg ->
-                val scene = seg.scene
-                val source = scene?.let { sourcesById[it.sourceId] }
-                if (scene == null || source == null) silent(seg.lengthSec)
-                else {
-                    if (!source.isImage) TimelineLoudnessCache.get(source)?.let { envelopes[source.id] = it }
-                    TrailerScene(source = source, start = scene.start, length = scene.length, sourceVolume = scene.sourceVolume)
-                }
-            }
-            AudioDuckingTimeline.buildWithLoudnessEnvelopes(timelineScenes, envelopes, binSeconds = 0.05, originalClipGain = 1.0f)
-        }
-    }
-    LaunchedEffect(duck, active, segments, sourcesById) {
-        if (!duck) return@LaunchedEffect
-        val appContext = context.applicationContext
-        while (isActive) {
-            val position = timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback)
-            // Playing: a few sources ahead; otherwise only the current one, so opening never decodes the project.
-            val pending = currentSegments.asSequence()
-                .filter { it.startSec + it.lengthSec >= position }
-                .mapNotNull { seg -> seg.scene?.let { sourcesById[it.sourceId] } }
-                .filter { !it.isImage && it.duration > 0.0 && TimelineLoudnessCache.get(it) == null }
-                .distinctBy { it.id }
-                .take(if (active) 3 else 1)
-                .toList()
-            val next = pending.firstOrNull()
-            if (next == null) { delay(500); continue }
-            val envelope = runCatching {
-                AudioAnalysisService.extractLoudnessEnvelope(appContext, Uri.fromFile(next.file), next.duration, 0.05)
-            }.getOrDefault(FloatArray(0))
-            TimelineLoudnessCache.put(next, envelope)
-            envVersion++
-        }
-    }
-    // Gain follows the export's processor: target from the timeline at the shown video position, ~0.08s attack / ~0.28s release.
-    LaunchedEffect(player, duck, duckingTimeline, active, volume, clipPlayback.userEpoch) {
-        val p = player ?: return@LaunchedEffect
-        val timeline = duckingTimeline ?: return@LaunchedEffect
-        val musicGain = volume.coerceIn(0f, 2f)
-        val full = 0.85f * musicGain
-        val ducked = 0.18f * musicGain
-        fun target() = timeline.targetMusicGainAt(timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback), ducked, full)
-        var gain = target()
-        p.volume = gain.coerceIn(0f, 1f)
-        if (!active) return@LaunchedEffect
-        var last = android.os.SystemClock.uptimeMillis()
-        while (isActive) {
-            delay(40)
-            val now = android.os.SystemClock.uptimeMillis()
-            val dt = (now - last) / 1000.0
-            last = now
-            val goal = target()
-            val tau = if (goal < gain) 0.08 else 0.28
-            gain += ((1.0 - kotlin.math.exp(-dt / tau)).toFloat()) * (goal - gain)
-            p.volume = gain.coerceIn(0f, 1f)
-        }
-    }
-    // Re-synced only when the timeline starts or the user seeks, not on every automatic scene advance.
-    LaunchedEffect(player, active, clipPlayback.userEpoch) {
-        val p = player ?: return@LaunchedEffect
-        if (!active) { p.pause(); return@LaunchedEffect }
-        // The video-wide position: start card, scenes and end card all count, so music lines up with the export.
-        val atSeconds = timelineSecondsAt(currentSegments, clipPlayback.sceneKey, clipPlayback)
-        val durationMs = ((track?.durationSeconds ?: 0.0) * 1000).toLong()
-        var targetMs = (atSeconds * 1000).toLong()
-        if (durationMs > 0L) {
-            if (policy == TrailerMusicPolicy.SINGLE && targetMs >= durationMs) { p.pause(); return@LaunchedEffect }
-            targetMs %= durationMs
-        }
-        p.seekTo(targetMs)
-        p.play()
     }
 }
 
@@ -3536,20 +3539,10 @@ private fun ScenePreview(
             clipPlayback.seekRequestMs = null
         }
     }
-    LaunchedEffect(playing, source.isImage, scene.length, planKey, scene.key) {
-        if (!playing || !source.isImage) {
-            return@LaunchedEffect
-        }
-        val durationMs = (scene.length * 1000).toLong().coerceAtLeast(100L)
-        val startOffsetMs = ((photoPlayProgress.coerceIn(0f, 1f) % 1f) * durationMs).toLong()
-        val startTime = android.os.SystemClock.uptimeMillis() - startOffsetMs
-        while (isActive && playing) {
-            val elapsed = android.os.SystemClock.uptimeMillis() - startTime
-            // On the project timeline a photo plays its camera move once; alone it loops.
-            val shown = if (clipPlayback.continuous) elapsed.coerceAtMost(durationMs) else elapsed % durationMs
-            photoPlayProgress = (shown.toFloat() / durationMs).coerceIn(0f, 1f)
-            if (clipPlayback.sceneKey == scene.key) clipPlayback.positionMs = shown
-            delay(16)
+    // The one preview engine drives the shared position; a photo's camera move just follows it.
+    LaunchedEffect(clipPlayback.positionMs, playing, source.isImage, scene.length, scene.key) {
+        if (source.isImage && playing && clipPlayback.sceneKey == scene.key) {
+            photoPlayProgress = (clipPlayback.positionMs.toFloat() / (scene.length * 1000).toFloat().coerceAtLeast(100f)).coerceIn(0f, 1f)
         }
     }
     // A paused video shows the frame at the held position (timeline/slider seek), in 0.1s steps; a playing one uses its player.
@@ -3655,91 +3648,22 @@ private fun ScenePreview(
             Modifier.width(boxWidth).aspectRatio(aspect).clip(RoundedCornerShape(10.dp)).background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
-            if (playing && playbackAllowed && !source.isImage) {
-                // The clip plays through the SAME framing effects the exporter applies (fit/focus in the output size).
-                // If this device's renderer rejects them, playback falls back to centered framing with a visible notice.
-                var framingEffectsFailed by remember(scene.key, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight) { mutableStateOf(false) }
-                val player = remember(scene.key, scene.start, scene.length, source.file, scene.fit, scene.focusX, scene.focusY, outputWidth, outputHeight, framingEffectsFailed) {
-                    ExoPlayer.Builder(context).build().apply {
-                        if (!framingEffectsFailed) {
-                            runCatching {
-                                setVideoEffects(sceneFramingVideoEffects(scene.fit, scene.focusX, scene.focusY, source.width, source.height, outputWidth, outputHeight))
-                            }.onFailure { framingEffectsFailed = true }
-                        }
-                        addListener(object : Player.Listener {
-                            override fun onPlaybackStateChanged(playbackState: Int) {
-                                playerBuffering = (playbackState == Player.STATE_BUFFERING)
-                            }
-                            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                                playerBuffering = false
-                                if (!framingEffectsFailed) framingEffectsFailed = true
-                            }
-                        })
-                        setMediaItem(
-                            MediaItem.Builder().setUri(Uri.fromFile(source.file)).setClippingConfiguration(
-                                MediaItem.ClippingConfiguration.Builder()
-                                     .setStartPositionMs((scene.start * 1000).toLong())
-                                     .setEndPositionMs(((scene.start + scene.length) * 1000).toLong())
-                                     .build(),
-                            ).build(),
-                            // Resumes where the previous player (another layout, or before pause) stopped, inside the clip.
-                            clipPlayback.positionFor(scene.key).coerceIn(0L, (scene.length * 1000).toLong()),
-                        )
-                        repeatMode = Player.REPEAT_MODE_ONE
-                        playWhenReady = true
-                        prepare()
-                        playerBuffering = (playbackState == Player.STATE_BUFFERING)
-                    }
-                }
-                LaunchedEffect(player, scene.sourceVolume) { player.volume = scene.sourceVolume.coerceIn(0f, 1f) }
-                LaunchedEffect(player, clipPlayback.seekRequestMs) {
-                    val target = clipPlayback.seekRequestMs ?: return@LaunchedEffect
-                    if (clipPlayback.sceneKey == scene.key) {
-                        player.seekTo(target)
-                        clipPlayback.seekRequestMs = null
-                    }
-                }
-                LaunchedEffect(player) {
-                    while (isActive) {
-                        clipPlayback.positionMs = player.currentPosition.coerceAtLeast(0L)
-                        delay(200)
-                    }
-                }
-                DisposableEffect(player) {
-                    onDispose {
-                        playerBuffering = false
-                        // The last known clip position; the next player (this or another layout) continues from it.
-                        runCatching { if (clipPlayback.sceneKey == scene.key) clipPlayback.positionMs = player.currentPosition.coerceAtLeast(0L) }
-                        player.release()
-                    }
-                }
-                // With effects the frames are already output-shaped, so FIT shows them 1:1 in this output-aspect box.
-                val resize = when {
-                    !framingEffectsFailed || scene.fit == SceneFit.FIT -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    else -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                }
+            val host = clipPlayback.previewHost
+            val enginePlayer = host.player
+            if (playbackAllowed && enginePlayer != null && !host.preparing && host.builtKey == previewKeyOf(session)) {
+                // ONE CompositionPlayer plays the same prepared composition the exporter renders (framing, rate, dissolve,
+                // voice, music); its position drives the shared ClipPlaybackState (see ProjectPreviewEngine).
                 AndroidView(
                     factory = {
                         PlayerView(it).apply {
                             useController = false
-                            this.player = player
-                            resizeMode = resize
+                            this.player = enginePlayer
+                            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                         }
                     },
-                    update = {
-                        it.player = player
-                        it.resizeMode = resize
-                    },
+                    update = { it.player = enginePlayer },
                     modifier = Modifier.fillMaxSize(),
                 )
-                if (framingEffectsFailed && scene.fit == SceneFit.FILL && (scene.focusX != 0f || scene.focusY != 0f)) {
-                    Text(
-                        "이 기기 재생 미리보기는 가운데 기준입니다 · 전체 영상에는 위치가 반영됩니다",
-                        Modifier.align(Alignment.TopStart).padding(8.dp).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
             } else if (source.isImage) {
                 // Same camera path, easing and timing as the exporter's PhotoMotionGlTransformation: the viewport
                 // (photo coordinates) is mapped onto this output-aspect box, so zoom and pan preview exactly.
@@ -4647,6 +4571,8 @@ private fun SceneBoard(
 
     // Multirow LazyVerticalGrid: the page item (when given), then (클립 only) the toolbar and the clips.
     val minCellSize = 136.dp
+    // Output seconds per clip on the canonical timeline (rate/overlap applied); start~end below is source time.
+    val outputLengths = remember(project) { project.canonicalClipMappings().associate { it.sceneKey to it.outputDuration } }
     LazyVerticalGrid(
         // 자세히 is a vertical list (thumbnail left, text right) whatever the per-row setting; 썸네일/포스터 keep the grid.
         columns = if (boardDisplayMode == BoardDisplayMode.DETAIL) GridCells.Fixed(1)
@@ -4823,7 +4749,7 @@ private fun SceneBoard(
                     val lengthText = if (source.isImage) {
                         "재생 ${seconds1(scene.length)}"
                     } else {
-                        "${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} (${seconds1(scene.length)})"
+                        "원본 ${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} · 영상 ${seconds1(outputLengths[scene.key] ?: scene.length)}"
                     }
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
@@ -5004,7 +4930,7 @@ private fun SceneBoard(
                             val detailText = if (source.isImage) {
                                 "사진 · 재생 ${seconds1(scene.length)}"
                             } else {
-                                "영상 · 구간 ${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} (선택 ${seconds1(scene.length)})"
+                                "영상 · 원본 ${seconds1(scene.start)}~${seconds1(scene.start + scene.length)} · 영상 ${seconds1(outputLengths[scene.key] ?: scene.length)}"
                             }
                             Text(
                                 detailText,
@@ -6216,13 +6142,14 @@ private fun editorInspectorColumns(
     onOpenMusicPicker: () -> Unit,
     rankedBackgroundChoices: List<RankedBackgroundChoice> = emptyList(),
     isRankingBackgroundChoices: Boolean = false,
+    clipPlayback: ClipPlaybackState? = null,
 ): InspectorColumns {
     // Saved here (not inside the caption section) so the choice survives tab switches and relayouts.
     var captionTarget by rememberSaveable { mutableStateOf(CaptionTarget.BODY) }
     var pendingScope by rememberSaveable { mutableStateOf<CaptionScope?>(null) }
     return when (if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab) {
     // 클립: only the selected clip's compact length/range, so the clip grid below stays in the first viewport.
-    InspectorTab.SCENE, InspectorTab.PLAN -> InspectorColumns(left = { SceneSection(session, scene, source, model, onSelectScene) })
+    InspectorTab.SCENE, InspectorTab.PLAN -> InspectorColumns(left = { SceneSection(session, scene, source, model, onSelectScene, clipPlayback) })
     InspectorTab.CAPTION -> {
         // 본문 keeps the unchanged caption inspector (its own 현재/선택/전체 scopes and pending draft); 시작 화면/마지막 화면
         // swap only the body below this selector for the title card controls, so no caption or card data is touched.
@@ -6243,7 +6170,7 @@ private fun editorInspectorColumns(
             val bodySingle = body.single
             val singleWithTiming: (@Composable () -> Unit)? = if (bodySingle == null) null else {
                 {
-                    SceneSection(session, scene, source, model, onSelectScene)
+                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback)
                     HorizontalDivider()
                     bodySingle()
                 }
@@ -6252,7 +6179,7 @@ private fun editorInspectorColumns(
             // (single, or left + right), so it is never composed twice. Title card targets below get none.
             InspectorColumns(
                 left = {
-                    SceneSection(session, scene, source, model, onSelectScene)
+                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback)
                     HorizontalDivider()
                     body.left()
                 },
@@ -6283,7 +6210,7 @@ private fun editorInspectorColumns(
         }
     }
     InspectorTab.SOUND -> InspectorColumns(
-        left = { SoundClipSection(scene, source, model) },
+        left = { SoundClipSection(scene, source, model); VoiceSection(session, scene, source, model, clipPlayback) },
         right = { SoundMusicSection(session, model, onOpenMusicPicker) },
         dividerBetween = true,
     )
@@ -6431,7 +6358,7 @@ private fun <T> MacSegmentedControl(
 }
 
 @Composable
-private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit) {
+private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit, clipPlayback: ClipPlaybackState? = null) {
     if (scene == null || source == null) {
         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("선택한 클립이 없습니다. 클립 목록에서 길이나 구간을 조절할 클립을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -6444,8 +6371,11 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
     }
     val project = session.editor ?: return
     val index = project.scenes.indexOfFirst { it.key == scene.key }
-    TrailerSectionTitle("${index + 1}번 클립 / 전체 ${project.scenes.size}개 · ${if (source.isImage) "사진" else "영상"} ${seconds1(scene.length)}")
+    val outputLength = remember(project) { project.canonicalClipMappings().firstOrNull { it.sceneKey == scene.key }?.outputDuration } ?: scene.length
+    // 번호는 목록 순서(index + 1)이며 내부 key가 아니다. 원본 구간 길이와 영상에서 차지하는 길이를 구분한다.
+    TrailerSectionTitle("${index + 1}번 클립 / 전체 ${project.scenes.size}개 · ${if (source.isImage) "사진" else "영상"} ${seconds1(outputLength)}" + if (!source.isImage && kotlin.math.abs(outputLength - scene.length) > 0.05) " (원본 ${seconds1(scene.length)})" else "")
     Text(source.name, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    SceneActionRow(session, scene, model, clipPlayback, onSelectScene)
     if (source.isImage) {
         var length by remember(scene.key, scene.length) { mutableFloatStateOf(scene.length.toFloat()) }
         Text("보여 줄 사진 재생 시간: ${seconds1(length.toDouble())}", style = MaterialTheme.typography.labelMedium)
@@ -6491,6 +6421,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
             }
         }
     }
+    SceneAdvancedSection(scene, source, model, clipPlayback)
     // 위치 이동·복제·삭제 live on the scene board (selection actions and each thumbnail's menu), not repeated here.
 }
 
@@ -6937,7 +6868,8 @@ private fun DurationActionButton(
 @Composable
 private fun PlanLengthSection(session: TrailerSession, model: NasFinderViewModel) {
     val project = session.editor ?: return
-    val totalTime = session.scenes.sumOf { it.length }
+    // Output seconds on the canonical timeline (rate/overlap applied); per-clip start..end elsewhere stays source time.
+    val totalTime = session.bodyOutputDuration
     val recDefaults = remember(session.sources) { recommendedTrailerDefaults(session.sources) }
 
     if (session.isMusicOverlayMode) {

@@ -71,6 +71,10 @@ object TrailerDraftStore {
     private val drafts = mutableMapOf<String, TrailerDraft>()
     // Metadata entries this build could not parse: written back verbatim so they are never lost.
     private val preservedRawRecords = mutableListOf<Any>()
+    // Master list of all raw entries in exact file order; untouched entries are never re-serialized.
+    private val rawRecords = mutableListOf<Any>()
+    // Maps accepted draft IDs to their underlying raw record instances in [rawRecords].
+    private val acceptedRawRecords = mutableMapOf<String, Any>()
     // Legacy project root (cache/trailers) and the durable root (files/trailer_projects) used by new projects.
     private var canonicalTrailersRoot: String? = null
     private var canonicalDurableRoot: String? = null
@@ -127,8 +131,10 @@ object TrailerDraftStore {
         if (existing != null) drafts.remove(existing.id)
         // 오염은 저장 중에도 풀리지 않는다. 프라이버시 모드에서 새로 생긴 편집본은 비공개로 시작한다.
         val tainted = draft.isPrivate || existing?.isPrivate == true || (existing == null && PrivacyMode.isActive)
-        drafts[draft.id] = draft.copy(migrationIssue = null, isPrivate = tainted)
-        if (!persistDraftsToDisk()) {
+        val updated = draft.copy(migrationIssue = null, isPrivate = tainted)
+        drafts[draft.id] = updated
+        val replaceRaw = existing?.id?.let { acceptedRawRecords[it] }
+        if (!persistDraftsToDisk(DraftMutation.Upsert(updated, replaceRaw = replaceRaw, oldDraftId = existing?.id))) {
             drafts.clear()
             drafts.putAll(previous)
             return false
@@ -139,7 +145,8 @@ object TrailerDraftStore {
     @Synchronized
     fun detachDraft(draftId: String): TrailerDraft? {
         val target = drafts.remove(draftId) ?: return null
-        if (!persistDraftsToDisk()) {
+        val targetRaw = acceptedRawRecords[draftId]
+        if (!persistDraftsToDisk(DraftMutation.Remove(targetRaw = targetRaw, draftId = draftId))) {
             drafts[draftId] = target
             return null
         }
@@ -167,8 +174,13 @@ object TrailerDraftStore {
     fun setDraftPrivate(id: String, isPrivate: Boolean): Boolean {
         val existing = drafts[id] ?: return false
         if (existing.isPrivate == isPrivate) return true
-        drafts[id] = existing.copy(isPrivate = isPrivate)
-        if (!persistDraftsToDisk()) { drafts[id] = existing; return false }
+        val updated = existing.copy(isPrivate = isPrivate)
+        drafts[id] = updated
+        val targetRaw = acceptedRawRecords[id]
+        if (!persistDraftsToDisk(DraftMutation.Upsert(updated, replaceRaw = targetRaw, oldDraftId = id))) {
+            drafts[id] = existing
+            return false
+        }
         return true
     }
 
@@ -190,7 +202,8 @@ object TrailerDraftStore {
         val target = drafts.remove(draft.id)
             ?: drafts.values.firstOrNull { sameDirectory(it.directory, draft.directory) }?.also { drafts.remove(it.id) }
             ?: return false
-        if (!persistDraftsToDisk()) {
+        val targetRaw = acceptedRawRecords[target.id]
+        if (!persistDraftsToDisk(DraftMutation.Remove(targetRaw = targetRaw, draftId = target.id))) {
             // Metadata still lists it: keep the files so the project stays openable.
             drafts[target.id] = target
             return false
@@ -245,8 +258,12 @@ object TrailerDraftStore {
     @Synchronized
     fun renameDraft(draftId: String, newTitle: String) {
         val existing = drafts[draftId] ?: return
-        drafts[draftId] = existing.copy(customTitle = newTitle.ifBlank { null })
-        if (!persistDraftsToDisk()) drafts[draftId] = existing
+        val updated = existing.copy(customTitle = newTitle.ifBlank { null })
+        drafts[draftId] = updated
+        val targetRaw = acceptedRawRecords[draftId]
+        if (!persistDraftsToDisk(DraftMutation.Upsert(updated, replaceRaw = targetRaw, oldDraftId = draftId))) {
+            drafts[draftId] = existing
+        }
     }
 
     @Synchronized
@@ -433,7 +450,8 @@ object TrailerDraftStore {
             return false
         }
         drafts[original.id] = migrated
-        if (!persistDraftsToDisk()) {
+        val targetRaw = acceptedRawRecords[original.id]
+        if (!persistDraftsToDisk(DraftMutation.Upsert(migrated, replaceRaw = targetRaw, oldDraftId = original.id))) {
             drafts[original.id] = current!!.copy(migrationIssue = "편집 정보를 새 위치로 저장하지 못했습니다. 기존 편집은 그대로이며 다시 시도할 수 있습니다.")
             safeDeletePrivateTrailerDirectory(migrated.directory)
             return false
@@ -544,10 +562,22 @@ object TrailerDraftStore {
             val music = original.musicTrack?.let { track ->
                 if (track.file.isFile && track.file.length() > 0L) track.copy(file = copyOwned(track.file)) else track
             }
+            val voiceovers = original.editor?.voiceovers?.map { take ->
+                val voiceFile = File(original.directory, take.relativeFile)
+                if (voiceFile.isFile && isInside(voiceFile, original.directory)) {
+                    val copiedFile = copyOwned(voiceFile)
+                    val newRelative = copiedFile.relativeTo(newDir).path
+                    take.copy(relativeFile = newRelative)
+                } else {
+                    take
+                }
+            }.orEmpty()
+            val editor = original.editor?.copy(voiceovers = voiceovers)
             original.copy(
                 directory = newDir, sources = sources, output = output, musicTrack = music,
                 outputRevision = if (output != null) original.outputRevision else null,
                 migrationIssue = null,
+                editor = editor,
             )
         } catch (_: Exception) {
             synchronized(this) { safeDeletePrivateTrailerDirectory(newDir) }
@@ -581,15 +611,20 @@ object TrailerDraftStore {
         if (!writeRecoveryBackup(plan.raw, "$newId-${plan.fingerprint.take(16)}")) { discardCopy(); return false }
         val previousDrafts = drafts.toMap()
         val previousRaw = preservedRawRecords.toList()
-        if (copied != null) {
+        val recoveredDraft = if (copied != null) {
             val sharesPrivateFolder = drafts.values.any { sameDirectory(it.directory, plan.parsed.directory) && it.isPrivate }
-            drafts[newId] = copied.copy(
+            copied.copy(
                 customTitle = "${plan.parsed.displayTitle} (복구)",
                 isPrivate = plan.parsed.isPrivate || winner.isPrivate || sharesPrivateFolder,
-            )
-        }
+            ).also { drafts[newId] = it }
+        } else null
         preservedRawRecords.removeAt(rawIndex)
-        if (!persistDraftsToDisk()) {
+        val mutation = if (recoveredDraft != null) {
+            DraftMutation.Upsert(recoveredDraft, replaceRaw = plan.raw, oldDraftId = null)
+        } else {
+            DraftMutation.Remove(targetRaw = plan.raw, draftId = null)
+        }
+        if (!persistDraftsToDisk(mutation)) {
             drafts.clear(); drafts.putAll(previousDrafts)
             preservedRawRecords.clear(); preservedRawRecords.addAll(previousRaw)
             discardCopy() // only the folder this call created; no draft references it after the rollback
@@ -619,6 +654,11 @@ object TrailerDraftStore {
             put("actionStart", scene.actionStart)
             put("actionEnd", scene.actionEnd)
         }
+        if (scene.excluded) put("excluded", true)
+        if (scene.budgetExcluded) put("budgetExcluded", true)
+        put("automationProtected", scene.automationProtected)
+        if (!scene.manual.isEmpty()) put("manual", scene.manual.rawMask)
+        scene.adjustments?.let { put("adjustments", it.toJson()) }
     }
 
     private fun draftJson(draft: TrailerDraft) = JSONObject().apply {
@@ -663,6 +703,10 @@ object TrailerDraftStore {
                 if (editor.outroCard.enabled || editor.outroCard.title.isNotEmpty() || editor.outroCard.subtitle.isNotEmpty() || editor.outroCard.duration != 3.0 || !editor.outroCard.usesFirstOrLastImage || editor.outroCard.backgroundSourceId != null || editor.outroCard.backgroundTimestamp != null || editor.outroCard.titleStyle != null || editor.outroCard.subtitleStyle != null) {
                     put("outroCard", editor.outroCard.toJson())
                 }
+                if (editor.voiceovers.isNotEmpty()) {
+                    put("voiceovers", JSONArray().apply { editor.voiceovers.forEach { put(it.toJson()) } })
+                }
+                editor.batchCaption?.let { put("batchCaption", it.toJson()) }
             })
         }
         val sourcesArr = JSONArray()
@@ -686,17 +730,51 @@ object TrailerDraftStore {
         put("sources", sourcesArr)
     }
 
-    /** Writes EVERY record (including currently unavailable ones and unparsed entries) atomically. */
-    private fun persistDraftsToDisk(): Boolean {
+    private sealed class DraftMutation {
+        data class Upsert(val draft: TrailerDraft, val replaceRaw: Any? = null, val oldDraftId: String? = null) : DraftMutation()
+        data class Remove(val targetRaw: Any?, val draftId: String? = null) : DraftMutation()
+    }
+
+    /** Writes metadata atomically, preserving untouched raw records and modifying only the target entry. */
+    private fun persistDraftsToDisk(mutation: DraftMutation): Boolean {
         if (persistBlocked) return false
         val storage = draftsStorageDir ?: return false
         val target = File(storage, DRAFTS_META_FILE)
         val temp = File(storage, "$DRAFTS_META_FILE.tmp")
         val backup = File(storage, "$DRAFTS_META_FILE.bak")
         return runCatching {
+            val nextRawRecords = rawRecords.toMutableList()
+            val nextAcceptedRaw = acceptedRawRecords.toMutableMap()
+
+            when (mutation) {
+                is DraftMutation.Upsert -> {
+                    val newJson = draftJson(mutation.draft)
+                    val replaceTarget = mutation.replaceRaw ?: nextAcceptedRaw[mutation.draft.id]
+                    val replaceIndex = replaceTarget?.let { raw -> nextRawRecords.indexOfFirst { it === raw } } ?: -1
+                    if (replaceIndex >= 0) {
+                        nextRawRecords[replaceIndex] = newJson
+                    } else {
+                        nextRawRecords.add(newJson)
+                    }
+                    if (mutation.oldDraftId != null && mutation.oldDraftId != mutation.draft.id) {
+                        nextAcceptedRaw.remove(mutation.oldDraftId)
+                    }
+                    nextAcceptedRaw[mutation.draft.id] = newJson
+                }
+                is DraftMutation.Remove -> {
+                    val removeTarget = mutation.targetRaw ?: mutation.draftId?.let { nextAcceptedRaw[it] }
+                    val removeIndex = removeTarget?.let { raw -> nextRawRecords.indexOfFirst { it === raw } } ?: -1
+                    if (removeIndex >= 0) {
+                        nextRawRecords.removeAt(removeIndex)
+                    }
+                    if (mutation.draftId != null) {
+                        nextAcceptedRaw.remove(mutation.draftId)
+                    }
+                }
+            }
+
             val array = JSONArray()
-            drafts.values.forEach { array.put(draftJson(it)) }
-            preservedRawRecords.forEach { array.put(it) }
+            nextRawRecords.forEach { array.put(it) }
             FileOutputStream(temp).use { fos ->
                 fos.write(array.toString(2).toByteArray(Charsets.UTF_8))
                 fos.flush()
@@ -720,6 +798,11 @@ object TrailerDraftStore {
                 return false
             }
             if (backup.exists()) backup.delete()
+
+            rawRecords.clear()
+            rawRecords.addAll(nextRawRecords)
+            acceptedRawRecords.clear()
+            acceptedRawRecords.putAll(nextAcceptedRaw)
             true
         }.getOrDefault(false)
     }
@@ -741,6 +824,8 @@ object TrailerDraftStore {
         // record as a duplicate of the copy already in memory (which would then be written back twice on the next save).
         drafts.clear()
         preservedRawRecords.clear()
+        rawRecords.clear()
+        acceptedRawRecords.clear()
         loadedFingerprints.clear()
         val file = File(storage, DRAFTS_META_FILE)
         val backup = File(storage, "$DRAFTS_META_FILE.bak")
@@ -788,6 +873,7 @@ object TrailerDraftStore {
         var duplicateIds = 0
         for (i in 0 until array.length()) {
             val raw = array.opt(i) ?: continue
+            rawRecords += raw
             val parsed = (raw as? JSONObject)?.let { obj -> runCatching { parseDraft(obj, i) }.getOrNull() }
             if (parsed == null || drafts.containsKey(parsed.id)) {
                 preservedRawRecords += raw
@@ -795,6 +881,7 @@ object TrailerDraftStore {
             } else {
                 drafts[parsed.id] = parsed
                 loadedFingerprints[parsed.id] = fingerprintOf(parsed)
+                acceptedRawRecords[parsed.id] = raw
             }
         }
         if (unparsed > 0 && metadataProblem == null) {
@@ -845,6 +932,12 @@ object TrailerDraftStore {
                 val sc = scenesArr.optJSONObject(sceneIndex) ?: return@mapNotNull null
                 val sourceId = sc.optInt("sourceId", -1)
                 if (sourceId !in sourceIds) return@mapNotNull null
+                val isExcluded = sc.optBoolean("excluded", false)
+                val budgetFlag = sc.optBoolean("budgetExcluded", false)
+                val isAutoProtected = if (sc.has("automationProtected")) sc.optBoolean("automationProtected") else true
+                val manualFields = if (sc.has("manual")) ManualFields.fromInt(sc.optInt("manual", 0)) else ManualFields.NONE
+                val adjustments = sc.optJSONObject("adjustments")?.let { TrailerClipAdjustments.fromJson(it) }
+
                 EditorScene(
                     key = sc.optLong("key", sceneIndex + 1L),
                     sourceId = sourceId,
@@ -857,6 +950,11 @@ object TrailerDraftStore {
                     caption = sceneCaptionFromJson(sc.optJSONObject("caption")),
                     actionStart = storedActionInterval(sc)?.first,
                     actionEnd = storedActionInterval(sc)?.second,
+                    excluded = isExcluded,
+                    budgetExcluded = isExcluded && budgetFlag,
+                    automationProtected = isAutoProtected,
+                    manual = manualFields,
+                    adjustments = adjustments,
                 ).let { scene ->
                     // 레거시 초안(보호 구간 필드 없음)의 영상 장면은 저장된 창 전체를 보호 구간으로 이관한다(수동 트림 포함, 보수적).
                     if (!sc.has("actionAnchored") && scene.actionStart == null && scene.actionEnd == null && sources.firstOrNull { it.id == sourceId }?.isImage == false &&
@@ -871,6 +969,12 @@ object TrailerDraftStore {
             val budgetOrder = editorObj.optJSONArray("budgetOrder")?.let { arr -> (0 until arr.length()).map { arr.optLong(it, -1L) } }.orEmpty()
             val introCard = editorObj.optJSONObject("introCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
             val outroCard = editorObj.optJSONObject("outroCard")?.let { TrailerTitleCard.fromJson(it) } ?: TrailerTitleCard()
+            val voiceovers = (editorObj.optJSONArray("voiceovers") ?: obj.optJSONArray("voiceovers"))?.let { arr ->
+                (0 until arr.length()).mapNotNull { i ->
+                    arr.optJSONObject(i)?.let { TrailerVoiceoverTake.fromJson(it) }
+                }
+            }.orEmpty()
+            val batchCaption = sceneCaptionFromJson(editorObj.optJSONObject("batchCaption") ?: obj.optJSONObject("batchCaption"), allowBlank = true)
             if (scenes.isEmpty()) null
             else EditorProject(
                 scenes = scenes,
@@ -883,6 +987,8 @@ object TrailerDraftStore {
                 budgetOrder = if (budgetReserve.isEmpty()) emptyList() else budgetOrder,
                 budgetTarget = editorObj.optDouble("budgetTarget", Double.NaN).takeIf { it.isFinite() && it > 0.0 },
                 clipChoiceExplicit = editorObj.optBoolean("clipChoiceExplicit", false),
+                voiceovers = voiceovers,
+                batchCaption = batchCaption,
             )
         }
 

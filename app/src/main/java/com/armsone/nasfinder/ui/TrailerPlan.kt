@@ -390,43 +390,163 @@ internal const val BUDGET_SLACK = 0.1
 internal fun fitEditorToBudget(project: EditorProject, sources: List<TrailerSource>, bodyTarget: Double, capOnly: Boolean = false): BudgetFit? {
     val byId = sources.associateBy { it.id }
     // A reserved scene whose source was removed meanwhile is gone with it.
+    // Pure automatic scenes reserved may reappear when budget grows; manual scenes cannot be hidden through reserve.
     val all = project.copy(budgetReserve = project.budgetReserve.filter { it.sourceId in byId }).withBudgetReserveRestored()
     if (all.scenes.isEmpty() || !bodyTarget.isFinite() || bodyTarget <= 0.0) return null
-    val minLen = all.scenes.map { resolveSceneDurationBounds(it, byId[it.sourceId]).minLen }
-    val keep = BooleanArray(all.scenes.size) { true }
-    var minSum = minLen.sum()
-    if (minSum > bodyTarget + 1e-6) {
-        val evidence = HashMap<Int, TrailerSourceEvidence>()
-        val importance = all.scenes.map { scene ->
-            sceneImportance(scene, byId[scene.sourceId]) { source -> evidence.getOrPut(source.id) { source.recommendationEvidence() } }
-        }
-        val representative = all.scenes.indices.groupBy { all.scenes[it].sourceId }.values
-            .map { group -> group.maxWith(compareBy<Int> { importance[it] }.thenByDescending { minLen[it] }.thenByDescending { it }) }.toSet()
-        // Least wanted first: extra scenes before each source's strongest, then less important, then (equally important) the longer
-        // protected minimum, so the most whole shots fit; then later.
-        val order = all.scenes.indices.sortedWith(
-            compareBy<Int> { it in representative }.thenBy { importance[it] }.thenByDescending { minLen[it] }.thenByDescending { it }
-        )
-        // When scenes must leave, the kept minimum leaves BUDGET_SLACK of the budget free so cuts can still move onto beats (and get
-        // context); a budget that holds a whole scene only without that room uses all of it.
-        // Most important first (each source's strongest scene before any extra one; shorter first on equal importance), every whole
-        // scene that still fits goes in.
-        fun choose(limit: Double) {
-            keep.fill(false)
-            minSum = 0.0
-            for (i in order.asReversed()) if (minSum + minLen[i] <= limit + 1e-6) { keep[i] = true; minSum += minLen[i] }
-        }
-        choose(bodyTarget * (1 - BUDGET_SLACK))
-        if (keep.none { it }) choose(bodyTarget)
-        if (keep.none { it }) return null
+
+    val activeIndices = all.scenes.indices.filter { !all.scenes[it].excluded }
+    if (activeIndices.isEmpty()) return null
+
+    val bounds = all.scenes.map { resolveSceneDurationBounds(it, byId[it.sourceId]) }
+    val rates = all.scenes.map { it.adjustments?.rate?.takeIf { r -> r.isFinite() && r in 0.25..4.0 } ?: 1.0 }
+    // All lengths below are output time. floorOut is the physical floor (one output frame plus any manual cue/keyframe envelope);
+    // softOut is the soft minimum: the whole action window (at least the UI minimum) of a timing-unlocked video scene, trimmed context first.
+    val floorOut = DoubleArray(all.scenes.size) { bounds[it].minLen / rates[it] }
+    val softOut = DoubleArray(all.scenes.size) { i ->
+        val scene = all.scenes[i]
+        val duration = byId[scene.sourceId]?.takeIf { !it.isImage }?.duration ?: 0.0
+        val soft = if (duration > 0.0 && !bounds[i].isFixed) max(scene.protectedLength(duration), MIN_EDITOR_VIDEO_SCENE_SECONDS) else 0.0
+        max(bounds[i].minLen, min(soft, bounds[i].maxLen)) / rates[i]
     }
-    val kept = all.scenes.filterIndexed { i, _ -> keep[i] }
-    val reserve = all.scenes.filterIndexed { i, _ -> !keep[i] }
-    // capOnly (a clip length change under a chosen total) or a chosen number clip: the budget only caps, kept scenes are not stretched.
-    val target = if (capOnly || project.clipChoiceExplicit) min(bodyTarget, kept.sumOf { it.length }) else bodyTarget
-    val (fitted, total) = redistributeManualTotal(all.copy(scenes = kept), sources, target)
-    val order = if (reserve.isEmpty()) emptyList() else all.scenes.map { it.key }
-    return BudgetFit(all.copy(scenes = fitted, budgetReserve = reserve, budgetOrder = order), total, kept.size, reserve.size)
+
+    val locked = activeIndices.filter { bounds[it].isFixed }
+    val candidates = activeIndices.filter { !bounds[it].isFixed }
+    // Only pure automatic scenes may leave; edited ones (caption/audio/framing/rate/order/inclusion) keep field, inclusion and order, only timing can narrow.
+    val droppable = candidates.filter { all.scenes[it].isPureAutomatic }
+    val mandatory = candidates.filter { !all.scenes[it].isPureAutomatic }
+    val lockedSum = locked.sumOf { bounds[it].currentLen / rates[it] }
+
+    val keep = BooleanArray(all.scenes.size) { false }
+    for (i in locked) keep[i] = true
+    for (i in mandatory) keep[i] = true
+
+    val evidence = HashMap<Int, TrailerSourceEvidence>()
+    fun peaksOf(source: TrailerSource) = evidence.getOrPut(source.id) { source.recommendationEvidence() }.peaks
+    val importance = all.scenes.map { scene -> sceneImportance(scene, byId[scene.sourceId]) { source -> evidence.getOrPut(source.id) { source.recommendationEvidence() } } }
+
+    // narrowedTo: scene index -> output length its action window is narrowed to around the best peak (others only trim/stretch context below).
+    val narrowedTo = HashMap<Int, Double>()
+    var effectiveTarget = bodyTarget
+    val freeForUnlocked = bodyTarget - lockedSum
+    val mandatorySoft = mandatory.sumOf { softOut[it] }
+    if (mandatorySoft > freeForUnlocked + 1e-6) {
+        // Edited scenes alone exceed the target: keep the target, share floor..soft proportionally, every pure automatic scene leaves.
+        // Only physically fixed (locked + floor) time may exceed the target, and then that actual duration wins.
+        val mandatoryFloor = mandatory.sumOf { floorOut[it] }
+        val available = max(freeForUnlocked, mandatoryFloor)
+        val span = mandatorySoft - mandatoryFloor
+        val share = if (span > 1e-9) ((available - mandatoryFloor) / span).coerceIn(0.0, 1.0) else 1.0
+        for (i in mandatory) {
+            val length = floorOut[i] + share * (softOut[i] - floorOut[i])
+            if (length < softOut[i] - 1e-9) narrowedTo[i] = length
+        }
+        effectiveTarget = lockedSum + available
+    } else {
+        val freeTarget = max(0.0, freeForUnlocked - mandatorySoft)
+        for (i in droppable) keep[i] = true
+        if (droppable.sumOf { softOut[it] } > freeTarget + 1e-6) {
+            for (i in droppable) keep[i] = false
+            // Each source's strongest scene first, then more important, then shorter soft minimum (a complete shot fits more), then earlier.
+            val representative = droppable.groupBy { all.scenes[it].sourceId }.values
+                .map { group -> group.maxWith(compareBy<Int> { importance[it] }.thenByDescending { softOut[it] }.thenByDescending { it }) }.toSet()
+            val wanted = droppable.sortedWith(
+                compareByDescending<Int> { it in representative }
+                    .thenByDescending { importance[it] }
+                    .thenBy { softOut[it] }
+                    .thenBy { it }
+            )
+            fun choose(limit: Double) {
+                for (i in droppable) keep[i] = false
+                narrowedTo.clear()
+                var remaining = limit
+                for (i in wanted) {
+                    if (softOut[i] <= remaining + 1e-6) {
+                        keep[i] = true
+                        remaining -= softOut[i]
+                        continue
+                    }
+                    // A more important scene that does not fit whole is narrowed into whatever remains (>= its physical floor) before any
+                    // later, less important one is considered; already kept scenes and the 0.2s policy do not block it.
+                    if (remaining >= floorOut[i] - 1e-6) {
+                        narrowedTo[i] = remaining
+                        keep[i] = true
+                        remaining = 0.0
+                        break
+                    }
+                }
+            }
+            // Leave BUDGET_SLACK free for whole scenes; if narrowing is involved the slack has no meaning, so choose again with the whole budget.
+            choose(freeTarget * (1.0 - BUDGET_SLACK))
+            if (droppable.none { keep[it] } || narrowedTo.isNotEmpty()) choose(freeTarget)
+            if (droppable.none { keep[it] } && locked.isEmpty() && mandatory.isEmpty()) {
+                val best = wanted.firstOrNull() ?: return null
+                val length = min(softOut[best], max(floorOut[best], freeTarget))
+                if (length < softOut[best] - 1e-9) narrowedTo[best] = length
+                effectiveTarget = max(bodyTarget, length)
+                keep[best] = true
+            }
+        }
+    }
+
+    val keptScenes = mutableListOf<EditorScene>()
+    val reservedScenes = mutableListOf<EditorScene>()
+
+    for (i in all.scenes.indices) {
+        val scene = all.scenes[i]
+        if (scene.excluded) {
+            keptScenes.add(scene)
+        } else if (keep[i]) {
+            val kept = scene.copy(budgetExcluded = false)
+            val narrow = narrowedTo[i]
+            val source = byId[scene.sourceId]
+            keptScenes.add(if (narrow == null || source == null) kept else kept.narrowedToLength(narrow * rates[i], source, peaksOf(source)))
+        } else {
+            reservedScenes.add(scene.copy(budgetExcluded = true))
+        }
+    }
+
+    val target = if (capOnly || project.clipChoiceExplicit) {
+        val currentKeptOutput = all.copy(scenes = keptScenes).bodyDuration()
+        min(effectiveTarget, currentKeptOutput)
+    } else effectiveTarget
+
+    val (fittedScenes, actualTotal) = redistributeManualTotal(all.copy(scenes = keptScenes), sources, target)
+    val order = if (reservedScenes.isEmpty()) emptyList() else all.scenes.map { it.key }
+    val keptCount = keptScenes.count { !it.excluded }
+    val reserveCount = reservedScenes.size
+    return BudgetFit(all.copy(scenes = fittedScenes, budgetReserve = reservedScenes, budgetOrder = order), actualTotal, keptCount, reserveCount)
+}
+
+/**
+ * Narrows a timing-unlocked video scene to [length] source seconds around the strongest known peak inside its protected span (Mac
+ * narrowToBestPoint): the window holds that peak's onset and impact, never starts at the span start by default, and keeps manual
+ * cue/keyframe anchors in. The narrowed window becomes the new soft action. Photos and scenes whose span already fits only get the length.
+ */
+private fun EditorScene.narrowedToLength(length: Double, source: TrailerSource, peaks: List<TrailerPeakEvidence>): EditorScene {
+    if (source.isImage || !source.hasValidDuration) return copy(length = length)
+    val duration = source.duration
+    val rate = adjustments?.rate?.takeIf { it.isFinite() && it in 0.25..4.0 } ?: 1.0
+    val floor = min(duration, rate / 30.0)
+    val len = min(duration, max(floor, length))
+    val span = protectedSpan()
+    val a = (span?.first ?: start).coerceIn(0.0, duration)
+    val b = max(a, min(span?.second ?: (start + this.length), duration))
+    if (b - a <= len + 1e-9) {
+        val kept = startKeepingAction(start, len, duration).coerceIn(0.0, max(0.0, duration - len))
+        return copy(start = kept, length = len)
+    }
+    var s = a
+    peaks.firstOrNull { it.time >= a - 1e-6 && it.time <= b + 1e-6 }?.let { peak ->
+        s = (peak.onset - 0.25 * len).coerceIn(a, max(a, b - len))
+        s = max(s, peak.time - len)
+    }
+    adjustments?.anchorSpan(start, start + this.length)?.let { anchor ->
+        val lower = anchor.second - len
+        val upper = anchor.first
+        s = if (lower <= upper) s.coerceIn(lower, upper) else upper
+    }
+    s = s.coerceIn(0.0, max(0.0, duration - len))
+    return copy(start = s, length = len, actionStart = s, actionEnd = s + len)
 }
 
 /**
@@ -622,6 +742,10 @@ data class TrailerScene(
     // Source-time interval of the detected action this scene must keep (null = nothing to protect).
     val actionStart: Double? = null,
     val actionEnd: Double? = null,
+    val adjustments: TrailerClipAdjustments? = null,
+    val sceneKey: Long? = null,
+    val manual: ManualFields = ManualFields.NONE,
+    val automationProtected: Boolean = false,
 )
 enum class TrailerFormat(val title: String, val width: Int, val height: Int) {
     ORIGINAL("원본", 0, 0),
@@ -721,7 +845,10 @@ data class TrailerSession(
     val scenes: List<TrailerScene> get() = editor?.toTrailerScenes(sources) ?: autoPlanScenes()
     val cardDuration: Double get() = (if (editor?.introCard?.enabled == true) editor.introCard.clampedDuration() else 0.0) +
         (if (editor?.outroCard?.enabled == true) editor.outroCard.clampedDuration() else 0.0)
-    val totalDuration: Double get() = cardDuration + scenes.sumOf { it.length }
+    /** Body output seconds (rate and clamped overlaps applied, cards excluded) from the same canonical map as export/preview. */
+    val bodyOutputDuration: Double get() = (editor ?: EditorProject.fromPlan(autoPlanScenes())).bodyDuration()
+    /** Whole output seconds: [EditorProject.totalDuration] (cards, rate, overlap, voice floor); cards are not added twice. */
+    val totalDuration: Double get() = (editor ?: EditorProject.fromPlan(autoPlanScenes())).totalDuration
 
     /** The recommended/automatic plan for the current parameters (what [editor] mirrors while autoPlan is true). */
     fun autoPlanScenes(): List<TrailerScene> = if (isMusicOverlayMode) {
@@ -1026,9 +1153,21 @@ fun syncPhotoScenesToBeatOnsets(
     val byId = sources.associateBy { it.id }
     val n = scenes.size
     val bounds = scenes.map { resolveSceneDurationBounds(it, byId[it.sourceId]) }
-    val minLen = DoubleArray(n) { bounds[it].minLen }
-    val maxLen = DoubleArray(n) { bounds[it].maxLen }
-    val origLen = DoubleArray(n) { bounds[it].currentLen }
+    val rate = DoubleArray(n) { i -> scenes[i].adjustments?.rate?.takeIf { it.isFinite() && it in 0.25..4.0 } ?: 1.0 }
+    val minLen = DoubleArray(n) { bounds[it].minLen / rate[it] }
+    val maxLen = DoubleArray(n) { bounds[it].maxLen / rate[it] }
+    val origLen = DoubleArray(n) { bounds[it].currentLen / rate[it] }
+    // 순수 자동 영상은 보호 동작 구간을 먼저 지킨다(앞뒤 맥락만 줄임). 예산상 불가능하면 하드 프레임 하한까지 좁힌다.
+    run {
+        val softMin = minLen.copyOf()
+        for (i in 0 until n) {
+            val src = byId[scenes[i].sourceId]
+            if (src == null || src.isImage || bounds[i].isFixed || !scenes[i].isPureAutomatic) continue
+            softMin[i] = max(minLen[i], min(maxLen[i], scenes[i].protectedLength(src.duration) / rate[i]))
+        }
+        val begin = max(0.0, introOffset)
+        if (maxBudget == null || begin + softMin.sum() <= maxBudget + eps) softMin.copyInto(minLen)
+    }
     // 보호된 영상이 줄지 못하면 남는 박자 흡수를 사진이 떠맡아 0.2초 깜빡임이나 7초 정지가 생긴다. 사진은 원래 길이의 절반~2배 안에서만 움직인다.
     // 이 범위로 음악 길이를 못 채우게 되면(예산 불가능) 원래의 넓은 범위로 되돌린다.
     run {
@@ -1138,19 +1277,21 @@ fun syncPhotoScenesToBeatOnsets(
             end = pick ?: currentEnd.coerceIn(lo, max(lo, hi))
         }
 
-        var newLen = (end - cursor).coerceIn(minLen[i], maxLen[i])
+        var newOutputLen = (end - cursor).coerceIn(minLen[i], maxLen[i])
         // 이미 비트에서 20ms 이내이고 예산 범위 안이면 길이를 건드리지 않는다.
-        if (pick != null && abs(newLen - origLen[i]) <= 0.02 && currentEnd >= lo - eps && currentEnd <= hi + eps) newLen = origLen[i]
-        if (abs(newLen - scene.length) > 1e-9) {
+        if (pick != null && abs(newOutputLen - origLen[i]) <= 0.02 && currentEnd >= lo - eps && currentEnd <= hi + eps) newOutputLen = origLen[i]
+        val newSourceLen = newOutputLen * rate[i]
+        if (abs(newSourceLen - scene.length) > 1e-9) {
             val src = byId[scene.sourceId]
-            val keptStart = if (src != null && !src.isImage) scene.startKeepingAction(scene.start, newLen, src.duration) else scene.start
-            resultScenes[i] = scene.copy(start = keptStart, length = newLen)
+            val keptStart = if (src != null && !src.isImage) scene.startKeepingAction(scene.start, newSourceLen, src.duration) else scene.start
+            val (clampedStart, clampedLen) = if (src != null) clampSceneWindow(src, keptStart, newSourceLen) else keptStart to newSourceLen
+            resultScenes[i] = scene.copy(start = clampedStart, length = clampedLen)
         }
-        if (pick != null && abs(newLen - origLen[i]) > 0.02) {
+        if (pick != null && abs(newOutputLen - origLen[i]) > 0.02) {
             adjustedCount++
-            totalShift += abs(newLen - origLen[i])
+            totalShift += abs(newOutputLen - origLen[i])
         }
-        cursor += newLen
+        cursor += newOutputLen
     }
 
     val fitResidual = if (maxBudget != null) maxBudget - cursor else 0.0
@@ -1175,9 +1316,59 @@ internal fun syncToBeatsWithMinimumRepeats(
     val introOffset = if (project.introCard.enabled) project.introCard.clampedDuration() else 0.0
     val outroDuration = if (project.outroCard.enabled) project.outroCard.clampedDuration() else 0.0
     val fit = musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && musicDuration.isFinite() && musicDuration > 0.0
-    val maxBudget = if (fit) musicDuration * fitCount - outroDuration else introOffset + project.scenes.sumOf { it.length }
+    val maxBudget = if (fit) musicDuration * fitCount - outroDuration else introOffset + project.bodyDuration()
     val (synced, sync) = syncPhotoScenesToBeatOnsets(project.scenes, sources, beats, musicDuration, introOffset, musicPolicy, maxBudget)
     return BeatFitResult(synced, sync, fitCount)
+}
+
+/**
+ * Merges recommended automatic scenes into an existing project.
+ * Preserves manual scenes, manual fields (timing, caption, framing, audio, adjust, exclusion, order),
+ * while refreshing allowed automatic fields from the fresh recommendation.
+ */
+internal fun mergeWithGeneratedPlan(
+    existing: EditorProject,
+    recommendedScenes: List<TrailerScene>,
+    sources: List<TrailerSource>,
+): EditorProject {
+    if (existing.scenes.isEmpty()) {
+        return EditorProject.fromPlan(
+            recommendedScenes,
+            autoPlan = existing.autoPlan,
+            musicVolume = existing.musicVolume,
+            firstKey = existing.nextKey,
+            introCard = existing.introCard,
+            outroCard = existing.outroCard,
+        )
+    }
+    val recBySource = recommendedScenes.associateBy { it.source.id }
+    val sourcesById = sources.associateBy { it.id }
+
+    val updatedScenes = existing.scenes.map { scene ->
+        if (scene.automationProtected) {
+            scene
+        } else {
+            val rec = recBySource[scene.sourceId]
+            val src = sourcesById[scene.sourceId]
+            if (rec == null || src == null) {
+                scene
+            } else {
+                val (recStart, recLen) = clampSceneWindow(src, rec.start, rec.length)
+                scene.copy(
+                    start = if (scene.timingProtected) scene.start else recStart,
+                    length = if (scene.timingProtected) scene.length else recLen,
+                    actionStart = if (scene.timingProtected) scene.actionStart else rec.actionStart,
+                    actionEnd = if (scene.timingProtected) scene.actionEnd else rec.actionEnd,
+                    fit = if (scene.framingProtected) scene.fit else rec.fit,
+                    focusX = if (scene.framingProtected) scene.focusX else rec.focusX,
+                    focusY = if (scene.framingProtected) scene.focusY else rec.focusY,
+                    sourceVolume = if (scene.audioProtected) scene.sourceVolume else rec.sourceVolume,
+                    caption = if (scene.captionProtected) scene.caption else rec.caption,
+                )
+            }
+        }
+    }
+    return existing.copy(scenes = updatedScenes)
 }
 
 /** Regenerates the scenes from the recommended plan; only valid while the project is still automatic. */
@@ -1190,18 +1381,20 @@ internal fun TrailerSession.regeneratedPlanOrNull(): TrailerSession? {
     if (!isMusicOverlayMode && musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && music != null &&
         music.durationSeconds.isFinite() && music.durationSeconds > 0.0
     ) {
-        // 음악 예산으로 장면을 새로 고르면 뒤쪽(마지막 샷)이 잘린다. 앵커가 있는 전체 추천을 먼저 옮기고,
-        // 보호 구간을 지키며 고른 반복 횟수의 길이에 맞춘다(안 들어가는 덜 중요한 장면은 통째로 뺀다).
         val full = recommendTrailerPlan(sources, explicitClip = clipLength)?.scenes
         if (!full.isNullOrEmpty()) {
-            val plan = EditorProject.fromPlan(
-                full,
-                autoPlan = true,
-                musicVolume = project.musicVolume,
-                firstKey = project.nextKey,
-                introCard = project.introCard,
-                outroCard = project.outroCard,
-            )
+            val plan = if (keepsManualScenesAsIs(project.scenes)) {
+                mergeWithGeneratedPlan(project, full, sources)
+            } else {
+                EditorProject.fromPlan(
+                    full,
+                    autoPlan = true,
+                    musicVolume = project.musicVolume,
+                    firstKey = project.nextKey,
+                    introCard = project.introCard,
+                    outroCard = project.outroCard,
+                )
+            }
             val seeded = copy(editor = plan.copy(
                 scenes = clipLengthScenes(plan.scenes, sources, clipLength, !project.clipChoiceExplicit),
                 clipChoiceExplicit = project.clipChoiceExplicit,
@@ -1210,27 +1403,27 @@ internal fun TrailerSession.regeneratedPlanOrNull(): TrailerSession? {
         }
     }
     if (!isMusicOverlayMode) {
-        // 정해 둔 길이로 장면을 새로 고르면 그 길이에 안 들어가는 샷이 조용히 빠진다. 전체 추천(모든 동작)에서 시작해 요청 길이에
-        // 맞추되 보호된 동작은 자르지 않고, 다 안 들어가면 덜 중요한 장면을 통째로 빼고 그렇게 알린다.
         val full = recommendTrailerPlan(sources, explicitClip = clipLength)?.scenes
         if (!full.isNullOrEmpty()) {
-            val plan = EditorProject.fromPlan(
-                full,
-                autoPlan = true,
-                musicVolume = project.musicVolume,
-                firstKey = project.nextKey,
-                introCard = project.introCard,
-                outroCard = project.outroCard,
-            )
+            val plan = if (keepsManualScenesAsIs(project.scenes)) {
+                mergeWithGeneratedPlan(project, full, sources)
+            } else {
+                EditorProject.fromPlan(
+                    full,
+                    autoPlan = true,
+                    musicVolume = project.musicVolume,
+                    firstKey = project.nextKey,
+                    introCard = project.introCard,
+                    outroCard = project.outroCard,
+                )
+            }
             val seeded = plan.copy(
                 scenes = clipLengthScenes(plan.scenes, sources, clipLength, !project.clipChoiceExplicit),
                 budgetTarget = project.budgetTarget,
                 clipChoiceExplicit = project.clipChoiceExplicit,
             )
-            // Only a whole length the user chose (cards included) is a budget, kept through every regeneration (order, photos, cards,
-            // added sources). Without one the recommendation keeps every shot (an older automatic total is not a budget).
             val requested = project.budgetTarget?.let { it - cardDuration }
-                ?: return copy(total = seeded.scenes.sumOf { it.length }, editor = seeded)
+                ?: return copy(total = seeded.totalDuration, editor = seeded)
             val fit = fitEditorToBudget(seeded, sources, requested) ?: return null
             return copy(
                 total = fit.total,
@@ -1241,16 +1434,21 @@ internal fun TrailerSession.regeneratedPlanOrNull(): TrailerSession? {
     }
     val genScenes = autoPlanScenes()
     val actualSum = genScenes.sumOf { it.length }
-    return copy(
-        total = if (actualSum > 0.0) actualSum else total,
-        editor = EditorProject.fromPlan(
+    val newProject = if (keepsManualScenesAsIs(project.scenes)) {
+        mergeWithGeneratedPlan(project, genScenes, sources)
+    } else {
+        EditorProject.fromPlan(
             genScenes,
             autoPlan = true,
             musicVolume = project.musicVolume,
             firstKey = project.nextKey,
             introCard = project.introCard,
             outroCard = project.outroCard,
-        ),
+        )
+    }
+    return copy(
+        total = newProject.totalDuration,
+        editor = newProject,
     )
 }
 

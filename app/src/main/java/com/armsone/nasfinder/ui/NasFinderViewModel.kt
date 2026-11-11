@@ -6071,7 +6071,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val from = scenes.indexOfFirst { it.key == key }
             val to = from + delta
             if (from < 0 || to !in scenes.indices) return@editProject null
-            session.withManualScenes(scenes.toMutableList().apply { add(to, removeAt(from)) })
+            val moved = scenes.toMutableList().apply { add(to, removeAt(from)) }
+            val updated = moved.map { if (it.key == key) it.copy(manual = it.manual.with(ManualField.ORDER)) else it }
+            session.withManualScenes(updated)
         }
     }
 
@@ -6081,7 +6083,9 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val from = scenes.indexOfFirst { it.key == key }
             val to = targetIndex.coerceIn(0, scenes.lastIndex)
             if (from < 0 || from == to) return@editProject null
-            session.withManualScenes(scenes.toMutableList().apply { add(to, removeAt(from)) })
+            val moved = scenes.toMutableList().apply { add(to, removeAt(from)) }
+            val updated = moved.map { if (it.key == key) it.copy(manual = it.manual.with(ManualField.ORDER)) else it }
+            session.withManualScenes(updated)
         }
     }
 
@@ -6092,9 +6096,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val (selected, remaining) = scenes.partition { it.key in keys }
             if (selected.isEmpty()) return@editProject null
             val insertAt = targetIndex.coerceIn(0, remaining.size)
+            val markedSelected = selected.map { it.copy(manual = it.manual.with(ManualField.ORDER)) }
             val newScenes = ArrayList<EditorScene>(scenes.size).apply {
                 addAll(remaining.subList(0, insertAt))
-                addAll(selected)
+                addAll(markedSelected)
                 addAll(remaining.subList(insertAt, remaining.size))
             }
             if (newScenes == scenes) return@editProject null
@@ -6109,7 +6114,11 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val project = session.editor ?: return@editProject null
             val index = project.scenes.indexOfFirst { it.key == key }
             if (index < 0) return@editProject null
-            val copyScene = project.scenes[index].copy(key = project.nextKey)
+            val orig = project.scenes[index]
+            val copyScene = orig.copy(
+                key = project.nextKey,
+                manual = orig.manual.with(ManualField.ORDER),
+            )
             newKey = copyScene.key
             session.copy(editor = project.copy(
                 scenes = project.scenes.toMutableList().apply { add(index + 1, copyScene) },
@@ -6131,7 +6140,10 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             for (scene in project.scenes) {
                 newScenes.add(scene)
                 if (scene.key in keys) {
-                    val copyScene = scene.copy(key = nextKey++)
+                    val copyScene = scene.copy(
+                        key = nextKey++,
+                        manual = scene.manual.with(ManualField.ORDER),
+                    )
                     newKeys.add(copyScene.key)
                     newScenes.add(copyScene)
                 }
@@ -6170,7 +6182,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         return editProject { session ->
             val project = session.editor ?: return@editProject null
             if (project.scenes.none { it.key in keys }) return@editProject null
-            session.withManualScenes(project.scenes.map { if (it.key in keys) it.copy(caption = normalized) else it })
+            session.withManualScenes(project.scenes.map {
+                if (it.key in keys) it.copy(
+                    caption = normalized,
+                    manual = it.manual.with(ManualField.CAPTION),
+                ) else it
+            })
         }
     }
 
@@ -6180,8 +6197,16 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val scene = project.scene(key) ?: return@editProject null
             val source = session.sources.firstOrNull { it.id == scene.sourceId } ?: return@editProject null
             val (safeStart, safeLength) = clampSceneWindow(source, start, length)
-            // 사용자가 직접 자른 구간은 자동 보호 구간을 해제한다.
-            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(start = safeStart, length = safeLength, actionStart = null, actionEnd = null) else it })
+            // 사용자가 직접 자른 구간은 자동 보호 구간을 해제하고 timing manual 플래그를 설정한다.
+            session.withManualScenes(project.scenes.map {
+                if (it.key == key) it.copy(
+                    start = safeStart,
+                    length = safeLength,
+                    actionStart = null,
+                    actionEnd = null,
+                    manual = it.manual.with(ManualField.TIMING),
+                ) else it
+            })
         }
     }
 
@@ -6216,7 +6241,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                 val (finalScenes, actualTotal) = if (session.isMusicOverlayMode && session.musicPolicy == TrailerMusicPolicy.FIT_MUSIC_LENGTH && session.musicTrack != null) {
                     redistributeManualTotal(project.copy(scenes = updatedScenes), newSources, session.total)
                 } else {
-                    updatedScenes to updatedScenes.sumOf { it.length }
+                    val p = project.copy(scenes = updatedScenes)
+                    updatedScenes to p.bodyDuration()
                 }
                 session.copy(
                     sources = newSources,
@@ -6237,7 +6263,13 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     val source = sourcesById[scene.sourceId]
                     if (source != null) {
                         val (safeStart, safeLength) = clampSceneWindow(source, start, length)
-                        scene.copy(start = safeStart, length = safeLength, actionStart = null, actionEnd = null)
+                        scene.copy(
+                            start = safeStart,
+                            length = safeLength,
+                            actionStart = null,
+                            actionEnd = null,
+                            manual = scene.manual.with(ManualField.TIMING),
+                        )
                     } else scene
                 } else scene
             }
@@ -6250,7 +6282,12 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
             val project = session.editor ?: return@editProject null
             if (project.scene(key) == null) return@editProject null
             session.withManualScenes(project.scenes.map {
-                if (it.key == key) it.copy(fit = fit, focusX = focusX.coerceIn(-1f, 1f), focusY = focusY.coerceIn(-1f, 1f)) else it
+                if (it.key == key) it.copy(
+                    fit = fit,
+                    focusX = focusX.coerceIn(-1f, 1f),
+                    focusY = focusY.coerceIn(-1f, 1f),
+                    manual = it.manual.with(ManualField.FRAMING),
+                ) else it
             })
         }
     }
@@ -6259,7 +6296,208 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
         editProject { session ->
             val project = session.editor ?: return@editProject null
             if (project.scene(key) == null) return@editProject null
-            session.withManualScenes(project.scenes.map { if (it.key == key) it.copy(sourceVolume = volume.coerceIn(0f, 2f)) else it })
+            session.withManualScenes(project.scenes.map {
+                if (it.key == key) it.copy(
+                    sourceVolume = volume.coerceIn(0f, 2f),
+                    manual = it.manual.with(ManualField.AUDIO),
+                ) else it
+            })
+        }
+    }
+
+    /** Folder (inside the project) that holds recorded / imported voice takes. */
+    fun editorVoiceDirectory(): File? = _state.value.trailer?.directory?.let { File(it, "voice") }
+
+    /** Adds a take whose file already sits inside the project directory; one undoable edit. */
+    fun editorAddVoiceTake(file: File, durationSeconds: Double, outputStart: Double): Boolean {
+        val session = _state.value.trailer ?: return false
+        val rel = runCatching { file.canonicalFile.relativeTo(session.directory.canonicalFile).path }.getOrNull() ?: return false
+        if (rel.startsWith("..") || !TrailerVoiceoverTake.isValidRelativeFilePath(rel) || !durationSeconds.isFinite() || durationSeconds < 0.2) return false
+        val take = TrailerVoiceoverTake(relativeFile = rel, outputStart = outputStart.coerceAtLeast(0.0), sourceIn = 0.0, sourceOut = durationSeconds)
+        return editProject { live ->
+            val project = live.editor ?: return@editProject null
+            live.copy(editor = project.copy(voiceovers = project.voiceovers + take))
+        }
+    }
+
+    fun editorRemoveVoiceTake(id: UUID) {
+        editProject { live ->
+            val project = live.editor ?: return@editProject null
+            if (project.voiceovers.none { it.stableId == id }) return@editProject null
+            live.copy(editor = project.copy(voiceovers = project.voiceovers.filterNot { it.stableId == id }))
+        }
+    }
+
+    /** Copies an audio file the user picked into the project's voice folder and adds it as a take. */
+    fun editorImportVoice(uri: android.net.Uri, outputStart: Double) {
+        val directory = _state.value.trailer?.directory ?: return
+        viewModelScope.launch {
+            val target = File(directory, "voice/voice-${UUID.randomUUID()}.m4a")
+            val duration = withContext(Dispatchers.IO) {
+                runCatching {
+                    application.contentResolver.openInputStream(uri)?.let { copyToVoiceFile(it, target) } ?: return@runCatching null
+                    val retriever = android.media.MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(target.absolutePath)
+                        retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.let { it / 1000.0 }
+                    } finally { retriever.release() }
+                }.getOrNull()
+            }
+            val live = _state.value.trailer
+            if (duration == null || duration < 0.2 || live?.directory != directory || !editorAddVoiceTake(target, duration, outputStart)) {
+                withContext(Dispatchers.IO) { target.delete() }
+                _state.update { it.copy(message = "음성 파일을 가져오지 못했습니다. 다른 오디오 파일을 선택해 주세요.") }
+            }
+        }
+    }
+
+    /**
+     * Merges generated timed cues into one scene. Applied only when the scene still has the window the speech ran on,
+     * so a late recognition result never lands on a clip the user has since trimmed, moved or removed.
+     */
+    fun editorApplyGeneratedCues(
+        expectedDirectory: File,
+        expectedSource: TrailerSource,
+        sceneKey: Long,
+        expectedStart: Double,
+        expectedLength: Double,
+        cues: List<TrailerTimedCaptionCue>,
+    ): Boolean =
+        editProject { live ->
+            // The request belongs to one project and one source file; a late result for anything else is dropped.
+            if (live.directory != expectedDirectory) return@editProject null
+            val project = live.editor ?: return@editProject null
+            val scene = project.scene(sceneKey) ?: return@editProject null
+            val liveSource = live.sources.firstOrNull { it.id == scene.sourceId } ?: return@editProject null
+            if (liveSource.id != expectedSource.id || liveSource.file != expectedSource.file || liveSource.duration != expectedSource.duration) return@editProject null
+            if (kotlin.math.abs(scene.start - expectedStart) > 1e-6 || kotlin.math.abs(scene.length - expectedLength) > 1e-6) return@editProject null
+            live.copy(editor = project.copy(scenes = mergeGeneratedCues(cues, sceneKey, project.scenes)))
+        }
+
+    /**
+     * One undoable edit of a clip's advanced adjustments (rate, dissolve, color, keyframes, timed cues). Manual-field
+     * bits are derived from what actually changed, so a caption/rate/color edit never freezes the clip's timing window.
+     */
+    fun editorEditAdjustments(key: Long, change: (TrailerClipAdjustments) -> TrailerClipAdjustments): Boolean =
+        editProject { live ->
+            val project = live.editor ?: return@editProject null
+            val scene = project.scene(key) ?: return@editProject null
+            val before = scene.adjustments ?: TrailerClipAdjustments()
+            val after = change(before)
+            if (after == before) return@editProject null
+            val edited = scene.copy(adjustments = after.takeUnless { it == TrailerClipAdjustments() })
+            val fields = changedManualFields(scene, edited)
+            live.withManualScenes(project.scenes.map { if (it.key == key) edited.copy(manual = it.manual.plus(fields)) else it })
+        }
+
+    fun editorSetSceneProtected(keys: Set<Long>, isProtected: Boolean) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scenes.none { it.key in keys }) return@editProject null
+            val updated = setAutomationProtected(isProtected, keys, project.scenes)
+            session.withManualScenes(updated)
+        }
+    }
+
+    fun editorSetSceneExcluded(keys: Set<Long>, excluded: Boolean) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            if (project.scenes.none { it.key in keys }) return@editProject null
+            val updated = project.scenes.map { scene ->
+                if (scene.key in keys) {
+                    scene.copy(
+                        excluded = excluded,
+                        budgetExcluded = false,
+                        manual = scene.manual.with(ManualField.EXCLUSION),
+                    )
+                } else scene
+            }
+            session.withManualScenes(updated)
+        }
+    }
+
+    fun editorSplitScene(key: Long, outputPlayheadTime: Double): Long? {
+        var newKey: Long? = null
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val index = project.scenes.indexOfFirst { it.key == key }
+            if (index < 0) return@editProject null
+            val scene = project.scenes[index]
+            val starts = project.outputStarts(includeIntro = true)
+            val sceneOutputStart = starts[key] ?: return@editProject null
+            val rate = scene.adjustments?.rate?.takeIf { it.isFinite() && it in 0.25..4.0 } ?: 1.0
+            val outputOffset = outputPlayheadTime - sceneOutputStart
+            val sourceOffset = outputOffset * rate
+            val minSplitSource = (1.0 / 30.0) * rate
+            if (sourceOffset < minSplitSource || sourceOffset > scene.length - minSplitSource) return@editProject null
+
+            val part1 = scene.copy(
+                length = sourceOffset,
+                manual = scene.manual.with(ManualField.TIMING),
+            )
+            val part2Key = project.nextKey
+            newKey = part2Key
+            val part2 = scene.copy(
+                key = part2Key,
+                start = scene.start + sourceOffset,
+                length = scene.length - sourceOffset,
+                manual = scene.manual.with(ManualField.TIMING),
+            )
+            val newScenes = project.scenes.toMutableList()
+            newScenes[index] = part1
+            newScenes.add(index + 1, part2)
+            session.copy(editor = project.copy(
+                scenes = newScenes,
+                autoPlan = false,
+                nextKey = project.nextKey + 1,
+            ))
+        }
+        return newKey
+    }
+
+    fun editorRecommendScenes(keys: Set<Long>) {
+        if (keys.isEmpty()) return
+        editProject { session ->
+            val project = session.editor ?: return@editProject null
+            val targetScenes = project.scenes.filter { it.key in keys }
+            if (targetScenes.isEmpty()) return@editProject null
+            val sourcesById = session.sources.associateBy { it.id }
+            val updated = project.scenes.map { scene ->
+                if (scene.key !in keys || scene.automationProtected) scene
+                else {
+                    val source = sourcesById[scene.sourceId] ?: return@map scene
+                    val rec = recommendTrailerPlan(listOf(source), explicitClip = session.clipLength)?.scenes?.firstOrNull()
+                    if (rec == null) scene
+                    else {
+                        val (recStart, recLen) = clampSceneWindow(source, rec.start, rec.length)
+                        // The recommended window must still hold the manual cue/keyframe envelope of this clip.
+                        val anchor = scene.adjustments?.anchorSpan(scene.start, scene.start + scene.length)
+                        val (safeStart, safeLen) = if (anchor == null) recStart to recLen
+                        else if (source.isImage) {
+                            // Photo windows start at 0 on the source logical timeline; the length must still reach the anchor end.
+                            0.0 to maxOf(recLen, anchor.second)
+                        } else {
+                            val lo = minOf(recStart, anchor.first).coerceAtLeast(0.0)
+                            val hi = maxOf(recStart + recLen, anchor.second).coerceAtMost(source.duration)
+                            lo to (hi - lo).coerceAtLeast(recLen.coerceAtMost(source.duration - lo))
+                        }
+                        scene.copy(
+                            start = if (scene.timingProtected) scene.start else safeStart,
+                            length = if (scene.timingProtected) scene.length else safeLen,
+                            actionStart = if (scene.timingProtected) scene.actionStart else rec.actionStart,
+                            actionEnd = if (scene.timingProtected) scene.actionEnd else rec.actionEnd,
+                            fit = if (scene.framingProtected) scene.fit else rec.fit,
+                            focusX = if (scene.framingProtected) scene.focusX else rec.focusX,
+                            focusY = if (scene.framingProtected) scene.focusY else rec.focusY,
+                            sourceVolume = if (scene.audioProtected) scene.sourceVolume else rec.sourceVolume,
+                            caption = if (scene.captionProtected) scene.caption else rec.caption,
+                        )
+                    }
+                }
+            }
+            session.withManualScenes(updated)
         }
     }
 
@@ -6610,7 +6848,7 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     )
                     val next = session.copy(
                         sources = migratedSources,
-                        total = newProject.scenes.sumOf { it.length },
+                        total = newProject.totalDuration,
                         clipLength = length,
                         photoClipLength = defaultPhotoClipLength(length, session.hasVideos),
                         editor = newProject,
@@ -6995,6 +7233,8 @@ class NasFinderViewModel(private val application: NasFinderApplication) : ViewMo
                     introCard = session.editor?.introCard?.takeIf { it.enabled },
                     outroCard = session.editor?.outroCard?.takeIf { it.enabled },
                     cardBackgroundSources = (session.scenes.map { it.source } + session.sources).distinctBy { it.id },
+                    voiceovers = session.editor?.voiceovers.orEmpty(),
+                    projectDirectory = directory,
                     onSuccess = { recovered, excluded ->
                         exportRecoveredScenes = recovered
                         exportExcludedScenes = excluded
