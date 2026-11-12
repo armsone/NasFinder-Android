@@ -1002,7 +1002,7 @@ internal fun AdaptiveEditorWorkspace(
         }
 
         @Composable
-        fun inspectorColumns(shownTab: InspectorTab): InspectorColumns =
+        fun inspectorColumns(shownTab: InspectorTab, listBeside: Boolean = false): InspectorColumns =
             editorInspectorColumns(
                 session = session,
                 scene = selectedScene,
@@ -1020,6 +1020,7 @@ internal fun AdaptiveEditorWorkspace(
                 rankedBackgroundChoices = rankedBackgroundChoices,
                 isRankingBackgroundChoices = isRankingBackgroundChoices,
                 clipPlayback = clipPlayback,
+                listBeside = listBeside,
             )
 
         // The made video of the current revision: while rendering, the snapshot scene the progress has reached (still
@@ -1235,7 +1236,8 @@ internal fun AdaptiveEditorWorkspace(
                             // (the LaunchedEffect in those panes then stores it), so no clip toolbar flashes.
                             val settingsPaneLayout = portraitSplit || twoColumns
                             val bodyTab = if (settingsPaneLayout && (inspectorTab == InspectorTab.SCENE || inspectorTab == InspectorTab.PLAN)) InspectorTab.CAPTION else inspectorTab
-                            val body = inspectorColumns(bodyTab)
+                            // 클립/설정 좌측 2분할만 목록과 상세가 나란히 보인다(미리보기 좌측은 설정이 목록 아래 footer).
+                            val body = inspectorColumns(bodyTab, listBeside = twoColumns && landscapePlacement != LandscapePlacement.PREVIEW_LEFT)
                             // Low phone landscape: fixed picture/timeline/selected-clip area beside the tools (same condition as the Row below).
                             val phoneLowLandscape = isPhone && maxWidth > maxHeight &&
                                 ((inspectorTab != InspectorTab.SCENE && inspectorTab != InspectorTab.PLAN) || phonePreviewOnly)
@@ -1408,7 +1410,6 @@ internal fun AdaptiveEditorWorkspace(
                                         Row(Modifier.fillMaxSize()) {
                                             Column(Modifier.weight(splitRatio).fillMaxHeight()) {
                                                 PreviewPane(Modifier.weight(1f).fillMaxWidth(), paneHeight)
-                                                SelectedClipLine()
                                             }
                                             SplitDivider()
                                             Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
@@ -1463,12 +1464,12 @@ internal fun AdaptiveEditorWorkspace(
                                         Row(Modifier.fillMaxSize()) {
                                             BoardPane(Modifier.weight(splitRatio).fillMaxHeight())
                                             SplitDivider()
-                                            // Picture + timeline stay fixed, the selected clip is named under them, only the tools scroll.
+                                            // Picture + timeline stay fixed, only the tools scroll. The selected clip is named once:
+                                            // highlighted in the clip list and in the 자막·구간 heading, not again under the picture.
                                             Column(Modifier.weight(1f - splitRatio).fillMaxHeight()) {
                                                 Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
                                                     PreviewAndTabs(tabsBelowPicture = false, stageHeight = paneHeight * 0.8f - 13.dp)
                                                 }
-                                                SelectedClipLine()
                                                 Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(landscapeRightScroll)) { InspectorContent() }
                                             }
                                         }
@@ -1482,7 +1483,6 @@ internal fun AdaptiveEditorWorkspace(
                                                 Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
                                                     PreviewAndTabs(tabsBelowPicture = false, stageHeight = paneHeight * 0.8f - 13.dp)
                                                 }
-                                                SelectedClipLine()
                                                 BoardPane(Modifier.weight(1f).fillMaxWidth(), page = null)
                                             }
                                         }
@@ -6412,13 +6412,14 @@ private fun editorInspectorColumns(
     rankedBackgroundChoices: List<RankedBackgroundChoice> = emptyList(),
     isRankingBackgroundChoices: Boolean = false,
     clipPlayback: ClipPlaybackState? = null,
+    listBeside: Boolean = false,
 ): InspectorColumns {
     // Saved here (not inside the caption section) so the choice survives tab switches and relayouts.
     var captionTarget by rememberSaveable { mutableStateOf(CaptionTarget.BODY) }
     var pendingScope by rememberSaveable { mutableStateOf<CaptionScope?>(null) }
     return when (if (tab == InspectorTab.PLAN) InspectorTab.SCENE else tab) {
     // 클립: only the selected clip's compact length/range, so the clip grid below stays in the first viewport.
-    InspectorTab.SCENE, InspectorTab.PLAN -> InspectorColumns(left = { SceneSection(session, scene, source, model, onSelectScene, clipPlayback) })
+    InspectorTab.SCENE, InspectorTab.PLAN -> InspectorColumns(left = { SceneSection(session, scene, source, model, onSelectScene, clipPlayback, listBeside = listBeside) })
     InspectorTab.CAPTION -> {
         // 본문 keeps the unchanged caption inspector (its own 현재/선택/전체 scopes and pending draft); 시작 화면/마지막 화면
         // swap only the body below this selector for the title card controls, so no caption or card data is touched.
@@ -6439,7 +6440,7 @@ private fun editorInspectorColumns(
             val bodySingle = body.single
             val singleWithTiming: (@Composable () -> Unit)? = if (bodySingle == null) null else {
                 {
-                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback)
+                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback, listBeside = listBeside)
                     HorizontalDivider()
                     bodySingle()
                 }
@@ -6448,7 +6449,7 @@ private fun editorInspectorColumns(
             // (single, or left + right), so it is never composed twice. Title card targets below get none.
             InspectorColumns(
                 left = {
-                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback)
+                    SceneSection(session, scene, source, model, onSelectScene, clipPlayback, listBeside = listBeside)
                     HorizontalDivider()
                     body.left()
                 },
@@ -6627,7 +6628,7 @@ private fun <T> MacSegmentedControl(
 }
 
 @Composable
-private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit, clipPlayback: ClipPlaybackState? = null, phoneCompact: Boolean = false) {
+private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: TrailerSource?, model: NasFinderViewModel, onSelectScene: (Long) -> Unit, clipPlayback: ClipPlaybackState? = null, phoneCompact: Boolean = false, listBeside: Boolean = false) {
     if (scene == null || source == null) {
         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("선택한 클립이 없습니다. 클립 목록에서 길이나 구간을 조절할 클립을 선택해 주세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -6640,7 +6641,7 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
     }
     val project = session.editor ?: return
     val index = project.scenes.indexOfFirst { it.key == scene.key }
-    val outputLength = remember(project) { project.canonicalClipMappings().firstOrNull { it.sceneKey == scene.key }?.outputDuration } ?: scene.length
+    val outputLength = remember(project, scene.key) { project.canonicalClipMappings().firstOrNull { it.sceneKey == scene.key }?.outputDuration } ?: scene.length
     // 번호는 목록 순서(index + 1)이며 내부 key가 아니다. 원본 구간 길이와 영상에서 차지하는 길이를 구분한다.
     if (phoneCompact) {
         // 폰: 선택 맥락은 한 줄. 세부 효과는 '효과' 도구에서, 정밀 조절은 아래에서 열고 닫는다.
@@ -6651,7 +6652,8 @@ private fun SceneSection(session: TrailerSession, scene: EditorScene?, source: T
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-    } else {
+    } else if (!listBeside) {
+    // 넓은 2분할에서 목록이 옆에 보이면 선택 표시(번호·파일명·길이)가 대상을 알려 주므로 여기서 다시 쓰지 않는다.
     TrailerSectionTitle("${index + 1}번 클립 / 전체 ${project.scenes.size}개 · ${if (source.isImage) "사진" else "영상"} ${seconds1(outputLength)}" + if (!source.isImage && kotlin.math.abs(outputLength - scene.length) > 0.05) " (원본 ${seconds1(scene.length)})" else "")
     Text(source.name, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
